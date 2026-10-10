@@ -2744,6 +2744,92 @@ class TemplateCaps(unittest.TestCase):
             self.assertFalse(any(caps.values()))
 
 
+class CancelById(unittest.TestCase):
+    """POST /cancel ends a running request by the page's X-Strata-Request-Id: a browser can fail a stream's read and
+    keep the socket open, so the disconnect watcher never sees a hang-up and the GPU wrote the rest for nobody."""
+
+    RID = "0123456789abcdef0123456789abcdef"
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\n" + "xy" * 1000, max_context=CTX, delay_s=0.01), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    @staticmethod
+    def answer(body: str) -> str:
+        """The streamed answer's text."""
+        chunks = [json.loads(x[5:]) for x in body.splitlines() if x.startswith("data: {")]
+        return "".join(ch["choices"][0]["delta"].get("content") or "" for ch in chunks if ch.get("choices"))
+
+    def cancel(self, rid, headers=None):
+        req = urllib.request.Request(self.base + "/cancel", data=json.dumps({"id": rid}).encode(),
+                                     headers=headers or {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_a_cancel_ends_the_running_stream(self):
+        data = json.dumps({"model": "m", "stream": True, "max_tokens": 2000,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=data, headers={
+            "Content-Type": "application/json", "X-Strata-Request-Id": self.RID})
+        start = time.monotonic()
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertIn(b"data:", r.readline())                 # it runs: ~20 s for the whole answer
+            self.assertEqual(self.cancel(self.RID), (200, {"cancelled": True}))
+            body = r.read().decode()                                 # the server ends the stream itself
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertLess(self.answer(body).count("x"), 500)
+        self.assertEqual(self.cancel(self.RID), (404, {"cancelled": False}))   # gone once it ended
+
+    def test_a_cancel_that_overtakes_its_request_still_ends_it(self):
+        rid = "a" * 32
+        self.assertEqual(self.cancel(rid), (404, {"cancelled": False}))     # its request has not registered yet
+        data = json.dumps({"model": "m", "stream": True, "max_tokens": 2000,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        start = time.monotonic()
+        with urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=data, headers={
+                "Content-Type": "application/json", "X-Strata-Request-Id": rid}), timeout=30) as r:
+            body = r.read().decode()
+        self.assertLess(time.monotonic() - start, 5)                        # not the ~20 s answer
+        self.assertLess(self.answer(body).count("x"), 50)
+
+    def test_a_reused_id_stays_with_the_running_request(self):
+        """A second request with a running request's id neither takes the id over nor unregisters the first."""
+        rid = "b" * 32
+        data = json.dumps({"model": "m", "stream": True, "max_tokens": 3000,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        open_ = lambda: urllib.request.urlopen(urllib.request.Request(  # noqa: E731
+            self.base + "/v1/chat/completions", data=data,
+            headers={"Content-Type": "application/json", "X-Strata-Request-Id": rid}), timeout=30)
+        with open_() as first:
+            self.assertIn(b"data:", first.readline())
+            second = {}
+            t = threading.Thread(target=lambda: second.setdefault("body", open_().read()))   # waits for the turn
+            t.start()
+            time.sleep(0.5)
+            self.assertEqual(self.cancel(rid), (200, {"cancelled": True}))  # the first one's
+            first.read()
+        t.join(30)
+        self.assertEqual(self.answer(second["body"].decode()).count("x"), 1000)   # the second ran to its end
+
+    def test_unknown_ids_and_foreign_pages_cancel_nothing(self):
+        self.assertEqual(self.cancel("f" * 32), (404, {"cancelled": False}))
+        self.assertEqual(self.cancel(7), (404, {"cancelled": False}))
+        self.assertEqual(self.cancel(self.RID, {"Content-Type": "text/plain"})[0], 415)   # a plain form POST
+        self.assertEqual(self.cancel(self.RID, {"Content-Type": "application/json",
+                                                "Origin": "https://elsewhere.example"})[0], 403)
+
+
 class WebApp(unittest.TestCase):
     """The web app (PR #22's dashboard idea, rebuilt): its page and files, and GET /metrics."""
 
@@ -2784,6 +2870,36 @@ class WebApp(unittest.TestCase):
                      "/fonts/missing.woff2", "/fonts/x.ttf"):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 404)
+
+    def test_files_revalidate_with_an_etag_and_a_304(self):
+        """RFC 9110 13.1.2 / 15.4.5: no-cache files (a reuse revalidates) answer a matching If-None-Match - weak
+        comparison, or "*" - with a 304 that repeats ETag and Cache-Control and has no content."""
+        for path in ("/", "/web/sprite.svg", "/web/app.js"):
+            with self.subTest(path=path):
+                with urllib.request.urlopen(self.base + path, timeout=10) as r:
+                    tag, cache = r.headers["ETag"], r.headers["Cache-Control"]
+                    self.assertTrue(r.read())
+                self.assertRegex(tag, r'^"[0-9a-f]{32}"$')
+                for asked in (tag, "W/" + tag, f'"other", {tag}', "*"):
+                    conn = socket.create_connection(self.httpd.server_address, timeout=10)
+                    conn.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nIf-None-Match: {asked}\r\n\r\n".encode())
+                    raw = b"".join(iter(lambda: conn.recv(65536), b""))
+                    conn.close()
+                    head, _, rest = raw.partition(b"\r\n\r\n")
+                    self.assertIn(b" 304 ", head.split(b"\r\n")[0], asked)
+                    self.assertIn(f"ETag: {tag}".encode(), head)
+                    self.assertIn(f"Cache-Control: {cache}".encode(), head)
+                    self.assertEqual(rest, b"")
+                for asked in ('"other"', '"x,*,y"', f'"{tag[1:-1]}-not"'):    # "x,*,y" is ONE tag, not a "*"
+                    code, _, body = self.get(path, {"If-None-Match": asked})
+                    self.assertEqual(code, 200, asked)
+                    self.assertTrue(body)
+                conn = socket.create_connection(self.httpd.server_address, timeout=10)    # a list over two lines
+                conn.sendall(f'GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nIf-None-Match: "other"\r\n'
+                             f'If-None-Match: {tag}\r\n\r\n'.encode())
+                raw = b"".join(iter(lambda: conn.recv(65536), b""))
+                conn.close()
+                self.assertIn(b" 304 ", raw.split(b"\r\n")[0])
 
     def test_metrics(self):
         data = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}).encode()

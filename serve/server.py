@@ -260,6 +260,8 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
+ENTITY_TAG = re.compile(r'(?:W/)?("[^"]*")')   # RFC 9110 8.8.3; the group is the opaque tag (weak comparison)
+REQUEST_ID = re.compile(r"[0-9a-f]{32}")  # the web chat's X-Strata-Request-Id: 128 random bits, hex
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
@@ -4536,11 +4538,18 @@ class BadBody(Exception):
 
 
 def make_handler(svc: Service):
+    # the running requests' cancel events by the page's X-Strata-Request-Id (128 random bits: not guessable), and the
+    # last ids cancelled before their request registered (the page's /cancel can overtake its own request)
+    cancels: dict[str, threading.Event] = {}               # ponytail: single dict ops, atomic in CPython
+    cancelled_early: dict[str, None] = {}                   # insertion-ordered, the oldest dropped past 256
+    early_lock = threading.Lock()                           # its pruning iterates it
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
+        cancel_id = None                                    # this request's X-Strata-Request-Id, while it runs
         body_read = False                                   # whether a handler took this request's body
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
@@ -4711,6 +4720,15 @@ def make_handler(svc: Service):
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             sock = self.connection
+            rid = self.headers.get("X-Strata-Request-Id", "")
+            # POST /cancel can end it (a stream the page lost).  An id already running stays with its request
+            # (setdefault), so a reused id cancels or unregisters nothing of another request's
+            if REQUEST_ID.fullmatch(rid) and cancels.setdefault(rid, cancel) is cancel:
+                self.cancel_id = rid
+                with early_lock:
+                    early = cancelled_early.pop(rid, False) is None
+                if early:
+                    cancel.set()
 
             def watch():
                 while not done.wait(0.5) and not cancel.is_set():
@@ -4795,6 +4813,26 @@ def make_handler(svc: Service):
                        {"WWW-Authenticate": challenge})
             return False
 
+        def _static(self, body: bytes, ctype: str, cache: str):
+            """One of the web app's files.  `no-cache` makes a browser revalidate before each reuse (RFC 9111 5.2.2.4),
+            so an update shows at once; the strong ETag makes that a 304 without the file (RFC 9110 13.1.2: weak
+            comparison, "*" matches any), where before every reuse - each repaint of an answer, for the icon sprite -
+            fetched it whole."""
+            tag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'   # ponytail: hashed per request; files are small
+            # every If-None-Match line (a list field may be split over several), whole tags only: a tag may hold a
+            # comma ("x,*,y" is one tag), and "*" counts only as the whole value
+            asked = ", ".join(self.headers.get_all("If-None-Match") or [])
+            fresh = asked.strip() == "*" or tag in ENTITY_TAG.findall(asked)
+            self.send_response(304 if fresh else 200)
+            self.send_header("ETag", tag)                    # RFC 9110 15.4.5: a 304 repeats ETag and Cache-Control
+            self.send_header("Cache-Control", cache)
+            if not fresh:
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not fresh:
+                self.wfile.write(body)
+
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
@@ -4804,13 +4842,7 @@ def make_handler(svc: Service):
                 if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():
                     self._json(404, {"error": {"message": "not found"}})
                     return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "font/woff2")
-                self.send_header("Cache-Control", "max-age=86400")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._static(f.read_bytes(), "font/woff2", "max-age=86400")
                 return
             if path.startswith("/web/"):
                 # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
@@ -4822,13 +4854,7 @@ def make_handler(svc: Service):
                 if "/" in name or "\\" in name or ext not in types or not f.is_file():
                     self._json(404, {"error": {"message": "not found"}})
                     return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", types[ext])
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._static(f.read_bytes(), types[ext], "no-cache")
                 return
             if path == "/metrics/prometheus":
                 if self._authorized():
@@ -4878,11 +4904,7 @@ def make_handler(svc: Service):
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._static(body, "text/html; charset=utf-8", "no-cache")
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
@@ -4968,6 +4990,25 @@ def make_handler(svc: Service):
                 return
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
+                return
+            if path == "/cancel":
+                # the web chat's stream broke but the request may still run (a browser can fail the read and keep
+                # the socket open, so the disconnect watcher never sees a hang-up): end it by the page's request id
+                if not self._own_page("a request can be cancelled"):
+                    return
+                try:
+                    rid = json.loads(self._body() or b"{}").get("id")
+                except (ValueError, AttributeError):
+                    rid = None
+                event = cancels.get(rid) if isinstance(rid, str) else None
+                if event is not None:
+                    event.set()
+                elif isinstance(rid, str) and REQUEST_ID.fullmatch(rid):   # its request may not have registered yet
+                    with early_lock:
+                        cancelled_early[rid] = None
+                        while len(cancelled_early) > 256:
+                            cancelled_early.pop(next(iter(cancelled_early)))
+                self._json(200 if event is not None else 404, {"cancelled": event is not None})
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
@@ -5084,6 +5125,9 @@ def make_handler(svc: Service):
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
+                if self.cancel_id is not None:
+                    cancels.pop(self.cancel_id, None)        # ours: only the registering request sets cancel_id
+                    self.cancel_id = None
                 record = self.record
                 if record is not None:
                     with svc.status_lock:

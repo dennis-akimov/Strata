@@ -3,7 +3,18 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const SPRITE = "web/sprite.svg";
+// the icon sprite, put into the page once: a <use> of another file is fetched again for every copy the page builds (an
+// answer is rebuilt on each repaint while it streams: ~20 sprite requests a second), one of this page's ids never is.
+// Until it is in (or if it cannot be fetched), icons use the file.
+let SPRITE = "web/sprite.svg";
+fetch(SPRITE).then((r) => (r.ok ? r.text() : "")).then((svg) => {
+  if (!svg.includes("<symbol")) return;
+  const box = document.createElement("div");
+  box.hidden = true;
+  box.innerHTML = svg;
+  document.body.prepend(box);
+  SPRITE = "";
+}).catch(() => { /* keep the file */ });
 const icon = (name, cls = "st-icon") => `<svg class="${cls}" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
@@ -693,9 +704,9 @@ function updateAssistant(el, m, streaming) {
     if (!thinkingNow && det.open && !det.dataset.touched) { det._auto = true; det.open = false; }
   }
   const bubble = el.querySelector(".st-bubble");
-  if (m.error) {
-    bubble.innerHTML = `<div class="msg-error"></div>`;
-    bubble.firstChild.textContent = m.error;
+  if (m.error) {                                   // the answer that arrived, then the error
+    bubble.innerHTML = `${m.text ? answerHtml(m) : ""}<div class="msg-error"></div>`;
+    bubble.lastChild.textContent = m.error;
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
@@ -800,6 +811,9 @@ async function send() {
   renderChat();
   const el = $("chat").lastElementChild;
   const controller = new AbortController();
+  // 128 random bits (crypto.randomUUID needs https; this page is often plain http on the LAN): POST /cancel ends the
+  // request on the server when the stream breaks but the socket does not close, so the GPU is not busy for nothing
+  const rid = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
   busy = {controller, msg: m};
   setBusy(true);
 
@@ -816,11 +830,25 @@ async function send() {
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
-  let firstAt = null, thinkStart = null, usage = null, frame = 0;
-  const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
+  let firstAt = null, thinkStart = null, usage = null, frame = 0, ended = false, cost = 0, painted = 0;
+  // a repaint rebuilds the whole answer from its markdown, so it costs more as the answer grows: the next one waits 4x
+  // the last one's cost (painting keeps under ~20% of the page's time), else a long answer's repaints fill every frame
+  const paint = () => {
+    if (ended) return;
+    frame = 0;
+    const t = performance.now();
+    updateAssistant(el, m, true);
+    scrollDown();
+    painted = performance.now();
+    cost = painted - t;
+  };
+  const schedule = () => {
+    const wait = 4 * cost - (performance.now() - painted);
+    frame = wait > 0 ? setTimeout(() => requestAnimationFrame(paint), wait) : requestAnimationFrame(paint);
+  };
   try {
-    const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
-                                                   signal: controller.signal});
+    const r = await fetch("v1/chat/completions", {method: "POST", headers: {...headers(true), "X-Strata-Request-Id": rid},
+                                                   body: JSON.stringify(body), signal: controller.signal});
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
@@ -859,12 +887,21 @@ async function send() {
           if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
           m.text += d.content;
         }
-        if (!frame) frame = requestAnimationFrame(paint);
+        if (!frame) schedule();
       }
     }
   } catch (e) {
+    // Stop, or a broken stream: either way the server may still be writing this answer (a browser can fail the read and
+    // keep the socket open, so the server never sees a hang-up) - end it there too
+    fetch("cancel", {method: "POST", headers: headers(true), body: JSON.stringify({id: rid})}).catch(() => {});
     if (e.name === "AbortError") m.stopped = true;
-    else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+    else {
+      const lost = e instanceof TypeError && (m.text || m.reasoning);   // fetch's "network error" mid-answer
+      m.error = lost ? `The connection broke while the answer was being written (${e.message}); what arrived is ` +
+                       "kept above, and the server was asked to stop it. Send it again to retry."
+                     : e.message || String(e);
+      toast("error", lost ? "The connection broke" : "The request failed", m.error, 6000);
+    }
   }
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
@@ -881,7 +918,7 @@ async function send() {
   if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
   busy = null;
   setBusy(false);
-  if (frame) cancelAnimationFrame(frame);
+  ended = true;                                   // a repaint still scheduled does nothing
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();

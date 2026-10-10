@@ -305,10 +305,10 @@ class ChatThinkingBudget(unittest.TestCase):
     """The chat's thinking budget (#123's reasoning_budget_tokens), through app.js's own send() and the shared defaults
     (node, fixtures/chat_request.js)."""
 
-    def run_chat(self, settings):
+    def run_chat(self, settings, *mode):
         here = Path(__file__).parent
         out = subprocess.run(["node", str(here / "fixtures" / "chat_request.js"), str(here / "web" / "app.js"),
-                              json.dumps(settings)], capture_output=True, text=True, timeout=60)
+                              json.dumps(settings), *mode], capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -322,6 +322,15 @@ class ChatThinkingBudget(unittest.TestCase):
             r = self.run_chat({"budget": budget})
             self.assertNotIn("reasoning_budget_tokens", r["body"])
             self.assertNotIn("reasoning_budget_tokens", r["shared"])
+
+    def test_a_lost_stream_keeps_the_answer_and_cancels_it_on_the_server(self):
+        """Chrome can fail a stream's read ("network error") and keep the socket open, so the server never sees a
+        hang-up: the page POSTs /cancel with the id it sent as X-Strata-Request-Id, and keeps what arrived."""
+        r = self.run_chat({}, "lost")
+        self.assertRegex(r["rid"], r"^[0-9a-f]{32}$")
+        self.assertEqual(r["cancelled"], {"id": r["rid"]})
+        self.assertEqual(r["msg"]["text"], "partial")
+        self.assertIn("connection broke", r["msg"]["error"])
 
     def test_thinking_off_sends_no_budget(self):
         r = self.run_chat({"budget": "2048", "thinking": "none"})
