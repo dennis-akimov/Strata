@@ -23,6 +23,9 @@ Strata 在你自己的电脑上运行大型 AI 模型：它们能聊天、写代
 | **[GPT-OSS 120B](docs/MACOS.md#gpt-oss-120b)**（MXFP4） | 93-100 token/秒 | 93-103 token/秒 | 63 GB |
 | **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) Q2_0**，`--mtp on` | 60-69 token/秒 | 92-102 token/秒 | 38 GB |
 | **Qwen3.8-Flash-Next IQ3_XXS**，`--mtp on` | 46-48 token/秒 | 73-92 token/秒 | 47 GB |
+| **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 token/秒 | 29-32 token/秒 | 86 GB |
+
+\* 于 2026-10-10 测得，当时 Docker 占用约 40 GB、交换空间已满（GPU 频率偏低），因此是下限；此外 GLM 每个 token 读取的激活参数约为其他模型的 3 倍。
 
 Qwen 的数字使用了它的 MTP 草稿层，这是可选功能（`./setup.sh --setup --mtp on`，多占约 12 GB 磁盘）。上下文缓存
 另外占用内存（几 GB；上下文越长越多）。在 *自动* 能耗模式下，同一台 Mac 写长回答要慢 2-3 倍。没有在其他 Mac 上
@@ -64,7 +67,7 @@ make run                   # 加载模型，就绪后打开 http://127.0.0.1:808
 | Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB（实测） | 压缩程度低于 Q2_0；在我们的测试中慢 10-30%。`make pull MODEL=IQ3_XXS` |
 | Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB（实测） | 压缩程度更低；在一次 A/B 测试中比 Q2_0 慢约 10%。`make pull MODEL=IQ3_S` |
 | **GPT-OSS 120B** | 63 GB | 约 70 GB（估计） | 这里最快的模型（每个 token 约激活 50 亿参数）。需手动安装：[步骤](docs/MACOS.md#gpt-oss-120b) |
-| GLM-5.3-Flash（Maya-S24） | 95 GB | 32K 时约 100 GB（估计） | 仅代码：Strata 能读取它的分词器、对话格式和工具调用，但还没有实际运行过该模型。 |
+| GLM-5.3-Flash（Maya-S24） | 95 GB | 32K 时 89 GB（实测） | 这里最大（3200 亿参数，每个 token 约激活 180 亿）也最慢。聊天、思考和工具调用都可用。需手动安装：[步骤](docs/MACOS.md#glm-53-flash) |
 
 “内存占用”是在测试用的 Mac 上，引擎加上 Qwen 模型的 MTP 草稿层和 2 个请求槽位时的数值；上下文越小占用越少
 （`make run CONTEXT=32768`）。它必须放得进 macOS 允许 GPU 使用的范围，`make check` 会显示你的 Mac 的这个值（测试用的

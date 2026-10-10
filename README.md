@@ -25,6 +25,9 @@ Measured on one MacBook Pro with an M5 Max (40-core GPU, 128 GB), macOS 26.4, in
 | **[GPT-OSS 120B](docs/MACOS.md#gpt-oss-120b)** (MXFP4) | 93-100 tokens/s | 93-103 tokens/s | 63 GB |
 | **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) Q2_0**, with `--mtp on` | 60-69 tokens/s | 92-102 tokens/s | 38 GB |
 | **Qwen3.8-Flash-Next IQ3_XXS**, with `--mtp on` | 46-48 tokens/s | 73-92 tokens/s | 47 GB |
+| **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 tokens/s | 29-32 tokens/s | 86 GB |
+
+\* Measured 2026-10-10 while Docker used about 40 GB and swap was full (the GPU at a low clock), so a floor; GLM also reads about 3x the active parameters per token of the others.
 
 The Qwen numbers use its MTP draft layer, which is opt-in (`./setup.sh --setup --mtp on`, about 12 GB more disk).
 The context's cache comes on top of the model file (a few GB; more for long contexts). In the *Automatic* energy mode
@@ -69,7 +72,7 @@ in your browser.
 | Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB (measured) | Less compressed than Q2_0; 10-30% slower in our runs. `make pull MODEL=IQ3_XXS` |
 | Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB (measured) | Less compressed again; about 10% slower than Q2_0 in one A/B. `make pull MODEL=IQ3_S` |
 | **GPT-OSS 120B** | 63 GB | about 70 GB (estimate) | The fastest here (about 5B parameters active per token). Set up by hand: [steps](docs/MACOS.md#gpt-oss-120b) |
-| GLM-5.3-Flash (Maya-S24) | 95 GB | about 100 GB at 32K (estimate) | Code only: Strata reads its tokenizer, chat format and tool calls, but the model has not been run yet. |
+| GLM-5.3-Flash (Maya-S24) | 95 GB | 89 GB at 32K (measured) | The largest here (320B parameters, about 18B active per token), and the slowest. Chat, thinking and tool calls work. Set up by hand: [steps](docs/MACOS.md#glm-53-flash) |
 
 "In memory" is the engine with the Qwen models' MTP draft layer and 2 request slots, on the tested Mac; a smaller
 context needs less (`make run CONTEXT=32768`). It must fit in what macOS lets the GPU use, which `make check` prints

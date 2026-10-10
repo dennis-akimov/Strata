@@ -25,6 +25,9 @@ Gemessen auf einem MacBook Pro mit M5 Max (40-Kern-GPU, 128 GB), macOS 26.4, im 
 | **[GPT-OSS 120B](docs/MACOS.md#gpt-oss-120b)** (MXFP4) | 93-100 Token/s | 93-103 Token/s | 63 GB |
 | **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) Q2_0**, mit `--mtp on` | 60-69 Token/s | 92-102 Token/s | 38 GB |
 | **Qwen3.8-Flash-Next IQ3_XXS**, mit `--mtp on` | 46-48 Token/s | 73-92 Token/s | 47 GB |
+| **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 Token/s | 29-32 Token/s | 86 GB |
+
+\* Gemessen am 2026-10-10, während Docker etwa 40 GB belegte und der Swap voll war (GPU mit niedrigem Takt), also eine Untergrenze; GLM liest außerdem etwa 3x so viele aktive Parameter pro Token wie die anderen.
 
 Die Qwen-Werte nutzen seine MTP-Entwurfsschicht, die optional ist (`./setup.sh --setup --mtp on`, etwa 12 GB mehr
 Speicherplatz). Der Cache des Kontexts kommt zur Modelldatei hinzu (einige GB; mehr bei langen Kontexten). Im
@@ -69,7 +72,7 @@ Modell bleibt). **Wo was liegt:** Modelle in `Strata-data/` neben dem Ordner `St
 | Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB (gemessen) | Weniger stark komprimiert als Q2_0; in unseren Läufen 10-30 % langsamer. `make pull MODEL=IQ3_XXS` |
 | Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB (gemessen) | Noch weniger komprimiert; in einem A/B-Test etwa 10 % langsamer als Q2_0. `make pull MODEL=IQ3_S` |
 | **GPT-OSS 120B** | 63 GB | etwa 70 GB (Schätzung) | Hier das schnellste (etwa 5 Mrd. aktive Parameter pro Token). Einrichtung von Hand: [Schritte](docs/MACOS.md#gpt-oss-120b) |
-| GLM-5.3-Flash (Maya-S24) | 95 GB | etwa 100 GB bei 32K (Schätzung) | Nur Code: Strata liest Tokenizer, Chatformat und Tool-Aufrufe, aber das Modell lief noch nicht. |
+| GLM-5.3-Flash (Maya-S24) | 95 GB | 89 GB bei 32K (gemessen) | Das größte hier (320 Mrd. Parameter, etwa 18 Mrd. aktiv pro Token) und das langsamste. Chat, Denken und Tool-Aufrufe funktionieren. Manuell einrichten: [Schritte](docs/MACOS.md#glm-53-flash) |
 
 „Im Speicher“ ist die Engine mit der MTP-Entwurfsschicht der Qwen-Modelle und 2 Anfrage-Slots, auf dem getesteten
 Mac; ein kleinerer Kontext braucht weniger (`make run CONTEXT=32768`). Es muss in das passen, was macOS der GPU

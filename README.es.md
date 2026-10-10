@@ -26,6 +26,9 @@ Medido en un MacBook Pro con M5 Max (GPU de 40 núcleos, 128 GB), macOS 26.4, en
 | **[GPT-OSS 120B](docs/MACOS.md#gpt-oss-120b)** (MXFP4) | 93-100 tokens/s | 93-103 tokens/s | 63 GB |
 | **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) Q2_0**, con `--mtp on` | 60-69 tokens/s | 92-102 tokens/s | 38 GB |
 | **Qwen3.8-Flash-Next IQ3_XXS**, con `--mtp on` | 46-48 tokens/s | 73-92 tokens/s | 47 GB |
+| **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 tokens/s | 29-32 tokens/s | 86 GB |
+
+\* Medido el 2026-10-10 mientras Docker usaba unos 40 GB y el swap estaba lleno (la GPU a baja frecuencia), así que es un mínimo; GLM además lee unas 3 veces más parámetros activos por token que los demás.
 
 Las cifras de Qwen usan su capa de borrador MTP, que es opcional (`./setup.sh --setup --mtp on`, unos 12 GB más de
 disco). La caché del contexto se suma al archivo del modelo (unos pocos GB; más con contextos largos). En el modo de
@@ -70,7 +73,7 @@ modelo se queda). **Dónde está cada cosa:** los modelos en `Strata-data/` junt
 | Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB (medido) | Menos comprimido que Q2_0; un 10-30 % más lento en nuestras pruebas. `make pull MODEL=IQ3_XXS` |
 | Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB (medido) | Aún menos comprimido; un 10 % más lento que Q2_0 en una prueba A/B. `make pull MODEL=IQ3_S` |
 | **GPT-OSS 120B** | 63 GB | unos 70 GB (estimación) | El más rápido aquí (unos 5 mil millones de parámetros activos por token). Se instala a mano: [pasos](docs/MACOS.md#gpt-oss-120b) |
-| GLM-5.3-Flash (Maya-S24) | 95 GB | unos 100 GB con 32K (estimación) | Solo código: Strata lee su tokenizador, su formato de chat y sus llamadas a herramientas, pero el modelo aún no se ha ejecutado. |
+| GLM-5.3-Flash (Maya-S24) | 95 GB | 89 GB con 32K (medido) | El más grande aquí (320 mil millones de parámetros, unos 18 mil millones activos por token) y el más lento. El chat, el razonamiento y las llamadas a herramientas funcionan. Se instala a mano: [pasos](docs/MACOS.md#glm-53-flash) |
 
 «En memoria» es el motor con la capa de borrador MTP de los modelos Qwen y 2 espacios para peticiones, en el Mac
 probado; un contexto más pequeño necesita menos (`make run CONTEXT=32768`). Debe caber en lo que macOS permite usar a

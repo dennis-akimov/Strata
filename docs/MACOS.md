@@ -5,8 +5,7 @@ The main document of this independently maintained, Apple Silicon-only fork of
 they were at the fork point, but not maintained here; see [docs/README.md](README.md)).
 
 **Tested on one Mac:** a MacBook Pro M5 Max (40-core GPU, 128 GB) on macOS 26.4, with Qwen3.8-Flash-Next Q2_0, IQ3_XXS
-and IQ3_S, and GPT-OSS 120B. GLM-5.3-Flash support is in, but not tested end to end yet. Other Apple Silicon Macs and
-other model files are untested. Read [Limits and warnings](#limits-and-warnings) before you install.
+and IQ3_S, GPT-OSS 120B and GLM-5.3-Flash (Maya-S24). Other Apple Silicon Macs and other model files are untested. Read [Limits and warnings](#limits-and-warnings) before you install.
 
 On a Mac, Strata serves the same web app and APIs (OpenAI, Anthropic, Responses, MCP) as on a PC. The engine under
 them is different: `strata-metal` (`metal/`) runs the model on llama.cpp's Metal backend.
@@ -69,7 +68,7 @@ If setup stops, it says what is missing and the command that fixes it.
   differs between Macs and macOS versions. Q2_0's weights take about 35 GB of it (IQ3_S's about 51 GB), plus the context's cache. Everything
   the Mac does shares the same memory, so close other large apps. Below 128 GB only the 64 GB floor applies: nobody
   has measured how close a 64 GB Mac gets.
-- **Of the Qwen sizes, only Q2_0, IQ3_XXS and IQ3_S were tested** (and GPT-OSS 120B of the others). `make check` marks the other sizes "untested on a Mac". On a PC, the Unsloth sizes
+- **Of the Qwen sizes, only Q2_0, IQ3_XXS and IQ3_S were tested** (and GPT-OSS 120B and GLM-5.3-Flash Maya-S24 of the others). `make check` marks the other sizes "untested on a Mac". On a PC, the Unsloth sizes
   (UD-Q4_K_XL, UD-IQ4_XS) stream part of their experts from the SSD; the Mac engine cannot, so all of a model's experts
   must fit in Metal's limit. UD-Q4_K_XL (111 GB) is larger than the test Mac's default limit.
 - **Speed.** On the test Mac: 13-17 tokens/s for the answer and 225-270 tokens/s to read a prompt, with other programs
@@ -133,6 +132,7 @@ thumb: 8-16 GB): set too high, the whole Mac can slow down or stop responding un
 | Pictures | yes: `strata-vision` runs on Metal |
 | MTP draft layer | opt-in: `--mtp on` |
 | GPT-OSS 120B (OpenAI's harmony format) | yes, set up by hand: see [GPT-OSS 120B](#gpt-oss-120b) |
+| GLM-5.3-Flash (Maya-S24) | yes, set up by hand: see [GLM-5.3-Flash](#glm-53-flash) |
 | EAGLE3 draft model (`--eagle3`) | opt-in engine flag, off: slower than no draft on GPT-OSS ([below](#eagle3-draft-model---eagle3)) |
 | Several requests at once (`"parallel"`) | opt-in, the same as on a PC |
 | Monitor tab | GPU load, memory and power, the chip's temperature (its die sensors), CPU, RAM; PCIe shows "n/a" (an integrated GPU has no PCIe link) |
@@ -181,6 +181,42 @@ tool is not forced (the model chooses); its template writes one tool call per me
 (temperature 0.6, top-k 20) are Qwen's: set temperature 1.0 and top-p 1.0 there for GPT-OSS. Only the `qwen35` and
 `gpt-4o` tokenizers are known to Strata; another model's pack is refused rather than tokenized wrongly.
 
+### GLM-5.3-Flash
+
+Z.ai's GLM-5.3-Flash (320B parameters, about 18B active per token) runs in Strata as
+[Project Maya's](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) Maya-S24: 2-bit routed experts, 94.7 GB
+in 3 files; its model card rates it at 97.7% of the full model's zero-shot accuracy. Setup does not install it; by hand:
+
+```sh
+D=../Strata-data/models/GLM-5.3-Flash-Maya-S24; mkdir -p $D
+R=https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/resolve/f16ee4ba50d8fd2bb726ea1862ca6ca14ba188da
+for f in 1 2 3; do aria2c -x16 -s16 -c -d $D "$R/Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-0000$f-of-00003.gguf"; done
+aria2c -c -d $D "$R/vision/GLM-5.3-Flash-vocab.gguf"                                    # 9 MB, the tokenizer
+.venv/bin/python tools/strata_tokenizer.py --gguf $D/GLM-5.3-Flash-vocab.gguf --out ../Strata-data/packs/glm-5.3-flash-maya-s24
+```
+
+If a part stops with a 403 near its end (Hugging Face's signed link expired), run the same line again: it continues.
+Then a run config as for GPT-OSS, with `"--gguf", "<the -00001-of-00003 file>", "--max-context", "32768"`.
+
+What Strata does for it: its tokenizer (`pre` = `glm4`) matched GLM-5.3-Flash's own on 2,179 strings (0 differences);
+the server reads its thinking and its tool calls (GLM's `<arg_key>`/`<arg_value>` form) and stops a reply at
+`<|user|>`, `<|observation|>` or `<|endoftext|>`. GLM always opens its thinking: the chat's efforts map to its template's
+low / high / max ("Off" and "Low" are its low, which often writes no thinking at all).
+
+| Measured on the test Mac, 2026-10-10, *High Power* | |
+|---|---|
+| A question, thinking (`high`), a tool call and its result (OpenAI API) | correct |
+| Decode, short answers (127-346 tokens) | 29-32 tok/s |
+| Decode, 900-word answers (930-1,220 tokens) | 13-26 tok/s (25.6, 13.4, 16.0, 19.9) |
+| Decode, one 17,940-token answer (a 319-token prompt, 14.5 min) | 20.5 tok/s on average |
+| A follow-up after a tool's result | read only its new part (199 of 217 prompt tokens reused) |
+| Engine memory at a 32K context | 88.6 GB of Metal's 107.5 GB: weights 85.6, compute 2.6, cache 0.3 |
+| Load | about 60 s |
+
+These runs were not on a quiet Mac: Docker Desktop held about 40 GB and swap was full (34 of 35 GB), and the GPU ran
+at 400-840 MHz, so read them as a floor. The model's own measurements: 13.5 tok/s on a 24 GB PC graphics card with
+the rest in RAM. Its cache is small (0.3 GB at 32K), so larger contexts should fit, but only 32K was run.
+
 ### EAGLE3 draft model (`--eagle3`)
 
 `strata-metal --eagle3 <gguf> --spec N` drafts with an EAGLE3 model (it reads 3 of the target's layers) instead of an MTP
@@ -218,6 +254,23 @@ medians of 3, 2026-10-06, with other programs running (the answer speed moved by
 - Two requests at once with MTP: 17.2 tok/s together against 18.7 one after the other (batch slots decode without
   drafts). llama.cpp's `batched-bench` without MTP: 13.2 tok/s for one sequence, 22.5 for two, 29.7 for four.
 - No large overhead over llama.cpp was apparent: `llama-bench` on the same file gave 16.9 tok/s output.
+
+### The models compared
+
+On the test Mac, through the OpenAI API, thinking off, *High Power* (details in each model's section):
+
+| | GPT-OSS 120B | Qwen3.8-Flash-Next Q2_0 | Qwen3.8-Flash-Next IQ3_XXS | GLM-5.3-Flash Maya-S24 |
+|---|---:|---:|---:|---:|
+| Parameters, active per token | 117B, ~5B | 180B, ~6B | 180B, ~6B | 320B, ~18B |
+| Download | 63 GB | 66 GB | 76 GB | 95 GB |
+| Engine memory | the 63 GB file + cache | ~60 GB at 128K (estimate) | 65 GB at 128K | 89 GB at 32K |
+| Decode, 900-word answers | 93-100 tok/s | 60-69 tok/s (`--mtp on`) | 46-48 tok/s (`--mtp on`) | 13-26 tok/s\* |
+| Decode, short answers | 93-103 tok/s | 92-102 tok/s (`--mtp on`) | 73-92 tok/s (`--mtp on`) | 29-32 tok/s\* |
+| Measured | 2026-10-08 | 2026-10-08 | 2026-10-08 | 2026-10-10 |
+
+\* With Docker using about 40 GB and swap full; the GPU ran at 400-840 MHz against 1,300-1,620 for the others, so this
+column is a floor. GLM reads about 3x the active parameters per token of the others, so it would be slower on a quiet Mac
+too.
 
 ### IQ3_S compared with Q2_0
 

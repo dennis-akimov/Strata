@@ -25,6 +25,9 @@ M5 Max（40 コア GPU、128 GB）の MacBook Pro、macOS 26.4、省エネルギ
 | **[GPT-OSS 120B](docs/MACOS.md#gpt-oss-120b)**（MXFP4） | 93-100 トークン/秒 | 93-103 トークン/秒 | 63 GB |
 | **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) Q2_0**（`--mtp on`） | 60-69 トークン/秒 | 92-102 トークン/秒 | 38 GB |
 | **Qwen3.8-Flash-Next IQ3_XXS**（`--mtp on`） | 46-48 トークン/秒 | 73-92 トークン/秒 | 47 GB |
+| **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 トークン/秒 | 29-32 トークン/秒 | 86 GB |
+
+\* 2026-10-10 に、Docker が約 40 GB を使いスワップが満杯の状態（GPU のクロックが低い）で測定したため、下限の値です。GLM は 1 トークンあたり、ほかのモデルの約 3 倍のアクティブパラメータを読みます。
 
 Qwen の数値は MTP ドラフト層を使っています。MTP は任意で、有効にするには `./setup.sh --setup --mtp on`（ディスクを
 約 12 GB 追加で使用）。コンテキストのキャッシュはモデルファイルとは別に必要です（数 GB、長いコンテキストではさらに
@@ -69,7 +72,7 @@ make run                   # モデルを読み込み、準備ができたら ht
 | Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB（実測） | Q2_0 より圧縮が少ない。今回の測定では 10〜30 % 遅い。`make pull MODEL=IQ3_XXS` |
 | Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB（実測） | さらに圧縮が少ない。A/B テスト 1 回で Q2_0 より約 10 % 遅い。`make pull MODEL=IQ3_S` |
 | **GPT-OSS 120B** | 63 GB | 約 70 GB（推定） | ここで最速（1 トークンあたり約 50 億パラメータが動作）。手動でセットアップ：[手順](docs/MACOS.md#gpt-oss-120b) |
-| GLM-5.3-Flash（Maya-S24） | 95 GB | 32K で約 100 GB（推定） | コードのみ：Strata はトークナイザー、チャット形式、ツール呼び出しに対応していますが、まだモデルを動かしていません。 |
+| GLM-5.3-Flash（Maya-S24） | 95 GB | 32K で 89 GB（実測） | ここで最大（3,200 億パラメータ、1 トークンあたり約 180 億が動作）で、最も遅い。チャット、思考、ツール呼び出しは動作します。手動でセットアップ：[手順](docs/MACOS.md#glm-53-flash) |
 
 「メモリ上」は、テストした Mac で Qwen モデルの MTP ドラフト層とリクエスト枠 2 つを含むエンジン全体の値です。
 コンテキストを小さくすれば少なくて済みます（`make run CONTEXT=32768`）。これが macOS が GPU に使わせる範囲に収まる
