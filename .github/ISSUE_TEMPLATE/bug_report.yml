@@ -4,10 +4,15 @@ title: "[Bug]: "
 labels: ["bug"]
 body:
   - type: markdown
-    value: |
-      Thanks for the report.
+    attributes:
+      value: |
+        This is the Apple Silicon (Mac) fork of Strata. For a Windows or Linux PC, use the original: [github.com/Niko1221/Strata](https://github.com/Niko1221/Strata/issues).
 
-      Please search the [open issues](https://github.com/Niko1221/Strata/issues?q=is%3Aissue+state%3Aopen) first — this may already be tracked.
+        Thanks for the report.
+
+        A security problem? Don't post it here: report it privately (see [SECURITY.md](https://github.com/dennis-akimov/Strata/blob/main/SECURITY.md)).
+
+        Please search the [open issues](https://github.com/dennis-akimov/Strata/issues?q=is%3Aissue+state%3Aopen) first — this may already be tracked.
   - type: textarea
     id: what
     attributes:
@@ -18,20 +23,29 @@ body:
   - type: input
     id: hardware
     attributes:
-      label: Strata version, GPU, OS
+      label: Strata version, Mac, macOS
       description: The engine version is on the About tab, or in `GET /v1/status` under `engine`.
-      placeholder: "0.1.31 · RTX 5070 12GB · Windows 11"
+      placeholder: "0.1.41 · MacBook Pro M5 Max 128 GB · macOS 26.4"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and settings
+      description: The model and size, the context, whether `--mtp on` is set, and how you started it (make run, make start, a run-<model>.sh).
+      placeholder: "Qwen3.8-Flash-Next Q2_0 · 131072 · MTP on · make run"
     validations:
       required: true
   - type: textarea
     id: log
     attributes:
-      label: Engine log
-      description: Drag in `strata-<model>.log` from your Strata folder. Drag and drop works directly into this box.
+      label: Logs
+      description: The engine's `strata-<model>.log` from your Strata folder, and with `make start` also `strata-run.log`; with `make run`, the last lines in Terminal. Drag and drop works directly into this box. Remove any API keys or private text first.
     validations:
       required: false
   - type: markdown
-    value: |
-      A couple of extras that help a lot:
+    attributes:
+      value: |
+        A couple of extras that help a lot:
 
-      - Check the [troubleshooting table](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md#troubleshooting) first, many reports are already solved there.
+        - Check the [Mac limits and warnings](https://github.com/dennis-akimov/Strata/blob/main/docs/MACOS.md#limits-and-warnings) first, many reports are already solved there.

@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import socket
+import platform
 import sys
 import tempfile
 import threading
@@ -838,6 +839,12 @@ class StatusNeedsTheKey(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(base, timeout=10)
             self.assertEqual(e.exception.code, 401)
+            # RFC 9110 11.6.1 / RFC 6750 3: the challenge; no error code when no key was sent (RFC 6750 3.1)
+            self.assertEqual(e.exception.headers["WWW-Authenticate"], 'Bearer realm="strata"')
+            e.exception.close()
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(urllib.request.Request(base, headers={"Authorization": "Bearer wrong"}), timeout=10)
+            self.assertEqual(e.exception.headers["WWW-Authenticate"], 'Bearer realm="strata", error="invalid_token"')
             e.exception.close()
             req = urllib.request.Request(base, headers={"Authorization": "Bearer k3y"})
             with urllib.request.urlopen(req, timeout=10) as r:
@@ -1999,6 +2006,14 @@ class PeerDevice(unittest.TestCase):
         done = args + ["--vision", "--vram-reserve-mib", "700"]                  # setup wrote it: unchanged
         self.assertEqual(engine_args({"args": list(done), "vision": {"gpu": True}}), done)
         self.assertEqual(engine_args({"args": list(args)}), args)                # no section: no images
+
+    def test_a_mac_config_gets_no_vision_flags(self):
+        # the Metal engine takes pictures without --vision (it ignores the flag) and setup never writes it there
+        cfg = {"args": ["--gguf", "x"], "backend": "metal", "vision": {"exe": "v", "gpu": True}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(engine_args(cfg), ["--gguf", "x"])
+        self.assertEqual(out.getvalue(), "")                                  # and no note on every start
 
     def test_split_added_for_several_gpus(self):
         self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0, 1]}),
@@ -3704,6 +3719,7 @@ class ForcedToolChoice(unittest.TestCase):
         self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT[:20]) + extra)
 
     def test_auto_absent_and_none_leave_the_tools_to_the_model(self):
+        prompts = {}
         for extra in ({}, {"tool_choice": "auto"}, {"tool_choice": "none"}):
             with self.subTest(extra=extra):
                 self.engine.prompts = []
@@ -3712,8 +3728,18 @@ class ForcedToolChoice(unittest.TestCase):
                 self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
                 self.assertEqual(b["choices"][0]["finish_reason"], "stop")
                 self.assertEqual(len(self.engine.prompts), 1)
-                offered = "search the web" in self.tok.decode(self.engine.prompts[0])
-                self.assertEqual(offered, extra.get("tool_choice") != "none")   # "none": no tools in the prompt
+                # "none" too: the tools stay in the prompt, so an agent's tool-free last step keeps its KV prefix
+                self.assertIn("search the web", self.tok.decode(self.engine.prompts[0]))
+                prompts[extra.get("tool_choice", "absent")] = self.engine.prompts[0]
+        self.assertEqual(prompts["none"], prompts["auto"])
+
+    def test_none_does_not_coerce_a_bad_stop_into_a_valid_one(self):
+        """tool_choice "none" adds <tool_call> to stop: a bad stop must still be a 400, not ["END", "<tool_call>"]."""
+        for stop in ({"END": 1}, False, 7, ["a", 1]):
+            for choice in ("none", "auto"):
+                with self.subTest(stop=stop, choice=choice):
+                    code, b = self.openai(tool_choice=choice, stop=stop)
+                    self.assertEqual(code, 400, b)
 
     def test_a_call_cut_by_max_tokens_is_not_a_tool_call(self):
         code, b = self.openai(tool_choice="required", max_tokens=5, **self.NO_THINKING)
@@ -4060,6 +4086,120 @@ class ModelAliases(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class AppleTelemetry(unittest.TestCase):
+    """macOS (docs/MACOS.md): a Mac's GPU load and memory from ioreg's PerformanceStatistics line, its total from Metal."""
+
+    LINE = ('      "PerformanceStatistics" = {"In use system memory (driver)"=0,"Alloc system memory"=8902623232,'
+            '"Renderer Utilization %"=12,"Device Utilization %"=37,"In use system memory"=477233152}')
+
+    def test_parse(self):
+        from serve import telemetry
+        self.assertEqual(telemetry._Apple.parse(self.LINE), (37, 477233152))   # not the "(driver)" or "Alloc" figures
+        self.assertEqual(telemetry._Apple.parse(""), (None, None))
+
+    def test_read_uses_ioreg_and_the_working_set(self):
+        from serve import telemetry
+        with mock.patch.object(telemetry, "metal_working_set_bytes", return_value=64 << 30), \
+                mock.patch.object(telemetry.sys, "platform", "darwin"), \
+                mock.patch("subprocess.run", return_value=mock.Mock(stdout=self.LINE)):
+            g = telemetry.gpu_reader(0)
+            self.assertIsInstance(g, telemetry._Apple)
+            self.assertTrue(g.ok())
+            fake = mock.Mock(read=mock.Mock(return_value={"power": 6.5, "temp": 58.9}))
+            with mock.patch.object(telemetry._MacSensors, "get", return_value=fake):
+                self.assertEqual(g.read(), {"util": 37, "mem_used": 477233152, "mem_total": 64 << 30,
+                                            "unified": True, "power": 6.5, "temp": 58.9})
+            fake.read.assert_called_once_with(37)                     # the load decides a stuck power counter
+            self.assertIsInstance(telemetry.gpu_reader(0, amd=True), telemetry._Amd)   # an explicit AMD path stays
+
+    def test_chip_temp_is_the_hottest_die_sensor(self):
+        from serve import telemetry
+        readings = [("PMU tdie1", 57.2), ("PMU tdie3", 59.3), ("PMU tdev3", -9201.1),   # tdev: an idle sensor
+                    ("PMU tcal", 70.0), ("NAND CH0 temp", 61.0), ("PMU tdie9", float("nan"))]
+        self.assertEqual(telemetry.chip_temp(readings), 59.3)        # die sensors only: not tcal, the SSD or NaN
+        self.assertIsNone(telemetry.chip_temp([("PMU tdev1", -9202.9)]))
+        self.assertIsNone(telemetry.chip_temp([("PMU tdieBogus", 60.0), ("PMU tdie", 61.0), ("PMU tdie3x", 99.0)]))   # exactly tdie<number>
+        self.assertIsNone(telemetry.chip_temp([]))
+
+    def test_energy_watts(self):
+        from serve import telemetry
+        self.assertAlmostEqual(telemetry.energy_watts(5_678_467_559, "nJ", 1.0), 5.678467559)
+        self.assertAlmostEqual(telemetry.energy_watts(4270, "mJ", 2.0), 2.135)
+        self.assertIsNone(telemetry.energy_watts(10, "furlongs", 1.0))
+        self.assertIsNone(telemetry.energy_watts(10, "mJ", 0))
+        self.assertIsNone(telemetry.energy_watts(-1, "mJ", 1.0))      # a counter that went backwards
+        self.assertIsNone(telemetry.energy_watts(10, "mJ", float("inf")))   # not a believable 0 W
+        self.assertIsNone(telemetry.energy_watts(float("nan"), "mJ", 1.0))
+
+    def sensors(self, watts, temps):
+        from serve import telemetry
+        m = object.__new__(telemetry._MacSensors)                     # no IOKit: the read rules only
+        m.lock, m.power_ok, m.temp_ok, m.zero_streak = threading.Lock(), True, True, 0
+        m.gpu_watts = mock.Mock(side_effect=watts) if isinstance(watts, (Exception, list)) else mock.Mock(return_value=watts)
+        m.temps = mock.Mock(side_effect=temps) if isinstance(temps, Exception) else mock.Mock(return_value=temps)
+        return m
+
+    def test_mac_sensor_read_rules(self):
+        self.assertEqual(self.sensors(6.8, [("PMU tdie1", 59.0)]).read(40), {"power": 6.8, "temp": 59.0})
+        self.assertEqual(self.sensors(0.0, []).read(0), {"power": 0.0, "temp": None})          # an idle GPU: 0 W
+        self.assertIsNone(self.sensors(float("inf"), []).read(1)["power"])     # JSON (RFC 8259): finite only
+
+    def test_a_stopped_counter_reads_none_only_after_a_streak(self):
+        m = self.sensors([0.0, 0.0, 0.0, 0.0, 5.0, 0.0], [])
+        got = [m.read(55)["power"] for _ in range(6)]
+        self.assertEqual(got, [0.0, 0.0, None, None, 5.0, 0.0])      # 3 busy zeros in a row: stale; a reading resets
+        self.assertEqual(self.sensors([0.0] * 5, []).read(5)["power"], 0.0)   # a nearly idle GPU: zero is real
+
+    def test_power_and_temperature_fail_separately(self):
+        m = self.sensors(OSError("IOReport gone"), [("PMU tdie2", 57.0)])
+        self.assertEqual(m.read(10), {"power": None, "temp": 57.0})
+        self.assertEqual(m.read(10), {"power": None, "temp": 57.0})
+        m.gpu_watts.assert_called_once()                              # off from then on; the temperature keeps reading
+        t = self.sensors(4.0, OSError("HID gone"))
+        self.assertEqual((t.read(10), t.read(10)), ({"power": 4.0, "temp": None}, {"power": 4.0, "temp": None}))
+        t.temps.assert_called_once()
+
+    def test_the_off_switch_is_checked_under_the_lock(self):
+        inside = threading.Event()
+
+        def fail():                                                   # thread A fails while holding the lock
+            inside.set()
+            time.sleep(0.2)
+            raise OSError("IOReport gone")
+        m = self.sensors(OSError("unused"), [])
+        m.gpu_watts = mock.Mock(side_effect=fail)
+        a = threading.Thread(target=m.read, args=(50,))
+        a.start()
+        inside.wait(5)
+        b = threading.Thread(target=m.read, args=(50,))               # B arrives while A still has it on
+        b.start()
+        a.join(5)
+        b.join(5)
+        m.gpu_watts.assert_called_once()                              # B saw A's "off" once it got the lock
+
+    def test_free_vram_does_not_touch_the_power_counter(self):
+        from serve import telemetry
+        with mock.patch.object(telemetry, "metal_working_set_bytes", return_value=64 << 30), \
+                mock.patch.object(telemetry.sys, "platform", "darwin"), \
+                mock.patch("subprocess.run", return_value=mock.Mock(stdout=self.LINE)), \
+                mock.patch.object(telemetry._MacSensors, "get") as get:
+            self.assertEqual(telemetry.free_vram_mib(0), ((64 << 30) - 477233152) >> 20)
+        get.assert_not_called()                                       # the sampler's interval stays its own
+
+    @unittest.skipUnless(sys.platform == "darwin" and platform.machine() == "arm64", "an Apple Silicon Mac")
+    def test_live_mac_sensors(self):
+        from serve import telemetry
+        m = telemetry._MacSensors()                                   # a fresh one: its first read has no baseline
+        self.assertTrue(m.power_ok and m.temp_ok)
+        first = m.read(None)
+        self.assertIsNone(first["power"])                             # no earlier sample to compare with
+        time.sleep(0.3)
+        second = m.read(None)
+        self.assertIsInstance(second["power"], float)
+        self.assertGreaterEqual(second["power"], 0.0)
+        self.assertTrue(second["temp"] is None or 0.0 < second["temp"] < 130.0, second["temp"])
 
 
 class AmdTelemetry(unittest.TestCase):
@@ -4849,7 +4989,8 @@ class VisionArgs(unittest.TestCase):
 
         with mock.patch.object(server.subprocess, "Popen", popen), mock.patch.object(server, "contain"):
             server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", **cfg})
-        return seen[0]
+        # Popen is patched module-wide, so a telemetry thread of another test (ioreg, nvidia-smi) can land here too
+        return next(a for a in seen if a and a[0] == "strata-vision")
 
     def test_min_tokens_is_passed_only_when_set(self):
         base = self.args_for({"max_tokens": 300})

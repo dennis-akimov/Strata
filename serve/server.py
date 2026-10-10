@@ -54,7 +54,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, CALL_START, H_CHANNEL, ChatTemplate, Event, GlmParser, HarmonyParser,  # noqa: E402
+                            OutputParser,
+                            anthropic_to_messages,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -103,6 +105,53 @@ def listen_problem(host: str, port: int, e: OSError) -> str:
     return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
 
 
+def port_holders(port: int) -> list[tuple[int, str]]:
+    """The processes listening on `port` as (pid, command line), from lsof and ps; [] where those are missing (Windows)."""
+    try:
+        pids = subprocess.run(["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True,
+                              timeout=10).stdout.split()
+        return [(int(p), subprocess.run(["ps", "-o", "command=", "-p", p], capture_output=True, text=True,
+                                        timeout=10).stdout.strip()) for p in dict.fromkeys(pids)]
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
+
+
+def stop_ids_of(tokenizer, strings) -> set[int]:
+    """The token ids that end a reply: each string that is ONE token of this vocabulary.  Another model's tag (Qwen's
+    <|im_end|> with GLM's tokenizer) is several ordinary pieces, and those must never stop a reply."""
+    return {ids[0] for s in strings for ids in [tokenizer.encode(s, parse_special=True)] if len(ids) == 1}
+
+
+def is_strata_server(command: str) -> bool:
+    """A Strata server's command line (only such a process is ever stopped to free a port)."""
+    return "serve/server.py" in command.replace("\\", "/")
+
+
+def stop_server(pid: int, port: int, wait_s: float = 30.0) -> bool:
+    """Stop a Strata server so its port is free: SIGCONT first (one suspended with Ctrl+Z cannot act on anything),
+    then SIGTERM, which ends its engine too; after wait_s, SIGKILL for it and its children.  True once the port is free."""
+    def free():
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            return False
+        except OSError:
+            return True
+    kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+    for sig in (signal.SIGCONT, signal.SIGTERM):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, sig)
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if free() and subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode != 0:
+            return True
+        time.sleep(0.5)
+    for p in [pid, *map(int, kids)]:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(p, signal.SIGKILL)
+    time.sleep(1)
+    return free()
+
+
 def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     """#874: where one request's combined image-embeddings file goes.  Every request with images rewrites it (it is
     deleted after the request), which on a disk is steady heavy writing: on Linux it goes to /dev/shm when that has
@@ -149,6 +198,9 @@ ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thin
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# GPT-OSS (harmony): the same two, as its own end of the analysis message and the start of the final one
+HARMONY_CLOSE = "<|end|><|start|>assistant<|channel|>final<|message|>"
+HARMONY_WRAP_UP = " I have thought about this long enough; time to give my answer." + HARMONY_CLOSE
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -2278,7 +2330,9 @@ def engine_args(cfg: dict) -> list[str]:
     # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
     # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
     # (only when the config has no reserve of its own).
-    if isinstance(cfg.get("vision"), dict) and "--vision" not in args:
+    # A Mac (backend "metal") takes pictures without either flag (strata-vision encodes them; the Metal engine ignores
+    # --vision), and its setup never writes them: the note would be wrong there, and repeated on every start.
+    if isinstance(cfg.get("vision"), dict) and "--vision" not in args and cfg.get("backend") != "metal":
         args.append("--vision")
         note = "added --vision"
         if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
@@ -2792,8 +2846,13 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        # GPT-OSS: the harmony format (its tokenizer has <|channel|>); its replies end at <|return|> or <|call|>
+        self.harmony = H_CHANNEL in getattr(tokenizer, "special_tokens", {})
+        # GLM-5.3-Flash: <|observation|> (a tool's turn) is its; a reply ends at <|endoftext|>, <|user|> or that
+        self.glm = "<|observation|>" in getattr(tokenizer, "special_tokens", {})
+        ends = (("<|return|>", "<|call|>", "<|endoftext|>") if self.harmony else
+                ("<|endoftext|>", "<|user|>", "<|observation|>") if self.glm else (IM_END, "<|endoftext|>"))
+        self.stop_ids = stop_ids_of(tokenizer, ends)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3395,6 +3454,19 @@ class Service:
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
         fetched = self._note_unreadable_tool_images(messages)
+        if self.harmony:
+            # GPT-OSS always reasons (harmony has no "off"): no thinking is its low effort; its template's efforts are
+            # low / medium / high.  A forced call is written in Qwen's form, so harmony leaves the choice to the model.
+            effort = "low" if kwargs.get("enable_thinking") is False else kwargs.get("reasoning_effort")
+            kwargs = {**kwargs, "enable_thinking": True,
+                      "reasoning_effort": {"xhigh": "high", "none": "low", None: "medium", "": "medium"}.get(effort, effort)}
+            force = None
+        elif self.glm:
+            # GLM-5.3-Flash always opens its thinking; its template's efforts are low / high / max (the default)
+            effort = "low" if kwargs.get("enable_thinking") is False else kwargs.get("reasoning_effort")
+            kwargs = {**kwargs, "enable_thinking": True,
+                      "reasoning_effort": {"none": "low", "medium": "high", "xhigh": "max", "": None}.get(effort, effort)}
+            force = None                                  # a forced call is written in Qwen's form
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -3620,7 +3692,9 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        parser = (HarmonyParser if self.harmony else GlmParser if self.glm else OutputParser)(
+                                                                  thinking=thinking, tools=tools, stream_tools=True,
+                                                                  recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3869,7 +3943,7 @@ class Service:
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(HARMONY_CLOSE if self.harmony else REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
@@ -3893,7 +3967,7 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = (HARMONY_WRAP_UP if self.harmony else REASONING_WRAP_UP) + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -4688,7 +4762,7 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, headers=None):
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -4700,6 +4774,8 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -4712,7 +4788,11 @@ def make_handler(svc: Service):
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             if key_matches(given, svc.api_key):
                 return True
-            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+            # RFC 9110 11.6.1: a 401 MUST carry a WWW-Authenticate challenge; RFC 6750 3 / 3.1: the Bearer scheme, with
+            # error="invalid_token" for a key that was sent and is wrong, and no error code when none was sent
+            challenge = 'Bearer realm="strata"' + (', error="invalid_token"' if given else "")
+            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}},
+                       {"WWW-Authenticate": challenge})
             return False
 
         def do_GET(self):
@@ -5217,8 +5297,15 @@ def make_handler(svc: Service):
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
+            prompt_tools = tools
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
+                # ...but the prompt keeps them: an agent's last, tool-free step renders the same prefix as its tool
+                # steps, so the KV cache still matches (dropping them re-prefilled ~100K tokens: 138-266 s on a
+                # Mac, Osaurus 2026-10-09).  No calls are parsed, and a reply that starts one ends there.
                 tools = None
+                stop = stop_strings({"stop": req.get("stop")})     # a bad value is still a 400, never coerced
+                if len(stop) < OPENAI_MAX_STOP and CALL_START not in stop:
+                    req = {**req, "stop": stop + [CALL_START]}
             force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
@@ -5240,7 +5327,7 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
+            ids, thinking, max_new = svc.prepare(messages, tools or prompt_tools, kw, max_new, force=force, req=req)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
@@ -6024,6 +6111,8 @@ def main() -> int:
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--replace", action="store_true",
+                    help="if another Strata server holds the port, stop it and start this one (without it: asked in a terminal)")
     ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
                                   "(\"0,2\"; also \"gpu\" in the config)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
@@ -6069,7 +6158,28 @@ def main() -> int:
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
-        ap.error(listen_problem(a.host, a.port, e))
+        # another Strata server on it (a model started earlier): offer to stop that one; anything else is left alone
+        holders = port_holders(a.port) if "already in use" in listen_problem(a.host, a.port, e) else []
+        ours = [(pid, cmd) for pid, cmd in holders if is_strata_server(cmd)]
+        if not ours or len(ours) != len(holders):
+            others = "; ".join(f"pid {pid}: {cmd[:120]}" for pid, cmd in holders if not is_strata_server(cmd))
+            ap.error(listen_problem(a.host, a.port, e) + (f" (held by {others})" if others else ""))
+        pid, cmd = ours[0]
+        config = cmd.split("--config", 1)[1].split()[0].strip('"') if "--config" in cmd else "?"
+        print(f"[strata] port {a.port} is held by another Strata server: pid {pid}, {Path(config).name}", flush=True)
+        if not a.replace:
+            if not (sys.stdin.isatty() and sys.stderr.isatty()):
+                ap.error(listen_problem(a.host, a.port, e) + " (--replace stops that Strata server and starts this one)")
+            try:
+                answer = input("Stop it and start this one? [y/N] ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer not in ("y", "yes"):
+                ap.error(f"port {a.port} is still in use; nothing was stopped")
+        print(f"[strata] stopping pid {pid} ...", flush=True)
+        if not stop_server(pid, a.port):
+            ap.error(f"could not free port {a.port} (pid {pid} did not stop)")
+        print(f"[strata] port {a.port} is free", flush=True)
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
@@ -6084,7 +6194,8 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        meta = json.loads((tpath / "tokenizer.json").read_text()) if (tpath / "tokenizer.json").exists() else {}
+        tok = ST.Tokenizer(tokens, merges, types, meta.get("pre", "qwen35"))   # gpt-4o: GPT-OSS (o200k)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
