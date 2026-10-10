@@ -1,8 +1,12 @@
 # Strata on a Mac (Apple Silicon)
 
-**Experimental: tested on one Mac.** A MacBook Pro M5 Max (40-core GPU, 128 GB) on macOS 26.4, with the Q2_0, IQ3_XXS and
-IQ3_S models. Other Apple Silicon Macs and other model files are untested. Read
-[Limits and warnings](#limits-and-warnings) before you install.
+The main document of this independently maintained, Apple Silicon-only fork of
+[Strata](https://github.com/Niko1221/Strata) (the original's Windows and Linux engines are kept in the repository as
+they were at the fork point, but not maintained here; see [docs/README.md](README.md)).
+
+**Tested on one Mac:** a MacBook Pro M5 Max (40-core GPU, 128 GB) on macOS 26.4, with Qwen3.8-Flash-Next Q2_0, IQ3_XXS
+and IQ3_S, and GPT-OSS 120B. GLM-5.3-Flash support is in, but not tested end to end yet. Other Apple Silicon Macs and
+other model files are untested. Read [Limits and warnings](#limits-and-warnings) before you install.
 
 On a Mac, Strata serves the same web app and APIs (OpenAI, Anthropic, Responses, MCP) as on a PC. The engine under
 them is different: `strata-metal` (`metal/`) runs the model on llama.cpp's Metal backend.
@@ -25,7 +29,7 @@ In Terminal, one line at a time:
 ```sh
 xcode-select --install       # a dialog opens: click Install, wait until it finishes (skip if already installed)
 
-git clone https://github.com/Niko1221/Strata.git
+git clone https://github.com/dennis-akimov/Strata.git
 cd Strata
 make check                   # what this Mac can run; installs nothing
 make pull MODEL=Q2_0         # builds the engine and downloads the model; asks about images and the context
@@ -48,7 +52,7 @@ run the same command again: it continues where it stopped. Q2_0, IQ3_XXS (`make 
 |---|---|
 | run in the background | `make start`, then `make status` / `make stop` (log: `strata-run.log`) |
 | send one test message | `make chat PROMPT="Write a haiku"` |
-| cap the thinking | `make chat PROMPT="..." EFFORT=high MAX_TOKENS=32768 REASONING_BUDGET=4096` (then it must answer); in the web chat: Sampling > Thinking budget |
+| cap the thinking | `make chat PROMPT="..." EFFORT=high MAX_TOKENS=32768 REASONING_BUDGET=4096` (the thinking is closed there, then it answers if max tokens leaves room); in the web chat: Sampling > Thinking budget |
 | use another port | `make run PORT=8090`, or put `PORT := 8090` in a file named `Makefile.local` |
 | use a bigger context window | `make run CONTEXT=131072` (up to 262,144; it stays set, and needs more memory) |
 | download without questions | `make pull MODEL=Q2_0 SETUP_ARGS="--yes"` |
@@ -65,7 +69,7 @@ If setup stops, it says what is missing and the command that fixes it.
   differs between Macs and macOS versions. Q2_0's weights take about 35 GB of it (IQ3_S's about 51 GB), plus the context's cache. Everything
   the Mac does shares the same memory, so close other large apps. Below 128 GB only the 64 GB floor applies: nobody
   has measured how close a 64 GB Mac gets.
-- **Only Q2_0, IQ3_XXS and IQ3_S were tested.** `make check` marks the other sizes "untested on a Mac". On a PC, the Unsloth sizes
+- **Of the Qwen sizes, only Q2_0, IQ3_XXS and IQ3_S were tested** (and GPT-OSS 120B of the others). `make check` marks the other sizes "untested on a Mac". On a PC, the Unsloth sizes
   (UD-Q4_K_XL, UD-IQ4_XS) stream part of their experts from the SSD; the Mac engine cannot, so all of a model's experts
   must fit in Metal's limit. UD-Q4_K_XL (111 GB) is larger than the test Mac's default limit.
 - **Speed.** On the test Mac: 13-17 tokens/s for the answer and 225-270 tokens/s to read a prompt, with other programs
@@ -104,13 +108,18 @@ If setup stops, it says what is missing and the command that fixes it.
 
 ### If a model does not fit
 
-Pick a smaller size first. If you know what you are doing, you can raise Metal's limit until the Mac restarts:
+Pick a smaller size or a smaller context first. If you know what you are doing, you can raise Metal's limit; the
+setting lasts until the Mac restarts:
 
 ```sh
-sysctl iogpu.wired_limit_mb                  # the current value; 0 means macOS' default
-sudo sysctl iogpu.wired_limit_mb=110000      # e.g. ~107 GB on a 128 GB Mac; the value is in MB
-sudo sysctl iogpu.wired_limit_mb=0           # back to the default
+sysctl -n iogpu.wired_limit_mb               # the current value in MB; 0 means macOS' default
+sysctl -n hw.memsize | awk '{print $1/1048576 " MB of memory"}'
+sudo sysctl iogpu.wired_limit_mb=$(( $(sysctl -n hw.memsize) / 1048576 - 16384 ))   # all memory but 16 GB
+sudo sysctl iogpu.wired_limit_mb=0           # back to the default (or to the value the first line printed)
 ```
+
+macOS' default is already close to this on a 128 GB Mac (107.5 GB there), so this helps most on smaller Macs, which
+keep a larger share for the system. Never set more than the Mac's memory.
 
 This is an undocumented macOS setting, and Strata never changes it. Leave macOS plenty of memory (Strata's rule of
 thumb: 8-16 GB): set too high, the whole Mac can slow down or stop responding until it restarts.

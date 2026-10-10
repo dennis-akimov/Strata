@@ -1,201 +1,121 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">Strata for Mac</h1>
 
 [English](README.md) · **简体中文** · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
-<p align="center"><b>在你自己的游戏电脑上运行 1250 亿参数的 AI 模型</b><br>
-NVIDIA 或 AMD 显卡（12 GB 及以上）· Windows 或 Linux · 免费开源</p>
+<p align="center"><b>在你自己的 Mac 上运行千亿参数级的 AI 模型</b><br>
+Apple Silicon · 已在 128 GB 的 M5 Max 上测试 · 免费开源</p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="Strata 的模型写出的体素宝塔花园，在浏览器中运行"></a><br>
-<sub>体素宝塔花园，一次提示生成，在 RTX 5070 上用 Strata 运行（IQ3_S，128K 上下文）·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">完整视频（49 秒）</a></sub></p>
+> **这是 [Strata](https://github.com/Niko1221/Strata) 的一个独立维护的分支（fork），只面向 Apple Silicon Mac**，
+> 维护者为 [dennis-akimov](https://github.com/dennis-akimov)。它增加了 Metal 引擎和 Mac 上的安装流程。原项目的
+> Windows 和 Linux 引擎（NVIDIA CUDA、AMD HIP、Intel SYCL）仍保留在本仓库中，保持分叉时的状态，但在这里不会编译、
+> 测试或更新。**如果你用的是 Windows 或 Linux PC，请使用原项目：[github.com/Niko1221/Strata](https://github.com/Niko1221/Strata)。**
 
-Strata 能在普通电脑上运行 **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**。这是一个又大又聪明的
-AI 模型，通常要用服务器才能跑。它能聊天、写代码、看图片，还能配合你的应用和编程智能体一起工作。所有数据都留在你的电脑上。
+Strata 在你自己的电脑上运行大型 AI 模型：它们能聊天、写代码、看图片，并通过与云服务相同的 API 与你的应用和编程
+助手协作。模型在你的 Mac 上运行；有哪些数据离开 Mac 由你决定（模型下载，以及你接入的应用、工具或 MCP 服务器）。
 
-## 速度有多快？
+## 速度如何？
 
-我们在两台普通的游戏电脑上做了测试。一个 token 大约相当于 ¾ 个英文单词。
+在一台 M5 Max（40 核 GPU，128 GB）的 MacBook Pro 上测得，macOS 26.4，能耗模式为 *高功率*，2026-10-08，关闭思考。
+一个 token 约相当于 ¾ 个英文单词。
 
-- **写回答：** 短对话中回复出现的速度。每秒 60 个 token 已经比你的阅读速度还快。
-- **读提示：** 读入你发送内容的速度（这里是一份 32K token 的文档、代码或聊天记录）。
+| 模型 | 900 词的回答 | 简短回答 | 内存中的模型文件 |
+| --- | ---: | ---: | ---: |
+| **[GPT-OSS 120B](docs/MACOS.md#gpt-oss-120b)**（MXFP4） | 93-100 token/秒 | 93-103 token/秒 | 63 GB |
+| **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) Q2_0**，`--mtp on` | 60-69 token/秒 | 92-102 token/秒 | 38 GB |
+| **Qwen3.8-Flash-Next IQ3_XXS**，`--mtp on` | 46-48 token/秒 | 73-92 token/秒 | 47 GB |
 
-<table>
-<tr><th>NVIDIA：RTX 5070（12 GB）、Ryzen 5 7600、64 GB 内存</th><th>AMD：RX 9070 XT（16 GB）、Ryzen 9 3900X、47 GB 内存</th></tr>
-<tr><td>
-
-| 规格 | 写回答 | 读提示 |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
-
-</td><td>
-
-| 规格 | 写回答 | 读提示 |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
-
-</td></tr>
-</table>
-
-NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答，32K 提示）。完整表格见
-[DETAILS.md](docs/DETAILS.md#speed-measured)。显存越大的显卡越快：RTX 3090（24 GB）写回答应该能达到每秒约
-100-140 个 token。长对话和其他显卡的数据：[各模型的速度](docs/MODELS.md#how-fast-is-each-size)、
-[社区测试结果](docs/COMMUNITY_BENCHMARKS.md)。
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a><br>
-<sub>Strata 是免费的。如果它在你的电脑上跑得不错，请我喝杯咖啡，让这个项目继续下去。</sub></p>
+Qwen 的数字使用了它的 MTP 草稿层，这是可选功能（`./setup.sh --setup --mtp on`，多占约 12 GB 磁盘）。上下文缓存
+另外占用内存（几 GB；上下文越长越多）。在 *自动* 能耗模式下，同一台 Mac 写长回答要慢 2-3 倍。没有在其他 Mac 上
+测量过。全部数字及测量方法：[docs/MACOS.md](docs/MACOS.md#measured)（英文）。
 
 ## 你需要什么
 
 | | |
 | --- | --- |
-| **显卡** | **NVIDIA** GeForce RTX 20、30、40 或 50 系列，或 **AMD** Radeon RX 7900 XT / XTX、RX 7800 XT / 7700 XT、RX 9060 XT、RX 9070 / 9070 XT、Radeon AI PRO R9700 或 RX 6800 / 6900 系列。需要 **12 GB 或以上显存**。 |
-| **内存** | 32 GB 或以上。内存大小决定能装下[哪个模型](#该选哪个模型)。64 GB 可以运行所有规格。 |
-| **硬盘** | 约 80 GB 可用空间。尽量用 SSD：第一次启动会快很多。 |
-| **系统** | Windows 10 / 11 或 Linux，以及 NVIDIA 或 AMD 的最新显卡驱动。 |
-
-其他的都由安装程序搞定。两到三张显卡可以分担同一个模型（[多 GPU](docs/MULTI_GPU.md)）。
-
-实验性支持，由社区成员在自己的机器上编写和测试：
-
-- **较老的显卡**（Tesla P40 / V100、GTX 10、Radeon VII / MI50、RX 6700 XT、RX 5500 XT）：[较老的 GPU](docs/OLDER_GPUS.md)。
-- **Intel Arc**，在 Linux 上从源码构建：[Intel Arc](docs/INTEL_ARC.md)。
-- **AMD Ryzen AI Max（Strix Halo）**，在 Linux 上从源码构建：[Strix Halo](docs/STRIX_HALO.md)。
-- **搭载 Apple Silicon 的 Mac**（M1 或更新，64 GB 以上内存），通过 llama.cpp 的 Metal 后端：[macOS](docs/MACOS.md)（英文）。
-- **不支持 AVX2 的老处理器**：能用，但很慢。[较老的 CPU](docs/INSTALL.md#older-cpus-experimental)。
-
-完整列表：[docs/INSTALL.md](docs/INSTALL.md#what-you-need)。
+| **Mac** | Apple Silicon（M1 或更新）。只测试过一台 128 GB 的 M5 Max；其他芯片和内存容量应该也能运行，但没有试过。 |
+| **内存** | 足够容纳模型文件及其缓存，且在 macOS 允许 GPU 使用的范围内（测试用的 128 GB Mac 上为 107.5 GB）。安装检查以 64 GB 为最低要求。`make check` 会估计你的 Mac 能放下哪些模型；另见下面的模型表。 |
+| **磁盘** | 模型下载大小再加几 GB（每个模型 70-100 GB），放在内置 SSD 上。 |
+| **软件** | Apple 的 Command Line Tools（`xcode-select --install`，等它装完）以及 Python 3.10 或更新版本（如果没有，且装有 Homebrew，安装程序会用 Homebrew 安装）。在 macOS 26.4 上测试。 |
 
 ## 安装
 
-### 让你的 AI 帮你装
+在终端中：
 
-你在用 AI 编程助手吗（Claude Code、Cursor、Codex、GitHub Copilot 等）？把下面这段粘贴给它：
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```sh
+git clone https://github.com/dennis-akimov/Strata.git
+cd Strata
+make check                 # 这台 Mac 能运行什么；不安装任何东西
+make pull MODEL=Q2_0       # 编译引擎并下载模型（66 GB）
+make run                   # 加载模型，就绪后打开 http://127.0.0.1:8080
 ```
 
-它会检查你的显卡、内存和硬盘，选出合适的模型。然后安装并启动它，再告诉你怎么连接你的应用。AI 工具也可以通过
-Strata 的 [MCP 服务器](docs/MCP_SERVER.md)来安装、启动和停止 Strata。
+`make pull` 会问几个问题（上下文大小、图片）；按回车即选推荐答案。如果下载中断，再运行一次：它会从中断处继续。
+每次启动加载大约需要一分钟。`make run` 在 Strata 运行期间会占用终端；按 Ctrl+C 停止，或用 `make start` /
+`make stop` 在后台运行。全部选项、限制和注意事项：**[docs/MACOS.md](docs/MACOS.md)**（英文）。
 
-### 或者自己动手
+**更新：** `git pull`，然后 `make run`（源码有变化时，安装程序会重新编译引擎；模型保留不动）。**文件位置：** 模型在
+`Strata` 文件夹旁边的 `Strata-data/` 中，设置在 `strata-<模型>.json` 中，聊天记录保存在浏览器里。
 
-[下载 Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) 并解压（或者用 `git clone`）。
-**Windows：** 双击 **`START-HERE.bat`**。**Linux：** 在 Strata 文件夹里运行 **`./setup.sh`**。
+## 选哪个模型？
 
-NVIDIA 和 AMD 的步骤完全一样。安装程序会识别你的显卡，并装好对应的引擎。它会问你几个问题：
+| 模型 | 下载大小 | 内存占用（128K 上下文） | 说明 |
+| --- | ---: | ---: | --- |
+| **Qwen3.8-Flash-Next Q2_0** | 66 GB | 约 60 GB（估计） | 默认选项，在 Mac 上测试最多。`make pull MODEL=Q2_0` |
+| Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB（实测） | 压缩程度低于 Q2_0；在我们的测试中慢 10-30%。`make pull MODEL=IQ3_XXS` |
+| Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB（实测） | 压缩程度更低；在一次 A/B 测试中比 Q2_0 慢约 10%。`make pull MODEL=IQ3_S` |
+| **GPT-OSS 120B** | 63 GB | 约 70 GB（估计） | 这里最快的模型（每个 token 约激活 50 亿参数）。需手动安装：[步骤](docs/MACOS.md#gpt-oss-120b) |
+| GLM-5.3-Flash（Maya-S24） | 95 GB | 32K 时约 100 GB（估计） | 仅代码：Strata 能读取它的分词器、对话格式和工具调用，但还没有实际运行过该模型。 |
 
-- 用哪个模型、哪个规格，
-- 上下文多大（模型能记住多少文字），
-- 是否要识别图片。
+“内存占用”是在测试用的 Mac 上，引擎加上 Qwen 模型的 MTP 草稿层和 2 个请求槽位时的数值；上下文越小占用越少
+（`make run CONTEXT=32768`）。它必须放得进 macOS 允许 GPU 使用的范围，`make check` 会显示你的 Mac 的这个值（测试用的
+128 GB Mac 上为 107.5 GB；内存更小的 Mac 更少）。Qwen 模型运行时还会从 SSD 读取一个 28 GB 的表。其他 Qwen 尺寸
+（IQ2_XS、Unsloth 的版本）没有在 Mac 上试过。
 
-每次直接按回车就是推荐选项。之后它会下载模型（约 70 GB）并启动。如果下载中断了，再运行一次即可：它会从中断的地方继续。
-浏览器会打开 Strata 应用，地址是 `http://127.0.0.1:8080`。
+## 使用
 
-> **模型启动时，你的电脑可能会变慢或卡住 1-3 分钟**（第一次最久）。
-> Strata 会把 35-55 GB 加载到内存，并为显卡锁定其中一部分。这是正常的。请耐心等待，不要关闭窗口。
-> 窗口里会显示 Strata 正在做什么。
+- **在浏览器中：** `http://127.0.0.1:8080` 有 **Chat**、模型和 Mac 的实时 **Monitor**（GPU 负载、内存、功耗、温度）
+  以及 **About**。思考强度（**Thinking**，*Off* 到 *High*）决定模型思考多久；聊天的 **Sampling** 设置中的
+  **Thinking budget** 可以按 token 数限制思考。
+- **你的应用和编程助手：** 一个“OpenAI 兼容”的提供方，基础 URL 为 `http://127.0.0.1:8080/v1`（模型名任意；在你
+  没有设置 API 密钥前，密钥也任意）；Anthropic API 在 `http://127.0.0.1:8080/v1/messages`（Claude Code：
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`）；Responses API 在 `/v1/responses`。支持工具和 MCP。客户端示例：
+  [docs/DETAILS.md](docs/DETAILS.md#using-it)。
+- **图片：** 在安装时选择启用图片（Qwen 模型），然后在聊天或应用中附加图片。
+- **默认一次处理一个请求**；其他请求排队等待。同一对话中的后续消息只读取新增内容，所以开始得很快；很长的新提示词
+  需要先读取一段时间，回答才会开始。
+- **从网络中的其他设备访问：** 在 `strata-<模型>.json` 中设置 `"host": "0.0.0.0"` 和 `"api_key"`，重启 Strata，
+  然后用该密钥访问 `http://<你的 Mac 的 IP>:8080`。通信未加密：请只在可信的网络（或 VPN）中使用。
 
-**下次使用时**，再运行一次 `START-HERE.bat`（或 `./setup.sh`）。它会马上启动，已下载的东西不会重复下载。关闭它的窗口就能停止模型。
-`UPDATE.bat`（`./update.sh`）只更新 Strata，不启动。更新、Docker、多张显卡、文件存放位置以及所有选项：
-[docs/INSTALL.md](docs/INSTALL.md)。
+## 出了问题？
 
-## 该选哪个模型
+- **速度慢。** 如果你的 Mac 有这个选项，请把能耗模式设为 *高功率*（笔记本：*系统设置 > 电池 > 能耗模式*；台式机：
+  *系统设置 > 能耗*），并让笔记本接上电源。查看 GPU 频率：`brew install macmon`，然后运行 `macmon`。
+- **思考时间很长。** 降低思考强度，或设置 **Thinking budget**（4096-8192）：预算用完后，服务器会结束思考，只要
+  max tokens 还留有余量，模型就会写出回答。
+- **提示端口被占用。** 有其他程序在监听 8080。如果是另一个 Strata，用 `make stop` 停止它，或者启动
+  `run-<模型>.sh` 时会询问是否停止它；否则换一个端口（`make run PORT=8090`）。同时运行两个模型需要两份内存。
+- **模型放不下。** 关闭大型应用，选择更小的模型或更小的上下文（`make run CONTEXT=32768`）。
 
-安装程序会根据你的内存推荐一个。同一个模型有几种规格，压缩程度不同。规格越小越快，越大越聪明一些。
-
-| 你的内存 | 选择 | 原因 |
-| --- | --- | --- |
-| **32 GB** | **Coder** | 32 GB 装得下，而且专为代码打造（如果显卡是 24 GB，Q2_0 和 IQ2_XS 也能跑） |
-| **48 GB** | **IQ2_XS**（或 Q2_0，最快） | 更大的规格装不下 |
-| **64 GB** | **IQ2_XS**（推荐），或 IQ3_XXS / IQ3_S | 所有规格都装得下；IQ3_S 最好，也最慢 |
-| **96 GB 或以上** | **IQ3_S**，或 Unsloth 的 UD-IQ4_XS（约 4-bit） | 开着其他程序也能放下最大的规格 |
-
-- **[Coder](docs/MODELS.md#coder)：** 编程版本，去掉了一半专家。它达到完整模型 SWE-bench Verified 分数的 91%（由其作者测得），
-  32 GB 内存就能装下。代码以外的能力较弱，包括中文和其他中日韩文本（#438）。这类用途请选 Q2_0、IQ2_XS 或 IQ3_S，
-  它们保留了所有专家。
-- **[Swift 1.5](docs/MODELS.md#swift-15)：** 一个微调版本，回答前思考的时间短得多。你能更早拿到答案，质量基本不变。
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs)：** Unsloth 的约 4-bit 版本，质量介于 IQ3_S 和 UD-Q4_K_XL 之间。
-  下载 94 GB。内存少于约 80 GB 时，Strata 回答时要从 SSD 读取其中一部分，所以会更慢（NVMe SSD 有帮助）。
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)**（实验性）：最接近完整模型。但 Strata
-  回答时要从 SSD 读取其中大部分内容，所以在 64 GB 的电脑上每秒只能写 7-8.5 个 token。
-- **[OrcaRouter 的 Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)：** 需要手动设置，不在安装程序的菜单里。
-
-规格、下载以及各配置能装下什么：[docs/MODELS.md](docs/MODELS.md)。以后想再添加模型，运行
-`SETUP.bat`（Linux：`./setup.sh --setup`）。
-
-## 使用方法
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="Strata 应用的 Monitor 标签页，旁边是一个编程智能体"><br>
-<sub>Strata 应用的 <b>Monitor</b>（左），编程智能体正在写视频里的宝塔花园（右）</sub></p>
-
-- **在浏览器里：** 打开 `http://127.0.0.1:8080`。里面有 **Chat**（聊天）、实时 **Monitor**（监控模型和你的
-  GPU/CPU/内存），以及 **About**（设置和地址）。
-- **你的应用和编程智能体：** 添加一个“OpenAI 兼容”的提供商，base URL 填 **`http://127.0.0.1:8080/v1`**。
-  API key 和模型名随便填都行。
-  - 使用 Anthropic API 的应用：`http://127.0.0.1:8080/v1/messages`（Claude Code：
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`）。
-  - Codex CLI 和其他使用 OpenAI Responses API 的应用：`/v1/responses`
-    （[设置方法](docs/DETAILS.md#the-responses-api-and-codex-cli)）。
-- **思考：** 在聊天菜单或应用的“reasoning effort”里选择 **off、low、medium 或 high**。off 最快，
-  high 最适合难题。
-- **图片：** 在安装时对“Images?”选是。然后在聊天里点 **Picture**，或在你的应用里附上图片。
-  AMD 显卡在 Linux 上通过处理器识别图片；在 Windows 上暂时还不行。
-- **从手机或另一台电脑访问：** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`。一定要设置 key。
-- **一次处理一个请求：** 默认情况下 Strata 一次只回答一个请求，其他请求排队等待。想同时回答多个，
-  设置 `"parallel": 2`（[BATCHING.md](docs/BATCHING.md)）。在 12 GB 显卡上，这会让每个回答变慢。
-- **长提示：** Strata 会完整读入对话的第一条消息，大约每 30,000 个 token 需要 1 分钟。之后的消息几秒内就开始回答。
-
-更多：[聊天记录存在哪里](docs/INSTALL.md#where-things-are-stored)、[API](docs/DETAILS.md#using-it)。
-
-## 出问题了？
-
-- **Strata 第一次启动时电脑卡死了。** 加载模型时这是正常的。请耐心等待，不要关闭窗口。
-  10 分钟后还卡着？重启电脑，关掉其他程序再试一次，或者换一个更小的规格。
-- **下载或安装时中断了。** 再运行一次 `START-HERE.bat`（或 `./setup.sh`）。它会从中断的地方继续。
-- **非常慢，硬盘灯一直闪，或者提示“the engine stopped unexpectedly”。** 你的电脑可用内存不够。
-  关掉其他程序（浏览器很占内存），或者换一个更小的规格（Q2_0 或 IQ2_XS）。
-- **提示 8080 端口已被占用。** Strata 已经在运行了。找一下它的窗口。
-
-更多问题和解决办法：[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。还是解决不了？提交一个
-[issue](https://github.com/Niko1221/Strata/issues)，并附上 Strata 文件夹里的 `strata-<model>.log`。发现了安全问题？
-请私下报告：[SECURITY.md](SECURITY.md)。
+更多：[docs/MACOS.md](docs/MACOS.md#limits-and-warnings)（英文）。这个 Mac 分支的问题：
+[issues](https://github.com/dennis-akimov/Strata/issues)。安全问题请私下报告，见 [SECURITY.md](SECURITY.md)。
 
 ## 它是怎么工作的？
 
-这类模型通常运行在拥有数百 GB 显存的服务器上。而你的显卡只有 12-24 GB。Strata 让模型装得下的办法是
-**把工作分摊到整台电脑上**。可以想象一个厨房：常用的东西放在台面上，其余的放在储藏室里。
+在 Mac 上，Strata 自己的引擎（`strata-metal`，位于 [`metal/`](metal/)）通过 [llama.cpp](https://github.com/ggml-org/llama.cpp)
+的 Metal 后端在 GPU 上运行模型，Strata 服务器运行在它之上：网页应用、OpenAI / Anthropic / Responses / MCP API、
+对话复用、提前猜测几个 token 的模型草稿层，以及 Qwen、GPT-OSS（harmony）和 GLM 的对话格式。Mac 的内存由 CPU 和
+GPU 共享，所以模型权重只在内存中存放一份，供两者共用。设计与测量：[docs/MACOS.md](docs/MACOS.md#how-it-fits-together)
+（英文）。原项目的文档保留在 [`docs/`](docs/README.md) 中，并注明了哪些适用于 Mac。
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="模型的 24,576 个专家：最常用的在显卡上，全部在内存里，一张查找表在 SSD 上"></p>
+## 致谢与许可
 
-- **这个模型是由 24,576 个小专家（“experts”）组成的团队。** 每个词只需要其中 10 个。
-- **你的显卡** 存放最常用的几千个专家。**你的内存** 存放全部专家，
-  **你的处理器** 同时处理其余的部分。**你的 SSD** 存放一张大查找表。
+**[Strata](https://github.com/Niko1221/Strata) 是 Niko1221 及 Strata 贡献者的成果**
+（[全部致谢](docs/HOW_IT_WORKS.md#credits)）；这个分支增加了对 Mac 的支持。模型来自 Qwen 团队
+（[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)，由
+[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) 压缩）、OpenAI
+（[GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)）和 Z.ai（GLM-5.3-Flash，由
+[Project Maya](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) 压缩）。Strata 使用了
+[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) 的部分代码。以 [MIT 许可证](LICENSE) 开源（Copyright (c)
+2026 Niko1221 and the Strata contributors）；部分组件和每个模型都有各自的许可证（[详见](docs/HOW_IT_WORKS.md#license)）。
 
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="一个小助手猜测接下来的几个词；大模型一次性全部检查，保留正确的"></p>
-
-- **先猜，再检查：** 一个小助手先猜接下来的几个词，大模型再一次性检查它们。答案完全一样，但快 1.6-1.8 倍。
-- **长文本分大块读入**（每次最多 8,192 个 token），速度超过每秒 1,000 个 token。
-
-更详细的解释：[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)。每个部分及其数据：
-[详细说明](docs/DETAILS.md#how-it-works)和[论文](docs/paper/Strata-Paper.pdf)。
-
-## 致谢与许可证
-
-模型是 Qwen 团队的 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)。它由
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)、UkisAI（Swift 1.5）
-和 Unsloth 压缩。Strata 使用了 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) 的部分代码。完整致谢：
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits)。Strata 以 [MIT 许可证](LICENSE)开源。少数部分和每个模型
-有各自的许可证（[具体是哪些](docs/HOW_IT_WORKS.md#license)）。
-
-## 支持 Strata
-
-Strata 免费且开源。如果它对你有用，欢迎支持它的开发：
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a></p>
+如果这个 Mac 分支对你有帮助，你可以支持它的维护者：[buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov)。
