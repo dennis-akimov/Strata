@@ -3733,6 +3733,14 @@ class ForcedToolChoice(unittest.TestCase):
                 prompts[extra.get("tool_choice", "absent")] = self.engine.prompts[0]
         self.assertEqual(prompts["none"], prompts["auto"])
 
+    def test_none_does_not_coerce_a_bad_stop_into_a_valid_one(self):
+        """tool_choice "none" adds <tool_call> to stop: a bad stop must still be a 400, not ["END", "<tool_call>"]."""
+        for stop in ({"END": 1}, False, 7, ["a", 1]):
+            for choice in ("none", "auto"):
+                with self.subTest(stop=stop, choice=choice):
+                    code, b = self.openai(tool_choice=choice, stop=stop)
+                    self.assertEqual(code, 400, b)
+
     def test_a_call_cut_by_max_tokens_is_not_a_tool_call(self):
         code, b = self.openai(tool_choice="required", max_tokens=5, **self.NO_THINKING)
         finish, calls, _ = self.call_of(code, b, False)

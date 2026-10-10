@@ -5303,8 +5303,7 @@ def make_handler(svc: Service):
                 # steps, so the KV cache still matches (dropping them re-prefilled ~100K tokens: 138-266 s on a
                 # Mac, Osaurus 2026-10-09).  No calls are parsed, and a reply that starts one ends there.
                 tools = None
-                stop = req.get("stop")
-                stop = [stop] if isinstance(stop, str) else list(stop or [])
+                stop = stop_strings({"stop": req.get("stop")})     # a bad value is still a 400, never coerced
                 if len(stop) < OPENAI_MAX_STOP and CALL_START not in stop:
                     req = {**req, "stop": stop + [CALL_START]}
             force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
