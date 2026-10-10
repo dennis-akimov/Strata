@@ -54,7 +54,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, CALL_START, H_CHANNEL, ChatTemplate, Event, HarmonyParser, OutputParser,  # noqa: E402
+from serve.frontend import (THINK_END, CALL_START, H_CHANNEL, ChatTemplate, Event, GlmParser, HarmonyParser,  # noqa: E402
+                            OutputParser,
                             anthropic_to_messages,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
@@ -113,6 +114,12 @@ def port_holders(port: int) -> list[tuple[int, str]]:
                                         timeout=10).stdout.strip()) for p in dict.fromkeys(pids)]
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return []
+
+
+def stop_ids_of(tokenizer, strings) -> set[int]:
+    """The token ids that end a reply: each string that is ONE token of this vocabulary.  Another model's tag (Qwen's
+    <|im_end|> with GLM's tokenizer) is several ordinary pieces, and those must never stop a reply."""
+    return {ids[0] for s in strings for ids in [tokenizer.encode(s, parse_special=True)] if len(ids) == 1}
 
 
 def is_strata_server(command: str) -> bool:
@@ -2841,8 +2848,11 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         # GPT-OSS: the harmony format (its tokenizer has <|channel|>); its replies end at <|return|> or <|call|>
         self.harmony = H_CHANNEL in getattr(tokenizer, "special_tokens", {})
-        ends = ("<|return|>", "<|call|>", "<|endoftext|>") if self.harmony else (IM_END, "<|endoftext|>")
-        self.stop_ids = set(t for e in ends for t in tokenizer.encode(e, parse_special=True))
+        # GLM-5.3-Flash: <|observation|> (a tool's turn) is its; a reply ends at <|endoftext|>, <|user|> or that
+        self.glm = "<|observation|>" in getattr(tokenizer, "special_tokens", {})
+        ends = (("<|return|>", "<|call|>", "<|endoftext|>") if self.harmony else
+                ("<|endoftext|>", "<|user|>", "<|observation|>") if self.glm else (IM_END, "<|endoftext|>"))
+        self.stop_ids = stop_ids_of(tokenizer, ends)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3451,6 +3461,12 @@ class Service:
             kwargs = {**kwargs, "enable_thinking": True,
                       "reasoning_effort": {"xhigh": "high", "none": "low", None: "medium", "": "medium"}.get(effort, effort)}
             force = None
+        elif self.glm:
+            # GLM-5.3-Flash always opens its thinking; its template's efforts are low / high / max (the default)
+            effort = "low" if kwargs.get("enable_thinking") is False else kwargs.get("reasoning_effort")
+            kwargs = {**kwargs, "enable_thinking": True,
+                      "reasoning_effort": {"none": "low", "medium": "high", "xhigh": "max", "": None}.get(effort, effort)}
+            force = None                                  # a forced call is written in Qwen's form
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -3676,7 +3692,8 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = (HarmonyParser if self.harmony else OutputParser)(thinking=thinking, tools=tools, stream_tools=True,
+        parser = (HarmonyParser if self.harmony else GlmParser if self.glm else OutputParser)(
+                                                                  thinking=thinking, tools=tools, stream_tools=True,
                                                                   recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token

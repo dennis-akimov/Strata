@@ -101,6 +101,9 @@ class ChatTemplate:
                                 prompt, re.S)
             try:
                 parsed = [parse_tool_call(body) for body in bodies]
+                if glm:                         # GLM: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`
+                    parsed = [parse_tool_call(glm_call_to_qwen(c)[len(CALL_START):-len(CALL_END)])
+                              for c in re.findall(r"<tool_call>strata_caps_call_\d+<arg_key>.*?</tool_call>", prompt, re.S)]
                 if harmony:                     # GPT-OSS: `to=functions.NAME<|channel|>commentary json<|message|>{...}`
                     parsed = [ToolCall(n, json.loads(a)) for n, a in re.findall(
                         r"to=functions\.(strata_caps_call_\d+)<\|channel\|>commentary json<\|message\|>(\{.*?\})<\|call\|>",
@@ -111,9 +114,10 @@ class ChatTemplate:
                 and all(reply in prompt for reply in replies)
 
         harmony = "<|channel|>" in self.source
+        glm = "<arg_key>" in self.source
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
-        marks = ("namespace functions",) if harmony else ("<tool_call>", "<function=")
+        marks = ("namespace functions",) if harmony else ("<tools>", "<arg_key>") if glm else ("<tool_call>", "<function=")
         return {"supports_tools": all(s in tool_prompt for s in
                                       ("strata_caps_call_0", "strata_caps_description", *marks)),
                 "supports_tool_calls": calls_supported(1),
@@ -1424,3 +1428,63 @@ class HarmonyParser:
             out.append(Event(self.state, rest))
         self.state = "header"
         return out
+
+
+# ------------------------------------------------------------------ GLM-5.3-Flash: its tool-call form
+GLM_ARG = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
+
+
+def glm_call_to_qwen(call: str) -> str:
+    """`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` (GLM) -> the same call in the form
+    OutputParser reads (`<function=NAME>` / `<parameter=K>`); anything else is returned as it is (then it is text)."""
+    body = call[len(CALL_START):-len(CALL_END)] if call.endswith(CALL_END) else call[len(CALL_START):]
+    name = body.split("<arg_key>", 1)[0].strip()
+    if not name or "<" in name or "\n" in name:
+        return call
+    params = "".join(f"<parameter={k.strip()}>\n{v}\n</parameter>\n" for k, v in GLM_ARG.findall(body))
+    return f"{CALL_START}\n<function={name}>\n{params}</function>\n{CALL_END}"
+
+
+class GlmParser:
+    """OutputParser for GLM-5.3-Flash: the same reasoning (<think>) and text, and its own tool-call form, which is held
+    whole from <tool_call> to </tool_call> and handed to OutputParser in OutputParser's form.  `buf` is what either
+    holds, so the server's "clean point" (no tag held) still means one."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 recover: bool = False):
+        self.inner = OutputParser(thinking=thinking, tools=tools, stream_tools=False, recover=recover)
+        self.hold = ""
+
+    state = property(lambda self: self.inner.state)
+    buf = property(lambda self: self.hold + self.inner.buf)
+    pending = property(lambda self: self.inner.pending)
+    rescued = property(lambda self: self.inner.rescued)
+    refused = property(lambda self: self.inner.refused)
+
+    def feed(self, delta: str) -> list[Event]:
+        self.hold += delta
+        out: list[Event] = []
+        while self.hold:
+            i = self.hold.find(CALL_START)
+            if i < 0:                               # no call: all but a possible start of "<tool_call>"
+                keep = next((k for k in range(min(len(self.hold), len(CALL_START) - 1), 0, -1)
+                             if CALL_START.startswith(self.hold[-k:])), 0)
+                out += self.inner.feed(self.hold[:len(self.hold) - keep])
+                self.hold = self.hold[len(self.hold) - keep:]
+                return out
+            if i > 0:
+                out += self.inner.feed(self.hold[:i])
+                self.hold = self.hold[i:]
+            j = self.hold.find(CALL_END)
+            if j < 0:
+                return out                          # a call: held until it ends
+            call, self.hold = self.hold[:j + len(CALL_END)], self.hold[j + len(CALL_END):]
+            out += self.inner.feed(glm_call_to_qwen(call))
+        return out
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        """A call cut before its </tool_call> is given to OutputParser as it is (OutputParser decides, as for Qwen)."""
+        out = self.inner.feed(glm_call_to_qwen(self.hold) if self.hold.startswith(CALL_START) and reason in (None, "stop")
+                              else self.hold) if self.hold else []
+        self.hold = ""
+        return out + self.inner.finish(reason)

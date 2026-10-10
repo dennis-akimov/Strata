@@ -127,3 +127,21 @@ class GptOssPreTokenizer(unittest.TestCase):
     def test_an_unknown_pre_tokenizer_is_refused(self):
         with self.assertRaises(ValueError):
             self.tok("llama3")
+
+
+class GlmPreTokenizer(unittest.TestCase):
+    """`glm4` (GLM-5.3-Flash): the split pattern against zai-org/GLM-5.3-Flash's tokenizer.json pre_tokenize_str output
+    (contractions split off, combining marks NOT joined to their letter, CJK and Latin in one run, digits by 3)."""
+
+    REFERENCE = {
+        "Hello world's 12345 HELLO'S": ["Hello", " world", "'s", " ", "123", "45", " HELLO", "'S"],
+        "été café!!\n\n": ["e", "́te", "́", " cafe", "́!!\n\n"],
+        "a/b/c\n/ x": ["a", "/b", "/c", "\n", "/", " x"],
+        "你好世界abc123": ["你好世界abc", "123"],
+    }
+
+    def test_the_split_matches_the_reference(self):
+        base = [ST.BYTE_TO_UNICODE[b] for b in range(256)]
+        tk = ST.Tokenizer(base, [], pre="glm4")
+        for text, pieces in self.REFERENCE.items():
+            self.assertEqual(tk._re.findall(text), pieces, text)

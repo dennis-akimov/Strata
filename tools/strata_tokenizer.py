@@ -74,10 +74,21 @@ GPT4O_PATTERN = (
     r"|\s+(?!\S)"
     r"|\s+"
 )
+# `glm4` (GLM-5.3-Flash): zai-org/GLM-5.3-Flash's tokenizer.json, as written (single-script letter runs, digits by 3).
+GLM4_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
 # pre -> (pattern, where it comes from, ignore_merges: a piece that is a whole token is that token, as tiktoken does)
 PRE = {
     "qwen35": (QWEN35_PATTERN, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)", False),
     "gpt-4o": (GPT4O_PATTERN, "openai/gpt-oss-120b tokenizer.json pre_tokenizer (o200k); model.ignore_merges", True),
+    "glm4": (GLM4_PATTERN, "zai-org/GLM-5.3-Flash tokenizer.json pre_tokenizer; model.ignore_merges", True),
 }
 
 
