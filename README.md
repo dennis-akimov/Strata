@@ -1,212 +1,137 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">Strata for Mac</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+<p align="center"><b>Run 100-billion-parameter AI models on your own Mac</b><br>
+Apple Silicon · tested on an M5 Max with 128 GB · free and open source</p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+> **This is an independently maintained fork of [Strata](https://github.com/Niko1221/Strata) for Apple Silicon Macs
+> only**, maintained by [dennis-akimov](https://github.com/dennis-akimov). It adds a Metal engine and the Mac setup.
+> The original's Windows and Linux engines (NVIDIA CUDA, AMD HIP, Intel SYCL) are still in this repository as they were
+> at the fork point, but they are not built, tested or updated here.
+> **For a Windows or Linux PC, use the original: [github.com/Niko1221/Strata](https://github.com/Niko1221/Strata).**
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+Strata runs large AI models on your own computer: they chat, write code, read pictures and work with your apps and
+coding agents through the same APIs as cloud services. The model runs on your Mac; what leaves it is up to you (the
+model downloads, and any app, tool or MCP server you connect).
 
 ## How fast is it?
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+Measured on one MacBook Pro with an M5 Max (40-core GPU, 128 GB), macOS 26.4, in the *High Power* energy mode,
+2026-10-08, thinking off. A token is about ¾ of a word.
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+| Model | 900-word answers | Short answers | Model file in memory |
+| --- | ---: | ---: | ---: |
+| **[GPT-OSS 120B](docs/MACOS.md#gpt-oss-120b)** (MXFP4) | 93-100 tokens/s | 93-103 tokens/s | 63 GB |
+| **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) Q2_0**, with `--mtp on` | 60-69 tokens/s | 92-102 tokens/s | 38 GB |
+| **Qwen3.8-Flash-Next IQ3_XXS**, with `--mtp on` | 46-48 tokens/s | 73-92 tokens/s | 47 GB |
+| **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 tokens/s | 29-32 tokens/s | 86 GB |
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+\* Measured 2026-10-10 while Docker used about 40 GB and swap was full (the GPU at a low clock), so a floor; GLM also reads about 3x the active parameters per token of the others.
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
-
-</td><td>
-
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
-
-</td></tr>
-</table>
-
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+The Qwen numbers use its MTP draft layer, which is opt-in (`./setup.sh --setup --mtp on`, about 12 GB more disk).
+The context's cache comes on top of the model file (a few GB; more for long contexts). In the *Automatic* energy mode
+the same Mac wrote long answers 2-3x slower. Other Macs were not measured. Every number and how it was measured:
+[docs/MACOS.md](docs/MACOS.md#measured).
 
 ## What you need
 
 | | |
 | --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
-
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
-
-Experimental, written and tested by community members on their own machines:
-
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
-
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+| **Mac** | Apple Silicon (M1 or newer). Only one M5 Max with 128 GB was tested; other chips and sizes are expected to work but were not tried. |
+| **Memory** | Enough for the model file plus its cache, inside what macOS lets the GPU use (on the tested 128 GB Mac: 107.5 GB). Setup's check counts 64 GB as the minimum. `make check` estimates what fits on yours; see [Which model?](#which-model) |
+| **Disk** | The model's download plus a few GB (70-100 GB per model), on the internal SSD. |
+| **Software** | Apple's Command Line Tools (`xcode-select --install`, wait until it finishes) and Python 3.10 or newer (if it is missing, setup installs it with Homebrew when Homebrew is there). Tested on macOS 26.4. |
 
 ## Install
 
-### Let your AI set it up
+In Terminal:
 
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```sh
+git clone https://github.com/dennis-akimov/Strata.git
+cd Strata
+make check                 # what this Mac can run; installs nothing
+make pull MODEL=Q2_0       # builds the engine and downloads the model (66 GB)
+make run                   # loads the model and opens http://127.0.0.1:8080 when it is ready
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+`make pull` asks a few questions (context size, pictures); Enter takes the recommended answer. If the download stops,
+run it again: it continues where it stopped. Loading takes a minute or so each start. `make run` keeps Terminal busy
+while Strata runs; press Ctrl+C to stop it, or use `make start` / `make stop` to run it in the background. Every
+option, the limits and the warnings: **[docs/MACOS.md](docs/MACOS.md)**.
 
-### Or do it yourself
+**Updating:** `git pull`, then `make run` (setup rebuilds the engine when the sources changed; the model stays).
+**Where things are:** models in `Strata-data/` next to the `Strata` folder, settings in `strata-<model>.json`, chats
+in your browser.
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+## Which model?
 
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
+| Model | Download | In memory, 128K context | Notes |
+| --- | ---: | ---: | --- |
+| **Qwen3.8-Flash-Next Q2_0** | 66 GB | about 60 GB (estimate) | The default and the most tested on a Mac. `make pull MODEL=Q2_0` |
+| Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB (measured) | Less compressed than Q2_0; 10-30% slower in our runs. `make pull MODEL=IQ3_XXS` |
+| Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB (measured) | Less compressed again; about 10% slower than Q2_0 in one A/B. `make pull MODEL=IQ3_S` |
+| **GPT-OSS 120B** | 63 GB | about 70 GB (estimate) | The fastest here (about 5B parameters active per token). Set up by hand: [steps](docs/MACOS.md#gpt-oss-120b) |
+| GLM-5.3-Flash (Maya-S24) | 95 GB | 89 GB at 32K (measured) | The largest here (320B parameters, about 18B active per token), and the slowest. Chat, thinking and tool calls work. Set up by hand: [steps](docs/MACOS.md#glm-53-flash) |
 
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
-
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
-
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
-
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
-
-## Which model should I pick?
-
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
-
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
-
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
-  model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
-
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
+"In memory" is the engine with the Qwen models' MTP draft layer and 2 request slots, on the tested Mac; a smaller
+context needs less (`make run CONTEXT=32768`). It must fit in what macOS lets the GPU use, which `make check` prints
+for your Mac (107.5 GB on the tested 128 GB one; less on smaller Macs). The Qwen models also read a 28 GB table from
+the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not tried on a Mac.
 
 ## Using it
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
-
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
+- **In the browser:** `http://127.0.0.1:8080` has **Chat**, a live **Monitor** of the model and the Mac (GPU load,
+  memory, power, temperature) and **About**. Thinking effort (*Off* to *High*) sets how long the model thinks; a
+  **Thinking budget** in the chat's **Sampling** settings caps it in tokens.
+- **Your apps and coding agents:** an "OpenAI-compatible" provider with the base URL `http://127.0.0.1:8080/v1` (any
+  model name; any API key unless you set one), the Anthropic API at `http://127.0.0.1:8080/v1/messages` (Claude Code:
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`), and the Responses API at `/v1/responses`. Tools and MCP work. Client
+  examples: [docs/DETAILS.md](docs/DETAILS.md#using-it).
+- **Pictures:** say yes to pictures in setup (Qwen models), then attach them in the chat or your app.
+- **One request at a time** by default; others wait. A follow-up in the same conversation reads only what is new, so
+  it starts quickly; a long new prompt takes a while to read before the answer starts.
+- **From another device on your network:** in `strata-<model>.json` set `"host": "0.0.0.0"` and an `"api_key"`,
+  start Strata again, then use `http://<your Mac's IP>:8080` with that key. The traffic is not encrypted: keep it on a
+  network you trust (or a VPN).
 
 ## Something went wrong?
 
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+- **It is slow.** Use the *High Power* energy mode where your Mac has it (laptops: *System Settings > Battery > Energy
+  Mode*; desktops: *System Settings > Energy*) and keep a laptop plugged in. To see the GPU's clock: `brew install
+  macmon`, then `macmon`.
+- **It thinks for a very long time.** Set a lower thinking effort, or a **Thinking budget** (4096-8192): when the
+  budget runs out the server closes the thinking and the model writes its answer, if max tokens leaves room for one.
+- **It says the port is in use.** Another program listens on 8080. If it is another Strata, `make stop` or starting a
+  `run-<model>.sh` offers to stop it; otherwise use another port (`make run PORT=8090`). Two models at once need the
+  memory for both.
+- **The model does not fit.** Close large apps, choose a smaller model or a smaller context (`make run CONTEXT=32768`).
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
+More: [docs/MACOS.md](docs/MACOS.md#limits-and-warnings). Problems with this Mac fork:
+[issues](https://github.com/dennis-akimov/Strata/issues). A security problem: report it privately, see
+[SECURITY.md](SECURITY.md).
 
 ## How does it work?
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
-
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
-
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
-
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+On a Mac, Strata's own engine (`strata-metal`, in [`metal/`](metal/)) runs the model on the GPU through
+[llama.cpp](https://github.com/ggml-org/llama.cpp)'s Metal backend, and the Strata server sits on top of it: the web
+app, the OpenAI / Anthropic / Responses / MCP APIs, conversation reuse, the model's draft layer that guesses a few
+tokens ahead, and the chat formats of Qwen, GPT-OSS (harmony) and GLM. The CPU and the GPU share the Mac's memory, so
+the model's weights sit in it once, for both. The design and the measurements:
+[docs/MACOS.md](docs/MACOS.md#how-it-fits-together). The documents of the original are kept in
+[`docs/`](docs/README.md), with which ones apply on a Mac.
 
 ## Credits and license
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+**[Strata](https://github.com/Niko1221/Strata) is the work of Niko1221 and the Strata contributors**
+([all credits](docs/HOW_IT_WORKS.md#credits)); this fork adds the Mac support. The models are by the Qwen team
+([Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), compressed by
+[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)), OpenAI
+([GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)) and Z.ai (GLM-5.3-Flash, compressed by
+[Project Maya](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF)). Strata uses parts of
+[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). Open source under the [MIT License](LICENSE) (Copyright (c)
+2026 Niko1221 and the Strata contributors); a few parts and every model have their own licenses
+([which ones](docs/HOW_IT_WORKS.md#license)).
 
-## Support Strata
-
-Strata is free and open source. If it is useful to you, you can support its development:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+If this Mac fork is useful to you, you can support its maintainer:
+[buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov).

@@ -4,8 +4,11 @@ title: "[Feature]: "
 labels: ["enhancement"]
 body:
   - type: markdown
-    value: |
-      Explain what you want in plain language.
+    attributes:
+      value: |
+        This is the Apple Silicon (Mac) fork of Strata. For a Windows or Linux PC, use the original: [github.com/Niko1221/Strata](https://github.com/Niko1221/Strata/issues).
+
+        Explain what you want in plain language.
   - type: textarea
     id: idea
     attributes:
@@ -14,5 +17,6 @@ body:
     validations:
       required: true
   - type: markdown
-    value: |
-      All of this counts: model and architecture support, the server and API, the web app, multi-GPU and layer split, images and vision, MCP servers, setup and installation, and performance.
+    attributes:
+      value: |
+        All of this counts: model support on a Mac, the server and API, the web app, images, MCP servers, Mac setup and installation, and performance on Apple Silicon. (Windows or Linux PCs: the original Strata, github.com/Niko1221/Strata.)

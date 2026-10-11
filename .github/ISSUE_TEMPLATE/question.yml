@@ -4,19 +4,22 @@ title: "Question: "
 labels: ["question"]
 body:
   - type: markdown
-    value: |
-      Not sure how to do something, or want to share numbers from your machine? Ask here.
+    attributes:
+      value: |
+        This is the Apple Silicon (Mac) fork of Strata. For a Windows or Linux PC, use the original: [github.com/Niko1221/Strata](https://github.com/Niko1221/Strata/issues).
+
+        Not sure how to do something, or want to share numbers from your machine? Ask here.
   - type: textarea
     id: question
     attributes:
       label: Your question
-      description: What you're trying to do. Include your version, GPU, and OS if it affects the answer.
+      description: What you're trying to do. Include your version, Mac (chip and memory) and macOS version if it affects the answer.
     validations:
       required: true
   - type: textarea
     id: numbers
     attributes:
       label: Results (optional)
-      description: Only if you ran a benchmark or measured speed. Model, quant, context, and the tok/s you get.
+      description: "Only if you measured speed: the Mac (chip, memory), the energy mode (Automatic / High Power), the model and size, context, MTP on or off, thinking on or off, the answer length, and the tok/s you get."
     validations:
       required: false

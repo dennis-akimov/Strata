@@ -54,7 +54,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, CALL_START, H_CHANNEL, ChatTemplate, Event, GlmParser, HarmonyParser,  # noqa: E402
+                            OutputParser,
+                            anthropic_to_messages,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -103,6 +105,53 @@ def listen_problem(host: str, port: int, e: OSError) -> str:
     return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
 
 
+def port_holders(port: int) -> list[tuple[int, str]]:
+    """The processes listening on `port` as (pid, command line), from lsof and ps; [] where those are missing (Windows)."""
+    try:
+        pids = subprocess.run(["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True,
+                              timeout=10).stdout.split()
+        return [(int(p), subprocess.run(["ps", "-o", "command=", "-p", p], capture_output=True, text=True,
+                                        timeout=10).stdout.strip()) for p in dict.fromkeys(pids)]
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
+
+
+def stop_ids_of(tokenizer, strings) -> set[int]:
+    """The token ids that end a reply: each string that is ONE token of this vocabulary.  Another model's tag (Qwen's
+    <|im_end|> with GLM's tokenizer) is several ordinary pieces, and those must never stop a reply."""
+    return {ids[0] for s in strings for ids in [tokenizer.encode(s, parse_special=True)] if len(ids) == 1}
+
+
+def is_strata_server(command: str) -> bool:
+    """A Strata server's command line (only such a process is ever stopped to free a port)."""
+    return "serve/server.py" in command.replace("\\", "/")
+
+
+def stop_server(pid: int, port: int, wait_s: float = 30.0) -> bool:
+    """Stop a Strata server so its port is free: SIGCONT first (one suspended with Ctrl+Z cannot act on anything),
+    then SIGTERM, which ends its engine too; after wait_s, SIGKILL for it and its children.  True once the port is free."""
+    def free():
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            return False
+        except OSError:
+            return True
+    kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+    for sig in (signal.SIGCONT, signal.SIGTERM):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, sig)
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if free() and subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode != 0:
+            return True
+        time.sleep(0.5)
+    for p in [pid, *map(int, kids)]:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(p, signal.SIGKILL)
+    time.sleep(1)
+    return free()
+
+
 def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     """#874: where one request's combined image-embeddings file goes.  Every request with images rewrites it (it is
     deleted after the request), which on a disk is steady heavy writing: on Linux it goes to /dev/shm when that has
@@ -149,6 +198,9 @@ ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thin
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# GPT-OSS (harmony): the same two, as its own end of the analysis message and the start of the final one
+HARMONY_CLOSE = "<|end|><|start|>assistant<|channel|>final<|message|>"
+HARMONY_WRAP_UP = " I have thought about this long enough; time to give my answer." + HARMONY_CLOSE
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -208,6 +260,8 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
+ENTITY_TAG = re.compile(r'(?:W/)?("[^"]*")')   # RFC 9110 8.8.3; the group is the opaque tag (weak comparison)
+REQUEST_ID = re.compile(r"[0-9a-f]{32}")  # the web chat's X-Strata-Request-Id: 128 random bits, hex
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
@@ -2278,7 +2332,9 @@ def engine_args(cfg: dict) -> list[str]:
     # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
     # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
     # (only when the config has no reserve of its own).
-    if isinstance(cfg.get("vision"), dict) and "--vision" not in args:
+    # A Mac (backend "metal") takes pictures without either flag (strata-vision encodes them; the Metal engine ignores
+    # --vision), and its setup never writes them: the note would be wrong there, and repeated on every start.
+    if isinstance(cfg.get("vision"), dict) and "--vision" not in args and cfg.get("backend") != "metal":
         args.append("--vision")
         note = "added --vision"
         if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
@@ -2792,8 +2848,13 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        # GPT-OSS: the harmony format (its tokenizer has <|channel|>); its replies end at <|return|> or <|call|>
+        self.harmony = H_CHANNEL in getattr(tokenizer, "special_tokens", {})
+        # GLM-5.3-Flash: <|observation|> (a tool's turn) is its; a reply ends at <|endoftext|>, <|user|> or that
+        self.glm = "<|observation|>" in getattr(tokenizer, "special_tokens", {})
+        ends = (("<|return|>", "<|call|>", "<|endoftext|>") if self.harmony else
+                ("<|endoftext|>", "<|user|>", "<|observation|>") if self.glm else (IM_END, "<|endoftext|>"))
+        self.stop_ids = stop_ids_of(tokenizer, ends)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3395,6 +3456,19 @@ class Service:
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
         fetched = self._note_unreadable_tool_images(messages)
+        if self.harmony:
+            # GPT-OSS always reasons (harmony has no "off"): no thinking is its low effort; its template's efforts are
+            # low / medium / high.  A forced call is written in Qwen's form, so harmony leaves the choice to the model.
+            effort = "low" if kwargs.get("enable_thinking") is False else kwargs.get("reasoning_effort")
+            kwargs = {**kwargs, "enable_thinking": True,
+                      "reasoning_effort": {"xhigh": "high", "none": "low", None: "medium", "": "medium"}.get(effort, effort)}
+            force = None
+        elif self.glm:
+            # GLM-5.3-Flash always opens its thinking; its template's efforts are low / high / max (the default)
+            effort = "low" if kwargs.get("enable_thinking") is False else kwargs.get("reasoning_effort")
+            kwargs = {**kwargs, "enable_thinking": True,
+                      "reasoning_effort": {"none": "low", "medium": "high", "xhigh": "max", "": None}.get(effort, effort)}
+            force = None                                  # a forced call is written in Qwen's form
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -3620,7 +3694,9 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        parser = (HarmonyParser if self.harmony else GlmParser if self.glm else OutputParser)(
+                                                                  thinking=thinking, tools=tools, stream_tools=True,
+                                                                  recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3869,7 +3945,7 @@ class Service:
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(HARMONY_CLOSE if self.harmony else REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
@@ -3893,7 +3969,7 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = (HARMONY_WRAP_UP if self.harmony else REASONING_WRAP_UP) + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -4462,11 +4538,18 @@ class BadBody(Exception):
 
 
 def make_handler(svc: Service):
+    # the running requests' cancel events by the page's X-Strata-Request-Id (128 random bits: not guessable), and the
+    # last ids cancelled before their request registered (the page's /cancel can overtake its own request)
+    cancels: dict[str, threading.Event] = {}               # ponytail: single dict ops, atomic in CPython
+    cancelled_early: dict[str, None] = {}                   # insertion-ordered, the oldest dropped past 256
+    early_lock = threading.Lock()                           # its pruning iterates it
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
+        cancel_id = None                                    # this request's X-Strata-Request-Id, while it runs
         body_read = False                                   # whether a handler took this request's body
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
@@ -4637,6 +4720,15 @@ def make_handler(svc: Service):
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             sock = self.connection
+            rid = self.headers.get("X-Strata-Request-Id", "")
+            # POST /cancel can end it (a stream the page lost).  An id already running stays with its request
+            # (setdefault), so a reused id cancels or unregisters nothing of another request's
+            if REQUEST_ID.fullmatch(rid) and cancels.setdefault(rid, cancel) is cancel:
+                self.cancel_id = rid
+                with early_lock:
+                    early = cancelled_early.pop(rid, False) is None
+                if early:
+                    cancel.set()
 
             def watch():
                 while not done.wait(0.5) and not cancel.is_set():
@@ -4688,7 +4780,7 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, headers=None):
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -4700,6 +4792,8 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -4712,8 +4806,32 @@ def make_handler(svc: Service):
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             if key_matches(given, svc.api_key):
                 return True
-            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+            # RFC 9110 11.6.1: a 401 MUST carry a WWW-Authenticate challenge; RFC 6750 3 / 3.1: the Bearer scheme, with
+            # error="invalid_token" for a key that was sent and is wrong, and no error code when none was sent
+            challenge = 'Bearer realm="strata"' + (', error="invalid_token"' if given else "")
+            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}},
+                       {"WWW-Authenticate": challenge})
             return False
+
+        def _static(self, body: bytes, ctype: str, cache: str):
+            """One of the web app's files.  `no-cache` makes a browser revalidate before each reuse (RFC 9111 5.2.2.4),
+            so an update shows at once; the strong ETag makes that a 304 without the file (RFC 9110 13.1.2: weak
+            comparison, "*" matches any), where before every reuse - each repaint of an answer, for the icon sprite -
+            fetched it whole."""
+            tag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'   # ponytail: hashed per request; files are small
+            # every If-None-Match line (a list field may be split over several), whole tags only: a tag may hold a
+            # comma ("x,*,y" is one tag), and "*" counts only as the whole value
+            asked = ", ".join(self.headers.get_all("If-None-Match") or [])
+            fresh = asked.strip() == "*" or tag in ENTITY_TAG.findall(asked)
+            self.send_response(304 if fresh else 200)
+            self.send_header("ETag", tag)                    # RFC 9110 15.4.5: a 304 repeats ETag and Cache-Control
+            self.send_header("Cache-Control", cache)
+            if not fresh:
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not fresh:
+                self.wfile.write(body)
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
@@ -4724,13 +4842,7 @@ def make_handler(svc: Service):
                 if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():
                     self._json(404, {"error": {"message": "not found"}})
                     return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "font/woff2")
-                self.send_header("Cache-Control", "max-age=86400")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._static(f.read_bytes(), "font/woff2", "max-age=86400")
                 return
             if path.startswith("/web/"):
                 # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
@@ -4742,13 +4854,7 @@ def make_handler(svc: Service):
                 if "/" in name or "\\" in name or ext not in types or not f.is_file():
                     self._json(404, {"error": {"message": "not found"}})
                     return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", types[ext])
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._static(f.read_bytes(), types[ext], "no-cache")
                 return
             if path == "/metrics/prometheus":
                 if self._authorized():
@@ -4798,11 +4904,7 @@ def make_handler(svc: Service):
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._static(body, "text/html; charset=utf-8", "no-cache")
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
@@ -4889,6 +4991,25 @@ def make_handler(svc: Service):
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
                 return
+            if path == "/cancel":
+                # the web chat's stream broke but the request may still run (a browser can fail the read and keep
+                # the socket open, so the disconnect watcher never sees a hang-up): end it by the page's request id
+                if not self._own_page("a request can be cancelled"):
+                    return
+                try:
+                    rid = json.loads(self._body() or b"{}").get("id")
+                except (ValueError, AttributeError):
+                    rid = None
+                event = cancels.get(rid) if isinstance(rid, str) else None
+                if event is not None:
+                    event.set()
+                elif isinstance(rid, str) and REQUEST_ID.fullmatch(rid):   # its request may not have registered yet
+                    with early_lock:
+                        cancelled_early[rid] = None
+                        while len(cancelled_early) > 256:
+                            cancelled_early.pop(next(iter(cancelled_early)))
+                self._json(200 if event is not None else 404, {"cancelled": event is not None})
+                return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
                     r = svc.unload()
@@ -4966,6 +5087,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/context":
+                    self._context(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -5004,6 +5127,9 @@ def make_handler(svc: Service):
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
+                if self.cancel_id is not None:
+                    cancels.pop(self.cancel_id, None)        # ours: only the registering request sets cancel_id
+                    self.cancel_id = None
                 record = self.record
                 if record is not None:
                     with svc.status_lock:
@@ -5217,8 +5343,15 @@ def make_handler(svc: Service):
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
+            prompt_tools = tools
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
+                # ...but the prompt keeps them: an agent's last, tool-free step renders the same prefix as its tool
+                # steps, so the KV cache still matches (dropping them re-prefilled ~100K tokens: 138-266 s on a
+                # Mac, Osaurus 2026-10-09).  No calls are parsed, and a reply that starts one ends there.
                 tools = None
+                stop = stop_strings({"stop": req.get("stop")})     # a bad value is still a 400, never coerced
+                if len(stop) < OPENAI_MAX_STOP and CALL_START not in stop:
+                    req = {**req, "stop": stop + [CALL_START]}
             force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
@@ -5240,7 +5373,7 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
+            ids, thinking, max_new = svc.prepare(messages, tools or prompt_tools, kw, max_new, force=force, req=req)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
@@ -5447,6 +5580,35 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+
+        def _context(self, req):
+            """POST /context: what the web chat's next request (the body it would send) puts in the context window, by
+            part - rendered and tokenized as the request itself would be, MCP tools included; the model does not run and
+            nothing is kept.  `strata_draft`: the last user message is the text still being typed."""
+            req = svc.with_shared(req, "openai")
+            messages, tools, kw = openai_to_messages(req)
+            # a new chat: what the first question will carry anyway (a template wants a message; this one is empty)
+            messages = messages or [{"role": "user", "content": ""}]
+            if req.get("strata_mcp") is True and svc.mcp is not None:   # as _openai: the request's own tools win
+                own = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+                tools = (tools or []) + svc.mcp.template_tools(exclude=own) or None
+            total = len(svc.encode_prompt(messages, tools, kw))
+            parts = {"tools": total - len(svc.encode_prompt(messages, None, kw)) if tools else 0,
+                     "system": 0, "user": 0, "assistant": 0, "tool_io": 0, "draft": 0}
+            draft = len(messages) - 1 if req.get("strata_draft") and messages and messages[-1]["role"] == "user" else -1
+            n = lambda text: len(svc.tok.encode(text)) if text else 0   # noqa: E731
+            for i, m in enumerate(messages):
+                c = m["content"]
+                text = c if isinstance(c, str) else "".join(x.get("text", "") for x in c if isinstance(x, dict))
+                key = ("draft" if i == draft else "system" if m["role"] == "system" else "tool_io"
+                       if m["role"] == "tool" else "assistant" if m["role"] == "assistant" else "user")
+                parts[key] += n(text)
+                parts["tool_io"] += sum(n(json.dumps(x["function"].get("arguments"), ensure_ascii=False))
+                                        for x in m.get("tool_calls") or [])
+            parts["formatting"] = max(0, total - sum(parts.values()))   # the template's markup and its own text
+            images = sum(1 for m in messages if not isinstance(m["content"], str)
+                         for x in m["content"] if isinstance(x, dict) and x.get("type") != "text")
+            self._json(200, {"max_context": svc.reported_ctx(), "total": total, "parts": parts, "images": images})
 
         def _anthropic(self, req):
             svc.load()
@@ -6024,6 +6186,8 @@ def main() -> int:
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--replace", action="store_true",
+                    help="if another Strata server holds the port, stop it and start this one (without it: asked in a terminal)")
     ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
                                   "(\"0,2\"; also \"gpu\" in the config)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
@@ -6069,7 +6233,28 @@ def main() -> int:
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
-        ap.error(listen_problem(a.host, a.port, e))
+        # another Strata server on it (a model started earlier): offer to stop that one; anything else is left alone
+        holders = port_holders(a.port) if "already in use" in listen_problem(a.host, a.port, e) else []
+        ours = [(pid, cmd) for pid, cmd in holders if is_strata_server(cmd)]
+        if not ours or len(ours) != len(holders):
+            others = "; ".join(f"pid {pid}: {cmd[:120]}" for pid, cmd in holders if not is_strata_server(cmd))
+            ap.error(listen_problem(a.host, a.port, e) + (f" (held by {others})" if others else ""))
+        pid, cmd = ours[0]
+        config = cmd.split("--config", 1)[1].split()[0].strip('"') if "--config" in cmd else "?"
+        print(f"[strata] port {a.port} is held by another Strata server: pid {pid}, {Path(config).name}", flush=True)
+        if not a.replace:
+            if not (sys.stdin.isatty() and sys.stderr.isatty()):
+                ap.error(listen_problem(a.host, a.port, e) + " (--replace stops that Strata server and starts this one)")
+            try:
+                answer = input("Stop it and start this one? [y/N] ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer not in ("y", "yes"):
+                ap.error(f"port {a.port} is still in use; nothing was stopped")
+        print(f"[strata] stopping pid {pid} ...", flush=True)
+        if not stop_server(pid, a.port):
+            ap.error(f"could not free port {a.port} (pid {pid} did not stop)")
+        print(f"[strata] port {a.port} is free", flush=True)
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
@@ -6084,7 +6269,8 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        meta = json.loads((tpath / "tokenizer.json").read_text()) if (tpath / "tokenizer.json").exists() else {}
+        tok = ST.Tokenizer(tokens, merges, types, meta.get("pre", "qwen35"))   # gpt-4o: GPT-OSS (o200k)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:

@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Troubleshooting and known issues
-    url: https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md#troubleshooting
-    about: Symptom-to-fix table for crashes, out of memory, hangs, and port problems.
+  - name: Mac limits, warnings and known issues
+    url: https://github.com/dennis-akimov/Strata/blob/main/docs/MACOS.md#limits-and-warnings
+    about: Speed (energy mode), memory, models that fit, and port problems on a Mac.
+  - name: Windows or Linux PC
+    url: https://github.com/Niko1221/Strata/issues
+    about: This edition is maintained only for Macs. PC problems go to the original Strata.

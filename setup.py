@@ -60,6 +60,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
+MAC = sys.platform == "darwin"   # Apple Silicon: the Metal engine (metal/setup_mac.py, docs/MACOS.md)
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
 # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
@@ -422,6 +423,8 @@ def _memory_status():
 def ram_gb():
     if WIN:
         return _memory_status().ullTotalPhys / 2**30
+    if MAC:                                            # no /proc: the physical pages (macOS' hw.memsize)
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
     for line in open("/proc/meminfo"):
         if line.startswith("MemTotal"):
             return int(line.split()[1]) * 1024 / 2**30
@@ -4786,6 +4789,15 @@ def sycl_setup(argv) -> int:
     return subprocess.call([sys.executable, str(script), *rest])
 
 
+def metal_setup(argv) -> int:
+    """macOS: the Metal engine (metal/, docs/MACOS.md), experimental. metal/setup_mac.py runs this setup with the
+    Apple steps swapped in; nothing of the CUDA / HIP paths is used or changed."""
+    script = ROOT / "metal" / "setup_mac.py"
+    if not script.exists():
+        fail(f"{script} is missing", "use a full Strata checkout (git clone)")
+    return subprocess.call([sys.executable, str(script), *argv])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
@@ -5144,7 +5156,18 @@ def main() -> int:
         say()
         any_fits = False
         for m, d in MODELS.items():
-            verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
+            # a Mac's GPU gets ~75-85% of the memory, so the RAM figures of a PC undercount it: 64 GB is the floor there
+            need_gb = max(d["ram_gb"], 64) if MAC else d["ram_gb"]
+            verdict = "fits" if ram >= need_gb else "tight" if ram >= need_gb - 8 else "does not fit"
+            if MAC:                                    # docs/MACOS.md: only Q2_0, IQ3_XXS and IQ3_S were measured on a Mac
+                if d.get("budget"):
+                    verdict = verdict if verdict == "does not fit" else ("untested on a Mac: the Metal engine does not "
+                                                                         "stream experts from the SSD, so all must fit in Metal's memory limit")
+                elif m not in ("Q2_0", "IQ3_XXS", "IQ3_S") and not verdict.startswith("does not fit"):
+                    verdict += " - untested on a Mac"
+                any_fits = any_fits or not verdict.startswith("does not fit")
+                say(f"  {m:8s} needs ~{need_gb} GB RAM: {verdict}")
+                continue
             if d.get("budget"):
                 verdict = (("EXPERIMENTAL, " if d.get("experimental") else "") +
                            f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest "
@@ -5798,7 +5821,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        sys.exit(metal_setup(sys.argv[1:]) if MAC else main())   # a Mac: metal/setup_mac.py drives main()
     except KeyboardInterrupt:
         say("\nstopped.")
         sys.exit(1)
