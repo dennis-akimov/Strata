@@ -35,7 +35,7 @@ TRAINED_CTX = 262144                                   # the Metal engine has no
 MTP_FILE = "mtp-qwen3.8-flash-next-q8_0.gguf"
 CONVERT_NUMPY = "2.4.0"                                # see metal/mtp_gguf.py: Q8_0_DIGEST
 ENGINE_SOURCES = ("metal/strata_metal.cpp", "metal/CMakeLists.txt", "tools/vision/strata_vision.cpp",
-                  *sorted(f"metal/patches/{p.name}" for p in (ROOT / "metal" / "patches").glob("*.patch")))   # rebuilt on change
+                  *sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "metal" / "patches").rglob("*.patch")))   # rebuilt on change
 MTP = {"on": False, "dir": None}                       # --mtp on|off (this file's own option), tools/mtp_fetch.py's --out
 
 
@@ -106,9 +106,9 @@ def build_engine(*_a, **_k) -> Path:
 def llama_source() -> Path:
     """The llama.cpp source the engine was built from (its converter makes the MTP file): CMake's fetched copy, or
     STRATA_LLAMA_DIR."""
-    deps = ROOT / "build-metal" / "_deps"              # metal/CMakeLists.txt: one tree per kernel-patch choice
-    src = Path(os.environ.get("STRATA_LLAMA_DIR") or next(
-        (d for d in (deps / "llama_cpp-src-plain", deps / "llama_cpp-src-patched") if d.is_dir()), deps / "llama_cpp-src-plain"))
+    deps = ROOT / "build-metal" / "_deps"              # metal/CMakeLists.txt: one tree per set of patches (none touch
+    trees = sorted(deps.glob("llama_cpp-src-*"), key=lambda d: d.stat().st_mtime, reverse=True)   # the converter)
+    src = Path(os.environ.get("STRATA_LLAMA_DIR") or next((d for d in trees if d.is_dir()), deps / "llama_cpp-src"))
     if not (src / "convert_hf_to_gguf.py").exists():
         S.fail(f"llama.cpp's converter is not in {src}", "run setup again: it compiles the engine and fetches llama.cpp")
     return src

@@ -3,7 +3,7 @@
 # is configured.  llama.cpp comes at a pinned commit (STRATA_LLAMA_COMMIT), or from STRATA_LLAMA_DIR, a checkout of
 # exactly that commit (offline builds).
 set(STRATA_LLAMA_COMMIT "71ad0590f4808b6202f9213d166913858c73b1bc")   # 2026-10-08: few-row MMA mat-mul (#30065), +8% decode with MTP
-set(STRATA_LLAMA_DIR "" CACHE PATH "a llama.cpp checkout at STRATA_LLAMA_COMMIT with metal/patches applied (default: fetched)")
+set(STRATA_LLAMA_DIR "" CACHE PATH "a llama.cpp checkout at STRATA_LLAMA_COMMIT with metal/patches/core applied (default: fetched)")
 
 set(GGML_METAL ON CACHE BOOL "" FORCE)
 set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # the shaders inside the binary: no Xcode needed to run it
@@ -25,30 +25,35 @@ else()
   # by llama.cpp's test-backend-ops and A/B-tested on the model.  Off by default: on the 2026-10-08 pin they were not
   # measurably faster (docs/MACOS.md).  A new name, so a build folder made with the old ON default does not keep it.
   option(STRATA_METAL_KERNEL_PATCHES "apply metal/patches/*.patch to the fetched llama.cpp" OFF)
+  # metal/patches/core/*.patch always: what strata-metal's own options need from llama.cpp (--ablate)
+  file(GLOB _patches "${CMAKE_CURRENT_SOURCE_DIR}/patches/core/*.patch")
+  list(SORT _patches)
+  if(STRATA_METAL_KERNEL_PATCHES)
+    file(GLOB _kernel "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch")
+    list(SORT _kernel)
+    list(APPEND _patches ${_kernel})
+  endif()
   set(_patch "")
-  if(STRATA_METAL_KERNEL_PATCHES)
-    file(GLOB _patches "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch")
-    list(SORT _patches)
-    # patch(1), not git apply: the fetched tree lies inside this repository's build folder, and git apply inside
-    # another repository resolves the paths against that repository and silently applies nothing
-    find_program(STRATA_PATCH patch REQUIRED)
-    foreach(_p ${_patches})
-      if(_patch)
-        list(APPEND _patch COMMAND)
-      else()
-        set(_patch PATCH_COMMAND)
-      endif()
-      list(APPEND _patch "${STRATA_PATCH}" -p1 -N -i "${_p}")
-    endforeach()
-  endif()
+  set(_sig "")
+  # patch(1), not git apply: the fetched tree lies inside this repository's build folder, and git apply inside
+  # another repository resolves the paths against that repository and silently applies nothing
+  find_program(STRATA_PATCH patch REQUIRED)
+  foreach(_p ${_patches})
+    if(_patch)
+      list(APPEND _patch COMMAND)
+    else()
+      set(_patch PATCH_COMMAND)
+    endif()
+    list(APPEND _patch "${STRATA_PATCH}" -p1 -N -i "${_p}")
+    file(MD5 "${_p}" _h)
+    string(APPEND _sig "${_h}")
+  endforeach()
   include(FetchContent)
-  # a source folder per choice: FetchContent reuses a populated one, so turning the patches off in a build folder that
-  # had them on kept building the patched tree
-  if(STRATA_METAL_KERNEL_PATCHES)
-    set(_src "${FETCHCONTENT_BASE_DIR}/llama_cpp-src-patched")
-  else()
-    set(_src "${FETCHCONTENT_BASE_DIR}/llama_cpp-src-plain")
-  endif()
+  # a source folder per set of patches (named by their contents): FetchContent reuses a populated folder, so a changed
+  # patch, or the kernel patches turned off, would otherwise keep building the old tree
+  string(MD5 _sig "${_sig}")
+  string(SUBSTRING "${_sig}" 0 10 _sig)
+  set(_src "${FETCHCONTENT_BASE_DIR}/llama_cpp-src-${_sig}")
   FetchContent_Declare(llama_cpp URL https://github.com/ggml-org/llama.cpp/archive/${STRATA_LLAMA_COMMIT}.tar.gz
                        SOURCE_DIR "${_src}" ${_patch})
   FetchContent_MakeAvailable(llama_cpp)

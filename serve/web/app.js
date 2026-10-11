@@ -588,14 +588,120 @@ function budgetProblem(max, budget) {
   return "";
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
-let messages = store.get("chat", []);
+let messages = [];                    // the open chat (chatsReady loads it)
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
 
-function saveChat() {
-  store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
+// ------------------------------------------------------------------ chat history
+// Every chat is kept in this browser (IndexedDB "strata", store "chats": {id, title, updated, messages}); the server
+// keeps none, so it stays stateless.  localStorage would hold ~5 MB, a few dozen long answers.  Without IndexedDB (a
+// private window, the tests) the chats last until the page is closed.
+const chatsDb = (() => {
+  let opened = null;
+  const mem = new Map();
+  const db = () => opened || (opened = new Promise((res) => {
+    try {
+      const r = indexedDB.open("strata", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("chats", {keyPath: "id"});
+      r.onsuccess = () => res(r.result);
+      r.onerror = r.onblocked = () => res(null);
+    } catch (e) { res(null); }
+  }));
+  const run = (mode, fn) => db().then((d) => (d ? new Promise((res, rej) => {
+    const t = d.transaction("chats", mode), req = fn(t.objectStore("chats"));
+    t.oncomplete = () => res(req.result);
+    t.onerror = t.onabort = () => rej(t.error);
+  }) : undefined));
+  return {
+    all: () => run("readonly", (st) => st.getAll()).then((v) => v || [...mem.values()]),
+    get: (id) => run("readonly", (st) => st.get(id)).then((v) => v || mem.get(id)),
+    put: (c) => { mem.set(c.id, c); return run("readwrite", (st) => st.put(c)); },
+    del: (id) => { mem.delete(id); return run("readwrite", (st) => st.delete(id)); },
+  };
+})();
+const newChatId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+let chatId = store.get("chatId", "") || newChatId();
+
+function chatRecord() {                // pictures and files by name only (they can be large)
+  const kept = messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
+                                     files: (m.files || []).map((f) => ({name: f.name}))}));
+  const first = kept.find((m) => m.role === "user");
+  return {id: chatId, title: ((first && first.text) || "Chat").replace(/\s+/g, " ").trim().slice(0, 80) || "Chat",
+          updated: Date.now(), messages: kept};
 }
+function saveChat() {
+  store.set("chatId", chatId);
+  if (!messages.length) return;        // an empty chat is not kept
+  chatsDb.put(chatRecord()).catch((e) => toast("error", "The chat could not be saved",
+                                               `${(e && e.message) || e} (the browser's storage may be full: delete old chats in History)`));
+}
+function openChat(id, msgs) { chatId = id; store.set("chatId", id); messages = msgs; renderChat(); }
+
+// the open chat, after a reload; the one chat older versions kept in localStorage moves into the history
+const chatsReady = (async () => {
+  const legacy = store.get("chat", null);
+  if (Array.isArray(legacy) && legacy.length) {
+    chatId = newChatId();
+    messages = legacy;
+    try {
+      await chatsDb.put(chatRecord());
+      localStorage.removeItem("strata.chat");
+    } catch (e) { /* kept where it was: tried again on the next load */ }
+  }
+  const c = await chatsDb.get(chatId).catch(() => null);
+  if (c && !messages.length) messages = c.messages;
+  store.set("chatId", chatId);
+  renderChat();
+})();
+
+function openHistory(open) {
+  $("history").dataset.open = String(open);
+  $("history").setAttribute("aria-hidden", String(!open));
+  $("scrim").hidden = !open;
+  if (open) { renderHistory(); $("history-search").focus(); }
+}
+async function renderHistory() {
+  const q = $("history-search").value.trim().toLowerCase();
+  const has = (c) => !q || c.title.toLowerCase().includes(q) ||
+                     c.messages.some((m) => ((m.text || "") + (m.reasoning || "")).toLowerCase().includes(q));
+  const chats = (await chatsDb.all().catch(() => [])).filter(has).sort((a, b) => b.updated - a.updated);
+  const list = $("history-list");
+  list.innerHTML = chats.length ? "" : `<div class="muted">${q ? "No chat matches." : "No chats yet."}</div>`;
+  for (const c of chats) {
+    const row = document.createElement("div");
+    row.className = "history-item" + (c.id === chatId ? " is-current" : "");
+    row.dataset.id = c.id;
+    row.innerHTML = `<button type="button" class="history-open"><span class="history-title"></span>` +
+      `<span class="history-meta"></span></button>` +
+      `<button type="button" class="st-btn st-btn--icon history-del" title="Delete" aria-label="Delete this chat">${icon("trash")}</button>`;
+    row.querySelector(".history-title").textContent = c.title;
+    const n = c.messages.filter((m) => m.role === "user").length;
+    row.querySelector(".history-meta").textContent =
+      `${new Date(c.updated).toLocaleString([], {dateStyle: "medium", timeStyle: "short"})} · ${n} question${n === 1 ? "" : "s"}`;
+    list.appendChild(row);
+  }
+}
+$("history-list").onclick = async (e) => {
+  const row = e.target.closest(".history-item");
+  if (!row) return;
+  const id = row.dataset.id;
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  const c = await chatsDb.get(id);
+  if (!c) { renderHistory(); return; }
+  if (e.target.closest(".history-del")) {
+    await chatsDb.del(id);
+    if (id === chatId) openChat(newChatId(), []);
+    renderHistory();
+    toast("info", "Chat deleted", c.title, 6000, {label: "Undo", run: () => chatsDb.put(c).then(renderHistory)});
+    return;
+  }
+  saveChat();
+  openChat(id, c.messages);
+  openHistory(false);
+};
+$("history-search").addEventListener("input", () => renderHistory());
+$("history-btn").onclick = () => openHistory(true);
+$("history-close").onclick = () => openHistory(false);
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
 function msgEl(m, i) {
@@ -716,7 +822,77 @@ function updateAssistant(el, m, streaming) {
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
 }
+// ------------------------------------------------------------------ context window: the ring by the composer
+// What the next request puts in the model's context, by part: POST /context renders and tokenizes the same body send()
+// would post (plus the text being typed) with the model's own template and tokenizer; the model does not run.
+const CTX_PARTS = [["formatting", "Template and system text"], ["system", "System prompt"], ["tools", "Tool definitions"],
+                   ["user", "Your messages"], ["assistant", "Answers"], ["tool_io", "Tool calls and results"],
+                   ["draft", "Being typed"], ["writing", "Being written"]];
+let ctxInfo = null, ctxTimer = 0, ctxSeq = 0;
+function contextBody() {
+  const msgs = apiMessages(), draft = $("input").value.trim();
+  const b = {model: health.model, messages: msgs, reasoning_effort: settings.thinking};
+  if (draft) { msgs.push({role: "user", content: draft}); b.strata_draft = true; }
+  if (settings.mcp !== false && mcpInfo.tools > 0) b.strata_mcp = true;
+  return b;
+}
+function refreshContext(delay = 0) {
+  clearTimeout(ctxTimer);
+  ctxTimer = setTimeout(async () => {
+    if (busy) return;                          // counted again when the answer ends
+    const seq = ++ctxSeq;
+    try {
+      const r = await fetch("context", {method: "POST", headers: headers(true), body: JSON.stringify(contextBody())});
+      if (!r.ok || seq !== ctxSeq) return;
+      ctxInfo = await r.json();
+      paintContext();
+    } catch (e) { /* an older server, or offline: the ring keeps its last value */ }
+  }, delay);
+}
+function paintContext(writing = 0) {
+  const c = ctxInfo;
+  if (!c) return;
+  const max = c.max_context || health.max_context || 0, used = c.total + writing;
+  const pct = max ? Math.min(100, (used / max) * 100) : 0;
+  const btn = $("cw-btn");
+  btn.hidden = !max;
+  $("cw-fill").setAttribute("stroke-dasharray", `${used ? Math.max(pct, 2) : 0} 100`);
+  btn.dataset.level = pct >= 90 ? "full" : pct >= 75 ? "high" : "";
+  const label = `Context: ${fmt(used)} of ${fmt(max)} tokens (${fmt(pct, pct < 10 ? 1 : 0)}%)`;
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  if (!$("cw-pop").matches(":popover-open")) return;        // the popover is filled only while it shows
+  const parts = {...c.parts, writing};
+  const rows = CTX_PARTS.filter(([k]) => parts[k] > 0);
+  const share = (n) => (!max ? "" : n && (n / max) * 100 < 0.1 ? "<0.1%" : `${fmt((n / max) * 100, n / max < 0.1 ? 1 : 0)}%`);
+  const live = (k) => (k === "draft" || k === "writing" ? ` is-live${k === "writing" ? " is-writing" : ""}` : "");
+  $("cw-pct").textContent = `${fmt(pct, pct < 10 ? 1 : 0)}%`;
+  $("cw-total").innerHTML = `<b>${fmt(used)}</b> of ${fmt(max)} tokens used`;
+  $("cw-bar").innerHTML = rows.map(([k]) => `<i class="${live(k).trim()}" style="--c: var(--c-${k}); flex: 0 0 ${(parts[k] / max) * 100}%"></i>`).join("");
+  const free = Math.max(0, max - used);
+  $("cw-legend").innerHTML = rows.map(([k, label]) =>
+    `<li class="${live(k).trim()}" style="--c: var(--c-${k})"><span class="ctx-sw"></span><span>${label}</span>` +
+    `<span class="ctx-n">${fmt(parts[k])}</span><span class="ctx-p">${share(parts[k])}</span></li>`).join("") +
+    `<li class="ctx-free"><span class="ctx-sw"></span><span>Free</span><span class="ctx-n">${fmt(free)}</span><span class="ctx-p">${share(free)}</span></li>`;
+  const notes = ["Counted with the model's own tokenizer and chat template."];
+  if (c.images) notes.push(`${c.images} picture${c.images > 1 ? "s are" : " is"} not counted here (the image encoder adds their tokens).`);
+  notes.push(settings.thinking !== "none" ? "Earlier thinking is not sent back to the model; a new answer's thinking counts while it is written."
+                                          : "A new answer takes its room from what is free.");
+  if (pct >= 90) notes.push("Almost full: start a new chat so the next answer has room.");
+  $("cw-note").textContent = notes.join(" ");
+}
+$("cw-pop").addEventListener("toggle", (e) => {
+  if (e.newState !== "open") return;
+  paintContext();
+  const b = $("cw-btn").getBoundingClientRect(), p = $("cw-pop");       // above the ring, kept on screen
+  p.style.left = `${Math.max(8, Math.min(innerWidth - p.offsetWidth - 8, b.right - p.offsetWidth))}px`;
+  p.style.top = `${Math.max(8, b.top - p.offsetHeight - 10)}px`;
+  refreshContext();
+});
+$("input").addEventListener("input", () => refreshContext(600));
+
 function renderChat() {
+  refreshContext();
   const chat = $("chat");
   chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
   $("chat-empty").hidden = messages.length > 0;
@@ -830,7 +1006,8 @@ async function send() {
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
-  let firstAt = null, thinkStart = null, usage = null, frame = 0, ended = false, cost = 0, painted = 0;
+  let firstAt = null, thinkStart = null, usage = null, frame = 0, ended = false, cost = 0, painted = 0, streamed = 0;
+  if (ctxInfo) { ctxInfo.parts.user += ctxInfo.parts.draft; ctxInfo.parts.draft = 0; }   // the draft is sent now
   // a repaint rebuilds the whole answer from its markdown, so it costs more as the answer grows: the next one waits 4x
   // the last one's cost (painting keeps under ~20% of the page's time), else a long answer's repaints fill every frame
   const paint = () => {
@@ -839,6 +1016,7 @@ async function send() {
     const t = performance.now();
     updateAssistant(el, m, true);
     scrollDown();
+    paintContext(streamed);
     painted = performance.now();
     cost = painted - t;
   };
@@ -875,6 +1053,7 @@ async function send() {
         if (j.strata_mcp) onTool(m, j.strata_mcp);
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
+        if (d.reasoning_content || d.content) streamed++;   // ~ a token a delta: the ring grows while it writes
         if (d.reasoning_content) {
           if (!firstAt) firstAt = performance.now();
           if (!thinkStart) thinkStart = performance.now();
@@ -922,6 +1101,7 @@ async function send() {
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();
+  refreshContext();                               // counted exactly again, with this answer in it
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -935,11 +1115,9 @@ $("input").addEventListener("input", autosize);
 $("new-btn").onclick = () => {
   if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
   if (!messages.length) return;
-  const backup = messages;
-  messages = [];
   saveChat();
-  renderChat();
-  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
+  openChat(newChatId(), []);
+  toast("info", "New chat", "The last one is in History.");
 };
 $("export-btn").onclick = () => {
   if (!messages.length) { toast("info", "Nothing to save yet"); return; }
@@ -1115,6 +1293,7 @@ $("s-apply").onclick = async () => {
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
+  refreshContext();                               // the thinking level and the MCP tools change the prompt
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);
   if (share || sharedOn) {
@@ -1131,14 +1310,18 @@ $("s-apply").onclick = async () => {
 };
 $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);
-$("scrim").onclick = () => openDrawer(false);
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
+$("scrim").onclick = () => { openDrawer(false); openHistory(false); };
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if ($("drawer").dataset.open === "true") openDrawer(false);
+  if ($("history").dataset.open === "true") openHistory(false);
+});
 
 // ------------------------------------------------------------------ start
 setBusy(false);
-renderChat();
+renderChat();                         // empty until chatsReady has the open chat
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+Promise.all([chatsReady, loadHealth()]).then(loadMcp).then(() => { refreshContext(); if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();

@@ -33,6 +33,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -129,6 +130,12 @@ struct Options {
     int spec = 3;                                      // drafted tokens per pass with --mtp
     int batch = 0;                                     // --batch N: batch slots (the server's "parallel")
     int poll = -1;                                     // --poll N: ggml's CPU busy-wait level (llama.cpp default 50)
+    // --ablate <file>: directions projected out of every layer's output while the model runs (directional ablation;
+    // the GGUF is not changed; metal/patches/core).  Raw float32, layers x k x n_embd, each layer's k rows orthonormal,
+    // a layer of zeros left alone.  --ablate-layers: the file's layer count (default: the model's); k follows from it
+    std::string ablate;
+    int ablate_layers = 0;
+    float ablate_scale = 1.0f;
 };
 
 bool parse_ids(const char* s, std::vector<llama_token>& v) {
@@ -164,6 +171,9 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--threads") o.threads = std::atoi(val("--threads"));
         else if (a == "--poll") o.poll = std::max(0, std::min(100, std::atoi(val("--poll"))));
         else if (a == "--image-pad-id") g_image_pad = (llama_token) std::atoi(val("--image-pad-id"));
+        else if (a == "--ablate") o.ablate = val("--ablate");
+        else if (a == "--ablate-layers") o.ablate_layers = std::atoi(val("--ablate-layers"));
+        else if (a == "--ablate-scale") o.ablate_scale = (float) std::atof(val("--ablate-scale"));
         else if (a == "--eos-ids") {
             if (!parse_ids(val("--eos-ids"), o.eos)) { std::fprintf(stderr, "strata-metal: bad --eos-ids\n"); return false; }
         } else if (a.rfind("--", 0) == 0) {
@@ -350,6 +360,7 @@ struct Engine {
         if (!ctx) { err = "could not create the context (too long a --max-context for this Mac's memory?)"; return false; }
         vocab = llama_model_get_vocab(model);
         n_embd = llama_model_n_embd(model);
+        if (!o.ablate.empty() && !ablate(err)) return false;
         if (!draft_path.empty()) {
             common_params pd = common_base_params_to_speculative(p);
             spec_init = common_speculative_init_from_params(pd, model, ctx);
@@ -366,6 +377,51 @@ struct Engine {
         // a message's first token, where the checkpoints go: Qwen's <|im_start|>, GPT-OSS's <|start|>, GLM's <|user|>
         for (const char* s : {"<|im_start|>", "<|start|>", "<|user|>"})   // Qwen, GPT-OSS (harmony), GLM
             if (im_start < 0 && llama_tokenize(vocab, s, (int32_t) std::strlen(s), t, 4, false, true) == 1) im_start = t[0];
+        return true;
+    }
+
+    // --ablate: read the directions, check them, and hand them to llama.cpp (the target only: the MTP draft head is
+    // left alone, a draft only has to be a good guess)
+    bool ablate(std::string& err) {
+        std::FILE* f = std::fopen(o.ablate.c_str(), "rb");
+        if (!f) { err = "cannot read --ablate " + o.ablate; return false; }
+        std::vector<float> v;
+        float buf[4096];
+        for (size_t n; (n = std::fread(buf, sizeof(float), 4096, f)) > 0;) v.insert(v.end(), buf, buf + n);
+        const bool tail = std::fgetc(f) != EOF;               // a size that is not whole floats
+        std::fclose(f);
+        const int layers = o.ablate_layers > 0 ? o.ablate_layers : llama_model_n_layer(model);
+        const size_t per = (size_t) layers * (size_t) n_embd;
+        if (tail || v.empty() || per == 0 || v.size() % per != 0) {
+            err = "--ablate " + o.ablate + ": " + std::to_string(v.size()) + " floats are not " + std::to_string(layers) +
+                  " layers x k x " + std::to_string(n_embd) + " (set --ablate-layers to the file's layer count)";
+            return false;
+        }
+        const int k = (int) (v.size() / per);
+        // each steered layer's directions orthonormal: x - sum (x . v) v removes them only then, and a file of another
+        // layout (a wrong --ablate-layers, another model's width) fails here instead of steering at random
+        int steered = 0;
+        for (int l = 0; l < layers; ++l) {
+            const float* L = v.data() + (size_t) l * k * n_embd;
+            if (std::all_of(L, L + (size_t) k * n_embd, [](float x) { return x == 0.0f; })) continue;
+            ++steered;
+            for (int a = 0; a < k; ++a)
+                for (int b = a; b < k; ++b) {
+                    double d = 0.0;
+                    for (int e = 0; e < n_embd; ++e) d += (double) L[(size_t) a * n_embd + e] * L[(size_t) b * n_embd + e];
+                    if (std::fabs(d - (a == b ? 1.0 : 0.0)) > 1e-3) {
+                        err = "--ablate " + o.ablate + ": layer " + std::to_string(l) + "'s directions are not orthonormal (v" +
+                              std::to_string(a) + " . v" + std::to_string(b) + " = " + std::to_string(d) + ")";
+                        return false;
+                    }
+                }
+        }
+        if (llama_set_adapter_ablation(ctx, v.data(), v.size(), n_embd, k, o.ablate_scale) != 0) {
+            err = "llama.cpp refused --ablate " + o.ablate;
+            return false;
+        }
+        std::fprintf(stderr, "strata-metal: --ablate %s: %d of %d layers steered, %d directions each, scale %.2f\n",
+                     o.ablate.c_str(), steered, layers, k, o.ablate_scale);
         return true;
     }
 

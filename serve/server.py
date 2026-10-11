@@ -5087,6 +5087,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/context":
+                    self._context(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -5578,6 +5580,35 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+
+        def _context(self, req):
+            """POST /context: what the web chat's next request (the body it would send) puts in the context window, by
+            part - rendered and tokenized as the request itself would be, MCP tools included; the model does not run and
+            nothing is kept.  `strata_draft`: the last user message is the text still being typed."""
+            req = svc.with_shared(req, "openai")
+            messages, tools, kw = openai_to_messages(req)
+            # a new chat: what the first question will carry anyway (a template wants a message; this one is empty)
+            messages = messages or [{"role": "user", "content": ""}]
+            if req.get("strata_mcp") is True and svc.mcp is not None:   # as _openai: the request's own tools win
+                own = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+                tools = (tools or []) + svc.mcp.template_tools(exclude=own) or None
+            total = len(svc.encode_prompt(messages, tools, kw))
+            parts = {"tools": total - len(svc.encode_prompt(messages, None, kw)) if tools else 0,
+                     "system": 0, "user": 0, "assistant": 0, "tool_io": 0, "draft": 0}
+            draft = len(messages) - 1 if req.get("strata_draft") and messages and messages[-1]["role"] == "user" else -1
+            n = lambda text: len(svc.tok.encode(text)) if text else 0   # noqa: E731
+            for i, m in enumerate(messages):
+                c = m["content"]
+                text = c if isinstance(c, str) else "".join(x.get("text", "") for x in c if isinstance(x, dict))
+                key = ("draft" if i == draft else "system" if m["role"] == "system" else "tool_io"
+                       if m["role"] == "tool" else "assistant" if m["role"] == "assistant" else "user")
+                parts[key] += n(text)
+                parts["tool_io"] += sum(n(json.dumps(x["function"].get("arguments"), ensure_ascii=False))
+                                        for x in m.get("tool_calls") or [])
+            parts["formatting"] = max(0, total - sum(parts.values()))   # the template's markup and its own text
+            images = sum(1 for m in messages if not isinstance(m["content"], str)
+                         for x in m["content"] if isinstance(x, dict) and x.get("type") != "text")
+            self._json(200, {"max_context": svc.reported_ctx(), "total": total, "parts": parts, "images": images})
 
         def _anthropic(self, req):
             svc.load()

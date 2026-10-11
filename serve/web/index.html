@@ -56,12 +56,18 @@
           <input type="file" id="file" multiple hidden>
           <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="history-btn" title="Chat history" aria-label="Chat history">
+            <svg class="st-icon"><use href="web/sprite.svg#i-clock"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
             <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
           <span class="spacer"></span>
           <span class="composer-hint" id="composer-hint"></span>
+          <button type="button" class="ctx-ring" id="cw-btn" popovertarget="cw-pop" aria-label="Context window" hidden>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle class="ctx-ring__track" cx="10" cy="10" r="8"/>
+              <circle class="ctx-ring__fill" id="cw-fill" cx="10" cy="10" r="8" pathLength="100" stroke-dasharray="0 100"/></svg>
+          </button>
           <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
             <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg>Stop</button>
           <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send">
@@ -185,6 +191,27 @@
     </div>
   </section>
 </main>
+
+<!-- ============================ Context window (the ring by the composer) ============================ -->
+<div popover id="cw-pop" class="ctx-pop" role="dialog" aria-label="Context window">
+  <div class="ctx-pop__head"><span class="ctx-pop__title">Context window</span><span class="ctx-pop__pct" id="cw-pct"></span></div>
+  <div class="ctx-pop__total" id="cw-total"></div>
+  <div class="ctx-bar" id="cw-bar" aria-hidden="true"></div>
+  <ul class="ctx-legend" id="cw-legend"></ul>
+  <div class="ctx-pop__note" id="cw-note"></div>
+</div>
+
+<!-- ============================ Chat history (kept in this browser) ============================ -->
+<aside class="st-drawer" id="history" data-open="false" aria-label="Chat history" aria-hidden="true">
+  <div class="st-drawer__head"><span class="card-title">History</span>
+    <button class="st-btn st-btn--icon" id="history-close" aria-label="Close">
+      <svg class="st-icon"><use href="web/sprite.svg#i-chevron"/></svg></button></div>
+  <div class="st-drawer__body">
+    <input class="st-input" id="history-search" type="search" placeholder="Search chats" aria-label="Search chats">
+    <div class="history-list" id="history-list"></div>
+    <div class="muted history-note">Chats are kept in this browser only; the server keeps none.</div>
+  </div>
+</aside>
 
 <!-- ============================ Sampling drawer ============================ -->
 <aside class="st-drawer" id="drawer" data-open="false" aria-label="Sampling and thinking" aria-hidden="true">

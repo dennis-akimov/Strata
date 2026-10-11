@@ -2901,6 +2901,40 @@ class WebApp(unittest.TestCase):
                 conn.close()
                 self.assertIn(b" 304 ", raw.split(b"\r\n")[0])
 
+    def context(self, body):
+        req = urllib.request.Request(self.base + "/context", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+
+    def test_context_counts_the_next_prompt_by_part(self):
+        """POST /context: the next request's prompt, rendered and tokenized as the request would be, split by part;
+        the parts add up to it exactly (the template's markup is what is left)."""
+        msgs = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"}, {"role": "user", "content": "and 3+3?"}]
+        tools = [{"type": "function", "function": {"name": "add", "description": "Add two numbers",
+                  "parameters": {"type": "object", "properties": {"a": {"type": "number"}}}}}]
+        c = self.context({"messages": msgs, "strata_draft": True})
+        want = len(self.svc.encode_prompt(*self._msgs(msgs)))
+        self.assertEqual((c["total"], c["max_context"]), (want, CTX))
+        self.assertEqual(sum(c["parts"].values()), c["total"])
+        n = lambda t: len(self.svc.tok.encode(t))   # noqa: E731
+        self.assertEqual((c["parts"]["system"], c["parts"]["user"], c["parts"]["assistant"], c["parts"]["draft"]),
+                         (n("Be brief."), n("What is 2+2?"), n("4"), n("and 3+3?")))   # the last one: being typed
+        self.assertEqual(c["parts"]["tools"], 0)
+        with_tools = self.context({"messages": msgs, "tools": tools})
+        self.assertGreater(with_tools["parts"]["tools"], 0)
+        self.assertEqual(with_tools["total"], c["total"] + with_tools["parts"]["tools"])
+        self.assertEqual(with_tools["parts"]["draft"], 0)                 # no strata_draft: all sent
+        self.assertEqual(with_tools["parts"]["user"], n("What is 2+2?") + n("and 3+3?"))
+        empty = self.context({"messages": []})                             # a new chat: the fixed part only
+        self.assertGreater(empty["total"], 0)
+        self.assertEqual(empty["parts"]["formatting"], empty["total"])
+
+    def _msgs(self, msgs):
+        from serve.frontend import openai_to_messages
+        return openai_to_messages(self.svc.with_shared({"messages": msgs}, "openai"))
+
     def test_metrics(self):
         data = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}).encode()
         urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=data,
