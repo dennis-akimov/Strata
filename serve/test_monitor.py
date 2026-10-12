@@ -332,6 +332,13 @@ class ChatThinkingBudget(unittest.TestCase):
         self.assertEqual(r["msg"]["text"], "partial")
         self.assertIn("connection broke", r["msg"]["error"])
 
+    def test_a_stopped_server_is_named_not_failed_to_fetch(self):
+        """The page outlives its server (Ctrl+C, a restart): fetch rejects with the browser's two words; the page says
+        which server does not answer and what to do."""
+        r = self.run_chat({}, "down")
+        self.assertIn("127.0.0.1:8090 does not answer", r["msg"]["error"])
+        self.assertIn("Is Strata running", r["msg"]["error"])
+
     def test_thinking_off_sends_no_budget(self):
         r = self.run_chat({"budget": "2048", "thinking": "none"})
         self.assertEqual(r["body"]["reasoning_effort"], "none")

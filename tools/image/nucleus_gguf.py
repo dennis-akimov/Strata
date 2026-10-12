@@ -27,6 +27,18 @@ if LLAMA:
 import gguf  # noqa: E402  (llama.cpp's gguf-py, from the engine's build)
 
 ARCH = "nucleus-dit"
+# RoPE rotates the pairs (2i, 2i+1) of a head; ggml's rope_multi rotates (i, i + head_dim/2).  The query and key
+# projections' outputs (and their norms' weights) are stored with each head's dims de-interleaved - evens, then odds -
+# so ggml's rotation is the port's; a query-key dot product does not change when both are permuted alike.
+ROPE_PERMUTED = ("attn.to_q.weight", "attn.to_k.weight", "attn.add_k_proj.weight",
+                 "attn.norm_q.weight", "attn.norm_k.weight", "attn.norm_added_k.weight")
+
+
+def deinterleave(arr, head_dim):
+    """Rows (a Linear's outputs) or the vector of a [head_dim] norm weight, per head: [0, 2, 4, ..., 1, 3, 5, ...]."""
+    order = np.concatenate([np.arange(0, head_dim, 2), np.arange(1, head_dim, 2)])
+    rows = arr.reshape(-1, head_dim, *arr.shape[1:])
+    return np.ascontiguousarray(rows[:, order].reshape(arr.shape))
 
 
 SAFE_DTYPES = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}   # BF16: the bits, as uint16
@@ -114,6 +126,7 @@ def main():
     w.add_array(k("axes_dims"), [int(x) for x in cfg["axes_dims_rope"]])
     w.add_float32(k("rope_theta"), 10000.0)
     w.add_string(k("experts_type"), a.experts)
+    w.add_string(k("rope_layout"), "neox")          # see ROPE_PERMUTED; strata-image refuses a file without it
 
     plan = []                                   # (name, numpy shape, kind)
     for name in sorted(tensors):
@@ -141,6 +154,8 @@ def main():
         arr = to_numpy(tensors[name])
         if name.endswith(("experts.gate_up_proj", "experts.down_proj")):
             arr = np.ascontiguousarray(arr.transpose(0, 2, 1))
+        if name.endswith(ROPE_PERMUTED):
+            arr = deinterleave(arr, head_dim)
         if kind == "q":
             f32 = (arr.astype(np.uint32) << 16).view(np.float32)       # bf16 bits -> float32, exactly
             arr = gguf.quants.quantize(f32, qtype)

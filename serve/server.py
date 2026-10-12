@@ -6478,7 +6478,7 @@ def main() -> int:
     from serve.imagegen import ImageGen
     svc.image = ImageGen.from_config(cfg.get("image"))
     if svc.image:
-        print(f"[strata] pictures: POST /v1/images/generations runs strata-image with {Path(svc.image.dit).name} (the "
+        print(f"[strata] pictures: POST /v1/images/generations runs strata-image with {Path(svc.image.hunyuan or svc.image.dit).name} (the "
               f"chat model is unloaded for one when less than {svc.image.need_gb:.0f} GB is free)", flush=True)
     if svc.api_monitor:
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "

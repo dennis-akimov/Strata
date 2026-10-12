@@ -259,29 +259,82 @@ sent to the chat model).
   failing: 500 with its own message (or its last stderr). A client that hangs up (or the page's Stop): the process is
   stopped (SIGTERM, then SIGKILL 5 s later) and the turn is held until it has exited; past `timeout_s` (1800) the same,
   and 504. Every picture's end is in the server's log, failures and stops included.
-- **Measured** (M5 Max, 128 GB, 2026-10-11; Docker and other work running, so read timings as ranges):
+- **Measured** (M5 Max, 128 GB, 2026-10-11; the GPU clock moved between 600 and 1600 MHz from run to run, so read
+  timings as ranges, and compare engines only in interleaved runs):
 
-| | step, 512x512 | step, 1024x1024 | memory the process holds | weights |
-|---|---:|---:|---:|---|
-| strata-image (Q4_0 experts, Q8_0 encoder) | 0.45-0.58 s | 3.0-3.6 s | 0.4 GB + 0.3 / 1.5 GB of activations (512 / 1024) | 11.8 GB mapped, reclaimable |
-| for comparison: the MLX worker (nucleus-mlx), 4-bit, experts in memory | 0.48 s | 1.5-1.9 s | 14-18 GB | inside that |
-| the MLX worker, 4-bit, experts streamed from the SSD | 0.9-1.1 s | 1.8-2.1 s | 9.5-10.3 GB | streamed |
+| | step, 512x512 | step, 1024x1024 | 20 steps at 1024x1024, in all | memory the process holds | weights |
+|---|---:|---:|---:|---:|---|
+| strata-image (Q4_0 experts, Q8_0 encoder) | 0.38-0.5 s | 1.7-2.1 s (quiet), 2.5-3.2 s (busy) | 45 s | 0.4 GB + 0.3 / 1.5 GB of activations | 11.8 GB mapped, reclaimable |
+| for comparison: the MLX worker (nucleus-mlx), 4-bit, experts in memory | 0.48 s | 1.5-2.1 s | 46-56 s | 14.6-18.2 GB | inside that |
+| the MLX worker, 4-bit, experts streamed from the SSD | 0.9-1.1 s | 1.8-2.1 s | 54-64 s | 9.5-10.3 GB | streamed |
 
-  A step is both CFG branches. A 1024x1024 picture of 20 steps: 63 s in all (2.5 s for the prompt, 3.6 s to map the
-  DiT, 55 s of steps, 1.8 s to decode; the VAE needs 4.8 GB of scratch for that 1.8 s, after the DiT is freed); 512x512
-  of 30 steps: 17-20 s; 1536x1024: 9 s a step, 2.6 GB of activations, 13 s to decode. The size is capped there:
-  2048x2048 ran at 40 s a step with 12.9 GB of activations (the expert-choice routing's one-hot grows with the square of
-  the pixel count). The 1024x1024 steps are slower than MLX's: a per-op profile puts them in ggml's own kernels
-  (the attention's 1 GB score matrix and softmax, the routing's one-hot transposes, then the expert matmuls); flash
-  attention was 0.2-0.3 s faster a step but moved the pictures (below), so it is not used. ggml's matmuls already
-  run on the M5's neural accelerators (the Metal 4 tensor API, `has tensor = true` in the log); its F16 flash attention
-  does too, but the softmax, the copies and the routing around them do not.
+  A step is both CFG branches. CPU time for a 1024x1024 picture: 4 s (strata-image), 36-77 s (MLX, mostly PyTorch's
+  text encoder). 1536x1024: 9 s a step, 2.6 GB of activations, 13 s to decode. The size is capped there: 2048x2048 ran
+  at 40 s a step with 12.9 GB of activations (the expert-choice routing's one-hot grows with the square of the pixel
+  count). The VAE needs 4.8 GB of scratch for its 1.8-2.7 s at 1024x1024, after the DiT is freed.
 
-  Quality, LPIPS against the float32 port's picture (same prompt, noise and settings; 3 prompts, 512x512, 30 steps;
-  lower is closer, another seed is ~0.5): strata-image 0.017 / 0.130 / 0.088, the MLX worker 0.021 / 0.137 / 0.132,
-  the port's own 4-bit 0.037 / 0.227 / 0.243, strata-image with flash attention 0.036 / 0.123 / 0.152. The checks:
+  What made the 1024x1024 step 1.6x faster (a per-op profile: each node of the graph alone, synchronized): flash
+  attention on ggml's tensor-API kernel, which it takes only when the keys are a multiple of 64 (4119 keys took a slower
+  kernel: the keys are padded and masked); RoPE as one `ggml_rope_multi` (MROPE sections 8/28/28, the converter
+  de-interleaves the query and key projections: `rope_layout` "neox" in the GGUF) instead of a dozen small operations;
+  the routed experts of the two branches as `[D, C, E, 2]` slabs; the routing scores gathered, not multiplied out.
+
+  Quality, LPIPS against the float32 port's picture (same prompt, noise and settings; 8 prompts, 512x512, 30 steps;
+  lower is closer, another seed is ~0.5): strata-image 0.174 on average, the MLX worker 0.199. The paired t-test
+  (`image-model-testing` skill in the bible, `img-check paired`) finds no difference shown between the two (t = -0.56),
+  nor between flash and float32 attention (t = 1.01); with 3 prompts the comparison had pointed both ways. The checks:
   `tools/image/check_dit.py` (every DiT block against the port), `strata-image --check-text` (the encoder against
-  PyTorch: 1.1% relative, Q8_0), `--check-vae` (0.24% against the port's decoder).
+  PyTorch: 1.1% relative, Q8_0), `--check-vae` (0.24-0.27% against the port's decoder).
+
+### Pictures from a prompt (HunyuanImage-3.0)
+
+`strata-image` also runs [HunyuanImage-3.0-Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil)
+(Tencent: an 80B mixture of experts, 64 experts a layer, top 8, ~13B active a token). It is one transformer for text
+and picture: the prompt and the image tokens are one sequence, so there is no separate text encoder. The prompt's
+keys and values are computed once. Each of the 8 steps then runs the 3 conditioning tokens (timestep, guidance,
+timestep_r) and the h x w image tokens. CFG is distilled into the model: one pass a step. The 3D VAE decodes the
+last of its 4 frames, as the pipeline does.
+
+**License.** The [Tencent Hunyuan Community License](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE)
+does not apply in the European Union, the United Kingdom or South Korea. Above 100 million monthly active users,
+you need Tencent's permission. Read it before you use the model.
+
+The model file, made once: the converter streams the 32 BF16 shards (169 GB) one at a time, and deletes each shard
+after it is converted. The disk needs room for one shard (5.4 GB) and the output (54 GB, Q4_0 experts). This takes
+about 2 hours at 20 MB/s. `make pull MODEL=HUNYUAN` does both steps below (also `MODEL=NUCLEUS`, `GLM-5.3`,
+`GPT-OSS-120B`: `tools/pull_model.sh`).
+
+```sh
+M=<a folder>
+.venv/bin/python tools/image/hunyuan_gguf.py --out $M/hunyuan-image3-q4_0.gguf --work $M/shards   # 54.4 GB
+curl -L -o $M/tokenizer.json https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil/resolve/main/tokenizer.json
+```
+
+Then in the run config: `"image": {"hunyuan": "$M/hunyuan-image3-q4_0.gguf", "tokenizer": "$M/tokenizer.json",
+"need_gb": 70}`. The defaults change to the model's own: 8 steps and `guidance_scale` 2.5. `size` goes to the nearest
+of the model's 37 trained sizes (1024x1024, 1280x768, 720x1280, ...). The server builds the token ids
+(`tools/image/hunyuan_tokens.py`: the "instruct" template, the "en_unified" system prompt, no think or recaption
+stage). The prompt is plain text: a prompt that spells `<img>` does not become that token. Alone:
+
+```sh
+.venv/bin/python tools/image/hunyuan_tokens.py $M/tokenizer.json "draw sweet cat" 1024x1024 > tokens.txt
+build-metal/metal/strata-image --hunyuan $M/hunyuan-image3-q4_0.gguf --tokens tokens.txt --seed 42 --out cat.png
+```
+
+- **Measured** (M5 Max, 128 GB, 2026-10-12, GPU at a median 1160 MHz), 1024x1024 in all: 88 s. The prompt pass took
+  17 s, mostly reading the mapped weights from the SSD. The 8 steps took 4.1-5.3 s each, with 1.5 GB of
+  activations. The decode took 31 s, of which 17 s is the VAE itself. The process held 0.28 GB (peak footprint).
+  The 54 GB of weights are the file's own pages, which macOS can drop and read again.
+- **The VAE** is 3D: each Conv3d is 3 temporal taps of 2D convolutions. The three taps run as one kernel, so each
+  frame's im2col is made once. The kernels are F16, as the pipeline decodes under fp16 autocast. This made the decode
+  5.4x faster (92.8 s to 17.1 s), with at most 1 of 255 in a pixel changed.
+- **Checked against Tencent's own modules** (float32, CPU), each part alone on the reference's input. The 80B model
+  does not fit in memory whole, so `tools/image/hunyuan_ref.py dump` runs the parts, `strata-image --check-hunyuan`
+  runs the same parts, and `hunyuan_ref.py compare` compares them. The experts are the GGUF's, dequantized. Relative
+  error: the input tokens 2.2e-4, layer 0 3.2e-4, layer 31 4.4e-3, the image head 1.7e-4, the VAE 2.1e-4. The
+  tokens and 2D RoPE positions are the reference tokenizer's and `build_2d_rope`'s, exactly, for 5 prompts and sizes.
+- **Open:** Q4_0 experts have 8.6% relative error a weight matrix. With the BF16 model not runnable here, its effect
+  on the pictures is not measured; text in pictures has single-letter errors ("STRASA" for "STRATA").
 
 ### EAGLE3 draft model (`--eagle3`)
 

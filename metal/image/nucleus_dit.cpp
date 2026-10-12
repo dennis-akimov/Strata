@@ -13,7 +13,7 @@ namespace {
 constexpr int kGraphSize = 65536;
 constexpr float kNormEps = 1e-5f;           // MLX's nn.LayerNorm / nn.RMSNorm default, as the port builds them
 constexpr float kOutNormEps = 1e-6f;        // the port's norm_out
-constexpr int64_t kAttnChunkBytes = int64_t{512} << 20;
+constexpr int64_t kKeyBlock = 64;            // OP_FLASH_ATTN_EXT_TENSOR_NCPSG: the tensor-API kernel's keys a block
 
 }  // namespace
 
@@ -41,6 +41,17 @@ bool NucleusDiT::load(const std::string& path, ggml_backend_t backend, std::stri
         err = path + ": inconsistent nucleus-dit settings";
         return false;
     }
+    if (wts_.str("nucleus-dit.rope_layout") != "neox") {
+        err = path + " is from an older tools/image/nucleus_gguf.py (no rope_layout): convert the DiT again";
+        return false;
+    }
+    // ggml_rope_multi's frequency of pair i is theta^(-2i / head_dim); the port's restarts on every axis
+    // (theta^(-2k / axis_dim), k counting within the axis): the factor that turns the one into the other
+    rope_ff_.clear();
+    for (int a = 0, i = 0; a < 3; ++a)
+        for (int k = 0; k < hp_.axes[static_cast<size_t>(a)]; k += 2, ++i)
+            rope_ff_.push_back(std::pow(hp_.rope_theta, -2.0f * static_cast<float>(i) / static_cast<float>(hp_.head_dim)) /
+                               std::pow(hp_.rope_theta, -static_cast<float>(k) / static_cast<float>(hp_.axes[static_cast<size_t>(a)])));
     return true;
 }
 
@@ -61,66 +72,39 @@ Conditioning NucleusDiT::conditioning(int grid_h, int grid_w, int T, float t) co
         c.t_emb[static_cast<size_t>(i)] = std::cos(arg);
         c.t_emb[static_cast<size_t>(half + i)] = std::sin(arg);
     }
-    // RoPE (NucleusMoEEmbedRope): per axis freqs = 1 / theta^(2k / dim); the image's height and width positions are
-    // centred ([-ceil(n/2), floor(n/2)) - scale_rope), its frame position 0; the text's positions start at
+    // RoPE positions (NucleusMoEEmbedRope), [frame, height, width, unused] each a run of tokens, as ggml_rope_multi
+    // reads them: the image's height and width centred ([-ceil(n/2), floor(n/2))), its frame 0; the text's start at
     // max(grid_h / 2, grid_w / 2), the same on every axis
-    std::vector<std::vector<float>> fr(3);
-    for (int a = 0; a < 3; ++a)
-        for (int k = 0; k < hp_.axes[static_cast<size_t>(a)]; k += 2)
-            fr[static_cast<size_t>(a)].push_back(1.0f / std::pow(hp_.rope_theta, static_cast<float>(k) /
-                                                                  static_cast<float>(hp_.axes[static_cast<size_t>(a)])));
-    const int hd2 = hp_.head_dim / 2;
     const int S = grid_h * grid_w;
-    c.img_cos.assign(static_cast<size_t>(S * hd2), 0.0f);
-    c.img_sin.assign(static_cast<size_t>(S * hd2), 0.0f);
+    c.img_pos.assign(static_cast<size_t>(4 * S), 0);
     const int n_neg_h = grid_h - grid_h / 2, n_neg_w = grid_w - grid_w / 2;
     for (int y = 0; y < grid_h; ++y)
         for (int x = 0; x < grid_w; ++x) {
-            const float pos[3] = {0.0f, static_cast<float>(y - n_neg_h), static_cast<float>(x - n_neg_w)};
-            float* co = &c.img_cos[static_cast<size_t>((y * grid_w + x) * hd2)];
-            float* si = &c.img_sin[static_cast<size_t>((y * grid_w + x) * hd2)];
-            int o = 0;
-            for (int a = 0; a < 3; ++a)
-                for (const float f : fr[static_cast<size_t>(a)]) {
-                    const float ang = pos[a] * f;
-                    co[o] = std::cos(ang);
-                    si[o] = std::sin(ang);
-                    ++o;
-                }
+            c.img_pos[static_cast<size_t>(S + y * grid_w + x)] = y - n_neg_h;
+            c.img_pos[static_cast<size_t>(2 * S + y * grid_w + x)] = x - n_neg_w;
         }
     const int start = std::max(grid_h / 2, grid_w / 2);
-    c.txt_cos.assign(static_cast<size_t>(T * hd2), 0.0f);
-    c.txt_sin.assign(static_cast<size_t>(T * hd2), 0.0f);
-    for (int i = 0; i < T; ++i) {
-        const float p = static_cast<float>(start + i);
-        int o = 0;
-        for (int a = 0; a < 3; ++a)
-            for (const float f : fr[static_cast<size_t>(a)]) {
-                c.txt_cos[static_cast<size_t>(i * hd2 + o)] = std::cos(p * f);
-                c.txt_sin[static_cast<size_t>(i * hd2 + o)] = std::sin(p * f);
-                ++o;
-            }
-    }
+    c.txt_pos.assign(static_cast<size_t>(4 * T), 0);
+    for (int i = 0; i < T; ++i)
+        for (int a = 0; a < 3; ++a) c.txt_pos[static_cast<size_t>(a * T + i)] = start + i;
     return c;
 }
 
 std::vector<float> NucleusDiT::forward(const std::vector<float>& x, int grid_h, int grid_w, const std::vector<float>& txt,
-                                       int T, float t, const Conditioning* given, std::vector<std::vector<float>>* blocks,
-                                       std::string& err) {
-    auto y = run(x, grid_h, grid_w, {{&txt, T}}, t, given, blocks, -1, err);
+                                       int T, float t, std::vector<std::vector<float>>* blocks, std::string& err) {
+    auto y = run(x, grid_h, grid_w, {{&txt, T}}, t, blocks, -1, err);
     return y.empty() ? std::vector<float>{} : std::move(y[0]);
 }
 
 std::vector<std::vector<float>> NucleusDiT::forward_branches(const std::vector<float>& x, int grid_h, int grid_w,
                                                              const std::vector<Text>& texts, float t, std::string& err) {
-    return run(x, grid_h, grid_w, texts, t, nullptr, nullptr, -1, err);
+    return run(x, grid_h, grid_w, texts, t, nullptr, -1, err);
 }
 
 std::vector<float> NucleusDiT::block(int layer, const std::vector<float>& h, int grid_h, int grid_w,
-                                     const std::vector<float>& txt, int T, float t, const Conditioning* given,
-                                     std::string& err) {
+                                     const std::vector<float>& txt, int T, float t, std::string& err) {
     if (layer < 0 || layer >= hp_.layers) { err = "block: no such layer"; return {}; }
-    auto y = run(h, grid_h, grid_w, {{&txt, T}}, t, given, nullptr, layer, err);
+    auto y = run(h, grid_h, grid_w, {{&txt, T}}, t, nullptr, layer, err);
     return y.empty() ? std::vector<float>{} : std::move(y[0]);
 }
 
@@ -128,13 +112,14 @@ std::vector<float> NucleusDiT::block(int layer, const std::vector<float>& h, int
 // Every branch (a prompt: the CFG's two) sees the same `x`; they run side by side in one graph, and their routed experts
 // in one batched mul_mat, so each expert's weights are read once a step for both.
 std::vector<std::vector<float>> NucleusDiT::run(const std::vector<float>& x, int grid_h, int grid_w,
-                                                const std::vector<Text>& texts, float t, const Conditioning* given,
+                                                const std::vector<Text>& texts, float t,
                                                 std::vector<std::vector<float>>* blocks, int only, std::string& err) {
     const int S = grid_h * grid_w, D = hp_.hidden, E = hp_.experts, hd = hp_.head_dim;
     const int nh = hp_.heads, nkv = hp_.kv_heads, hd2 = hd / 2;
+    int sections[GGML_MROPE_SECTIONS] = {hp_.axes[0] / 2, hp_.axes[1] / 2, hp_.axes[2] / 2, 0};
     const int B = static_cast<int>(texts.size());
     const int x_dim = only < 0 ? hp_.in_channels : hp_.hidden;
-    bool ok = B >= 1 && S >= 1 && static_cast<int64_t>(x.size()) == static_cast<int64_t>(S) * x_dim && (!given || B == 1);
+    bool ok = B >= 1 && S >= 1 && static_cast<int64_t>(x.size()) == static_cast<int64_t>(S) * x_dim;
     for (const Text& tx : texts)
         ok = ok && tx.T >= 1 && static_cast<int64_t>(tx.h->size()) == static_cast<int64_t>(tx.T) * hp_.text_dim;
     if (!ok) {
@@ -142,7 +127,7 @@ std::vector<std::vector<float>> NucleusDiT::run(const std::vector<float>& x, int
         return {};
     }
     std::vector<Conditioning> conds;
-    for (const Text& tx : texts) conds.push_back(given ? *given : conditioning(grid_h, grid_w, tx.T, t));
+    for (const Text& tx : texts) conds.push_back(conditioning(grid_h, grid_w, tx.T, t));
 
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false);
@@ -154,34 +139,26 @@ std::vector<std::vector<float>> NucleusDiT::run(const std::vector<float>& x, int
     auto input = [&](ggml_tensor* tsr) { ggml_set_input(tsr); return tsr; };
     ggml_tensor* x_in = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x_dim, S));
     ggml_tensor* temb = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 1));
-    ggml_tensor* icos = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd2, S));
-    ggml_tensor* isin = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd2, S));
+    ggml_tensor* ipos = input(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * S));
+    ggml_tensor* ff = input(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd2));
     ggml_tensor* eye = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, S));   // its rows: the one-hot of a token
-    std::vector<ggml_tensor*> txt_in(B), tcos(B), tsin(B);
+    // flash attention's keys padded to a multiple of kKeyBlock (ggml's tensor-API kernel needs it): a row of 0 for the
+    // S + T keys and -inf for the padding, repeated for every query on the GPU
+    std::vector<ggml_tensor*> txt_in(B), tpos(B), krow(B), kmask(B);
     for (int b = 0; b < B; ++b) {
+        const int64_t Lp = (S + texts[b].T + kKeyBlock - 1) / kKeyBlock * kKeyBlock;
         txt_in[b] = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp_.text_dim, texts[b].T));
-        tcos[b] = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd2, texts[b].T));
-        tsin[b] = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd2, texts[b].T));
+        tpos[b] = input(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * texts[b].T));
+        krow[b] = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Lp, 1));
+        kmask[b] = ggml_cast(ctx, ggml_repeat(ctx, krow[b], ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Lp, S)), GGML_TYPE_F16);
     }
 
     auto rms = [&](ggml_tensor* v, const std::string& wn) { return ggml_mul(ctx, ggml_rms_norm(ctx, v, kNormEps), w(wn)); };
-    // apply_rotary_emb_complex: (x[2i], x[2i+1]) as a complex number times (cos + i sin)
-    auto rope = [&](ggml_tensor* v, int heads, int n, ggml_tensor* co, ggml_tensor* si) {
-        ggml_tensor* v4 = ggml_reshape_4d(ctx, v, 2, hd2, heads, n);
-        auto plane = [&](int k) {
-            ggml_tensor* p = ggml_view_4d(ctx, v4, 1, hd2, heads, n, v4->nb[1], v4->nb[2], v4->nb[3],
-                                          static_cast<size_t>(k) * v4->nb[0]);
-            return ggml_reshape_3d(ctx, ggml_cont(ctx, p), hd2, heads, n);
-        };
-        ggml_tensor* re = plane(0);
-        ggml_tensor* im = plane(1);
-        ggml_tensor* c3 = ggml_reshape_3d(ctx, co, hd2, 1, n);
-        ggml_tensor* s3 = ggml_reshape_3d(ctx, si, hd2, 1, n);
-        ggml_tensor* o_re = ggml_sub(ctx, ggml_mul(ctx, re, c3), ggml_mul(ctx, im, s3));
-        ggml_tensor* o_im = ggml_add(ctx, ggml_mul(ctx, re, s3), ggml_mul(ctx, im, c3));
-        ggml_tensor* both = ggml_concat(ctx, ggml_reshape_4d(ctx, o_re, 1, hd2, heads, n),
-                                        ggml_reshape_4d(ctx, o_im, 1, hd2, heads, n), 0);
-        return ggml_reshape_3d(ctx, both, hd, heads, n);
+    // RoPE: the pairs (i, i + head_dim/2) - the converter stored the dims so (rope_layout "neox") - with the frame,
+    // height and width positions per section of pairs and the port's per-axis frequencies (rope_ff_)
+    auto rope = [&](ggml_tensor* v, ggml_tensor* pos) {
+        return ggml_rope_multi(ctx, v, pos, ff, hd, sections, GGML_ROPE_TYPE_MROPE, 0, hp_.rope_theta, 1.0f, 0.0f, 1.0f,
+                               0.0f, 0.0f);
     };
     ggml_tensor* h0 = only < 0 ? linear(ctx, x_in, "img_in", true) : x_in;                 // [D, S]
     std::vector<ggml_tensor*> h(B, h0), txtn(B);
@@ -218,31 +195,22 @@ std::vector<std::vector<float>> NucleusDiT::run(const std::vector<float>& x, int
             ggml_tensor* tk = rms(ggml_reshape_3d(ctx, linear(ctx, tp, p + "attn.add_k_proj", false), hd, nkv, T),
                                   p + "attn.norm_added_k.weight");
             ggml_tensor* tv = ggml_reshape_3d(ctx, linear(ctx, tp, p + "attn.add_v_proj", false), hd, nkv, T);
-            q = rope(q, nh, S, icos, isin);
-            k = rope(k, nkv, S, icos, isin);
-            tk = rope(tk, nkv, T, tcos[b], tsin[b]);
+            q = rope(q, ipos);
+            k = rope(k, ipos);
+            tk = rope(tk, tpos[b]);
             ggml_tensor* K = ggml_concat(ctx, k, tk, 2);                                      // [hd, nkv, S+T]
             ggml_tensor* V = ggml_concat(ctx, v, tv, 2);
-            // attention in F32 (flash attention, F16 or F32 K/V, moved the 3-prompt LPIPS from 0.079 to 0.104 / 0.10
-            // for no measurable speed: the routing amplifies small differences)
-            ggml_tensor* qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));               // [hd, S, nh]
-            ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));               // [hd, L, nkv]
-            ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));               // [L, hd, nkv]
-            // the queries in chunks of at most kAttnChunkBytes of scores (17 GB in one piece at 2048x2048); each row
-            // of scores is its query's own, so the chunks change nothing
-            const int64_t L = S + T;
-            const int64_t cs = std::clamp<int64_t>(kAttnChunkBytes / (L * nh * 4), 256, S);
-            ggml_tensor* o = nullptr;
-            for (int64_t c0 = 0; c0 < S; c0 += cs) {
-                const int64_t n = std::min<int64_t>(cs, S - c0);
-                ggml_tensor* qc = n == S ? qp : ggml_cont(ctx, ggml_view_3d(ctx, qp, hd, n, nh, qp->nb[1], qp->nb[2],
-                                                                            static_cast<size_t>(c0) * qp->nb[1]));
-                ggml_tensor* kq = ggml_mul_mat(ctx, kp, qc);                                  // [L, n, nh]
-                kq = ggml_soft_max_ext(ctx, kq, nullptr, 1.0f / std::sqrt(static_cast<float>(hd)), 0.0f);
-                ggml_tensor* oc = ggml_mul_mat(ctx, vt, kq);                                  // [hd, n, nh]
-                o = o ? ggml_concat(ctx, o, oc, 1) : oc;
-            }
-            o = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3)), D, S);
+            // flash attention on ggml's tensor-API kernel: K and V as F16, padded to kKeyBlock keys (masked), the
+            // softmax and the sums in F32; no [L, S, heads] score matrix (1 GB at 1024x1024)
+            const int64_t pad = kmask[b]->ne[0] - (S + T);
+            auto kv = [&](ggml_tensor* x4) {                                                  // [hd, nkv, L] -> [hd, Lp, nkv]
+                return ggml_cast(ctx, ggml_pad(ctx, ggml_cont(ctx, ggml_permute(ctx, x4, 0, 2, 1, 3)), 0,
+                                               static_cast<int>(pad), 0, 0), GGML_TYPE_F16);
+            };
+            ggml_tensor* o = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), kv(K), kv(V), kmask[b],
+                                    1.0f / std::sqrt(static_cast<float>(hd)), 0.0f, 0.0f);
+            ggml_prec_set_acc(o, GGML_PREC_F32);
+            o = ggml_reshape_2d(ctx, o, D, S);                                                // [hd, nh, S]: tokens' rows
             o = linear(ctx, o, p + "attn.to_out.0", false);
             h[b] = ggml_add(ctx, h[b], ggml_mul(ctx, o, gate1));
 
@@ -258,8 +226,9 @@ std::vector<std::vector<float>> NucleusDiT::run(const std::vector<float>& x, int
             ggml_tensor* order = ggml_argsort(ctx, aff, GGML_SORT_ORDER_DESC);                      // [S, E]
             idx[b] = ggml_reshape_1d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, order, C, E, order->nb[1], 0)), N);
             ggml_tensor* onehot = ggml_get_rows(ctx, eye, idx[b]);                                  // [S, N]
-            ggml_tensor* score = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_mul(ctx,
-                ggml_reshape_3d(ctx, onehot, S, C, E), ggml_reshape_3d(ctx, aff, S, 1, E))), 1, N);  // [1, N]
+            // each slot's affinity, gathered per expert: aff as [1, S, E] rows, the slots as [C, E] indices
+            ggml_tensor* score = ggml_reshape_2d(ctx, ggml_get_rows(ctx, ggml_reshape_3d(ctx, aff, 1, S, E),
+                                                                    ggml_reshape_2d(ctx, idx[b], C, E)), 1, N);  // [1, N]
             onehot_t[b] = ggml_cont(ctx, ggml_transpose(ctx, onehot));                              // [N, S]
             ggml_tensor* sums = ggml_mul_mat(ctx, onehot_t[b], ggml_reshape_2d(ctx, score, N, 1));   // [S, 1]
             ggml_tensor* sums_at = ggml_get_rows(ctx, ggml_reshape_2d(ctx, sums, 1, S), idx[b]);     // [1, N]
@@ -267,16 +236,16 @@ std::vector<std::vector<float>> NucleusDiT::run(const std::vector<float>& x, int
             xe[b] = ggml_reshape_3d(ctx, ggml_get_rows(ctx, m2[b], idx[b]), D, C, E);              // [D, C, E]
         }
 
-        // the routed experts of every branch at once: [D, B*C, E]
+        // the routed experts of every branch at once, [D, C, E, B]: the weights broadcast over the branches, and each
+        // branch's results are one contiguous slab
         std::vector<ggml_tensor*> ye(B);
         if (cf > 0.0f) {
-            ggml_tensor* xa = xe[0];
-            for (int b = 1; b < B; ++b) xa = ggml_concat(ctx, xa, xe[b], 1);
-            ggml_tensor* gu = ggml_mul_mat(ctx, w(p + "img_mlp.experts.gate_up_proj"), xa);         // [2H, B*C, E]
+            ggml_tensor* xa = ggml_reshape_4d(ctx, xe[0], D, C, E, 1);
+            for (int b = 1; b < B; ++b) xa = ggml_concat(ctx, xa, ggml_reshape_4d(ctx, xe[b], D, C, E, 1), 3);
+            ggml_tensor* gu = ggml_mul_mat(ctx, w(p + "img_mlp.experts.gate_up_proj"), xa);         // [2H, C, E, B]
             ggml_tensor* ya = ggml_mul_mat(ctx, w(p + "img_mlp.experts.down_proj"), ggml_swiglu(ctx, gu));   // silu(gate) * up
             for (int b = 0; b < B; ++b)
-                ye[b] = B == 1 ? ya : ggml_cont(ctx, ggml_view_3d(ctx, ya, D, C, E, ya->nb[1], ya->nb[2],
-                                                                  static_cast<size_t>(b) * C * ya->nb[1]));
+                ye[b] = ggml_view_3d(ctx, ya, D, C, E, ya->nb[1], ya->nb[2], static_cast<size_t>(b) * ya->nb[3]);
         }
         for (int b = 0; b < B; ++b) {
             ggml_tensor* ff = nullptr;
@@ -320,12 +289,14 @@ std::vector<std::vector<float>> NucleusDiT::run(const std::vector<float>& x, int
     auto set = [](ggml_tensor* tsr, const void* data) { if (tsr->buffer) ggml_backend_tensor_set(tsr, data, 0, ggml_nbytes(tsr)); };
     set(x_in, x.data());
     set(temb, conds[0].t_emb.data());
-    set(icos, conds[0].img_cos.data());
-    set(isin, conds[0].img_sin.data());
+    set(ipos, conds[0].img_pos.data());
+    set(ff, rope_ff_.data());
     for (int b = 0; b < B; ++b) {
+        std::vector<float> row(static_cast<size_t>(krow[b]->ne[0]), -std::numeric_limits<float>::infinity());
+        std::fill_n(row.begin(), S + texts[b].T, 0.0f);
+        set(krow[b], row.data());
         set(txt_in[b], texts[b].h->data());
-        set(tcos[b], conds[b].txt_cos.data());
-        set(tsin[b], conds[b].txt_sin.data());
+        set(tpos[b], conds[b].txt_pos.data());
     }
     if (eye->buffer) {
         std::vector<float> id(static_cast<size_t>(S) * static_cast<size_t>(S), 0.0f);

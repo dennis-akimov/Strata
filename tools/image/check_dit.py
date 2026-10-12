@@ -1,6 +1,6 @@
 """strata-image's DiT against the port: relative error of the host conditioning, every block and the output.
 
-    python tools/image/check_dit.py <dump>      (after: strata-image --dit <gguf> --check <dump> [--given])
+    python tools/image/check_dit.py <dump>      (after: strata-image --dit <gguf> --check <dump> [--each])
 """
 import sys
 from pathlib import Path
@@ -13,8 +13,6 @@ def rel(a, b):
 
 
 d = Path(sys.argv[1])
-for name in ("img_cos", "img_sin", "txt_cos", "txt_sin"):
-    print(f"{name:9s} host table: max abs diff {np.abs(np.load(d / f'{name}_cpp.npy') - np.load(d / f'{name}.npy')).max():.2e}")
 each = sorted(d.glob("each*_cpp.npy"))
 for f in each:                    # every block alone (strata-image --each): its own error, nothing carried in
     i = int(f.stem[4:6])

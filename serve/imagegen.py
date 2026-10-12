@@ -4,6 +4,10 @@ ggml/Metal engine) with the run config's "image":
     "image": {"dit": ".../nucleus-dit-q4_0.gguf", "encoder": ".../qwen3vl-8b-text-bf16.gguf",
               "vae": ".../nucleus-vae.gguf", "need_gb": 16, "queue_s": 600, "timeout_s": 1800}
 
+or HunyuanImage-3.0-Instruct-Distil (an 80B mixture of experts, tools/image/hunyuan_gguf.py; its tokenizer.json):
+
+    "image": {"hunyuan": ".../hunyuan-image3-q4_0.gguf", "tokenizer": ".../tokenizer.json", "need_gb": 70}
+
 ("exe" names the binary when it is not engine-metal/strata-image, which setup builds, or build-metal/metal/.)  strata-image is started for one picture and
 exits after it, so a crash or an out-of-memory there does not take the chat model with it, and its exit is the proof that
 its memory is back.  This server is the gate; its rule is that the chat model and the picture never both run (or sit) in
@@ -36,8 +40,8 @@ MAX_PIXELS = 1536 * 1024        # 1024x1024: 1.5 GB of activations, 3 s a step; 
 KILL_AFTER_S = 5.0               # SIGTERM, then SIGKILL this much later
 
 
-def parse_request(body) -> dict:
-    """OpenAI's images request (prompt, n, size, response_format) plus Nucleus' own steps, guidance_scale, seed and
+def parse_request(body, steps_default=30, cfg_default=4.0) -> dict:
+    """OpenAI's images request (prompt, n, size, response_format) plus the model's own steps, guidance_scale, seed and
     negative_prompt.  A bad value is a ValueError: a 400 before anything is loaded."""
     if not isinstance(body, dict):
         raise ValueError("the body must be a JSON object")
@@ -58,7 +62,7 @@ def parse_request(body) -> dict:
         raise ValueError("size: width and height must be multiples of 16 from 256 to 2048")
     if width * height > MAX_PIXELS:          # the expert-choice routing's memory grows with the square of the pixels
         raise ValueError("size: at most 1536x1024 pixels in all (1024x1024, 1536x1024, 1248x1248 ...)")
-    steps, cfg, seed = body.get("steps", 30), body.get("guidance_scale", 4.0), body.get("seed")
+    steps, cfg, seed = body.get("steps", steps_default), body.get("guidance_scale", cfg_default), body.get("seed")
     if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 100:
         raise ValueError("steps must be an integer from 1 to 100")
     if not isinstance(cfg, (int, float)) or isinstance(cfg, bool) or not 0 <= cfg <= 20:
@@ -84,10 +88,14 @@ def _error(msg: str, kind: str = "server_error") -> bytes:
 
 
 class ImageGen:
-    def __init__(self, exe, dit, encoder, vae, need_gb: float = 16.0, queue_s: float = 600.0,
-                 timeout_s: float = 1800.0):
-        self.exe, self.dit, self.encoder, self.vae = str(exe), str(dit), str(encoder), str(vae)
+    def __init__(self, exe, dit=None, encoder=None, vae=None, need_gb: float = 16.0, queue_s: float = 600.0,
+                 timeout_s: float = 1800.0, hunyuan=None, tokenizer=None):
+        self.exe, self.dit, self.encoder, self.vae = str(exe), dit, encoder, vae
+        self.hunyuan, self.tokenizer = hunyuan, tokenizer
         self.need_gb, self.queue_s, self.timeout_s = need_gb, queue_s, timeout_s
+        self._tok = None                                 # the Hunyuan tokenizer, read at the first picture
+        # HunyuanImage-3.0-Instruct-Distil's generation_config: 8 steps, guidance 2.5 (one pass a step)
+        self.defaults = (8, 2.5) if hunyuan else (30, 4.0)
 
     @staticmethod
     def from_config(cfg):
@@ -97,7 +105,8 @@ class ImageGen:
         if not isinstance(cfg, dict):
             raise ValueError('"image" must be {"dit": ..., "encoder": ..., "vae": ...} (docs/MACOS.md)')
         files = {}
-        for k in ("dit", "encoder", "vae", "exe"):
+        keys = ("hunyuan", "tokenizer", "exe") if "hunyuan" in cfg else ("dit", "encoder", "vae", "exe")
+        for k in keys:
             v = cfg.get(k, next((str(p) for p in (ROOT / "engine-metal/strata-image", ROOT / "build-metal/metal/strata-image")
                                  if p.is_file()), "strata-image") if k == "exe" else None)
             if not isinstance(v, str) or not Path(v).expanduser().is_file():
@@ -105,12 +114,22 @@ class ImageGen:
                                  (" (run setup, or: cmake --build build-metal --target strata-image)" if k == "exe" else ""))
             files[k] = str(Path(v).expanduser().resolve())
         nums = {}
-        for k, default in (("need_gb", 16.0), ("queue_s", 600.0), ("timeout_s", 1800.0)):
+        for k, default in (("need_gb", 70.0 if "hunyuan" in cfg else 16.0), ("queue_s", 600.0), ("timeout_s", 1800.0)):
             v = cfg.get(k, default)
             if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v <= 0:
                 raise ValueError(f'"image".{k} must be a positive number')
             nums[k] = float(v)
         return ImageGen(**files, **nums)
+
+    def hunyuan_tokens(self, prompt, height, width):
+        """tools/image/hunyuan_tokens.py's file: the size the model makes (its nearest trained ratio) and the ids."""
+        import sys
+        sys.path.insert(0, str(ROOT / "tools" / "image"))
+        import hunyuan_tokens
+        if self._tok is None:
+            self._tok = hunyuan_tokens.Tokenizer.from_hf_json(self.tokenizer, "hunyuan")
+        b = hunyuan_tokens.build(self._tok, prompt, height, width)
+        return f"{b['height']} {b['width']}\n" + " ".join(map(str, b["ids"][:b["image_start"] - 3])) + "\n"
 
     @staticmethod
     def available_gb():
@@ -124,7 +143,7 @@ class ImageGen:
     def validate(self, req):
         """None when `req` is a picture this server can make; else (400, body)."""
         try:
-            parse_request(req)
+            parse_request(req, *self.defaults)
         except ValueError as e:
             return 400, _error(str(e), "invalid_request_error")
         return None
@@ -132,15 +151,20 @@ class ImageGen:
     def forward(self, req: dict, cancel: threading.Event):
         """The picture: (status, headers, body), after strata-image has exited (stopped when `cancel` is set: 499, or
         at the deadline: 504)."""
-        p = parse_request(req)
+        p = parse_request(req, *self.defaults)
         with tempfile.TemporaryDirectory(prefix="strata-image-") as d:      # 0700: this user's only
             d = Path(d)
-            (d / "prompt.txt").write_text(p["prompt"], encoding="utf-8")
-            (d / "negative.txt").write_text(p["negative"], encoding="utf-8")
-            args = [self.exe, "--encoder", self.encoder, "--dit", self.dit, "--vae", self.vae,
-                    "--prompt-file", str(d / "prompt.txt"), "--negative-file", str(d / "negative.txt"),
-                    "--width", str(p["width"]), "--height", str(p["height"]), "--steps", str(p["steps"]),
-                    "--cfg", repr(p["cfg"]), "--seed", str(p["seed"]), "--out", str(d / "out.png"), "--watch-stdin", "1"]
+            if self.hunyuan:                             # the token ids (and the size the model snaps to) as a file
+                (d / "tokens.txt").write_text(self.hunyuan_tokens(p["prompt"], p["height"], p["width"]), encoding="utf-8")
+                args = [self.exe, "--hunyuan", self.hunyuan, "--tokens", str(d / "tokens.txt")]
+            else:
+                (d / "prompt.txt").write_text(p["prompt"], encoding="utf-8")
+                (d / "negative.txt").write_text(p["negative"], encoding="utf-8")
+                args = [self.exe, "--encoder", self.encoder, "--dit", self.dit, "--vae", self.vae,
+                        "--prompt-file", str(d / "prompt.txt"), "--negative-file", str(d / "negative.txt"),
+                        "--width", str(p["width"]), "--height", str(p["height"])]
+            args += ["--steps", str(p["steps"]), "--cfg", repr(p["cfg"]), "--seed", str(p["seed"]),
+                     "--out", str(d / "out.png"), "--watch-stdin", "1"]
             with open(d / "stderr.txt", "wb") as err:
                 try:
                     # stdin stays open and unwritten: strata-image ends itself when it closes (this server is gone)

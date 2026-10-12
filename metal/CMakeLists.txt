@@ -68,7 +68,7 @@ target_link_libraries(strata-metal PRIVATE llama llama-common)
 # the image engine (Nucleus-Image on ggml/Metal, docs/MACOS.md): its own executable, as strata-vision is.  Hardened as
 # bible's C++ skill lists for Apple clang 17 on arm64 (flags the compiler and linker accept there)
 add_executable(strata-image ${CMAKE_CURRENT_SOURCE_DIR}/image/strata_image.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/nucleus_dit.cpp
-               ${CMAKE_CURRENT_SOURCE_DIR}/image/text_encoder.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/image/text_encoder.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/hunyuan_image.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/image/gguf_weights.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/nucleus_vae.cpp)
 target_compile_features(strata-image PRIVATE cxx_std_17)
 target_compile_options(strata-image PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero

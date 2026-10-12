@@ -36,8 +36,8 @@ PNG = b"\x89PNG\r\n\x1a\nfake"
 FAKE = r'''
 import json, os, signal, sys, time
 a = dict(zip(sys.argv[1::2], sys.argv[2::2]))
-prompt = open(a["--prompt-file"], encoding="utf-8").read()
-negative = open(a["--negative-file"], encoding="utf-8").read()
+prompt = open(a.get("--prompt-file") or a["--tokens"], encoding="utf-8").read()     # --tokens: HunyuanImage's ids
+negative = open(a["--negative-file"], encoding="utf-8").read() if "--negative-file" in a else ""
 with open(os.environ["FAKE_ENGINE_LOG"], "a") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt, "negative": negative, "pid": os.getpid()}) + "\n")
 say = lambda o: (print(json.dumps(o)), sys.stdout.flush())
@@ -283,6 +283,23 @@ class ImageGeneration(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/health", timeout=5) as r:
             self.assertIs(json.loads(r.read())["image_generation"], False)
         self.assertEqual(self.post({"prompt": "x"})[0], 404)
+
+    def test_hunyuan_gets_its_token_ids_as_a_file_and_its_own_defaults(self):
+        d = Path(self.tmp.name)
+        (d / "hy.gguf").write_bytes(b"GGUF")
+        (d / "tokenizer.json").write_text("{}")
+        self.svc.image = ImageGen.from_config({"exe": str(d / "strata-image"), "hunyuan": str(d / "hy.gguf"),
+                                               "tokenizer": str(d / "tokenizer.json"), "queue_s": 5, "timeout_s": 10})
+        self.assertEqual(self.svc.image.need_gb, 70.0)
+        with self.mem(100.0), mock.patch.object(ImageGen, "hunyuan_tokens", return_value="1024 1024\n1 2 3\n") as tk:
+            code, _, _ = self.post({"prompt": "a red apple"})
+        self.assertEqual(code, 200)
+        tk.assert_called_once_with("a red apple", 1024, 1024)
+        run = self.runs()[0]
+        args = dict(zip(run["argv"][::2], run["argv"][1::2]))
+        self.assertEqual((args["--hunyuan"], args["--steps"], args["--cfg"]), (str((d / "hy.gguf").resolve()), "8", "2.5"))
+        self.assertEqual(run["prompt"], "1024 1024\n1 2 3\n")
+        self.assertNotIn("--encoder", args)
 
     def test_the_config_entry_is_checked_at_start(self):
         d = Path(self.tmp.name)

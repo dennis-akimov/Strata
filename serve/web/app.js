@@ -999,6 +999,14 @@ const IMAGE_CMD = /^\/image\s+([\s\S]+)$/i;
 // ...and a message that plainly asks for one ("draw a sweet cat", "create an image of ...", "picture of ...") when the
 // server makes pictures: the chat model cannot draw, so sending it there only loads it for nothing
 const DRAW_ASK = /^(?:please\s+)?(?:draw|paint|sketch|illustrate)\s+(?:me\s+)?([\s\S]+)$|^(?:please\s+)?(?:make|create|generate|show\s+me)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|drawing|photo|illustration)\s+(?:of\s+)?([\s\S]+)$|^(?:an?\s+)?(?:image|picture|photo)\s+of\s+([\s\S]+)$/i;
+// fetch rejects with a TypeError ("Failed to fetch", "Load failed") when no server answers: say that, not the browser's
+// two words - the page stays open after its server stops (Ctrl+C, a restart, the Mac asleep)
+function requestError(e) {
+  return e instanceof TypeError
+    ? `The server at ${location.host} does not answer (${e.message}). Is Strata running? Start it again, then send this again.`
+    : e.message || String(e);
+}
+
 async function makePicture(prompt, text) {
   messages.push({role: "user", text, cmd: "image", time: Date.now()});
   $("input").value = "";
@@ -1023,7 +1031,7 @@ async function makePicture(prompt, text) {
   } catch (e) {
     fetch("cancel", {method: "POST", headers: headers(true), body: JSON.stringify({id: rid})}).catch(() => {});
     if (e.name === "AbortError") m.stopped = true;
-    else { m.error = e.message || String(e); toast("error", "No picture", m.error, 6000); }
+    else { m.error = requestError(e); toast("error", "No picture", m.error, 8000); }
   }
   busy = null;
   setBusy(false);
@@ -1154,8 +1162,8 @@ async function send() {
       const lost = e instanceof TypeError && (m.text || m.reasoning);   // fetch's "network error" mid-answer
       m.error = lost ? `The connection broke while the answer was being written (${e.message}); what arrived is ` +
                        "kept above, and the server was asked to stop it. Send it again to retry."
-                     : e.message || String(e);
-      toast("error", lost ? "The connection broke" : "The request failed", m.error, 6000);
+                     : requestError(e);
+      toast("error", lost ? "The connection broke" : "The request failed", m.error, 8000);
     }
   }
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;

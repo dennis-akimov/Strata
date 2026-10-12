@@ -1,9 +1,13 @@
-// metal/image/strata_image.cpp - strata-image: Strata's image engine on ggml/Metal (Nucleus-Image).  One picture per
-// process (serve/imagegen.py starts it): its exit is what gives the memory back.
+// metal/image/strata_image.cpp - strata-image: Strata's image engine on ggml/Metal (Nucleus-Image, HunyuanImage-3.0).
+// One picture per process (serve/imagegen.py starts it): its exit is what gives the memory back.
 //
 //   strata-image --encoder qwen3vl-8b-text.gguf --dit nucleus-dit.gguf --vae nucleus-vae.gguf
 //                --prompt-file p.txt [--negative-file n.txt] --width 1024 --height 1024 --steps 20 --cfg 4 --seed 42
 //                --out picture.png [--noise z.npy] [--latent-out z.npy] [--watch-stdin 1]
+//   strata-image --hunyuan hunyuan-image3.gguf --tokens tokens.txt --steps 8 --cfg 2.5 --seed 42
+//                --out picture.png [--noise z.npy] [--latent-out z.npy] [--watch-stdin 1]
+//
+// tokens.txt is tools/image/hunyuan_tokens.py's: the picture's size and the prompt's token ids.
 //
 // --watch-stdin 1: the process ends when its stdin closes (serve/imagegen.py keeps it open: a server that is gone does
 // not leave a picture running).
@@ -13,13 +17,18 @@
 //
 // The checks against the port:
 //
-//   strata-image --dit nucleus-dit-bf16.gguf --check <dump> [--given] [--each]
+//   strata-image --dit nucleus-dit-bf16.gguf --check <dump> [--each]
 //   strata-image --encoder <gguf> --check-text <dir>
 //   strata-image --vae <gguf> --check-vae <dir>
 //
+//   strata-image --hunyuan <gguf> --check-hunyuan <dir>
+//
+// <dir> is tools/image/hunyuan_ref.py's: each part alone on the reference's input (layer 0, layer 31, the image
+// head, the VAE) and one whole step, written next to them as *_cpp.npy (tools/image/hunyuan_ref.py --compare).
 // <dump> is tools/image/dump_ref.py's folder (x.npy, txt.npy, case.json and the port's every block); the outputs land
-// next to them as *_cpp.npy and tools/image/check_dit.py compares the two.  --given takes the RoPE tables and the
-// timestep embedding from the dump too, so the blocks are checked apart from the host-side conditioning.
+// next to them as *_cpp.npy and tools/image/check_dit.py compares the two.  --each runs every block alone on the port's
+// previous block, so an error is that block's own.
+#include "hunyuan_image.h"
 #include "nucleus_dit.h"
 #include "nucleus_vae.h"
 #include "text_encoder.h"
@@ -320,6 +329,88 @@ int generate(const Request& r) {
     return 0;
 }
 
+// HunyuanImage-3.0-Instruct-Distil: the prompt's keys and values once, then Euler on sigma = shift(linspace(1, 0, steps
+// + 1)), shift 3, one pass a step (CFG-distilled: the guidance is an input), the 3D VAE's last frame.
+int generate_hunyuan(const Request& r) {
+    const auto say = [](const std::string& line) { std::printf("%s\n", line.c_str()); std::fflush(stdout); };
+    if (r.steps < 1 || r.steps > 100) return fail_line("steps must be from 1 to 100");
+    if (!(r.cfg >= 1.0 && r.cfg <= 20.0)) return fail_line("cfg (the guidance scale) must be from 1 to 20");
+    std::ifstream tf(r.prompt_file);
+    int H = 0, W = 0;
+    std::vector<int32_t> ids;
+    tf >> H >> W;
+    for (int32_t id; tf >> id;) ids.push_back(id);
+    if (!tf.eof() || H % 16 || W % 16 || H < 256 || W < 256 || H > 2048 || W > 2048 || ids.empty() || ids.size() > 16384)
+        return fail_line("cannot read the tokens file (tools/image/hunyuan_tokens.py makes it)");
+    const double t0 = now_s();
+    if (r.watch_stdin)
+        std::thread([] { while (std::fgetc(stdin) != EOF) {} std::_Exit(3); }).detach();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) return fail_line("no GPU backend (Metal) in this build");
+    strata_image::Backend backend(ggml_backend_dev_init(dev, nullptr));
+    if (!backend) return fail_line("could not start the Metal backend");
+
+    std::string err;
+    const int h = H / 16, w = W / 16;
+    std::vector<float> lat;
+    double t_text = 0.0, t_dit = 0.0, gb = 0.0;
+    {
+        strata_image::HunyuanImage m;
+        if (!m.load(r.dit, backend.get(), err)) return fail_line(err);
+        const int C = m.latent_channels();
+        if (!r.noise_file.empty()) {
+            std::vector<int64_t> s;
+            if (!read_npy(r.noise_file, lat, s) || s != std::vector<int64_t>{C, h, w}) return fail_line("--noise must be [32, h/16, w/16]");
+        } else {
+            lat = noise(r.seed, static_cast<size_t>(int64_t{C} * h * w));
+        }
+        say("{\"phase\": \"text\"}");
+        if (!m.prefix(ids, err)) return fail_line(err);
+        t_text = now_s() - t0;
+        say("{\"phase\": \"dit\"}");
+        // the scheduler's float32 sigmas and timesteps (sigma * 1000); the guidance as the pipeline's bfloat16
+        std::vector<float> sig(static_cast<size_t>(r.steps) + 1);
+        for (int i = 0; i <= r.steps; ++i) {
+            const float s = 1.0f - static_cast<float>(i) / static_cast<float>(r.steps);
+            sig[static_cast<size_t>(i)] = 3.0f * s / (1.0f + 2.0f * s);
+        }
+        const float g = ggml_bf16_to_fp32(ggml_fp32_to_bf16(static_cast<float>(1000.0 * r.cfg)));
+        for (int i = 0; i < r.steps; ++i) {
+            const double ts = now_s();
+            const float a = sig[static_cast<size_t>(i)], b = sig[static_cast<size_t>(i) + 1];
+            const std::vector<float> v = m.step(lat, h, w, a * 1000.0f, b * 1000.0f, g, err);
+            if (v.empty()) return fail_line(err);
+            for (size_t k = 0; k < lat.size(); ++k) lat[k] += v[k] * (b - a);
+            t_dit += now_s() - ts;
+            gb = std::max(gb, m.compute_bytes() / 1e9);
+            char line[96];
+            std::snprintf(line, sizeof line, "{\"step\": %d, \"steps\": %d, \"s\": %.3f}", i + 1, r.steps, now_s() - ts);
+            say(line);
+        }
+    }
+    say("{\"phase\": \"decode\"}");
+    const double td = now_s();
+    if (!r.latent_out.empty()) write_npy(r.latent_out, lat, {static_cast<int64_t>(lat.size()) / (h * w), h, w});
+    std::vector<uint8_t> rgb;
+    {
+        strata_image::HunyuanVAE vae;
+        if (!vae.load(r.dit, backend.get(), err)) return fail_line(err);
+        for (float& v : lat) v /= vae.scaling_factor();
+        const std::vector<float> img = vae.decode(lat, h, w, err);
+        if (img.empty()) return fail_line(err);
+        rgb.resize(img.size());
+        // diffusers' postprocess: (v / 2 + 0.5) clipped to [0, 1], * 255, NumPy's round (ties to even: nearbyint)
+        for (size_t i = 0; i < img.size(); ++i)
+            rgb[i] = static_cast<uint8_t>(std::nearbyint(std::clamp(img[i] / 2.0f + 0.5f, 0.0f, 1.0f) * 255.0f));
+    }
+    if (!write_png(r.out, rgb, W, H)) return fail_line("cannot write " + r.out);
+    char line[256];
+    std::snprintf(line, sizeof line, "{\"done\": true, \"text_s\": %.1f, \"denoise_s\": %.1f, \"decode_s\": %.1f, "
+                  "\"total_s\": %.1f, \"dit_activations_gb\": %.2f}", t_text, t_dit, now_s() - td, now_s() - t0, gb);
+    say(line);
+    return 0;
+}
+
 }  // namespace
 
 // --encoder <gguf> --check-text <dir>: <dir>/prompts.txt (one per line) to <dir>/emb<i>_cpp.npy
@@ -383,15 +474,110 @@ int bench(const std::string& path, int size, int reps) {
     return 0;
 }
 
+// --hunyuan <gguf> --decode z.npy --out picture.png: a latent from --latent-out [32, h, w] through the VAE alone
+int decode_hunyuan(const std::string& gguf, const std::string& zpath, const std::string& out) {
+    std::vector<float> z;
+    std::vector<int64_t> s;
+    if (!read_npy(zpath, z, s) || s.size() != 3 || s[0] != 32 || s[1] < 1 || s[2] < 1 || s[1] > 128 || s[2] > 128)
+        return fail("--decode needs a [32, h, w] latent (h, w up to 128)");
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) return fail("no GPU backend (Metal) in this build");
+    strata_image::Backend backend(ggml_backend_dev_init(dev, nullptr));
+    if (!backend) return fail("could not start the Metal backend");
+    strata_image::HunyuanVAE vae;
+    std::string err;
+    if (!vae.load(gguf, backend.get(), err)) return fail(err);
+    for (float& v : z) v /= vae.scaling_factor();
+    const int h = static_cast<int>(s[1]), w = static_cast<int>(s[2]);
+    const double t0 = now_s();
+    const std::vector<float> img = vae.decode(z, h, w, err);
+    if (img.empty()) return fail(err);
+    std::fprintf(stderr, "strata-image: VAE decode %dx%d: %.1f s\n", w * 16, h * 16, now_s() - t0);
+    std::vector<uint8_t> rgb(img.size());
+    for (size_t i = 0; i < img.size(); ++i)
+        rgb[i] = static_cast<uint8_t>(std::nearbyint(std::clamp(img[i] / 2.0f + 0.5f, 0.0f, 1.0f) * 255.0f));
+    return write_png(out, rgb, w * 16, h * 16) ? 0 : fail("cannot write " + out);
+}
+
+// --hunyuan <gguf> --check-hunyuan <dir>: see the top of this file.  <dir>/case.txt: "P h w t r g" and the P prefix ids
+int check_hunyuan(const std::string& gguf, const std::string& dir) {
+    std::ifstream cf(dir + "/case.txt");
+    int P = 0, h = 0, w = 0;
+    float t = 0, r = 0, g = 0;
+    cf >> P >> h >> w >> t >> r >> g;
+    std::vector<int32_t> ids(static_cast<size_t>(std::max(P, 0)));
+    for (auto& id : ids) cf >> id;
+    if (!cf || P < 1) return fail("cannot read " + dir + "/case.txt");
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) return fail("no GPU backend (Metal) in this build");
+    strata_image::Backend backend(ggml_backend_dev_init(dev, nullptr));
+    if (!backend) return fail("could not start the Metal backend");
+    std::string err;
+    std::vector<float> z, x0, out0, out31, zv;
+    std::vector<int64_t> s;
+    if (h < 1 || w < 1 || h > 256 || w > 256 || P > 16384) return fail("case.txt: P or the grid is out of range");
+    const int n = 3 + h * w, D = 4096;
+    const std::vector<int64_t> rows{P + n, D};
+    bool shapes = read_npy(dir + "/z.npy", z, s) && s == std::vector<int64_t>{32, h, w};
+    for (auto [name, v] : {std::pair{"/x0.npy", &x0}, {"/out0.npy", &out0}, {"/out31.npy", &out31}})
+        shapes = shapes && read_npy(dir + name, *v, s) && s == rows;
+    if (!shapes) return fail("z / x0 / out0 / out31 .npy in " + dir + " are missing or not [32, h, w] / [P + 3 + h*w, 4096]");
+    const auto part = [&](const std::vector<float>& v, int from, int count) {           // rows [from, from + count)
+        return std::vector<float>(v.begin() + static_cast<std::ptrdiff_t>(from) * D,
+                                  v.begin() + static_cast<std::ptrdiff_t>(from + count) * D);
+    };
+    {
+        strata_image::HunyuanImage m;
+        if (!m.load(gguf, backend.get(), err)) return fail(err);
+        for (const int l : {0, 31}) {                                   // a layer alone: the reference's input
+            const std::vector<float>& in = l == 0 ? x0 : out0;
+            const std::vector<float> pre = part(in, 0, P), cur = part(in, P, n);
+            if (!m.prefix(ids, err, &pre, l)) return fail(err);
+            const std::vector<float> y = m.step(z, h, w, t, r, g, err, nullptr, &cur, l);
+            if (y.empty()) return fail(err);
+            write_npy(dir + (l == 0 ? "/out0_cpp.npy" : "/out31_cpp.npy"), y, {n, D});
+        }
+        const std::vector<float> cur = part(out31, P, n);
+        std::vector<float> v = m.step(z, h, w, t, r, g, err, nullptr, &cur, -2);         // the image head alone
+        if (v.empty()) return fail(err);
+        write_npy(dir + "/head_cpp.npy", v, {m.latent_channels(), h, w});
+        if (!m.prefix(ids, err)) return fail(err);                                       // the whole step
+        std::vector<std::vector<float>> layers;
+        const auto t0 = ggml_time_us();
+        v = m.step(z, h, w, t, r, g, err, &layers);
+        if (v.empty()) return fail(err);
+        std::fprintf(stderr, "strata-image: one step, %d prefix + %d tokens: %.1f s, %.2f GB of activations\n", P, n,
+                     (ggml_time_us() - t0) / 1e6, m.compute_bytes() / 1e9);
+        write_npy(dir + "/x0_cpp.npy", layers[0], {n, D});
+        write_npy(dir + "/out0_chain_cpp.npy", layers[1], {n, D});
+        write_npy(dir + "/v_cpp.npy", v, {m.latent_channels(), h, w});
+    }
+    if (read_npy(dir + "/zv.npy", zv, s) && s.size() == 3 && s[0] == 32 && s[1] >= 1 && s[2] >= 1 && s[1] <= 128 && s[2] <= 128) {                             // the VAE alone
+        strata_image::HunyuanVAE vae;
+        if (!vae.load(gguf, backend.get(), err)) return fail(err);
+        const std::vector<float> img = vae.decode(zv, static_cast<int>(s[1]), static_cast<int>(s[2]), err);
+        if (img.empty()) return fail(err);
+        write_npy(dir + "/img_cpp.npy", img, {s[1] * 16, s[2] * 16, 3});
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc == 5 && std::string(argv[1]) == "--bench") return bench(argv[2], std::atoi(argv[3]), std::atoi(argv[4]));
-    if (argc > 1 && std::string(argv[1]) == "--encoder" && !(argc == 5 && std::string(argv[3]) == "--check-text")) {
+    if (argc == 5 && std::string(argv[1]) == "--hunyuan" && std::string(argv[3]) == "--check-hunyuan")
+        return check_hunyuan(argv[2], argv[4]);
+    if (argc == 7 && std::string(argv[1]) == "--hunyuan" && std::string(argv[3]) == "--decode" && std::string(argv[5]) == "--out")
+        return decode_hunyuan(argv[2], argv[4], argv[6]);
+    const bool hunyuan = argc > 1 && std::string(argv[1]) == "--hunyuan";
+    if (hunyuan || (argc > 1 && std::string(argv[1]) == "--encoder" && !(argc == 5 && std::string(argv[3]) == "--check-text"))) {
         Request r;
+        if (hunyuan) { r.steps = 8; r.cfg = 2.5; }                      // the Distil model's generation_config
         for (int i = 1; i + 1 < argc; i += 2) {
             const std::string a = argv[i], v = argv[i + 1];
             try {
                 if (a == "--encoder") r.encoder = v;
-                else if (a == "--dit") r.dit = v;
+                else if (a == "--dit" || (hunyuan && a == "--hunyuan")) r.dit = v;
+                else if (hunyuan && a == "--tokens") r.prompt_file = v;
                 else if (a == "--vae") r.vae = v;
                 else if (a == "--prompt-file") r.prompt_file = v;
                 else if (a == "--negative-file") r.negative_file = v;
@@ -410,6 +596,10 @@ int main(int argc, char** argv) {
             }
         }
         if (argc % 2 == 0) return fail_line("every option takes a value");
+        if (hunyuan) {
+            if (r.dit.empty() || r.prompt_file.empty() || r.out.empty()) return fail_line("--hunyuan, --tokens and --out are required");
+            return generate_hunyuan(r);
+        }
         if (r.encoder.empty() || r.dit.empty() || r.vae.empty() || r.prompt_file.empty() || r.out.empty())
             return fail_line("--encoder, --dit, --vae, --prompt-file and --out are required");
         return generate(r);
@@ -419,16 +609,15 @@ int main(int argc, char** argv) {
     if (argc == 5 && std::string(argv[1]) == "--encoder" && std::string(argv[3]) == "--check-text")
         return check_text(argv[2], argv[4]);
     std::string dit_path, check_dir;
-    bool given = false, each = false;
+    bool each = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--dit" && i + 1 < argc) dit_path = argv[++i];
         else if (a == "--check" && i + 1 < argc) check_dir = argv[++i];
-        else if (a == "--given") given = true;
         else if (a == "--each") each = true;
-        else return fail("usage: strata-image --dit <nucleus-dit.gguf> --check <dump> [--given]");
+        else return fail("usage: strata-image --dit <nucleus-dit.gguf> --check <dump> [--each]");
     }
-    if (dit_path.empty() || check_dir.empty()) return fail("usage: strata-image --dit <nucleus-dit.gguf> --check <dump> [--given]");
+    if (dit_path.empty() || check_dir.empty()) return fail("usage: strata-image --dit <nucleus-dit.gguf> --check <dump> [--each]");
 
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (!dev) return fail("no GPU backend (Metal) in this build");
@@ -449,19 +638,6 @@ int main(int argc, char** argv) {
     if (!read_npy(check_dir + "/x.npy", x, sx) || !read_npy(check_dir + "/txt.npy", txt, st))
         return fail("cannot read x.npy / txt.npy in " + check_dir);
 
-    strata_image::Conditioning cond = dit.conditioning(gh, gw, T, t);
-    const int hd2 = dit.hp().head_dim / 2;
-    write_npy(check_dir + "/img_cos_cpp.npy", cond.img_cos, {gh * gw, hd2});
-    write_npy(check_dir + "/img_sin_cpp.npy", cond.img_sin, {gh * gw, hd2});
-    write_npy(check_dir + "/txt_cos_cpp.npy", cond.txt_cos, {T, hd2});
-    write_npy(check_dir + "/txt_sin_cpp.npy", cond.txt_sin, {T, hd2});
-    if (given) {
-        std::vector<int64_t> s;
-        if (!read_npy(check_dir + "/img_cos.npy", cond.img_cos, s) || !read_npy(check_dir + "/img_sin.npy", cond.img_sin, s) ||
-            !read_npy(check_dir + "/txt_cos.npy", cond.txt_cos, s) || !read_npy(check_dir + "/txt_sin.npy", cond.txt_sin, s))
-            return fail("cannot read the dump's RoPE tables");
-    }
-
     if (each) {           // every block alone: the port's previous block in, so an error is that block's own
         std::vector<float> h, ref;
         std::vector<int64_t> s;
@@ -470,7 +646,7 @@ int main(int argc, char** argv) {
             if (l == 0) std::snprintf(prev, sizeof prev, "/after_img_in.npy");
             else std::snprintf(prev, sizeof prev, "/block%02d.npy", l - 1);
             if (!read_npy(check_dir + prev, h, s)) return fail(std::string("cannot read ") + prev);
-            std::vector<float> y = dit.block(l, h, gh, gw, txt, T, t, &cond, err);
+            std::vector<float> y = dit.block(l, h, gh, gw, txt, T, t, err);
             if (y.empty()) return fail(err);
             char name[64];
             std::snprintf(name, sizeof name, "/each%02d_cpp.npy", l);
@@ -482,7 +658,7 @@ int main(int argc, char** argv) {
     std::vector<float> y;
     for (int run = 0; run < 2; ++run) {          // the second is warm (the first compiles Metal kernels)
         const auto t0 = ggml_time_us();
-        y = dit.forward(x, gh, gw, txt, T, t, &cond, run == 0 ? &blocks : nullptr, err);
+        y = dit.forward(x, gh, gw, txt, T, t, run == 0 ? &blocks : nullptr, err);
         if (y.empty()) return fail(err);
         std::fprintf(stderr, "strata-image: DiT forward %dx%d tokens, %d text, %s: %.1f ms\n", gh, gw, T,
                      run == 0 ? "first" : "warm", (ggml_time_us() - t0) / 1000.0);
