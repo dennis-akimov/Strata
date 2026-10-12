@@ -16,6 +16,8 @@ images et travaillent avec vos applications et vos agents de code via les mêmes
 tourne sur votre Mac ; ce qui en sort dépend de vous (les téléchargements de modèles, et chaque application, outil ou
 serveur MCP que vous connectez).
 
+Il crée aussi des images à partir d'un prompt texte, avec son propre moteur d'images ([Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) ou [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)).
+
 ## Quelle vitesse ?
 
 Mesuré sur un MacBook Pro avec M5 Max (GPU 40 cœurs, 128 Go), macOS 26.4, en mode d'énergie *Haute puissance*,
@@ -93,6 +95,15 @@ Les modèles Qwen lisent aussi une table de 28 Go sur le SSD pendant qu'ils tour
   et l'API Responses sur `/v1/responses`. Les outils et MCP fonctionnent. Exemples de clients :
   [docs/DETAILS.md](docs/DETAILS.md#using-it).
 - **Images :** répondez oui aux images à l'installation (modèles Qwen), puis joignez-les dans le chat ou votre application.
+- **Créer des images :** `/image <prompt>` dans le chat, ou `POST /v1/images/generations` (l'API d'images d'OpenAI),
+  avec [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) (17B) sur le moteur d'images propre à Strata. Une
+  image 1024x1024 prend environ 45 à 70 s (20 à 30 étapes) et quelques Go de mémoire en plus des 20 Go de fichiers du
+  modèle, que macOS mappe depuis le SSD. À installer à la main :
+  [étapes](docs/MACOS.md#pictures-from-a-prompt-nucleus-image).
+  Ou [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) (Tencent, mélange d'experts de 80B ; un seul modèle pour le prompt et l'image, donc
+  pas d'encodeur de texte) : 8 étapes, environ 90 s en 1024x1024, 0,3 Go de mémoire privée en plus de son fichier de
+  54 Go, que macOS mappe depuis le SSD. Installer : `make pull MODEL=HUNYUAN` (environ 2 heures), puis [étapes](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30).
+  Sa licence ne s'applique pas dans l'UE, au Royaume-Uni ni en Corée du Sud.
 - **Une requête à la fois** par défaut ; les autres attendent. Un message de suivi dans la même conversation ne lit que
   le nouveau texte et démarre donc vite ; un long nouveau prompt met un moment à être lu avant le début de la réponse.
 - **Depuis un autre appareil du réseau :** dans `strata-<modèle>.json`, définissez `"host": "0.0.0.0"` et une
@@ -126,6 +137,11 @@ GLM. Le CPU et le GPU partagent la mémoire du Mac, donc les poids du modèle n'
 Conception et mesures : [docs/MACOS.md](docs/MACOS.md#how-it-fits-together) (en anglais). Les documents de l'original
 sont conservés dans [`docs/`](docs/README.md), avec ceux qui s'appliquent sur Mac.
 
+Les images à partir d'un prompt passent par un second moteur, `strata-image` (dans [`metal/image/`](metal/image/)) :
+l'encodeur de texte de Nucleus-Image, son modèle d'images à mélange d'experts de 17B et son décodeur sur le même backend
+Metal, un processus par image. HunyuanImage-3.0 y tourne aussi : les clés et valeurs du prompt une fois, puis 8 étapes des tokens d'image
+dans le transformer de 80B et son VAE 3D.
+
 ## Crédits et licence
 
 **[Strata](https://github.com/Niko1221/Strata) est l'œuvre de Niko1221 et des contributeurs de Strata**
@@ -137,6 +153,10 @@ l'équipe Qwen ([Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-N
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). Open source sous [licence MIT](LICENSE) (Copyright (c) 2026
 Niko1221 and the Strata contributors) ; quelques parties et chaque modèle ont leur propre licence
 ([lesquelles](docs/HOW_IT_WORKS.md#license)).
+
+Images : [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) de NucleusAI (Apache-2.0), converti depuis le
+portage [mlx-nucleus-image](https://huggingface.co/treadon/mlx-nucleus-image).
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) de Tencent ([Tencent Hunyuan Community License](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) : pas de licence dans l'UE, au Royaume-Uni ni en Corée du Sud).
 
 Si ce fork pour Mac vous est utile, vous pouvez soutenir son mainteneur :
 [buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov).

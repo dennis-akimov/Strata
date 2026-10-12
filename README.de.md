@@ -15,6 +15,8 @@ Strata führt große KI-Modelle auf deinem eigenen Computer aus: Sie chatten, sc
 über dieselben APIs wie Cloud-Dienste mit deinen Apps und Coding-Agenten zusammen. Das Modell läuft auf deinem Mac;
 was ihn verlässt, bestimmst du (die Modell-Downloads und jede App, jedes Tool und jeder MCP-Server, den du anbindest).
 
+Es erzeugt auch Bilder aus einem Text-Prompt, mit einer eigenen Bild-Engine ([Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) oder [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)).
+
 ## Wie schnell ist es?
 
 Gemessen auf einem MacBook Pro mit M5 Max (40-Kern-GPU, 128 GB), macOS 26.4, im Energiemodus *Hohe Leistung*,
@@ -90,6 +92,14 @@ Macs). Die Qwen-Modelle lesen außerdem während des Laufs eine 28-GB-Tabelle vo
   `http://127.0.0.1:8080/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`) und die Responses-API
   unter `/v1/responses`. Tools und MCP funktionieren. Beispiele für Clients: [docs/DETAILS.md](docs/DETAILS.md#using-it).
 - **Bilder:** Im Setup Bilder bejahen (Qwen-Modelle), dann im Chat oder in deiner App anhängen.
+- **Bilder erzeugen:** `/image <Prompt>` im Chat oder `POST /v1/images/generations` (die Bilder-API von OpenAI), mit
+  [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) (17B) auf Stratas eigener Bild-Engine. Ein Bild mit
+  1024x1024 dauert etwa 45-70 s (20-30 Schritte) und braucht einige GB Speicher neben den 20 GB Modelldateien, die macOS
+  von der SSD einblendet. Von Hand einzurichten: [Schritte](docs/MACOS.md#pictures-from-a-prompt-nucleus-image).
+  Oder [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) (Tencent, 80B-Mixture-of-Experts; ein Modell für Prompt und Bild, also kein
+  Text-Encoder): 8 Schritte, etwa 90 s bei 1024x1024, 0,3 GB privater Speicher neben der 54-GB-Datei, die macOS von der
+  SSD einblendet. Installieren: `make pull MODEL=HUNYUAN` (etwa 2 Stunden), dann [Schritte](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30). Seine Lizenz gilt
+  nicht in der EU, im Vereinigten Königreich und in Südkorea.
 - **Eine Anfrage nach der anderen** als Standard; weitere warten. Eine Folgenachricht im selben Gespräch liest nur das
   Neue und beginnt daher schnell; ein langer neuer Prompt braucht eine Weile, bis die Antwort beginnt.
 - **Von einem anderen Gerät im Netzwerk:** in `strata-<modell>.json` `"host": "0.0.0.0"` und einen `"api_key"`
@@ -124,6 +134,11 @@ Arbeitsspeicher des Macs, daher liegen die Gewichte des Modells einmal darin, f�
 [docs/MACOS.md](docs/MACOS.md#how-it-fits-together) (Englisch). Die Dokumente des Originals sind in
 [`docs/`](docs/README.md) erhalten, mit dem Hinweis, welche auf dem Mac gelten.
 
+Bilder aus einem Prompt erzeugt eine zweite Engine, `strata-image` (in [`metal/image/`](metal/image/)): der Text-Encoder
+von Nucleus-Image, sein 17B-Mixture-of-Experts-Bildmodell und sein Decoder auf demselben Metal-Backend, ein Prozess je
+Bild. Auch HunyuanImage-3.0 läuft dort: die Keys und Values des Prompts einmal, dann 8 Schritte der Bild-Tokens
+durch den 80B-Transformer und sein 3D-VAE.
+
 ## Danksagung und Lizenz
 
 **[Strata](https://github.com/Niko1221/Strata) ist das Werk von Niko1221 und den Strata-Mitwirkenden**
@@ -135,6 +150,10 @@ vom Qwen-Team ([Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Ne
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). Open Source unter der [MIT-Lizenz](LICENSE) (Copyright (c)
 2026 Niko1221 and the Strata contributors); einige Teile und jedes Modell haben eigene Lizenzen
 ([welche](docs/HOW_IT_WORKS.md#license)).
+
+Bilder: [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) von NucleusAI (Apache-2.0), konvertiert aus
+der Portierung [mlx-nucleus-image](https://huggingface.co/treadon/mlx-nucleus-image).
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) von Tencent ([Tencent Hunyuan Community License](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE): in der EU, im Vereinigten Königreich und in Südkorea nicht lizenziert).
 
 Wenn dir dieser Mac-Fork nützt, kannst du seinen Maintainer unterstützen:
 [buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov).

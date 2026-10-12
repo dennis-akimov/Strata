@@ -2822,6 +2822,9 @@ class Service:
         # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
         # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
         self.api_monitor = False
+        self.image = None                               # serve.imagegen.ImageGen: the config's "image" (pictures)
+        self.image_gate = threading.Event()             # set while a picture holds the turn: parallel requests wait
+        self.entering = 0                               # parallel requests between the gate and "busy" (status_lock)
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
@@ -3121,21 +3124,29 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            if not self.engine.alive():
-                return "not loaded"
-            with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
-                    return "busy"
-            if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
-                return "busy"
-            self.engine.unload()
-            if self.vision is not None and hasattr(self.vision, "unload"):
-                self.vision.unload()
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
-            return "unloaded"
+            return self.unload_held(idle_for)
         finally:
             self.fifo.release()
+
+    def unload_held(self, idle_for: float | None = None, waiting_ok: bool = False) -> str:
+        """unload() for a caller that holds self.fifo already (a picture making room for itself, serve/imagegen.py).
+        `waiting_ok`: requests queued for the turn do not count as busy (they wait behind the caller, and the first of
+        them loads the model again); running ones always do."""
+        if not hasattr(self.engine, "unload"):
+            return "unsupported"
+        if not self.engine.alive():
+            return "not loaded"
+        with self.status_lock:
+            if self.status.get("busy") or self.entering or (self.status.get("queued") and not waiting_ok):
+                return "busy"
+        if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+            return "busy"
+        self.engine.unload()
+        if self.vision is not None and hasattr(self.vision, "unload"):
+            self.vision.unload()
+        print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+              "the next request loads it again", flush=True)
+        return "unloaded"
 
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
@@ -3785,20 +3796,36 @@ class Service:
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
                     # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
                     # loaded engine has nothing to start, so it does not wait for the fifo at all
+                    entering = False
                     try:
                         if not par:
                             self.ensure_loaded()
-                        elif not (self.loaded() and not self._vision_down()):
-                            with self.fifo:
-                                self.ensure_loaded()
+                        else:
+                            # a picture holds the turn (and may unload the model): wait for it, as for a load.  Counted
+                            # as entering before the gate is read, until registered as busy below: a picture sets the
+                            # gate before unload_held() looks, so either it sees this request or this request sees it
+                            while True:
+                                with self.status_lock:
+                                    self.entering += 1
+                                    entering = True
+                                if not self.image_gate.is_set() and self.loaded() and not self._vision_down():
+                                    break
+                                with self.status_lock:
+                                    self.entering -= 1
+                                    entering = False
+                                with self.fifo:
+                                    self.ensure_loaded()
                     except BaseException:
                         if par:
                             with self.status_lock:
                                 self.status["queued"] -= 1
+                                if entering:
+                                    self.entering -= 1
                         raise
                     with self.status_lock:
                         if par:
                             self.status["queued"] -= 1
+                            self.entering -= 1
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
@@ -4908,6 +4935,7 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 "image_generation": svc.image is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
@@ -5089,6 +5117,8 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 elif path == "/context":
                     self._context(req)
+                elif path == "/v1/images/generations":
+                    self._images(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -5580,6 +5610,66 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+
+        def _images(self, req):
+            """POST /v1/images/generations: a picture from strata-image, made in this server's turn with the chat model
+            out of the way when memory is short (serve/imagegen.py: the whole rule, step by step)."""
+            from serve.imagegen import make_room
+            gen = svc.image
+            if gen is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "message": "this server makes no "
+                                           "pictures: add \"image\" to its run config (docs/MACOS.md)"}})
+                return
+            bad = gen.validate(req)                          # 1: before anything else
+            if bad is not None:
+                return self._raw(*bad)
+            cancel = threading.Event()
+            self._watch_client(cancel)                        # a hang-up, or POST /cancel with this request's id
+            deadline = time.monotonic() + gen.queue_s
+            got = False
+            while not got and not cancel.is_set() and time.monotonic() < deadline:   # 2: the turn
+                got = svc.fifo.acquire(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+            if not got:
+                if cancel.is_set():
+                    return self._raw(499, self._err("the picture was cancelled before it started"))
+                return self._raw(503, self._err(f"busy: no turn within {gen.queue_s:.0f} s"), retry=60)
+            svc.image_gate.set()                             # parallel chat requests wait for the turn now
+            try:
+                room = make_room(svc, gen, deadline, cancel)  # 3
+                if room == "cancelled":
+                    code, data, retry = 499, self._err("the picture was cancelled before it started"), None
+                elif room not in ("enough", "unloaded"):
+                    avail = gen.available_gb()
+                    why = {"busy": "the chat model is answering and memory is short",
+                           "unsupported": "the chat model cannot be unloaded and memory is short",
+                           "short": "memory is short even without the chat model"}[room]
+                    code, data, retry = 503, self._err(f"{why} ({avail if avail is None else round(avail, 1)} GB "
+                                                       f"free, {gen.need_gb:.0f} GB needed)"), 60
+                else:
+                    print(f"[strata] picture {req.get('size', '1024x1024')}: "
+                          f"{'the chat model unloaded for it' if room == 'unloaded' else 'memory enough'}", flush=True)
+                    code, headers, data = gen.forward(req, cancel)   # 4 and 5: back when strata-image has exited
+                    retry = headers.get("Retry-After")
+            finally:
+                svc.image_gate.clear()
+                svc.fifo.release()
+            self._raw(code, data, retry=retry)
+
+        def _err(self, msg) -> bytes:
+            return json.dumps({"error": {"type": "server_error", "message": msg}}).encode()
+
+        def _raw(self, code, data: bytes, retry=None):
+            """A JSON answer as it is; a client that has gone (BrokenPipe, reset) is not an error here."""
+            try:
+                self.send_response(code)
+                if retry:
+                    self.send_header("Retry-After", str(retry))   # RFC 9110 10.2.3: delay-seconds
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except OSError:
+                self._note(outcome="disconnected")
 
         def _context(self, req):
             """POST /context: what the web chat's next request (the body it would send) puts in the context window, by
@@ -6385,6 +6475,11 @@ def main() -> int:
         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+    from serve.imagegen import ImageGen
+    svc.image = ImageGen.from_config(cfg.get("image"))
+    if svc.image:
+        print(f"[strata] pictures: POST /v1/images/generations runs strata-image with {Path(svc.image.hunyuan or svc.image.dit).name} (the "
+              f"chat model is unloaded for one when less than {svc.image.need_gb:.0f} GB is free)", flush=True)
     if svc.api_monitor:
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),

@@ -13,6 +13,8 @@ Apple Silicon · 已在 128 GB 的 M5 Max 上测试 · 免费开源</p>
 Strata 在你自己的电脑上运行大型 AI 模型：它们能聊天、写代码、看图片，并通过与云服务相同的 API 与你的应用和编程
 助手协作。模型在你的 Mac 上运行；有哪些数据离开 Mac 由你决定（模型下载，以及你接入的应用、工具或 MCP 服务器）。
 
+它还能根据文字提示生成图片，使用自己的图像引擎（[Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) 或 [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)）。
+
 ## 速度如何？
 
 在一台 M5 Max（40 核 GPU，128 GB）的 MacBook Pro 上测得，macOS 26.4，能耗模式为 *高功率*，2026-10-08，关闭思考。
@@ -84,6 +86,12 @@ make run                   # 加载模型，就绪后打开 http://127.0.0.1:808
   `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`）；Responses API 在 `/v1/responses`。支持工具和 MCP。客户端示例：
   [docs/DETAILS.md](docs/DETAILS.md#using-it)。
 - **图片：** 在安装时选择启用图片（Qwen 模型），然后在聊天或应用中附加图片。
+- **生成图片：** 在聊天中输入 `/image <提示词>`，或调用 `POST /v1/images/generations`（OpenAI 的图像 API），使用
+  [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image)（17B）和 Strata 自己的图像引擎。一张 1024x1024 的图片大约需要 45-70 秒（20-30 步），除了 macOS
+  从 SSD 映射的 20 GB 模型文件外，只占用几 GB 内存。需要手动设置：[步骤](docs/MACOS.md#pictures-from-a-prompt-nucleus-image)。
+  也可使用 [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil)（腾讯，80B 混合专家模型；提示与图片由同一个模型处理，无需文本编码器）：
+  8 步，1024x1024 约 90 秒，除从 SSD 映射的 54 GB 文件外只占 0.3 GB 私有内存。安装：`make pull MODEL=HUNYUAN`
+  （约 2 小时），然后按[步骤](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)设置。其许可在欧盟、英国和韩国不适用。
 - **默认一次处理一个请求**；其他请求排队等待。同一对话中的后续消息只读取新增内容，所以开始得很快；很长的新提示词
   需要先读取一段时间，回答才会开始。
 - **从网络中的其他设备访问：** 在 `strata-<模型>.json` 中设置 `"host": "0.0.0.0"` 和 `"api_key"`，重启 Strata，
@@ -110,6 +118,9 @@ make run                   # 加载模型，就绪后打开 http://127.0.0.1:808
 GPU 共享，所以模型权重只在内存中存放一份，供两者共用。设计与测量：[docs/MACOS.md](docs/MACOS.md#how-it-fits-together)
 （英文）。原项目的文档保留在 [`docs/`](docs/README.md) 中，并注明了哪些适用于 Mac。
 
+根据提示生成图片由第二个引擎 `strata-image`（位于 [`metal/image/`](metal/image/)）完成：Nucleus-Image 的文本编码器、
+17B 混合专家图像模型和解码器在同一个 Metal 后端上运行，每张图片一个进程。HunyuanImage-3.0 也在其中运行：提示的键和值只算一次，然后图像 token 经过 80B Transformer 和 3D VAE 走 8 步。
+
 ## 致谢与许可
 
 **[Strata](https://github.com/Niko1221/Strata) 是 Niko1221 及 Strata 贡献者的成果**
@@ -120,5 +131,9 @@ GPU 共享，所以模型权重只在内存中存放一份，供两者共用。�
 [Project Maya](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) 压缩）。Strata 使用了
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) 的部分代码。以 [MIT 许可证](LICENSE) 开源（Copyright (c)
 2026 Niko1221 and the Strata contributors）；部分组件和每个模型都有各自的许可证（[详见](docs/HOW_IT_WORKS.md#license)）。
+
+图片：[Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image)，由 NucleusAI 发布（Apache-2.0），由
+[mlx-nucleus-image](https://huggingface.co/treadon/mlx-nucleus-image) 移植版转换而来。
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil)，由腾讯发布（[Tencent Hunyuan Community License](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE)：在欧盟、英国和韩国不授予许可）。
 
 如果这个 Mac 分支对你有帮助，你可以支持它的维护者：[buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov)。

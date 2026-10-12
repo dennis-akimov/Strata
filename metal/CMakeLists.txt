@@ -65,6 +65,19 @@ target_compile_definitions(strata-metal PRIVATE STRATA_VERSION="${PROJECT_VERSIO
                            STRATA_LLAMA_COMMIT="${STRATA_LLAMA_COMMIT}")
 target_link_libraries(strata-metal PRIVATE llama llama-common)
 
+# the image engine (Nucleus-Image on ggml/Metal, docs/MACOS.md): its own executable, as strata-vision is.  Hardened as
+# bible's C++ skill lists for Apple clang 17 on arm64 (flags the compiler and linker accept there)
+add_executable(strata-image ${CMAKE_CURRENT_SOURCE_DIR}/image/strata_image.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/nucleus_dit.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/image/text_encoder.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/hunyuan_image.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/image/gguf_weights.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/nucleus_vae.cpp)
+target_compile_features(strata-image PRIVATE cxx_std_17)
+target_compile_options(strata-image PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero
+                       -mbranch-protection=standard)
+target_link_libraries(strata-image PRIVATE llama ggml z)
+# ggml-backend-impl.h (gguf_weights.cpp: a Metal mapping that failed is a buffer with no context, not a null buffer)
+get_target_property(STRATA_GGML_SRC ggml SOURCE_DIR)
+target_include_directories(strata-image PRIVATE ${STRATA_GGML_SRC})
+
 # the image encoder (tools/vision): the same source as on a PC, on llama.cpp's mtmd with Metal (--gpu)
 add_executable(strata-vision ${CMAKE_CURRENT_SOURCE_DIR}/../tools/vision/strata_vision.cpp)
 target_compile_features(strata-vision PRIVATE cxx_std_17)

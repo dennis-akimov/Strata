@@ -84,11 +84,23 @@ GLM4_PATTERN = (
     r"|\s+(?!\S)"
     r"|\s+"
 )
+# HunyuanImage-3.0: digits one at a time (Qwen2's pattern)
+HUNYUAN_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
 # pre -> (pattern, where it comes from, ignore_merges: a piece that is a whole token is that token, as tiktoken does)
 PRE = {
     "qwen35": (QWEN35_PATTERN, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)", False),
     "gpt-4o": (GPT4O_PATTERN, "openai/gpt-oss-120b tokenizer.json pre_tokenizer (o200k); model.ignore_merges", True),
     "glm4": (GLM4_PATTERN, "zai-org/GLM-5.3-Flash tokenizer.json pre_tokenizer; model.ignore_merges", True),
+    "hunyuan": (HUNYUAN_PATTERN, "tencent/HunyuanImage-3.0-Instruct-Distil tokenizer.json pre_tokenizer; "
+                                 "model.ignore_merges", True),
 }
 
 
@@ -171,6 +183,26 @@ class Tokenizer:
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
                    md.get("tokenizer.ggml.pre", "qwen35"), special)
+
+    @classmethod
+    def from_hf_json(cls, path, pre: str) -> "Tokenizer":
+        """A Hugging Face tokenizer.json (byte-level BPE).  Its added tokens are CONTROL (type 3): matched only with
+        parse_special, so a prompt that spells `<img>` stays text."""
+        t = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        m = t["model"]
+        if m["type"] != "BPE" or m.get("byte_fallback"):
+            raise ValueError("expected a byte-level BPE tokenizer.json, got %r" % m["type"])
+        n = max(max(m["vocab"].values()), max(a["id"] for a in t["added_tokens"])) + 1
+        tokens = [""] * n
+        types = [1] * n
+        for tok, i in m["vocab"].items():
+            tokens[i] = tok
+        for a in t["added_tokens"]:
+            tokens[a["id"]], types[a["id"]] = a["content"], 3
+        if "" in tokens:
+            raise ValueError("tokenizer.json leaves ids without a token")
+        merges = [x if isinstance(x, str) else " ".join(x) for x in m["merges"]]
+        return cls(tokens, merges, types, pre)
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:

@@ -16,6 +16,8 @@ trabalham com seus aplicativos e agentes de programação pelas mesmas APIs dos 
 Mac; o que sai dele depende de você (os downloads de modelos e cada aplicativo, ferramenta ou servidor MCP que você
 conectar).
 
+Ele também cria imagens a partir de um prompt de texto, com seu próprio motor de imagens ([Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) ou [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)).
+
 ## Qual a velocidade?
 
 Medido em um MacBook Pro com M5 Max (GPU de 40 núcleos, 128 GB), macOS 26.4, no modo de energia *Alto desempenho*,
@@ -92,6 +94,14 @@ no Mac.
   Responses em `/v1/responses`. Ferramentas e MCP funcionam. Exemplos de clientes:
   [docs/DETAILS.md](docs/DETAILS.md#using-it).
 - **Imagens:** responda sim às imagens na instalação (modelos Qwen) e depois anexe-as no chat ou no seu aplicativo.
+- **Criar imagens:** `/image <prompt>` no chat, ou `POST /v1/images/generations` (a API de imagens da OpenAI), com
+  [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) (17B) no motor de imagens próprio do Strata. Uma
+  imagem de 1024x1024 leva cerca de 45-70 s (20-30 passos) e usa alguns GB de memória além dos 20 GB de arquivos do
+  modelo, que o macOS mapeia do SSD. Configurado à mão: [passos](docs/MACOS.md#pictures-from-a-prompt-nucleus-image).
+  Ou [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) (Tencent, mistura de especialistas de 80B; um só modelo para o prompt e a imagem,
+  sem codificador de texto): 8 passos, cerca de 90 s em 1024x1024, 0,3 GB de memória privada além do arquivo de 54 GB,
+  que o macOS mapeia do SSD. Instalar: `make pull MODEL=HUNYUAN` (cerca de 2 horas), depois [passos](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30). Sua
+  licença não se aplica na UE, no Reino Unido e na Coreia do Sul.
 - **Uma requisição por vez** por padrão; as outras esperam. Uma mensagem de continuação na mesma conversa lê só o que é
   novo, então começa rápido; um prompt novo e longo leva um tempo para ser lido antes de a resposta começar.
 - **De outro dispositivo na rede:** em `strata-<modelo>.json`, defina `"host": "0.0.0.0"` e uma `"api_key"`, reinicie
@@ -124,6 +134,11 @@ memória do Mac, então os pesos do modelo ficam nela uma vez só, para as duas.
 [docs/MACOS.md](docs/MACOS.md#how-it-fits-together) (em inglês). Os documentos do original são mantidos em
 [`docs/`](docs/README.md), indicando quais valem no Mac.
 
+Imagens a partir de um prompt passam por um segundo motor, `strata-image` (em [`metal/image/`](metal/image/)): o
+codificador de texto do Nucleus-Image, seu modelo de imagens de mistura de especialistas de 17B e seu decodificador no
+mesmo backend Metal, um processo por imagem. HunyuanImage-3.0 também roda ali: as chaves e valores do prompt uma vez, depois 8 passos dos tokens de
+imagem pelo transformer de 80B e seu VAE 3D.
+
 ## Créditos e licença
 
 **O [Strata](https://github.com/Niko1221/Strata) é obra de Niko1221 e dos colaboradores do Strata**
@@ -135,6 +150,10 @@ Qwen ([Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), comp
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). Código aberto sob a [licença MIT](LICENSE) (Copyright (c)
 2026 Niko1221 and the Strata contributors); algumas partes e cada modelo têm suas próprias licenças
 ([quais](docs/HOW_IT_WORKS.md#license)).
+
+Imagens: [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) da NucleusAI (Apache-2.0), convertido a
+partir do port [mlx-nucleus-image](https://huggingface.co/treadon/mlx-nucleus-image).
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) da Tencent ([Tencent Hunyuan Community License](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE): sem licença na UE, no Reino Unido e na Coreia do Sul).
 
 Se este fork para Mac for útil para você, você pode apoiar o mantenedor:
 [buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov).

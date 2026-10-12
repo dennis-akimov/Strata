@@ -15,6 +15,8 @@ Strata は大規模な AI モデルを自分のコンピューターで動かし
 クラウドサービスと同じ API を通じてアプリやコーディングエージェントと連携します。モデルは Mac 上で動きます。
 Mac の外に出るものは、あなたが決めます（モデルのダウンロードと、接続したアプリ・ツール・MCP サーバー）。
 
+テキストのプロンプトから画像を作ることもでき、そのための独自の画像エンジンを持ちます（[Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) または [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)）。
+
 ## どのくらい速い？
 
 M5 Max（40 コア GPU、128 GB）の MacBook Pro、macOS 26.4、省エネルギーモード *高出力* で測定（2026-10-08、思考オフ）。
@@ -90,6 +92,14 @@ Qwen モデルは動作中に 28 GB のテーブルを SSD から読み込みま
   （Claude Code：`ANTHROPIC_BASE_URL=http://127.0.0.1:8080`）、`/v1/responses` の Responses API。ツールと MCP も
   使えます。クライアントの例：[docs/DETAILS.md](docs/DETAILS.md#using-it)。
 - **画像：** セットアップで画像を有効にし（Qwen モデル）、チャットやアプリで添付します。
+- **画像の生成：** チャットで `/image <プロンプト>`、または `POST /v1/images/generations`（OpenAI の画像 API）。
+  [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image)（17B）を Strata 独自の画像エンジンで動かします。1024x1024 の画像 1 枚に約 45〜70 秒（20〜30
+  ステップ）かかり、macOS が SSD からマップする 20 GB のモデルファイルのほかに数 GB のメモリを使います。手動での
+  セットアップが必要です：[手順](docs/MACOS.md#pictures-from-a-prompt-nucleus-image)。
+  または [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil)（Tencent、80B の混合エキスパート。プロンプトと画像を 1 つのモデルで扱うため
+  テキストエンコーダーは不要）：8 ステップ、1024x1024 で約 90 秒、SSD からマップされる 54 GB のファイルのほかに 0.3 GB の
+  専用メモリ。インストール：`make pull MODEL=HUNYUAN`（約 2 時間）、続いて[手順](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)。ライセンスは EU・英国・韓国
+  では適用されません。
 - **標準では 1 度に 1 リクエスト**で、ほかは待ちます。同じ会話の続きは新しい部分だけを読むのですぐ始まりますが、
   長い新しいプロンプトは読み込みに時間がかかってから回答が始まります。
 - **ネットワーク上の別の機器から：** `strata-<モデル>.json` に `"host": "0.0.0.0"` と `"api_key"` を設定して
@@ -122,6 +132,11 @@ Anthropic / Responses / MCP の API、会話の再利用、数トークン先を
 メモリに置かれます。設計と測定：[docs/MACOS.md](docs/MACOS.md#how-it-fits-together)（英語）。オリジナルのドキュメントは
 [`docs/`](docs/README.md) に残してあり、Mac で当てはまるものがわかるようにしてあります。
 
+プロンプトからの画像生成は 2 つ目のエンジン `strata-image`（[`metal/image/`](metal/image/) 内）が行います。Nucleus-Image の
+テキストエンコーダー、17B の混合エキスパート画像モデル、デコーダーを同じ Metal バックエンドで動かし、画像 1 枚ごとに 1 つの
+プロセスを使います。HunyuanImage-3.0 も同じエンジンで動きます。プロンプトのキーと値を 1 回計算し、画像トークンを 80B の
+Transformer と 3D VAE に 8 ステップ通します。
+
 ## クレジットとライセンス
 
 **[Strata](https://github.com/Niko1221/Strata) は Niko1221 と Strata のコントリビューターによる成果です**
@@ -133,6 +148,10 @@ Anthropic / Responses / MCP の API、会話の再利用、数トークン先を
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) の一部を使っています。[MIT ライセンス](LICENSE)
 （Copyright (c) 2026 Niko1221 and the Strata contributors）のオープンソースです。一部のコンポーネントと各モデルには
 それぞれのライセンスがあります（[一覧](docs/HOW_IT_WORKS.md#license)）。
+
+画像：[Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image)（NucleusAI、Apache-2.0）。
+[mlx-nucleus-image](https://huggingface.co/treadon/mlx-nucleus-image) の移植版から変換しています。
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil)（Tencent、[Tencent Hunyuan Community License](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE)：EU・英国・韓国ではライセンスされません）。
 
 この Mac 用フォークが役に立ったら、メンテナーを支援できます：
 [buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov)。
