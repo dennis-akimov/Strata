@@ -336,6 +336,64 @@ build-metal/metal/strata-image --hunyuan $M/hunyuan-image3-q4_0.gguf --tokens to
 - **Open:** Q4_0 experts have 8.6% relative error a weight matrix. With the BF16 model not runnable here, its effect
   on the pictures is not measured; text in pictures has single-letter errors ("STRASA" for "STRATA").
 
+### Videos from a prompt (Wan 2.2 A14B)
+
+Strata makes short clips with [Wan 2.2 T2V A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B) (Apache-2.0): two
+14B experts, one for the high-noise steps and one for the low-noise steps. It runs on
+[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s `sd-cli` (ggml, Metal), one process a clip,
+built at a pinned commit with one patch, `metal/video/sdcpp-metal-conv3d.patch`. Metal has no `IM2COL_3D`, so the
+Wan VAE's Conv3d took ggml's direct kernel. The patch runs it as 2D convolutions, one per temporal tap: decoding 17
+frames went from 389 s to 30 s, and frame 8 matched the old output at 40.7 dB PSNR.
+
+```sh
+make pull MODEL=WAN2.2      # the 2 experts (Q4_K_M), UMT5 (Q8_0), the VAE, the Lightning LoRAs: 29 GB; builds sd-cli
+```
+
+Then `"video": {"exe": "<Strata>/build-sdcpp/build/bin/sd-cli", "low": "$D/Wan2.2-T2V-A14B-LowNoise-Q4_K_M.gguf",
+"high": "$D/Wan2.2-T2V-A14B-HighNoise-Q4_K_M.gguf", "t5": "$D/umt5-xxl-encoder-Q8_0.gguf", "vae":
+"$D/wan_2.1_vae.safetensors", "need_gb": 35}` in the run config. A clip takes minutes, so the API is a job, as
+OpenAI's video API is (the asynchronous request-reply pattern):
+
+- `POST /v1/videos` (`prompt`, `size` up to 1280x720, default 832x480, `seconds` up to 10, default 2; plus `steps`
+  (10), `high_noise_steps` (8), `guidance_scale` (3.5), `seed`, `negative_prompt`) answers 202 at once, with the job
+  and a `Location` to poll.
+- `GET /v1/videos/{id}` gives `status` (queued, in_progress, completed, failed) and `progress` (0-100).
+  `GET /v1/videos/{id}/content` gives the clip (`video/webm`). `DELETE /v1/videos/{id}` stops it or removes it.
+  `GET /v1/videos` lists the jobs.
+- A job waits for the server's turn and unloads the chat model when memory is short, as a picture does. A finished
+  clip is kept one hour (`keep_s`). The jobs live in the server's memory: a restart forgets them.
+- In the web chat, `/video <prompt>` makes a 2 s clip, shows its progress and keeps the clip in the chat.
+
+Measured (M5 Max, 128 GB, 2026-10-12; single runs, and the GPU clock moved between 600 and 1100 MHz):
+
+| 832x480, 17 frames, 2 + 2 steps | sampling | VAE decode | in all | peak footprint |
+|---|---:|---:|---:|---:|
+| weights in memory (the default) | 117 s | 30 s | 254 s | 28.2 GB |
+| `"args": ["--diffusion-fa", "--params-backend", "diffusion=disk"]` | 148 s | 26 s | 334 s | 18.2 GB |
+
+**Faster: the Lightning LoRAs.** [lightx2v's Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning)
+(Apache-2.0) distils Wan 2.2 to 4 steps without CFG: one pass a step, 4 passes for a clip instead of 36. `make pull
+MODEL=WAN2.2` gets them (their integer `alpha` tensors become float32: `tools/video/lora_alpha_f32.py`, as sd-cli
+loads no integer tensor). With `"loras": {"dir": "$D/loras", "low": "lightning-low", "high": "lightning-high"}` in
+`"video"`, a job's defaults are 2 + 2 steps and guidance 1. A prompt may not hold `<lora:...>` (sd-cli loads the file
+it names): only the config chooses.
+
+| 832x480, 33 frames (2 s) | steps | in all |
+|---|---:|---:|
+| the defaults without LoRAs (18 steps, CFG 3.5) | 36 passes | 2907 s |
+| Lightning, 2 + 2 steps, guidance 1 | 4 passes, 75-116 s each | 430 s |
+
+The frames passed `vid-check frames` (bible: video-model-testing). Measured and ruled out: the LoRAs at run time cost
+nothing visible (a pass without them: 89-110 s); merging them into the Q4_K weights (`--lora-apply-mode immediately`)
+aborts in sd-cli; llama.cpp's newer ggml (`SD_USE_UPSTREAM_GGML`) and `--disable-segmented-compute` were no faster.
+In every run the GPU sat at 600-750 MHz and 40% busy while the Mac had 44 GB in swap: memory pressure from other
+programs, not the model, sets the pace. Free memory first.
+
+Through the API: 287 s for the same clip. Both experts stay in memory by default. With `diffusion=disk`, only the
+expert in use is: 10 GB less at the peak, and 31% slower. **Flash attention is needed** (`--diffusion-fa`, the
+default here): without it, every frame came out white. A step took 30-100 s; the defaults (18 steps, 33 frames) take
+roughly 10-30 minutes a clip.
+
 ### EAGLE3 draft model (`--eagle3`)
 
 `strata-metal --eagle3 <gguf> --spec N` drafts with an EAGLE3 model (it reads 3 of the target's layers) instead of an MTP

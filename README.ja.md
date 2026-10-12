@@ -15,7 +15,7 @@ Strata は大規模な AI モデルを自分のコンピューターで動かし
 クラウドサービスと同じ API を通じてアプリやコーディングエージェントと連携します。モデルは Mac 上で動きます。
 Mac の外に出るものは、あなたが決めます（モデルのダウンロードと、接続したアプリ・ツール・MCP サーバー）。
 
-テキストのプロンプトから画像を作ることもでき、そのための独自の画像エンジンを持ちます（[Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) または [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)）。
+テキストのプロンプトから画像を作ることもでき、そのための独自の画像エンジンを持ちます（[Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) または [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)）。プロンプトから短い動画も作れます（[Wan 2.2](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b)）。
 
 ## どのくらい速い？
 
@@ -30,6 +30,17 @@ M5 Max（40 コア GPU、128 GB）の MacBook Pro、macOS 26.4、省エネルギ
 | **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 トークン/秒 | 29-32 トークン/秒 | 86 GB |
 
 \* 2026-10-10 に、Docker が約 40 GB を使いスワップが満杯の状態（GPU のクロックが低い）で測定したため、下限の値です。GLM は 1 トークンあたり、ほかのモデルの約 3 倍のアクティブパラメータを読みます。
+
+同じ Mac での画像と動画（2026-10-11/12）：
+
+| モデル | 出力 | 時間 | メモリ |
+| --- | --- | ---: | ---: |
+| **[HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)**（80B、Q4_0 エキスパート） | 1024x1024 の画像、8 ステップ | 88 秒 | 0.3 GB、54 GB のファイルをマップ |
+| **[Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image)**（17B、Q4_0 エキスパート） | 1024x1024 の画像、20 ステップ | 45 秒 | 2 GB、12 GB のファイルをマップ |
+| **[Wan 2.2 A14B](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b)** + Lightning LoRA | 832x480 の動画、2 秒（33 フレーム）、4 ステップ | 430 秒 | ピーク 30 GB |
+| Wan 2.2 A14B（LoRA なし） | 同じ動画、18 ステップ | 2907 秒 | 約 28 GB |
+
+動画の時間は Docker が 76 GB を使い macOS がスワップしている状態（GPU は 600〜750 MHz）で測定したため、下限の値です。
 
 Qwen の数値は MTP ドラフト層を使っています。MTP は任意で、有効にするには `./setup.sh --setup --mtp on`（ディスクを
 約 12 GB 追加で使用）。コンテキストのキャッシュはモデルファイルとは別に必要です（数 GB、長いコンテキストではさらに
@@ -73,8 +84,11 @@ make run                   # モデルを読み込み、準備ができたら ht
 | **Qwen3.8-Flash-Next Q2_0** | 66 GB | 約 60 GB（推定） | 標準で、Mac で最も多くテストしたもの。`make pull MODEL=Q2_0` |
 | Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB（実測） | Q2_0 より圧縮が少ない。今回の測定では 10〜30 % 遅い。`make pull MODEL=IQ3_XXS` |
 | Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB（実測） | さらに圧縮が少ない。A/B テスト 1 回で Q2_0 より約 10 % 遅い。`make pull MODEL=IQ3_S` |
-| **GPT-OSS 120B** | 63 GB | 約 70 GB（推定） | ここで最速（1 トークンあたり約 50 億パラメータが動作）。手動でセットアップ：[手順](docs/MACOS.md#gpt-oss-120b) |
-| GLM-5.3-Flash（Maya-S24） | 95 GB | 32K で 89 GB（実測） | ここで最大（3,200 億パラメータ、1 トークンあたり約 180 億が動作）で、最も遅い。チャット、思考、ツール呼び出しは動作します。手動でセットアップ：[手順](docs/MACOS.md#glm-53-flash) |
+| **GPT-OSS 120B** | 63 GB | 約 70 GB（推定） | ここで最速（1 トークンあたり約 50 億パラメータが動作）。インストール：`make pull MODEL=GPT-OSS-120B`、続いて[手順](docs/MACOS.md#gpt-oss-120b) |
+| GLM-5.3-Flash（Maya-S24） | 95 GB | 32K で 89 GB（実測） | ここで最大（3,200 億パラメータ、1 トークンあたり約 180 億が動作）で、最も遅い。チャット、思考、ツール呼び出しは動作します。インストール：`make pull MODEL=GLM-5.3`、続いて[手順](docs/MACOS.md#glm-53-flash) |
+| HunyuanImage-3.0（画像） | 169 GB をストリーミング（残るのは 54 GB） | 54 GB をマップ + 0.3 GB | 80B。画像 1 枚あたり約 90 秒。ライセンスは EU・英国・韓国では適用されません。`make pull MODEL=HUNYUAN`（約 2 時間） |
+| Nucleus-Image（画像） | 約 50 GB（残るのは 21 GB） | 12 GB をマップ + 2 GB | 17B、Apache-2.0。画像 1 枚あたり約 45 秒。`make pull MODEL=NUCLEUS` |
+| Wan 2.2 T2V A14B（動画） | 29 GB | ピーク 30 GB | 14B のエキスパート 2 つ + Lightning LoRA。2 秒の動画を約 7 分で生成。`make pull MODEL=WAN2.2` |
 
 「メモリ上」は、テストした Mac で Qwen モデルの MTP ドラフト層とリクエスト枠 2 つを含むエンジン全体の値です。
 コンテキストを小さくすれば少なくて済みます（`make run CONTEXT=32768`）。これが macOS が GPU に使わせる範囲に収まる
@@ -95,11 +109,16 @@ Qwen モデルは動作中に 28 GB のテーブルを SSD から読み込みま
 - **画像の生成：** チャットで `/image <プロンプト>`、または `POST /v1/images/generations`（OpenAI の画像 API）。
   [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image)（17B）を Strata 独自の画像エンジンで動かします。1024x1024 の画像 1 枚に約 45〜70 秒（20〜30
   ステップ）かかり、macOS が SSD からマップする 20 GB のモデルファイルのほかに数 GB のメモリを使います。手動での
-  セットアップが必要です：[手順](docs/MACOS.md#pictures-from-a-prompt-nucleus-image)。
+  インストール：`make pull MODEL=NUCLEUS`、続いて[手順](docs/MACOS.md#pictures-from-a-prompt-nucleus-image)。
   または [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil)（Tencent、80B の混合エキスパート。プロンプトと画像を 1 つのモデルで扱うため
   テキストエンコーダーは不要）：8 ステップ、1024x1024 で約 90 秒、SSD からマップされる 54 GB のファイルのほかに 0.3 GB の
   専用メモリ。インストール：`make pull MODEL=HUNYUAN`（約 2 時間）、続いて[手順](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)。ライセンスは EU・英国・韓国
   では適用されません。
+- **動画の生成：** チャットで `/video <プロンプト>`、または `POST /v1/videos`（OpenAI の動画 API：ジョブを作成して
+  状態を問い合わせる方式）。[Wan 2.2 T2V A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B)（14B のエキスパート 2 つ）を [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) の
+  Metal バックエンドで、[lightx2v の Lightning LoRA](https://huggingface.co/lightx2v/Wan2.2-Lightning)（18 ではなく 4 ステップ、1 ステップ 1 パス）とともに
+  動かします。832x480・2 秒の動画で約 7 分（LoRA なしでは 49 分）、メモリはピークで 30 GB。インストール：
+  `make pull MODEL=WAN2.2`（29 GB、LoRA を含む）、続いて[手順](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b)。
 - **標準では 1 度に 1 リクエスト**で、ほかは待ちます。同じ会話の続きは新しい部分だけを読むのですぐ始まりますが、
   長い新しいプロンプトは読み込みに時間がかかってから回答が始まります。
 - **ネットワーク上の別の機器から：** `strata-<モデル>.json` に `"host": "0.0.0.0"` と `"api_key"` を設定して
@@ -137,6 +156,9 @@ Anthropic / Responses / MCP の API、会話の再利用、数トークン先を
 プロセスを使います。HunyuanImage-3.0 も同じエンジンで動きます。プロンプトのキーと値を 1 回計算し、画像トークンを 80B の
 Transformer と 3D VAE に 8 ステップ通します。
 
+動画は stable-diffusion.cpp の `sd-cli` で動きます。Wan VAE の 3D 畳み込みを Metal で 13 倍速くする Strata のパッチを当てて
+ビルドし、サーバーはクリップごとにジョブとして実行します。
+
 ## クレジットとライセンス
 
 **[Strata](https://github.com/Niko1221/Strata) は Niko1221 と Strata のコントリビューターによる成果です**
@@ -152,6 +174,7 @@ Transformer と 3D VAE に 8 ステップ通します。
 画像：[Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image)（NucleusAI、Apache-2.0）。
 [mlx-nucleus-image](https://huggingface.co/treadon/mlx-nucleus-image) の移植版から変換しています。
 [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil)（Tencent、[Tencent Hunyuan Community License](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE)：EU・英国・韓国ではライセンスされません）。
+動画：[Wan 2.2](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B)（Alibaba の Wan チーム、Apache-2.0）、[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)（MIT）で実行。
 
 この Mac 用フォークが役に立ったら、メンテナーを支援できます：
 [buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov)。

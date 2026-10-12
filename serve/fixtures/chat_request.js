@@ -24,7 +24,10 @@ const els = {};                                        // elements keep what is 
 const el = (id) => (els[id] = els[id] || any());
 let posted = null, postedHeaders = null, cancelled = null;
 const lost = process.argv[4] === "lost";
-const down = process.argv[4] === "down";                // no server: fetch rejects as browsers do ("Failed to fetch")
+const down = process.argv[4] === "down";
+const stale = process.argv[4] === "stale";              // the tab runs older page code than the server has
+let reloaded = false;
+const stored = {};                // no server: fetch rejects as browsers do ("Failed to fetch")
 const piece = 'data: {"choices": [{"index": 0, "delta": {"content": "partial"}}]}\n\n';
 const brokenStream = () => {
   let n = 0;
@@ -33,8 +36,8 @@ const brokenStream = () => {
 };
 const ctx = {
   document: Object.assign(any(), {getElementById: el, querySelectorAll: () => [], addEventListener() {}}),
-  window: Object.assign(any(), {addEventListener() {}}), location: {hash: "", search: "", pathname: "/", host: "127.0.0.1:8090"},
-  localStorage: {getItem: () => null, setItem() {}}, matchMedia: () => ({matches: false, addEventListener() {}}),
+  window: Object.assign(any(), {addEventListener() {}}), location: {hash: "", search: "", pathname: "/", host: "127.0.0.1:8090", reload: () => { reloaded = true; }},
+  localStorage: {getItem: (k) => (k in stored ? stored[k] : null), setItem: (k, v) => { stored[k] = v; }}, matchMedia: () => ({matches: false, addEventListener() {}}),
   fetch: (url, opts) => {
     if (String(url).includes("chat/completions")) {
       posted = JSON.parse(opts.body);
@@ -42,6 +45,8 @@ const ctx = {
       if (lost) return Promise.resolve({ok: true, status: 200, body: brokenStream()});
       if (down) return Promise.reject(new TypeError("Failed to fetch"));
     }
+    if (String(url) === "health")                       // the check before each message (freshHealth)
+      return down ? Promise.reject(new TypeError("Failed to fetch")) : Promise.resolve({json: () => ({web: stale ? "new" : ""})});
     if (String(url) === "cancel") cancelled = JSON.parse(opts.body);
     return new Promise(() => {});
   },
@@ -54,17 +59,19 @@ ctx.globalThis = ctx;
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
 ctx.__s = JSON.parse(process.argv[3]);
-vm.runInContext("settings = {...DEFAULTS, ...__s}; busy = null;", ctx);
+vm.runInContext("settings = {...DEFAULTS, ...__s}; busy = null;" + (stale ? " webVersion = 'old';" : ""), ctx);
 el("input").value = "hi";
 (async () => {
 const sent = vm.runInContext("send()", ctx);   // without "lost" the answer never comes: do not wait for it
-if (lost || down) await sent;
+if (lost || down || stale) await sent;
+for (let i = 0; i < 100 && !posted && !down; i++) await new Promise((r) => setImmediate(r));   // past the health check
 const out = {
   body: posted,
   shared: vm.runInContext("sharedDefaults(settings)", ctx),
   problems: vm.runInContext(`[["", ""], ["", "2048"], ["4096", "2048"], ["4096", "4032"], ["4096", "4033"],
                               ["100", "50"], ["", "1.5"], ["", "-3"], ["", "0"]].map(([m, b]) => budgetProblem(m, b))`, ctx),
 };
+if (stale) Object.assign(out, {reloaded, draft: JSON.parse(stored["strata.draft"] || "null")});
 if (down) out.msg = vm.runInContext("({text: messages.at(-1).text, error: messages.at(-1).error})", ctx);
 if (lost) Object.assign(out, {rid: postedHeaders["X-Strata-Request-Id"], cancelled,
                               msg: vm.runInContext("({text: messages.at(-1).text, error: messages.at(-1).error})", ctx)});

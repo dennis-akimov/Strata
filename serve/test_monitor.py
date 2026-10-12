@@ -339,6 +339,14 @@ class ChatThinkingBudget(unittest.TestCase):
         self.assertIn("127.0.0.1:8090 does not answer", r["msg"]["error"])
         self.assertIn("Is Strata running", r["msg"]["error"])
 
+    def test_a_tab_older_than_the_server_reloads_and_keeps_the_text(self):
+        """A tab left open across an update ran old code (it sent "/video ..." to the chat model): before a message it
+        asks /health; newer page code there means reload, with the typed text kept as a draft, and nothing sent."""
+        r = self.run_chat({}, "stale")
+        self.assertTrue(r["reloaded"])
+        self.assertEqual(r["draft"], "hi")
+        self.assertIsNone(r["body"])
+
     def test_thinking_off_sends_no_budget(self):
         r = self.run_chat({"budget": "2048", "thinking": "none"})
         self.assertEqual(r["body"]["reasoning_effort"], "none")

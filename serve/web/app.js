@@ -23,6 +23,7 @@ const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000
 const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
 
+let webVersion = null;                                 // the page code this tab runs (/health's "web" at load)
 const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
@@ -102,19 +103,24 @@ function headers(json = false) {
   const key = store.get("apikey", "");
   if (key) h.Authorization = "Bearer " + key;
   if (json) h["Content-Type"] = "application/json";
+  if (webVersion) h["X-Strata-Web"] = webVersion;      // the page code this tab runs: the server spots an old tab
   return h;
 }
 $("api-key").value = store.get("apikey", "");
+if (store.get("draft", "")) { $("input").value = store.get("draft", ""); store.set("draft", ""); }   // kept over a reload
 $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
 
 let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
+    if (webVersion === null) webVersion = health.web || "";
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = health.image_generation
-      ? `Type /image and a description for a picture. ${health.model} answers chat messages` +
+    const make = [health.image_generation && "/image and a description for a picture",
+                  health.video_generation && "/video and a description for a short clip"].filter(Boolean);
+    $("chat-empty-sub").textContent = make.length
+      ? `Type ${make.join(", or ")}. ${health.model} answers chat messages` +
         `${health.loaded ? "" : " (it loads with the first one)"}. All on this PC.`
       : `${health.model} runs on this PC. Nothing leaves it.`;
     setBusy(!!busy);                                    // the hint: /image when this server makes pictures
@@ -814,6 +820,20 @@ function updateAssistant(el, m, streaming) {
     if (!thinkingNow && det.open && !det.dataset.touched) { det._auto = true; det.open = false; }
   }
   const bubble = el.querySelector(".st-bubble");
+  if (m.cmd === "video" && !m.error) {                  // a clip: the video itself, or the wait with its progress
+    if (m.video) {
+      bubble.innerHTML = `<video class="gen-image" controls loop muted playsinline autoplay></video><a class="gen-image__save" download="strata-video.webm">Save</a>`;
+      bubble.firstChild.src = m.video;
+      bubble.firstChild.title = m.prompt || "";
+      bubble.lastChild.href = m.video;
+    } else {
+      bubble.innerHTML = streaming ? `<span class="muted cursor"></span>` : `<span class="muted">${m.stopped ? "Stopped" : "No video"}</span>`;
+      if (streaming) bubble.firstChild.textContent = m.progress ? `Making the video · ${m.progress} %` : "Making the video (waiting for its turn)";
+    }
+    el.querySelector(".meta-text").textContent = m.meta || "";
+    el.querySelector("[data-msg-copy]").hidden = true;
+    return;
+  }
   if (m.cmd === "image" && !m.error) {                  // a picture: the image itself, or the wait for it
     if (m.image) {
       bubble.innerHTML = `<img class="gen-image" alt=""><a class="gen-image__save" download="strata-picture.png">Save</a>`;
@@ -947,7 +967,7 @@ $("chat").addEventListener("toggle", (e) => {
 function apiMessages() {
   const out = [];
   for (const m of messages) {
-    if (m.cmd === "image") continue;                    // a picture and its prompt are not chat
+    if (m.cmd === "image" || m.cmd === "video") continue;   // a picture or a clip, and its prompt, are not chat
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
       const text = userText(m);
@@ -989,8 +1009,8 @@ function assistantMessages(m) {
 function setBusy(on) {
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = on;
-  $("composer-hint").textContent = on ? "" : health.image_generation ? "Shift+Enter: new line · /image: a picture"
-                                                                     : "Shift+Enter: new line";
+  $("composer-hint").textContent = on ? "" : ["Shift+Enter: new line", health.image_generation && "/image: a picture",
+                                               health.video_generation && "/video: a clip"].filter(Boolean).join(" · ");
 }
 
 // "/image <prompt>": a picture from the server (strata-image; POST v1/images/generations, docs/MACOS.md), kept in the
@@ -1040,9 +1060,100 @@ async function makePicture(prompt, text) {
   scrollDown();
 }
 
+// "/video <prompt>": a clip from the server (sd-cli, Wan 2.2; POST v1/videos is a job, polled until it is done, then
+// its webm is kept in the chat as a data: URL).  Stop deletes the job, which stops the render.
+const VIDEO_CMD = /^\/video\s+([\s\S]+)$/i;
+async function makeVideo(prompt, text) {
+  messages.push({role: "user", text, cmd: "video", time: Date.now()});
+  $("input").value = "";
+  autosize();
+  const m = {role: "assistant", text: "", reasoning: "", cmd: "video", prompt, progress: 0, time: Date.now()};
+  messages.push(m);
+  renderChat();
+  const el = $("chat").lastElementChild;
+  const controller = new AbortController();
+  busy = {controller, msg: m};
+  setBusy(true);
+  updateAssistant(el, m, true);
+  const t0 = performance.now();
+  let id = null;
+  try {
+    // not aborted mid-way: a job the server made must get its id here, or Stop could not delete it (it answers at once)
+    const r = await fetch("v1/videos", {method: "POST", headers: headers(true),
+                                        body: JSON.stringify({prompt, size: "832x480", seconds: 2})});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    id = j.id;
+    if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");   // Stop while it was posted
+    for (;;) {                                         // poll the job (minutes): its progress shows in the bubble
+      await new Promise((ok, no) => {
+        const t = setTimeout(ok, 3000);
+        controller.signal.addEventListener("abort", () => { clearTimeout(t); no(new DOMException("stopped", "AbortError")); }, {once: true});
+      });
+      const s = await fetch(`v1/videos/${id}`, {signal: controller.signal, headers: headers(true)});
+      const v = await s.json().catch(() => ({}));
+      if (!s.ok) throw new Error((v.error && v.error.message) || `HTTP ${s.status}`);
+      if (v.status === "failed") throw new Error((v.error && v.error.message) || "the video failed");
+      m.progress = v.progress;
+      updateAssistant(el, m, true);
+      if (v.status === "completed") break;
+    }
+    const c = await fetch(`v1/videos/${id}/content`, {signal: controller.signal, headers: headers(true)});
+    if (!c.ok) throw new Error(`HTTP ${c.status}`);
+    const blob = await c.blob();
+    m.video = await new Promise((ok) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.readAsDataURL(blob); });
+    m.meta = `832×480 · 2 s · ${fmt((performance.now() - t0) / 1000, 0)} s`;
+    fetch(`v1/videos/${id}`, {method: "DELETE", headers: headers(true)}).catch(() => {});   // kept here now
+  } catch (e) {
+    if (id) fetch(`v1/videos/${id}`, {method: "DELETE", headers: headers(true)}).catch(() => {});
+    if (e.name === "AbortError") m.stopped = true;
+    else { m.error = requestError(e); toast("error", "No video", m.error, 8000); }
+  }
+  busy = null;
+  setBusy(false);
+  updateAssistant(el, m, false);
+  saveChat();
+  scrollDown();
+}
+
+// Before each message: the server may have been updated (this tab would run old code) or restarted with another setup
+// (/image or /video added or gone).  Newer page code: reload, the typed text kept as a draft.  Else take its abilities.
+async function freshHealth() {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 3000);       // a slow /health must not hold the message back
+  const h = await fetch("health", {signal: ctl.signal}).then((r) => r.json()).catch(() => null);
+  clearTimeout(t);
+  if (!h) return true;                                 // no answer: send() reports that on its own request
+  if (webVersion && h.web && h.web !== webVersion) {
+    const draft = $("input").value;
+    store.set("draft", draft);
+    if (attachments.length || store.get("draft", null) !== draft) {   // a reload would lose them: say so instead
+      toast("warn", "This page is out of date", "Strata was updated or restarted. Save your text and attachments, then reload the page.", 10000);
+      return false;
+    }
+    location.reload();
+    return false;
+  }
+  health = {...health, ...h};
+  return true;
+}
+
+let sending = false;                                   // between Enter and the request: a second Enter waits
 async function send() {
-  const text = $("input").value.trim();
+  if ((!$("input").value.trim() && !attachments.length) || busy || sending) return;
+  sending = true;
+  try {
+    if (!(await freshHealth())) return;
+  } finally {
+    sending = false;
+  }
+  const text = $("input").value.trim();                // what is in the box now (it may have changed meanwhile)
   if ((!text && !attachments.length) || busy) return;
+  const vid = VIDEO_CMD.exec(text);
+  if (vid && !attachments.length) {
+    if (!health.video_generation) { toast("warn", "No videos here", "This server is not set up for videos (docs/MACOS.md)."); return; }
+    return makeVideo(vid[1].trim(), text);
+  }
   const pic = IMAGE_CMD.exec(text);
   if (pic && !attachments.length) {
     if (!health.image_generation) { toast("warn", "No pictures here", "This server is not set up for pictures (docs/MACOS.md)."); return; }
