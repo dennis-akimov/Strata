@@ -7,6 +7,8 @@
 #   GPT-OSS-120B   gpt-oss-120b MXFP4 (63.4 GB, sha-256 checked) and its tokenizer pack
 #   NUCLEUS        Nucleus-Image: ~50 GB downloaded, converted to 3 GGUFs (~21 GB), the downloads deleted
 #   HUNYUAN        HunyuanImage-3.0-Instruct-Distil: 169 GB streamed shard by shard into one 54 GB GGUF
+#   WAN2.2         Wan 2.2 T2V A14B for videos: both experts (Q4_K_M), UMT5 (Q8_0), the VAE, the Lightning LoRAs (29 GB), and
+#                  stable-diffusion.cpp's sd-cli built for Metal with metal/video/sdcpp-metal-conv3d.patch
 set -eu
 cd "$(dirname "$0")/.."
 NAME=$(printf %s "${1:-}" | tr '[:lower:]' '[:upper:]')
@@ -61,9 +63,38 @@ HUNYUAN)
         "$PY" tools/image/hunyuan_gguf.py --out "$D/hunyuan-image3-q4_0.gguf" --work "$D/shards"
     get "$D" "https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil/resolve/c8ffd07206f1b843697606968196e8f59f8ff38c/tokenizer.json"
     ;;
+WAN2.2)
+    D=$M/Wan2.2-T2V-A14B
+    Q=https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF/resolve/73eafba53a1a8f29254e4c77f92e74ea27d7cd6f
+    get "$D" "$Q/HighNoise/Wan2.2-T2V-A14B-HighNoise-Q4_K_M.gguf"
+    get "$D" "$Q/LowNoise/Wan2.2-T2V-A14B-LowNoise-Q4_K_M.gguf"
+    get "$D" "https://huggingface.co/city96/umt5-xxl-encoder-gguf/resolve/b535255bee98c2b0a59ea7c0ae2dcd0c6657b3b7/umt5-xxl-encoder-Q8_0.gguf"
+    get "$D" "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/123acf1cc74bccbb9bfff8ac1ee72edc08c2341d/split_files/vae/wan_2.1_vae.safetensors"
+    # lightx2v's Wan2.2-Lightning LoRAs (4 steps, no CFG; Apache-2.0): their integer alphas as float32 for sd-cli
+    L=https://huggingface.co/lightx2v/Wan2.2-Lightning/resolve/18bccf8884ec0a078eed79785eb4ef13ea16ce1e/Wan2.2-T2V-A14B-4steps-lora-250928
+    for x in high low; do
+        [ -f "$D/loras/lightning-$x.safetensors" ] && continue   # the converter writes it only when complete
+        get "$D/loras" "$L/${x}_noise_model.safetensors"
+        "$PY" tools/video/lora_alpha_f32.py "$D/loras/${x}_noise_model.safetensors" "$D/loras/lightning-$x.safetensors"
+        rm -f "$D/loras/${x}_noise_model.safetensors"
+    done
+    # sd-cli: stable-diffusion.cpp at a pinned commit, with Strata's patch (Metal has no IM2COL_3D: the Wan VAE's
+    # Conv3d as 2D convolutions per temporal tap, 13x faster decoding)
+    B=build-sdcpp
+    SDC=d637cfb935feb2254898a8f1524046c958f3df80
+    [ -d $B/src/.git ] || git clone -q https://github.com/leejet/stable-diffusion.cpp $B/src
+    if [ "$(git -C $B/src rev-parse HEAD)" != $SDC ] || ! git -C $B/src apply --reverse --check ../../metal/video/sdcpp-metal-conv3d.patch 2>/dev/null; then
+        git -C $B/src fetch -q origin && git -C $B/src checkout -q -f $SDC && git -C $B/src submodule update -q --init --recursive
+        git -C $B/src apply ../../metal/video/sdcpp-metal-conv3d.patch
+    fi
+    NINJA=$(command -v ninja || echo "$PWD/.venv/bin/ninja")
+    cmake -S $B/src -B $B/build -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" -DCMAKE_BUILD_TYPE=Release -DSD_METAL=ON > /dev/null
+    cmake --build $B/build --target sd-cli
+    echo "sd-cli: $PWD/$B/build/bin/sd-cli"
+    ;;
 *)
     echo "make pull MODEL=NAME: a setup quant (Q2_0 IQ2_XS IQ3_XXS IQ3_S IQ1_M UD-Q4_K_XL UD-IQ4_XS) or one of"
-    echo "GLM-5.3 GPT-OSS-120B NUCLEUS HUNYUAN (tools/pull_model.sh)"
+    echo "GLM-5.3 GPT-OSS-120B NUCLEUS HUNYUAN WAN2.2 (tools/pull_model.sh)"
     exit 2
     ;;
 esac

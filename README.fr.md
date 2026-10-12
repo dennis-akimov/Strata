@@ -16,7 +16,7 @@ images et travaillent avec vos applications et vos agents de code via les mêmes
 tourne sur votre Mac ; ce qui en sort dépend de vous (les téléchargements de modèles, et chaque application, outil ou
 serveur MCP que vous connectez).
 
-Il crée aussi des images à partir d'un prompt texte, avec son propre moteur d'images ([Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) ou [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)).
+Il crée aussi des images à partir d'un prompt texte, avec son propre moteur d'images ([Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image) ou [HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)). Et de courtes vidéos à partir d'un prompt ([Wan 2.2](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b)).
 
 ## Quelle vitesse ?
 
@@ -31,6 +31,17 @@ Mesuré sur un MacBook Pro avec M5 Max (GPU 40 cœurs, 128 Go), macOS 26.4, en m
 | **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 tokens/s | 29-32 tokens/s | 86 Go |
 
 \* Mesuré le 2026-10-10 alors que Docker utilisait environ 40 Go et que le swap était plein (GPU à basse fréquence) : c'est un minimum ; GLM lit aussi environ 3x plus de paramètres actifs par token que les autres.
+
+Images et vidéos sur le même Mac (2026-10-11/12) :
+
+| Modèle | Sortie | Durée | Mémoire |
+| --- | --- | ---: | ---: |
+| **[HunyuanImage-3.0](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30)** (80B, experts Q4_0) | image 1024x1024, 8 étapes | 88 s | 0,3 Go, son fichier de 54 Go mappé |
+| **[Nucleus-Image](docs/MACOS.md#pictures-from-a-prompt-nucleus-image)** (17B, experts Q4_0) | image 1024x1024, 20 étapes | 45 s | 2 Go, ses 12 Go de fichiers mappés |
+| **[Wan 2.2 A14B](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b)** + LoRA Lightning | vidéo 832x480, 2 s (33 images), 4 étapes | 430 s | 30 Go au pic |
+| Wan 2.2 A14B sans les LoRA | la même vidéo, 18 étapes | 2907 s | environ 28 Go |
+
+Les durées vidéo ont été mesurées alors que Docker occupait 76 Go et que macOS utilisait le swap (GPU à 600-750 MHz) : un plancher.
 
 Les chiffres de Qwen utilisent sa couche de brouillon MTP, qui est optionnelle (`./setup.sh --setup --mtp on`, environ
 12 Go de disque en plus). Le cache du contexte s'ajoute au fichier du modèle (quelques Go ; davantage pour les longs
@@ -75,8 +86,11 @@ reste). **Où sont les choses :** les modèles dans `Strata-data/` à côté du 
 | **Qwen3.8-Flash-Next Q2_0** | 66 Go | environ 60 Go (estimation) | Le choix par défaut, le plus testé sur Mac. `make pull MODEL=Q2_0` |
 | Qwen3.8-Flash-Next IQ3_XXS | 76 Go | 65 Go (mesuré) | Moins compressé que Q2_0 ; 10 à 30 % plus lent dans nos essais. `make pull MODEL=IQ3_XXS` |
 | Qwen3.8-Flash-Next IQ3_S | 84 Go | 74 Go (mesuré) | Encore moins compressé ; environ 10 % plus lent que Q2_0 dans un test A/B. `make pull MODEL=IQ3_S` |
-| **GPT-OSS 120B** | 63 Go | environ 70 Go (estimation) | Le plus rapide ici (environ 5 milliards de paramètres actifs par token). À installer à la main : [étapes](docs/MACOS.md#gpt-oss-120b) |
-| GLM-5.3-Flash (Maya-S24) | 95 Go | 89 Go à 32K (mesuré) | Le plus gros ici (320 milliards de paramètres, environ 18 milliards actifs par token) et le plus lent. Discussion, réflexion et appels d'outils fonctionnent. À installer à la main : [étapes](docs/MACOS.md#glm-53-flash) |
+| **GPT-OSS 120B** | 63 Go | environ 70 Go (estimation) | Le plus rapide ici (environ 5 milliards de paramètres actifs par token). Installer : `make pull MODEL=GPT-OSS-120B`, puis [étapes](docs/MACOS.md#gpt-oss-120b) |
+| GLM-5.3-Flash (Maya-S24) | 95 Go | 89 Go à 32K (mesuré) | Le plus gros ici (320 milliards de paramètres, environ 18 milliards actifs par token) et le plus lent. Discussion, réflexion et appels d'outils fonctionnent. Installer : `make pull MODEL=GLM-5.3`, puis [étapes](docs/MACOS.md#glm-53-flash) |
+| HunyuanImage-3.0 (images) | 169 Go, en flux (54 Go gardés) | 54 Go mappés + 0,3 Go | 80B ; environ 90 s par image. Sa licence ne s'applique pas dans l'UE, au Royaume-Uni ni en Corée du Sud. `make pull MODEL=HUNYUAN` (environ 2 heures) |
+| Nucleus-Image (images) | environ 50 Go (21 Go gardés) | 12 Go mappés + 2 Go | 17B, Apache-2.0 ; environ 45 s par image. `make pull MODEL=NUCLEUS` |
+| Wan 2.2 T2V A14B (vidéos) | 29 Go | 30 Go au pic | Deux experts de 14B + les LoRA Lightning ; une vidéo de 2 s en environ 7 minutes. `make pull MODEL=WAN2.2` |
 
 « En mémoire » est le moteur avec la couche de brouillon MTP des modèles Qwen et 2 emplacements de requête, sur le Mac
 testé ; un contexte plus petit demande moins (`make run CONTEXT=32768`). Cela doit tenir dans ce que macOS accorde au
@@ -98,12 +112,16 @@ Les modèles Qwen lisent aussi une table de 28 Go sur le SSD pendant qu'ils tour
 - **Créer des images :** `/image <prompt>` dans le chat, ou `POST /v1/images/generations` (l'API d'images d'OpenAI),
   avec [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) (17B) sur le moteur d'images propre à Strata. Une
   image 1024x1024 prend environ 45 à 70 s (20 à 30 étapes) et quelques Go de mémoire en plus des 20 Go de fichiers du
-  modèle, que macOS mappe depuis le SSD. À installer à la main :
-  [étapes](docs/MACOS.md#pictures-from-a-prompt-nucleus-image).
+  modèle, que macOS mappe depuis le SSD. Installer : `make pull MODEL=NUCLEUS`, puis [étapes](docs/MACOS.md#pictures-from-a-prompt-nucleus-image).
   Ou [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) (Tencent, mélange d'experts de 80B ; un seul modèle pour le prompt et l'image, donc
   pas d'encodeur de texte) : 8 étapes, environ 90 s en 1024x1024, 0,3 Go de mémoire privée en plus de son fichier de
   54 Go, que macOS mappe depuis le SSD. Installer : `make pull MODEL=HUNYUAN` (environ 2 heures), puis [étapes](docs/MACOS.md#pictures-from-a-prompt-hunyuanimage-30).
   Sa licence ne s'applique pas dans l'UE, au Royaume-Uni ni en Corée du Sud.
+- **Créer des vidéos :** `/video <prompt>` dans le chat, ou `POST /v1/videos` (l'API vidéo d'OpenAI : une tâche
+  que l'on interroge), avec [Wan 2.2 T2V A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B) (deux experts de 14B) sur le backend Metal de
+  [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) et [les LoRA Lightning de lightx2v](https://huggingface.co/lightx2v/Wan2.2-Lightning) (4 étapes au lieu de 18, une passe par
+  étape). Une vidéo de 2 s en 832x480 prend environ 7 minutes (49 sans les LoRA) et 30 Go de mémoire au pic.
+  Installer : `make pull MODEL=WAN2.2` (29 Go, LoRA compris), puis [étapes](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b).
 - **Une requête à la fois** par défaut ; les autres attendent. Un message de suivi dans la même conversation ne lit que
   le nouveau texte et démarre donc vite ; un long nouveau prompt met un moment à être lu avant le début de la réponse.
 - **Depuis un autre appareil du réseau :** dans `strata-<modèle>.json`, définissez `"host": "0.0.0.0"` et une
@@ -142,6 +160,9 @@ l'encodeur de texte de Nucleus-Image, son modèle d'images à mélange d'experts
 Metal, un processus par image. HunyuanImage-3.0 y tourne aussi : les clés et valeurs du prompt une fois, puis 8 étapes des tokens d'image
 dans le transformer de 80B et son VAE 3D.
 
+Les vidéos tournent dans `sd-cli` de stable-diffusion.cpp, compilé avec un patch de Strata qui rend les convolutions 3D
+du VAE de Wan 13 fois plus rapides sur Metal ; le serveur exécute chaque clip comme une tâche.
+
 ## Crédits et licence
 
 **[Strata](https://github.com/Niko1221/Strata) est l'œuvre de Niko1221 et des contributeurs de Strata**
@@ -157,6 +178,7 @@ Niko1221 and the Strata contributors) ; quelques parties et chaque modèle ont l
 Images : [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) de NucleusAI (Apache-2.0), converti depuis le
 portage [mlx-nucleus-image](https://huggingface.co/treadon/mlx-nucleus-image).
 [HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) de Tencent ([Tencent Hunyuan Community License](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) : pas de licence dans l'UE, au Royaume-Uni ni en Corée du Sud).
+Vidéos : [Wan 2.2](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B) de l'équipe Wan d'Alibaba (Apache-2.0), exécuté avec [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (MIT).
 
 Si ce fork pour Mac vous est utile, vous pouvez soutenir son mainteneur :
 [buymeacoffee.com/dennisakimov](https://buymeacoffee.com/dennisakimov).

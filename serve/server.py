@@ -261,6 +261,16 @@ def focused_recovery_prompt(tok, ids, generated):
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 ENTITY_TAG = re.compile(r'(?:W/)?("[^"]*")')   # RFC 9110 8.8.3; the group is the opaque tag (weak comparison)
+def web_version() -> str:
+    """The web app's files as one short hash: a page compares it with the one it loaded with, so a tab left open
+    across an update reloads itself instead of running old code against a new server."""
+    h = hashlib.sha256()
+    for name in ("index.html", "app.js", "app.css"):
+        f = ROOT / "serve" / "web" / name
+        h.update(f.read_bytes() if f.is_file() else b"")
+    return h.hexdigest()[:16]
+
+
 REQUEST_ID = re.compile(r"[0-9a-f]{32}")  # the web chat's X-Strata-Request-Id: 128 random bits, hex
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
@@ -2824,6 +2834,7 @@ class Service:
         self.api_monitor = False
         self.image = None                               # serve.imagegen.ImageGen: the config's "image" (pictures)
         self.image_gate = threading.Event()             # set while a picture holds the turn: parallel requests wait
+        self.video = None                               # serve.videogen.VideoGen: the config's "video" (clips)
         self.entering = 0                               # parallel requests between the gate and "busy" (status_lock)
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
@@ -4710,7 +4721,7 @@ def make_handler(svc: Service):
                              f"turns this check off"}})
             return False
 
-        def _foreign_page(self) -> bool:
+        def _foreign_page(self, body=True) -> bool:
             """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
             then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
@@ -4726,7 +4737,7 @@ def make_handler(svc: Service):
                                  f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") "
                                  f"in the config"}})
                 return True
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
+            if body and not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
             return False
@@ -4793,7 +4804,7 @@ def make_handler(svc: Service):
             else:
                 return
             self.send_header("Access-Control-Allow-Origin", allow)
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
             # the headers the preflight asks for (SDKs add their own; "*" does not cover Authorization)
             asked = self.headers.get("Access-Control-Request-Headers")
             self.send_header("Access-Control-Allow-Headers",
@@ -4853,6 +4864,7 @@ def make_handler(svc: Service):
             self.send_response(304 if fresh else 200)
             self.send_header("ETag", tag)                    # RFC 9110 15.4.5: a 304 repeats ETag and Cache-Control
             self.send_header("Cache-Control", cache)
+            self._cors()                                     # a clip (/v1/videos/{id}/content) to a cors_origins page
             if not fresh:
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
@@ -4935,7 +4947,8 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "image_generation": svc.image is not None,
+                                 "image_generation": svc.image is not None, "video_generation": svc.video is not None,
+                                 "web": web_version(),
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
@@ -4990,6 +5003,9 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/v1/videos" or path.startswith("/v1/videos/"):
+                if self._authorized() and not self._foreign_page(body=False):
+                    self._videos_get(path)
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -5119,6 +5135,13 @@ def make_handler(svc: Service):
                     self._context(req)
                 elif path == "/v1/images/generations":
                     self._images(req)
+                elif path == "/v1/videos":
+                    if svc.video is None:
+                        self._json(404, {"error": {"type": "invalid_request_error", "message": "this server makes no "
+                                                   "videos: add \"video\" to its run config (docs/MACOS.md)"}})
+                    else:
+                        code, body = svc.video.create(svc, req)
+                        self._json(code, body, headers={"Location": f"/v1/videos/{body['id']}"} if code == 202 else None)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -5369,6 +5392,7 @@ def make_handler(svc: Service):
                 items.close()
 
         def _openai(self, req):
+            self._stale_page_command(req)
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
@@ -5610,6 +5634,61 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+
+        def _stale_page_command(self, req):
+            """Strata's own page (its X-Strata-Request-Id) sends /video or /image as chat only when it is older than
+            this server (a tab left open across an update or a restart with another config): say so, rather than load
+            the chat model to answer a command.  A current page says which code it runs (X-Strata-Web; it sends a
+            command with an attachment as chat on purpose).  Other clients' text is theirs and goes through."""
+            if not self.headers.get("X-Strata-Request-Id") or self.headers.get("X-Strata-Web") == web_version():
+                return
+            msgs = req.get("messages")
+            last = next((m for m in reversed(msgs) if isinstance(m, dict) and m.get("role") == "user"), None) \
+                if isinstance(msgs, list) else None
+            text = last.get("content") if last else None
+            if isinstance(text, list):
+                text = " ".join(p.get("text", "") for p in text if isinstance(p, dict))
+            cmd = re.match(r"\s*/(video|image)\s", text) if isinstance(text, str) else None
+            if cmd and (svc.video if cmd.group(1) == "video" else svc.image) is not None:
+                raise ValueError(f"this page is older than the server, so it sent /{cmd.group(1)} to the chat model: "
+                                 "reload the page (Cmd+R or Ctrl+R) and send it again")
+
+        def _videos_get(self, path):
+            """GET /v1/videos (the list), /v1/videos/{id} (the job), /v1/videos/{id}/content (the clip, video/webm)."""
+            gen = svc.video
+            if gen is None:
+                self._json(404, {"error": {"message": "this server makes no videos"}})
+                return
+            parts = path.split("/")[3:]                       # [] or [id] or [id, "content"]
+            if not parts:
+                self._json(200, {"object": "list", "data": gen.list()})
+                return
+            job = gen.get(parts[0])
+            if job is None or len(parts) > 2 or (len(parts) == 2 and parts[1] != "content"):
+                self._json(404, {"error": {"type": "invalid_request_error", "message": "no such video"}})
+            elif len(parts) == 1:
+                self._json(200, job.view(gen.MODEL, gen.keep_s))
+            elif job.status != "completed":
+                self._json(409, {"error": {"type": "invalid_request_error",
+                                           "message": f"the video is {job.status}, not completed"}})
+            else:
+                try:
+                    data = job.file.read_bytes()
+                except FileNotFoundError:                     # deleted or expired since the lookup
+                    self._json(404, {"error": {"type": "invalid_request_error", "message": "no such video"}})
+                    return
+                self._static(data, "video/webm", "no-store")
+
+        def do_DELETE(self):
+            path = self.path.split("?")[0].rstrip("/")
+            if not self._authorized() or self._foreign_page(body=False):
+                return
+            if path.startswith("/v1/videos/") and svc.video is not None and path.count("/") == 3:
+                jid = path.rsplit("/", 1)[1]
+                if svc.video.delete(jid):
+                    self._json(200, {"id": jid, "object": "video.deleted", "deleted": True})
+                    return
+            self._json(404, {"error": {"type": "invalid_request_error", "message": "no such video"}})
 
         def _images(self, req):
             """POST /v1/images/generations: a picture from strata-image, made in this server's turn with the chat model
@@ -6476,7 +6555,15 @@ def main() -> int:
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
     from serve.imagegen import ImageGen
+    from serve.videogen import VideoGen
     svc.image = ImageGen.from_config(cfg.get("image"))
+    svc.video = VideoGen.from_config(cfg.get("video"))
+    if svc.video:
+        import atexit
+        atexit.register(svc.video.shutdown)               # no sd-cli outlives this server, no clip folder either
+        print(f"[strata] videos: POST /v1/videos runs sd-cli with {Path(svc.video.low).name} (a job: poll "
+              f"GET /v1/videos/{{id}}; the chat model is unloaded for one when less than {svc.video.need_gb:.0f} GB "
+              "is free)", flush=True)
     if svc.image:
         print(f"[strata] pictures: POST /v1/images/generations runs strata-image with {Path(svc.image.hunyuan or svc.image.dit).name} (the "
               f"chat model is unloaded for one when less than {svc.image.need_gb:.0f} GB is free)", flush=True)
