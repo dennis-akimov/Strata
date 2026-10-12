@@ -241,3 +241,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .ctx-free .ctx-sw { background: var(--st-surface-2); box-shadow: inset 0 0 0 1px var(--st-line); }
 .ctx-pop__note { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--st-line-soft); font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
 @media (prefers-reduced-motion: reduce) { .ctx-pop, .ctx-ring__fill, .ctx-bar > i { transition: none; } .ctx-bar > i.is-writing { animation: none; } }
+
+/* a picture from /image */
+.gen-image { display: block; max-width: min(100%, 512px); height: auto; border-radius: var(--st-r-md); }
+.gen-image__save { display: inline-block; margin-top: 6px; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }

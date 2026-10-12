@@ -133,6 +133,7 @@ thumb: 8-16 GB): set too high, the whole Mac can slow down or stop responding un
 | MTP draft layer | opt-in: `--mtp on` |
 | GPT-OSS 120B (OpenAI's harmony format) | yes, set up by hand: see [GPT-OSS 120B](#gpt-oss-120b) |
 | GLM-5.3-Flash (Maya-S24) | yes, set up by hand: see [GLM-5.3-Flash](#glm-53-flash) |
+| Pictures from a prompt (`/image`, `/v1/images/generations`) | yes, on Strata's own engine (`strata-image`), with the model files converted by hand: see [Pictures from a prompt](#pictures-from-a-prompt-nucleus-image) |
 | EAGLE3 draft model (`--eagle3`) | opt-in engine flag, off: slower than no draft on GPT-OSS ([below](#eagle3-draft-model---eagle3)) |
 | Several requests at once (`"parallel"`) | opt-in, the same as on a PC |
 | Monitor tab | GPU load, memory and power, the chip's temperature (its die sensors), CPU, RAM; PCIe shows "n/a" (an integrated GPU has no PCIe link) |
@@ -216,6 +217,71 @@ low / high / max ("Off" and "Low" are its low, which often writes no thinking at
 These runs were not on a quiet Mac: Docker Desktop held about 40 GB and swap was full (34 of 35 GB), and the GPU ran
 at 400-840 MHz, so read them as a floor. The model's own measurements: 13.5 tok/s on a 24 GB PC graphics card with
 the rest in RAM. Its cache is small (0.3 GB at 32K), so larger contexts should fit, but only 32K was run.
+
+### Pictures from a prompt (Nucleus-Image)
+
+Strata makes pictures with [Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) (a 17B mixture-of-experts
+image model, Apache-2.0) on its own engine: `strata-image` (`metal/image/`, ggml's Metal backend, built by setup next
+to `strata-metal`). It runs the three parts in turn, each freed before the next: the text encoder (Qwen3-VL-8B through
+Strata's llama.cpp, the hidden state of layer 28), the DiT (64 experts a layer, expert-choice routing, both CFG
+branches in one graph with their experts in one batched matmul) and the VAE decoder. The weights are memory-mapped:
+they are the files' own pages, clean and file-backed, so macOS can drop them under pressure and read them again.
+
+The model files, made once (~50 GB downloaded, ~21 GB kept): the DiT and the VAE from the BF16 safetensors of
+[mlx-nucleus-image](https://huggingface.co/treadon/mlx-nucleus-image) (`dit/`, `vae/`), the text encoder from
+`NucleusAI/Nucleus-Image`'s `text_encoder/` with llama.cpp's converter (PyTorch: `.venv-mtp` has it):
+
+```sh
+M=<a folder>; L=build-metal/_deps/llama_cpp-src-*                    # the llama.cpp setup fetched
+.venv/bin/python tools/image/nucleus_gguf.py --src $M/mlx/dit --out $M/nucleus-dit-q4_0.gguf --experts q4_0   # 11.8 GB
+.venv/bin/python tools/image/nucleus_gguf.py --vae --src $M/mlx/vae --out $M/nucleus-vae.gguf                 # 0.1 GB
+.venv-mtp/bin/python $L/convert_hf_to_gguf.py $M/hf/text_encoder --outtype q8_0 --outfile $M/qwen3vl-8b-q8_0.gguf  # 8.7 GB
+```
+
+Then in the run config `"image": {"dit": "$M/nucleus-dit-q4_0.gguf", "encoder": "$M/qwen3vl-8b-q8_0.gguf", "vae":
+"$M/nucleus-vae.gguf", "need_gb": 16}` (full paths) and start Strata again: `/health` says `"image_generation": true`,
+`POST /v1/images/generations` (OpenAI's form: `prompt`, `size` "WxH" in steps of 16 from 256 to 2048, `n` 1; plus
+`steps` (30), `guidance_scale` (4), `seed`, `negative_prompt`; at most 1536x1024 pixels in all) answers with the picture as `b64_json` and the run's
+timings in `strata`, and the web chat makes one with `/image <prompt>` or "draw ..." (kept in the chat's history; not
+sent to the chat model).
+
+- **One process a picture.** Strata starts `strata-image` for each picture and waits for it to exit: a crash or an
+  out-of-memory there leaves the chat model alone, and the exit is the proof its memory is back. The prompts go to it
+  as files in a private temporary folder (not on its command line, which every user of the Mac can read); it ends
+  itself when Strata's end of its stdin closes, so a server that dies does not leave a picture running.
+- **Pictures only.** With `"lazy_load": true` as well, Strata starts without loading the chat model; it loads only if
+  a chat request comes. On the test Mac `run-image.sh` starts such a Strata.
+- **One model at a time when memory is short.** A picture takes the server's turn as a chat request does (chat
+  requests wait for it). When less than `need_gb` GB is free (psutil's "available"), the chat model is unloaded first,
+  after the requests running on it have ended; the next chat request loads it again (GLM-5.3-Flash: ~33 s).
+- **Errors.** A bad request is a 400, before anything is unloaded. No turn within `queue_s` (600) seconds, or the chat
+  model busy while memory is short: 503 with Retry-After; memory still short after the unload: 503 too. strata-image
+  failing: 500 with its own message (or its last stderr). A client that hangs up (or the page's Stop): the process is
+  stopped (SIGTERM, then SIGKILL 5 s later) and the turn is held until it has exited; past `timeout_s` (1800) the same,
+  and 504. Every picture's end is in the server's log, failures and stops included.
+- **Measured** (M5 Max, 128 GB, 2026-10-11; Docker and other work running, so read timings as ranges):
+
+| | step, 512x512 | step, 1024x1024 | memory the process holds | weights |
+|---|---:|---:|---:|---|
+| strata-image (Q4_0 experts, Q8_0 encoder) | 0.45-0.58 s | 3.0-3.6 s | 0.4 GB + 0.3 / 1.5 GB of activations (512 / 1024) | 11.8 GB mapped, reclaimable |
+| for comparison: the MLX worker (nucleus-mlx), 4-bit, experts in memory | 0.48 s | 1.5-1.9 s | 14-18 GB | inside that |
+| the MLX worker, 4-bit, experts streamed from the SSD | 0.9-1.1 s | 1.8-2.1 s | 9.5-10.3 GB | streamed |
+
+  A step is both CFG branches. A 1024x1024 picture of 20 steps: 63 s in all (2.5 s for the prompt, 3.6 s to map the
+  DiT, 55 s of steps, 1.8 s to decode; the VAE needs 4.8 GB of scratch for that 1.8 s, after the DiT is freed); 512x512
+  of 30 steps: 17-20 s; 1536x1024: 9 s a step, 2.6 GB of activations, 13 s to decode. The size is capped there:
+  2048x2048 ran at 40 s a step with 12.9 GB of activations (the expert-choice routing's one-hot grows with the square of
+  the pixel count). The 1024x1024 steps are slower than MLX's: a per-op profile puts them in ggml's own kernels
+  (the attention's 1 GB score matrix and softmax, the routing's one-hot transposes, then the expert matmuls); flash
+  attention was 0.2-0.3 s faster a step but moved the pictures (below), so it is not used. ggml's matmuls already
+  run on the M5's neural accelerators (the Metal 4 tensor API, `has tensor = true` in the log); its F16 flash attention
+  does too, but the softmax, the copies and the routing around them do not.
+
+  Quality, LPIPS against the float32 port's picture (same prompt, noise and settings; 3 prompts, 512x512, 30 steps;
+  lower is closer, another seed is ~0.5): strata-image 0.017 / 0.130 / 0.088, the MLX worker 0.021 / 0.137 / 0.132,
+  the port's own 4-bit 0.037 / 0.227 / 0.243, strata-image with flash attention 0.036 / 0.123 / 0.152. The checks:
+  `tools/image/check_dit.py` (every DiT block against the port), `strata-image --check-text` (the encoder against
+  PyTorch: 1.1% relative, Q8_0), `--check-vae` (0.24% against the port's decoder).
 
 ### EAGLE3 draft model (`--eagle3`)
 

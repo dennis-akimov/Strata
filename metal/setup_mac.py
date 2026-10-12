@@ -31,10 +31,12 @@ import setup as S  # noqa: E402
 
 ENGINE = ROOT / "engine-metal"                         # not engine/: update_installed_engine() manages that one
 EXE = "strata-metal"
+IEXE = "strata-image"                                  # pictures (metal/image, serve/imagegen.py): built alongside
 TRAINED_CTX = 262144                                   # the Metal engine has no rope scaling past it yet
 MTP_FILE = "mtp-qwen3.8-flash-next-q8_0.gguf"
 CONVERT_NUMPY = "2.4.0"                                # see metal/mtp_gguf.py: Q8_0_DIGEST
 ENGINE_SOURCES = ("metal/strata_metal.cpp", "metal/CMakeLists.txt", "tools/vision/strata_vision.cpp",
+                  *sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "metal" / "image").glob("*.[ch]*")),
                   *sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "metal" / "patches").rglob("*.patch")))   # rebuilt on change
 MTP = {"on": False, "dir": None}                       # --mtp on|off (this file's own option), tools/mtp_fetch.py's --out
 
@@ -78,7 +80,7 @@ def build_engine(*_a, **_k) -> Path:
         old = json.loads(info.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         old = {}
-    if all((ENGINE / x).exists() for x in (EXE, S.VEXE)) and all(old.get(k) == meta[k] for k in ("version", "llama", "src")):
+    if all((ENGINE / x).exists() for x in (EXE, S.VEXE, IEXE)) and all(old.get(k) == meta[k] for k in ("version", "llama", "src")):
         return ENGINE
     if not S.out(["xcrun", "--find", "clang++"]).strip():
         S.fail("the Xcode command-line tools are missing (the compiler)", "run: xcode-select --install, then this again")
@@ -95,9 +97,9 @@ def build_engine(*_a, **_k) -> Path:
     if os.environ.get("STRATA_LLAMA_DIR"):             # an offline build: a llama.cpp checkout at the pinned commit
         cfg.append(f"-DSTRATA_LLAMA_DIR={os.environ['STRATA_LLAMA_DIR']}")
     S.run(cfg, quiet=True)
-    S.run([cmake, "--build", str(build), "--target", EXE, S.VEXE, "-j", str(os.cpu_count() or 8)], quiet=True)
+    S.run([cmake, "--build", str(build), "--target", EXE, S.VEXE, IEXE, "-j", str(os.cpu_count() or 8)], quiet=True)
     ENGINE.mkdir(exist_ok=True)
-    for exe in (EXE, S.VEXE):                          # the engine and the image encoder (tools/vision, on Metal)
+    for exe in (EXE, S.VEXE, IEXE):                    # the engine, the image encoder (tools/vision) and strata-image
         shutil.copy2(build / "metal" / exe, ENGINE / exe)
     info.write_text(json.dumps(meta, indent=1), encoding="utf-8")
     return ENGINE

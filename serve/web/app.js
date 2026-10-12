@@ -113,7 +113,11 @@ async function loadHealth() {
     health = await (await fetch("health")).json();
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    $("chat-empty-sub").textContent = health.image_generation
+      ? `Type /image and a description for a picture. ${health.model} answers chat messages` +
+        `${health.loaded ? "" : " (it loads with the first one)"}. All on this PC.`
+      : `${health.model} runs on this PC. Nothing leaves it.`;
+    setBusy(!!busy);                                    // the hint: /image when this server makes pictures
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -810,11 +814,25 @@ function updateAssistant(el, m, streaming) {
     if (!thinkingNow && det.open && !det.dataset.touched) { det._auto = true; det.open = false; }
   }
   const bubble = el.querySelector(".st-bubble");
+  if (m.cmd === "image" && !m.error) {                  // a picture: the image itself, or the wait for it
+    if (m.image) {
+      bubble.innerHTML = `<img class="gen-image" alt=""><a class="gen-image__save" download="strata-picture.png">Save</a>`;
+      bubble.firstChild.src = m.image;
+      bubble.firstChild.alt = m.prompt || "";
+      bubble.lastChild.href = m.image;
+    } else {
+      bubble.innerHTML = streaming ? `<span class="muted cursor">Making the picture</span>` : `<span class="muted">${m.stopped ? "Stopped" : "No picture"}</span>`;
+    }
+    el.querySelector(".meta-text").textContent = m.meta || "";
+    el.querySelector("[data-msg-copy]").hidden = true;
+    return;
+  }
   if (m.error) {                                   // the answer that arrived, then the error
     bubble.innerHTML = `${m.text ? answerHtml(m) : ""}<div class="msg-error"></div>`;
     bubble.lastChild.textContent = m.error;
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
-    bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
+    bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>`
+      : `<span class="muted cursor">${esc(m.wait || "")}</span>`;      // what the server is doing before a word comes
   } else {
     bubble.innerHTML = answerHtml(m);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
@@ -929,6 +947,7 @@ $("chat").addEventListener("toggle", (e) => {
 function apiMessages() {
   const out = [];
   for (const m of messages) {
+    if (m.cmd === "image") continue;                    // a picture and its prompt are not chat
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
       const text = userText(m);
@@ -970,19 +989,66 @@ function assistantMessages(m) {
 function setBusy(on) {
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = on;
-  $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
+  $("composer-hint").textContent = on ? "" : health.image_generation ? "Shift+Enter: new line · /image: a picture"
+                                                                     : "Shift+Enter: new line";
+}
+
+// "/image <prompt>": a picture from the server (strata-image; POST v1/images/generations, docs/MACOS.md), kept in the
+// chat and its history but never sent to the chat model (apiMessages leaves both messages out)
+const IMAGE_CMD = /^\/image\s+([\s\S]+)$/i;
+// ...and a message that plainly asks for one ("draw a sweet cat", "create an image of ...", "picture of ...") when the
+// server makes pictures: the chat model cannot draw, so sending it there only loads it for nothing
+const DRAW_ASK = /^(?:please\s+)?(?:draw|paint|sketch|illustrate)\s+(?:me\s+)?([\s\S]+)$|^(?:please\s+)?(?:make|create|generate|show\s+me)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|drawing|photo|illustration)\s+(?:of\s+)?([\s\S]+)$|^(?:an?\s+)?(?:image|picture|photo)\s+of\s+([\s\S]+)$/i;
+async function makePicture(prompt, text) {
+  messages.push({role: "user", text, cmd: "image", time: Date.now()});
+  $("input").value = "";
+  autosize();
+  const m = {role: "assistant", text: "", reasoning: "", cmd: "image", prompt, time: Date.now()};
+  messages.push(m);
+  renderChat();
+  const el = $("chat").lastElementChild;
+  const controller = new AbortController();
+  const rid = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  busy = {controller, msg: m};
+  setBusy(true);
+  updateAssistant(el, m, true);
+  const t0 = performance.now();
+  try {
+    const r = await fetch("v1/images/generations", {method: "POST", signal: controller.signal,
+      headers: {...headers(true), "X-Strata-Request-Id": rid}, body: JSON.stringify({prompt, size: "1024x1024"})});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    m.image = `data:image/png;base64,${j.data[0].b64_json}`;
+    m.meta = `1024×1024 · ${fmt((performance.now() - t0) / 1000, 0)} s`;
+  } catch (e) {
+    fetch("cancel", {method: "POST", headers: headers(true), body: JSON.stringify({id: rid})}).catch(() => {});
+    if (e.name === "AbortError") m.stopped = true;
+    else { m.error = e.message || String(e); toast("error", "No picture", m.error, 6000); }
+  }
+  busy = null;
+  setBusy(false);
+  updateAssistant(el, m, false);
+  saveChat();
+  scrollDown();
 }
 
 async function send() {
   const text = $("input").value.trim();
   if ((!text && !attachments.length) || busy) return;
+  const pic = IMAGE_CMD.exec(text);
+  if (pic && !attachments.length) {
+    if (!health.image_generation) { toast("warn", "No pictures here", "This server is not set up for pictures (docs/MACOS.md)."); return; }
+    return makePicture(pic[1].trim(), text);
+  }
+  const ask = health.image_generation && !attachments.length ? DRAW_ASK.exec(text) : null;
+  if (ask) return makePicture((ask[1] || ask[2] || ask[3]).trim(), text);
   messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
                  files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
   attachments = [];
   renderAttachments();
   $("input").value = "";
   autosize();
-  const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
+  const m = {role: "assistant", text: "", reasoning: "", time: Date.now(), wait: ""};
   messages.push(m);
   renderChat();
   const el = $("chat").lastElementChild;
@@ -992,6 +1058,16 @@ async function send() {
   const rid = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
   busy = {controller, msg: m};
   setBusy(true);
+  // until the first word: what it is waiting for (the chat model may have to load first: ~a minute), with the seconds
+  const waitStart = performance.now();
+  let waitWhat = health.loaded === false ? "Loading the chat model (about a minute)" : "Reading your message";
+  fetch("health").then((r) => r.json()).then((h) => { health.loaded = h.loaded;
+    if (!h.loaded) waitWhat = "Loading the chat model (about a minute)"; }).catch(() => {});
+  const waitTimer = setInterval(() => {
+    if (m.text || m.reasoning || m.error) { clearInterval(waitTimer); return; }
+    m.wait = `${waitWhat} · ${Math.round((performance.now() - waitStart) / 1000)} s`;
+    updateAssistant(el, m, true);
+  }, 1000);
 
   const body = {model: health.model, messages: apiMessages(), stream: true,
                 reasoning_effort: settings.thinking};
@@ -1098,6 +1174,8 @@ async function send() {
   busy = null;
   setBusy(false);
   ended = true;                                   // a repaint still scheduled does nothing
+  clearInterval(waitTimer);
+  delete m.wait;
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();

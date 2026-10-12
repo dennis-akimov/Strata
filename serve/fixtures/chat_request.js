@@ -42,7 +42,7 @@ const ctx = {
     if (String(url) === "cancel") cancelled = JSON.parse(opts.body);
     return new Promise(() => {});
   },
-  innerHeight: 800, setTimeout() {}, setInterval() {}, clearTimeout() {}, requestAnimationFrame() {}, AbortController,
+  innerHeight: 800, setTimeout() {}, setInterval() {}, clearTimeout() {}, clearInterval() {}, requestAnimationFrame() {}, AbortController,
   crypto, TextDecoder, TextEncoder, TypeError, performance,
   navigator: any(), history: any(), sessionStorage: {getItem: () => null, setItem() {}}, Image: function () {},
   URLSearchParams, console, Number, Math, String, Date, JSON, Promise, Map, Set, Array, Object, RegExp,
