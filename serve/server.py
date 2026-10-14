@@ -49,7 +49,7 @@ from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -59,7 +59,7 @@ from serve.frontend import (THINK_END, CALL_START, H_CHANNEL, ChatTemplate, Even
                             anthropic_to_messages,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.mcp import McpCancelled, McpHub, hub_from_config, page_entry, settings_from  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -2331,6 +2331,17 @@ def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
     --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+
+
+def model_name_from_args(args) -> str:
+    """The id /v1/models reports when the config names none: the loaded GGUF's file name, lower case, without
+    ".gguf" and a "-00001-of-00003" shard suffix (gpt-oss-120b-MXFP4.gguf -> gpt-oss-120b-mxfp4)."""
+    args = args if isinstance(args, list) else []
+    if "--gguf" in args[:-1]:
+        name = re.sub(r"(-\d{5}-of-\d{5})?\.gguf$", "", Path(str(args[args.index("--gguf") + 1])).name, flags=re.I)
+        if name:
+            return name.lower()
+    return "qwen3.8-flash-next"
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -5027,6 +5038,9 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
+            if path == "/mcp/servers":
+                self._mcp_put()
+                return
             if path in ("/unload", "/load") and not self._control_body():
                 return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
@@ -5264,6 +5278,72 @@ def make_handler(svc: Service):
                                                       f"config's trusted_origins)"}})
                 return False
             return True
+
+        def _mcp_save(self, name: str, entry: dict | None) -> bool:
+            """The page's MCP connection into the run config's "mcp_servers" (None: out of it), so the next start
+            has it too.  False: no run config (the change lasts until the server stops)."""
+            if not svc.config_path:
+                return False
+            with svc.config_lock:
+                cfg = runconfig.load(svc.config_path)
+                block = cfg.get("mcp_servers")
+                if block is not None and not isinstance(block, dict):
+                    raise ValueError("the run config's mcp_servers is not an object")
+                block = dict(block or {})
+                if entry is None:
+                    block.pop(name, None)
+                else:
+                    block[name] = entry
+                runconfig.save(svc.config_path, {**cfg, "mcp_servers": block})
+            return True
+
+        def _mcp_put(self):
+            """POST /mcp/servers {name, url, key?, header?}: connect (or change) an MCP server at a URL from the
+            Settings view.  Strata's own page only (JSON, same origin) and the API key, as /config; a server that
+            runs a program, or one from the --mcp-config file, can't be changed here."""
+            body = self._body()
+            if not self._own_page("MCP servers can be changed"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+                old = svc.mcp.servers.get(req.get("name")) if isinstance(req, dict) else None
+                if old is not None and not old.editable:
+                    self._json(409, {"error": {"type": "invalid_request_error", "message":
+                                     f"{old.name!r} comes from the config file or --mcp-config, not from this page: "
+                                     "change it there"}})
+                    return
+                name, entry = page_entry(req, old.cfg if old is not None else None)
+                saved = self._mcp_save(name, entry)
+            except ValueError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            except OSError as e:
+                self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be written: {e}"}})
+                return
+            svc.mcp.put(name, entry)
+            print(f"[strata] the Settings view {'changed' if old else 'added'} the MCP server {name!r} "
+                  f"({entry['url'].split('?', 1)[0]}){'' if saved else '; no run config, so only until this server stops'}",
+                  flush=True)
+            self._json(200, {**svc.mcp.status(), "saved": saved})
+
+        def _mcp_delete(self, name: str):
+            if self._foreign_origin():
+                self._json(403, {"error": {"message": "MCP servers can be changed only from Strata's own page"}})
+                return
+            s = svc.mcp.servers.get(name)
+            if s is None or not s.editable:
+                self._json(404 if s is None else 409, {"error": {"type": "invalid_request_error", "message":
+                           f"no MCP server {name!r}" if s is None else
+                           f"{name!r} comes from the config file or --mcp-config, not from this page"}})
+                return
+            try:
+                saved = self._mcp_save(name, None)
+            except (OSError, ValueError) as e:
+                self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be written: {e}"}})
+                return
+            svc.mcp.remove(name)
+            print(f"[strata] the Settings view removed the MCP server {name!r}", flush=True)
+            self._json(200, {**svc.mcp.status(), "saved": saved})
 
         def _config_get(self):
             if not svc.config_path:
@@ -5677,11 +5757,14 @@ def make_handler(svc: Service):
                 except FileNotFoundError:                     # deleted or expired since the lookup
                     self._json(404, {"error": {"type": "invalid_request_error", "message": "no such video"}})
                     return
-                self._static(data, "video/webm", "no-store")
+                self._static(data, "video/mp4" if job.file.suffix == ".mp4" else "video/webm", "no-store")
 
         def do_DELETE(self):
             path = self.path.split("?")[0].rstrip("/")
             if not self._authorized() or self._foreign_page(body=False):
+                return
+            if path.startswith("/mcp/servers/"):
+                self._mcp_delete(unquote(path[len("/mcp/servers/"):]))
                 return
             if path.startswith("/v1/videos/") and svc.video is not None and path.count("/") == 3:
                 jid = path.rsplit("/", 1)[1]
@@ -6441,6 +6524,8 @@ def main() -> int:
         meta = json.loads((tpath / "tokenizer.json").read_text()) if (tpath / "tokenizer.json").exists() else {}
         tok = ST.Tokenizer(tokens, merges, types, meta.get("pre", "qwen35"))   # gpt-4o: GPT-OSS (o200k)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    if hub is None:                                     # none configured: an empty hub the Settings view can add to
+        hub = McpHub({}, settings_from(cfg))
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -6506,7 +6591,7 @@ def main() -> int:
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                  model_name=cfg.get("model_name") or model_name_from_args(cfg.get("args")), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
@@ -6635,19 +6720,24 @@ def main() -> int:
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
-    if hub is not None:
-        import atexit
-        svc.mcp = hub
+    import atexit
+    svc.mcp = hub
+    if hub.servers:
         print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
               f"chat: {', '.join(hub.servers)}", flush=True)
-        hub.start()
-        atexit.register(hub.close)                      # the servers Strata started end with it
+    hub.start()
+    atexit.register(hub.close)                          # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
+    args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+    gguf = Path(str(args[args.index("--gguf") + 1])).name if "--gguf" in args[:-1] else ""
+    print(f"       model: {svc.model}" + (f"  ({gguf})" if gguf else ""), flush=True)
+    if svc.api_key:                                     # shown on request: the terminal is the owner's (header Authorization: Bearer KEY)
+        print(f"       API key: {', '.join(key_list(svc.api_key))}", flush=True)
     print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it

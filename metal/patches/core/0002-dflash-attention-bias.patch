@@ -1,0 +1,53 @@
+Strata: optional attention biases (q/k/v/o) in DFlash drafts.  z-lab/gpt-oss-120b-DFlash is a Qwen3 draft with
+attention_bias=true; without this llama.cpp refuses its 32 bias tensors ("wrong number of tensors").  strata-metal --dflash.
+
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -227,6 +227,12 @@
+         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
+         layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, TENSOR_NOT_REQUIRED);
+         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
++
++        // optional projection biases (gpt-oss-120b-DFlash: a Qwen3 draft with attention_bias)
++        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), { n_embd_head_k * n_head }, TENSOR_NOT_REQUIRED);
++        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), { n_embd_k_gqa }, TENSOR_NOT_REQUIRED);
++        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), { n_embd_v_gqa }, TENSOR_NOT_REQUIRED);
++        layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), { n_embd }, TENSOR_NOT_REQUIRED);
+ 
+         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
+         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+@@ -622,8 +628,10 @@
+             const auto & layer = model.layers[il];
+ 
+             ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
++            if (layer.wk_b) Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
+             const bool shared_kv = layer.wv == nullptr;
+             ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);
++            if (!shared_kv && layer.wv_b) Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
+ 
+             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+@@ -712,9 +720,12 @@
+         }
+ 
+         ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm, layer.wq_s);
++        if (layer.wq_b) Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
+         ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm, layer.wk_s);
++        if (layer.wk_b) Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
+         const bool shared_kv = layer.wv == nullptr;
+         ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, noise_norm, layer.wv_s);
++        if (!shared_kv && layer.wv_b) Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
+ 
+         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+@@ -734,8 +745,8 @@
+ 
+         // cache-aware, non-causal attention
+         ggml_tensor * cur = use_iswa
+-            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+-            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
++            ? build_attn(inp_attn_iswa, layer.wo, layer.wo_b, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
++            : build_attn(inp_attn,      layer.wo, layer.wo_b, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+ 
+         if (hparams.f_attn_value_scale != 0.0f) {
+             cur = ggml_scale(ctx0, cur, hparams.f_attn_value_scale);

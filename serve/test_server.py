@@ -24,7 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
-                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
+                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, model_name_from_args, prompt_progress,
                           prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -1989,6 +1989,18 @@ class PcieShare(unittest.TestCase):
         self.assertEqual([r["hit_rate"] for r in rows], [0.6, 0.6, 0.6])
         self.assertEqual([r["pcie_share"] for r in rows], [0.2, 0.0, None])
         self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
+
+
+class ModelNameFromArgs(unittest.TestCase):
+    """A config without "model_name": /v1/models reports the loaded GGUF's own name, not Qwen's."""
+
+    def test_the_gguf_file_names_the_model(self):
+        self.assertEqual(model_name_from_args(["--gguf", "/m/gpt-oss-120b/gpt-oss-120b-MXFP4.gguf", "--kv", "f16"]),
+                         "gpt-oss-120b-mxfp4")
+        self.assertEqual(model_name_from_args(["--gguf", "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00001-of-00003.gguf"]),
+                         "glm-5.3-flash-maya-s24-iq2_xxs_s")
+        for args in (None, [], ["--native", "x"], ["--gguf"]):          # no GGUF named: the old default
+            self.assertEqual(model_name_from_args(args), "qwen3.8-flash-next", args)
 
 
 class PeerDevice(unittest.TestCase):

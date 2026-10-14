@@ -5,7 +5,7 @@ The main document of this independently maintained, Apple Silicon-only fork of
 they were at the fork point, but not maintained here; see [docs/README.md](README.md)).
 
 **Tested on one Mac:** a MacBook Pro M5 Max (40-core GPU, 128 GB) on macOS 26.4, with Qwen3.8-Flash-Next Q2_0, IQ3_XXS
-and IQ3_S, GPT-OSS 120B and GLM-5.3-Flash (Maya-S24). Other Apple Silicon Macs and other model files are untested. Read [Limits and warnings](#limits-and-warnings) before you install.
+and IQ3_S, GPT-OSS 120B and 20B, Qwen3.6-35B-A3B and GLM-5.3-Flash (Maya-S24). Other Apple Silicon Macs and other model files are untested. Read [Limits and warnings](#limits-and-warnings) before you install.
 
 On a Mac, Strata serves the same web app and APIs (OpenAI, Anthropic, Responses, MCP) as on a PC. The engine under
 them is different: `strata-metal` (`metal/`) runs the model on llama.cpp's Metal backend.
@@ -68,7 +68,7 @@ If setup stops, it says what is missing and the command that fixes it.
   differs between Macs and macOS versions. Q2_0's weights take about 35 GB of it (IQ3_S's about 51 GB), plus the context's cache. Everything
   the Mac does shares the same memory, so close other large apps. Below 128 GB only the 64 GB floor applies: nobody
   has measured how close a 64 GB Mac gets.
-- **Of the Qwen sizes, only Q2_0, IQ3_XXS and IQ3_S were tested** (and GPT-OSS 120B and GLM-5.3-Flash Maya-S24 of the others). `make check` marks the other sizes "untested on a Mac". On a PC, the Unsloth sizes
+- **Of the Qwen sizes, only Q2_0, IQ3_XXS and IQ3_S were tested** (and GPT-OSS 120B and 20B, Qwen3.6-35B-A3B and GLM-5.3-Flash Maya-S24 of the others). `make check` marks the other sizes "untested on a Mac". On a PC, the Unsloth sizes
   (UD-Q4_K_XL, UD-IQ4_XS) stream part of their experts from the SSD; the Mac engine cannot, so all of a model's experts
   must fit in Metal's limit. UD-Q4_K_XL (111 GB) is larger than the test Mac's default limit.
 - **Speed.** On the test Mac: 13-17 tokens/s for the answer and 225-270 tokens/s to read a prompt, with other programs
@@ -134,6 +134,7 @@ thumb: 8-16 GB): set too high, the whole Mac can slow down or stop responding un
 | GPT-OSS 120B (OpenAI's harmony format) | yes, set up by hand: see [GPT-OSS 120B](#gpt-oss-120b) |
 | GLM-5.3-Flash (Maya-S24) | yes, set up by hand: see [GLM-5.3-Flash](#glm-53-flash) |
 | Pictures from a prompt (`/image`, `/v1/images/generations`) | yes, on Strata's own engine (`strata-image`), with the model files converted by hand: see [Pictures from a prompt](#pictures-from-a-prompt-nucleus-image) |
+| DFlash draft model (`--dflash`) | opt-in, for GPT-OSS 120B: faster on math, slower on chat ([below](#gpt-oss-120b-with-a-dflash-draft)) |
 | EAGLE3 draft model (`--eagle3`) | opt-in engine flag, off: slower than no draft on GPT-OSS ([below](#eagle3-draft-model---eagle3)) |
 | Several requests at once (`"parallel"`) | opt-in, the same as on a PC |
 | Monitor tab | GPU load, memory and power, the chip's temperature (its die sensors), CPU, RAM; PCIe shows "n/a" (an integrated GPU has no PCIe link) |
@@ -162,7 +163,9 @@ aria2c -x16 -s16 -c -d $D \
 
 Then a run config like `strata-<model>.json` with `"args": ["--gguf", "<that file>", "--max-context", "131072", "--kv",
 "f16"]`, `"tokenizer": "<the pack>/tokenizer"`, `"backend": "metal"` and OpenAI's suggested sampling `"sampling":
-{"temperature": 1.0, "top_p": 1.0}`, and `serve/server.py --engine strata --config <it> --port 8090`.
+{"temperature": 1.0, "top_p": 1.0}`, and `serve/server.py --engine strata --config <it> --port 8090`. `GET /v1/models` (or
+`/models`) lists the loaded model under the config's `"model_name"`; without one, under the GGUF's file name
+(`gpt-oss-120b-mxfp4`).
 
 What Strata does for it: its tokenizer (`pre` = `gpt-4o`, OpenAI's o200k) matched `openai/gpt-oss-120b`'s own
 tokenizer on 2,178 strings (87,702 tokens, 0 differences); the server reads its replies in OpenAI's harmony format (the
@@ -181,6 +184,51 @@ Limits: GPT-OSS always thinks, so "Off" in the chat's Thinking setting means its
 tool is not forced (the model chooses); its template writes one tool call per message. The web chat's own defaults
 (temperature 0.6, top-k 20) are Qwen's: set temperature 1.0 and top-p 1.0 there for GPT-OSS. Only the `qwen35` and
 `gpt-4o` tokenizers are known to Strata; another model's pack is refused rather than tokenized wrongly.
+
+### GPT-OSS 120B with a DFlash draft
+
+z-lab's [gpt-oss-120b-DFlash](https://huggingface.co/z-lab/gpt-oss-120b-DFlash) (0.8B parameters, MIT) is a small draft
+model that guesses a block of tokens in one pass from 5 of GPT-OSS's layers; GPT-OSS then checks the guesses in one pass
+(`strata-metal --dflash <gguf> --spec N`, llama.cpp's `draft-dflash`). `make pull MODEL=GPT-OSS-120B-DFLASH` downloads
+it from a pinned revision (SHA-256 checked), converts it with llama.cpp's converter (it needs `.venv-mtp` and a built
+Metal engine) and keeps only `gpt-oss-120b-DFlash-bf16.gguf` (1.6 GB). The run config is GPT-OSS 120B's with
+`"--dflash", "<that file>", "--spec", "3"` added. This draft has attention biases, which llama.cpp's DFlash code did not
+load: `metal/patches/core/0002-dflash-attention-bias.patch` adds them.
+
+| Measured through the server, 2026-10-13, greedy, 300 tokens, 2 runs each | Without the draft | With it (`--spec 3`) |
+|---|---|---|
+| Math (a step-by-step answer) | 99, 91 tok/s | **135, 122 tok/s** |
+| Code (a Python function with doctests) | 102, 99 tok/s | 101, 98 tok/s |
+| Chat (a 200-word explanation) | 97, 88 tok/s | 77, 71 tok/s |
+
+Use it for math and other step-by-step answers, not for chat. Why: checking 4 tokens costs GPT-OSS about 1.9 times one
+token (its experts differ per token), so drafts must be mostly right to pay off; the draft model's guesses were accepted
+86% of the time on math, 53-64% on code and 43-46% on chat. `--spec 5` and `--spec 9` were slower in every case. A Q8_0 copy
+of the draft was no faster than bf16. The answers start the same as without the draft, but a long greedy answer can
+differ in places (the 4-token check rounds differently), as with EAGLE3.
+
+### GPT-OSS 20B and Qwen3.6-35B-A3B
+
+Two smaller models with few parameters active per token, on the same engine: OpenAI's
+[gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) (21B parameters, about 3.6B active, MXFP4, 12.1 GB) and
+Qwen's [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) (35B, about 3B active, Unsloth's MXFP4_MOE,
+21.7 GB). `make pull MODEL=GPT-OSS-20B` and `make pull MODEL=QWEN3.6-35B` download each from a pinned revision (SHA-256
+checked) and make its tokenizer pack (`packs/gpt-oss-20b`, `packs/qwen3.6-35b-a3b`; each matched its GGUF's vocabulary on
+16 test strings).
+
+Then a run config as for [GPT-OSS 120B](#gpt-oss-120b) with that file and pack, `"--max-context", "131072"`, `"--kv",
+"f16"`, and the model's own sampling: gpt-oss-20b `{"temperature": 1.0, "top_p": 1.0}`, Qwen3.6 `{"temperature": 0.6,
+"top_p": 0.95, "top_k": 20}`.
+
+| Measured on the test Mac, 2026-10-12 | gpt-oss-20b | Qwen3.6-35B-A3B |
+|---|---|---|
+| A short reasoning question (a trip from 14:35 to 17:10) | correct | correct |
+| Decode, 800-token answers, 3 runs | 139, 128, 130 tok/s | 97, 90, 89 tok/s |
+| GPU clock during those runs (throttled, so a floor) | 1.2-1.3 GHz | 1.2-1.5 GHz |
+| Memory at 131,072 tokens of context (model, cache and work buffers) | 19 GB | 29 GB |
+
+Qwen3.6 has fewer active parameters than GPT-OSS 120B but is no faster: 30 of its 40 layers are linear attention (Gated
+DeltaNet), whose small steps for each token take time that fewer parameters do not save. This file has no MTP head.
 
 ### GLM-5.3-Flash
 
@@ -302,7 +350,7 @@ you need Tencent's permission. Read it before you use the model.
 The model file, made once: the converter streams the 32 BF16 shards (169 GB) one at a time, and deletes each shard
 after it is converted. The disk needs room for one shard (5.4 GB) and the output (54 GB, Q4_0 experts). This takes
 about 2 hours at 20 MB/s. `make pull MODEL=HUNYUAN` does both steps below (also `MODEL=NUCLEUS`, `GLM-5.3`,
-`GPT-OSS-120B`: `tools/pull_model.sh`).
+`GPT-OSS-120B`, `GPT-OSS-120B-DFLASH`, `GPT-OSS-20B`, `QWEN3.6-35B`: `tools/pull_model.sh`).
 
 ```sh
 M=<a folder>
@@ -358,7 +406,8 @@ OpenAI's video API is (the asynchronous request-reply pattern):
   (10), `high_noise_steps` (8), `guidance_scale` (3.5), `seed`, `negative_prompt`) answers 202 at once, with the job
   and a `Location` to poll.
 - `GET /v1/videos/{id}` gives `status` (queued, in_progress, completed, failed) and `progress` (0-100).
-  `GET /v1/videos/{id}/content` gives the clip (`video/webm`). `DELETE /v1/videos/{id}` stops it or removes it.
+  `GET /v1/videos/{id}/content` gives the clip: H.264 MP4 (`video/mp4`, which QuickTime, Finder and Photos play) when
+  ffmpeg is installed (`brew install ffmpeg`), else sd-cli's own WebM (`video/webm`), which only browsers play. `DELETE /v1/videos/{id}` stops it or removes it.
   `GET /v1/videos` lists the jobs.
 - A job waits for the server's turn and unloads the chat model when memory is short, as a picture does. A finished
   clip is kept one hour (`keep_s`). The jobs live in the server's memory: a restart forgets them.

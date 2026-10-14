@@ -5,6 +5,12 @@
 #
 #   GLM-5.3        GLM-5.3-Flash Maya-S24 (94.7 GB) and its tokenizer pack
 #   GPT-OSS-120B   gpt-oss-120b MXFP4 (63.4 GB, sha-256 checked) and its tokenizer pack
+#   GPT-OSS-120B-HERETIC  llmfan46's gpt-oss-120b-heretic-v2, refusals removed (65.4 GB, sha-256 checked), requantized
+#                  to stock's layout (63.4 GB: BF16 attention/output -> Q8_0, +26% decode), and its tokenizer pack
+#   GPT-OSS-120B-DFLASH  z-lab's DFlash draft for gpt-oss-120b (1.6 GB, sha-256 checked), converted to one GGUF
+#                  (strata-metal --dflash; it needs metal/patches/core/0002)
+#   GPT-OSS-20B    gpt-oss-20b MXFP4 (12.1 GB, sha-256 checked) and its tokenizer pack
+#   QWEN3.6-35B    Qwen3.6-35B-A3B MXFP4_MOE (21.7 GB, sha-256 checked) and its tokenizer pack
 #   NUCLEUS        Nucleus-Image: ~50 GB downloaded, converted to 3 GGUFs (~21 GB), the downloads deleted
 #   HUNYUAN        HunyuanImage-3.0-Instruct-Distil: 169 GB streamed shard by shard into one 54 GB GGUF
 #   WAN2.2         Wan 2.2 T2V A14B for videos: both experts (Q4_K_M), UMT5 (Q8_0), the VAE, the Lightning LoRAs (29 GB), and
@@ -41,6 +47,54 @@ GPT-OSS-120B)
     get "$D" "https://huggingface.co/ggml-org/gpt-oss-120b-GGUF/resolve/238abdd290bb874b90a5da1b4549881b7d05c091/gpt-oss-120b-MXFP4.gguf" \
         --checksum=sha-256=582bd40f6886200101f4c4ed9f25f3fe80cc14c86e9e2b37746cd8904a0c622d
     "$PY" tools/strata_tokenizer.py --gguf "$D/gpt-oss-120b-MXFP4.gguf" --out "$DATA/packs/gpt-oss-120b"
+    ;;
+GPT-OSS-120B-HERETIC)
+    D=$M/gpt-oss-120b-heretic-v2
+    if [ -f "$D/gpt-oss-120b-heretic-v2-MXFP4_MOE.gguf" ]; then echo "GPT-OSS-120B-HERETIC: already in $D"; exit 0; fi
+    L=$(ls -d build-metal/_deps/llama_cpp-src-* 2>/dev/null | head -1)
+    [ -n "$L" ] || { echo "GPT-OSS-120B-HERETIC needs the Metal engine's llama.cpp: make update first"; exit 1; }
+    get "$D" "https://huggingface.co/llmfan46/gpt-oss-120b-heretic-v2-GGUF/resolve/58b83826e2f3e652fa404e493bb9982884bd7200/gpt-oss-120b-heretic-v2-MXFP4.gguf" \
+        --checksum=sha-256=8f2bc3ba1f84707ce18bbc75a4cdbb211f365928e60a1ed076238dfd3de0c0f7
+    "$PY" tools/strata_tokenizer.py --gguf "$D/gpt-oss-120b-heretic-v2-MXFP4.gguf" --out "$DATA/packs/gpt-oss-120b-heretic-v2"
+    # the published file keeps attention and the output layer in BF16 (5.0 GB read a token against stock's 3.6 GB:
+    # 84 against 106 tok/s); MXFP4_MOE writes them as Q8_0 as stock does and copies the MXFP4 experts byte for byte
+    NINJA=$(command -v ninja || echo "$PWD/.venv/bin/ninja")
+    cmake -S "$L" -B build-llama-tools -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON \
+        -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /dev/null
+    cmake --build build-llama-tools --target llama-quantize > /dev/null
+    build-llama-tools/bin/llama-quantize "$D/gpt-oss-120b-heretic-v2-MXFP4.gguf" "$D/gpt-oss-120b-heretic-v2-MXFP4_MOE.gguf.tmp" MXFP4_MOE
+    mv "$D/gpt-oss-120b-heretic-v2-MXFP4_MOE.gguf.tmp" "$D/gpt-oss-120b-heretic-v2-MXFP4_MOE.gguf"
+    rm -f "$D/gpt-oss-120b-heretic-v2-MXFP4.gguf"     # only the requantized file is used
+    ;;
+GPT-OSS-120B-DFLASH)
+    D=$M/gpt-oss-120b-DFlash
+    if [ -f "$D/gpt-oss-120b-DFlash-bf16.gguf" ]; then echo "GPT-OSS-120B-DFLASH: already in $D"; exit 0; fi
+    [ -x .venv-mtp/bin/python ] || { echo "GPT-OSS-120B-DFLASH needs .venv-mtp (PyTorch) for llama.cpp's converter: setup makes it"; exit 1; }
+    L=$(ls -d build-metal/_deps/llama_cpp-src-* 2>/dev/null | head -1)
+    [ -n "$L" ] || { echo "GPT-OSS-120B-DFLASH needs the Metal engine's llama.cpp: make update first"; exit 1; }
+    R=https://huggingface.co/z-lab/gpt-oss-120b-DFlash/resolve/1278df34f0a7bd2c8588a27f49048aaa05c7db00
+    get "$D/hf" "$R/config.json"
+    get "$D/hf" "$R/model.safetensors" --checksum=sha-256=4546a44a2b4f3da784003964085f979ef1e59fb22955dafbac11535b7f413827
+    # the converter takes the draft's tokenizer from its target: gpt-oss-120b's config and tokenizer (28 MB)
+    T=https://huggingface.co/openai/gpt-oss-120b/resolve/b5c939de8f754692c1647ca79fbf85e8c1e70f8a
+    for f in config.json tokenizer.json tokenizer_config.json special_tokens_map.json generation_config.json chat_template.jinja; do
+        get "$D/target" "$T/$f"
+    done
+    .venv-mtp/bin/python "$L/convert_hf_to_gguf.py" "$D/hf" --target-model-dir "$D/target" --model-name gpt-oss-120b-DFlash --outtype bf16 \
+        --outfile "$D/gpt-oss-120b-DFlash-bf16.gguf"
+    rm -rf "${D:?}/hf" "${D:?}/target"         # only the GGUF is used
+    ;;
+GPT-OSS-20B)
+    D=$M/gpt-oss-20b
+    get "$D" "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/ef9b12f2ff56c69cf32153a02784e7a3c88bf524/gpt-oss-20b-MXFP4.gguf" \
+        --checksum=sha-256=27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901
+    "$PY" tools/strata_tokenizer.py --gguf "$D/gpt-oss-20b-MXFP4.gguf" --out "$DATA/packs/gpt-oss-20b"
+    ;;
+QWEN3.6-35B)
+    D=$M/Qwen3.6-35B-A3B
+    get "$D" "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-MXFP4_MOE.gguf" \
+        --checksum=sha-256=2fdd20997c4d88ee25f70f500c61f8b999378d92ab055f9d450fc70d617158d3
+    "$PY" tools/strata_tokenizer.py --gguf "$D/Qwen3.6-35B-A3B-MXFP4_MOE.gguf" --out "$DATA/packs/qwen3.6-35b-a3b"
     ;;
 NUCLEUS)
     D=$M/Nucleus-Image
@@ -94,7 +148,7 @@ WAN2.2)
     ;;
 *)
     echo "make pull MODEL=NAME: a setup quant (Q2_0 IQ2_XS IQ3_XXS IQ3_S IQ1_M UD-Q4_K_XL UD-IQ4_XS) or one of"
-    echo "GLM-5.3 GPT-OSS-120B NUCLEUS HUNYUAN WAN2.2 (tools/pull_model.sh)"
+    echo "GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B NUCLEUS HUNYUAN WAN2.2 (tools/pull_model.sh)"
     exit 2
     ;;
 esac

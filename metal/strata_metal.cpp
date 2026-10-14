@@ -16,9 +16,11 @@
 // Images (GENI): strata-vision's records, placed at the prompt's <|image_pad|> runs with the CUDA engine's M-RoPE
 // positions (t = p, h = p + y, w = p + x; the text after an image goes on at p + max(nx, ny)).
 //
-// Speculative decoding (--mtp <MTP-only GGUF>): the checkpoint's own MTP head drafts --spec tokens, the trunk checks
+// Speculative decoding (--mtp <MTP-only GGUF>, or --mtp self for a GGUF that carries its own MTP layer): the checkpoint's own MTP head drafts --spec tokens, the trunk checks
 // them in one pass (llama.cpp's draft-mtp, #29761); the output is the trunk's, drafts only decide how many tokens a
 // pass yields.  metal/mtp_gguf.py makes the file from the checkpoint.
+// --eagle3 <gguf> and --dflash <gguf> draft with a separate small model instead (DFlash: a block of tokens in one pass
+// from 5 of the target's layers; docs/MACOS.md, "GPT-OSS 120B with a DFlash draft").
 //
 // Batch slots (--batch N, the server's "parallel"): BGEN admissions into sequences 1..N, decoded together a token a
 // window between commands (BT / BDONE); BSTOP ends one.  Not here: the expert cache (VRAM), BYIELD (never gives way).
@@ -121,13 +123,14 @@ llama_token g_image_pad = 248056;   // qwen4exp.ple.image_token_id; --image-pad-
 struct Options {
     std::string gguf, mtp;
     std::string eagle3;                                // --eagle3 <gguf>: an EAGLE3 draft model instead of --mtp
+    std::string dflash;                                // --dflash <gguf>: a DFlash draft model (a block per pass)
     int64_t max_context = 32768;
     std::string kv = "int8";
     std::vector<llama_token> eos = {248044, 248046};   // <|endoftext|>, <|im_end|>: the CUDA engine's --eos-ids
     int n_batch = 2048;
     int checkpoints = 8;
     int threads = 0;
-    int spec = 3;                                      // drafted tokens per pass with --mtp
+    int spec = 3;                                      // drafted tokens per pass with --mtp, --eagle3 or --dflash
     int batch = 0;                                     // --batch N: batch slots (the server's "parallel")
     int poll = -1;                                     // --poll N: ggml's CPU busy-wait level (llama.cpp default 50)
     // --ablate <file>: directions projected out of every layer's output while the model runs (directional ablation;
@@ -162,6 +165,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--gguf") o.gguf = val("--gguf");
         else if (a == "--mtp") o.mtp = val("--mtp");
         else if (a == "--eagle3") o.eagle3 = val("--eagle3");
+        else if (a == "--dflash") o.dflash = val("--dflash");
         else if (a == "--spec") o.spec = std::atoi(val("--spec"));
         else if (a == "--batch" || a == "--slots") o.batch = std::max(0, std::min(16, std::atoi(val("--batch"))));
         else if (a == "--max-context") o.max_context = std::atoll(val("--max-context"));
@@ -184,7 +188,10 @@ bool parse_args(int argc, char** argv, Options& o) {
     }
     if (o.gguf.empty()) { std::fprintf(stderr, "strata-metal: --gguf <the model's first GGUF shard> is required\n"); return false; }
     if (o.max_context < 512) { std::fprintf(stderr, "strata-metal: --max-context must be 512 or more\n"); return false; }
-    if (!o.mtp.empty() && !o.eagle3.empty()) { std::fprintf(stderr, "strata-metal: --mtp or --eagle3, not both\n"); return false; }
+    if (!o.mtp.empty() + !o.eagle3.empty() + !o.dflash.empty() > 1) {
+        std::fprintf(stderr, "strata-metal: --mtp, --eagle3 and --dflash: only one of them\n");
+        return false;
+    }
     if (o.spec < 1 || o.spec > 16) { std::fprintf(stderr, "strata-metal: --spec takes 1 to 16 drafted tokens\n"); return false; }
     if (o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "f16") {
         std::fprintf(stderr, "strata-metal: --kv takes int8, q4_0, k8v4 or f16\n");
@@ -339,12 +346,20 @@ struct Engine {
         postprocess_cpu_params(p.cpuparams_batch, &p.cpuparams);
         postprocess_cpu_params(p.speculative.draft.cpuparams, &p.cpuparams);
         postprocess_cpu_params(p.speculative.draft.cpuparams_batch, &p.cpuparams_batch);
-        const std::string& draft_path = o.mtp.empty() ? o.eagle3 : o.mtp;
+        const std::string& draft_path = !o.mtp.empty() ? o.mtp : !o.eagle3.empty() ? o.eagle3 : o.dflash;
         if (!draft_path.empty()) {
-            // the draft: the model's MTP head, or an EAGLE3 model (it reads 3 of the target's layers; llama.cpp's
-            // common_speculative drives both through the same begin / process / draft / accept calls)
-            p.speculative.types = {o.mtp.empty() ? COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 : COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
-            p.speculative.draft.mparams.path = draft_path;
+            // the draft: the model's MTP head, an EAGLE3 model (it reads 3 of the target's layers) or a DFlash model
+            // (it reads 5 and drafts a whole block in one pass; metal/patches/core/0002 for gpt-oss-120b-DFlash's
+            // attention biases); llama.cpp's common_speculative drives all three through the same begin / process /
+            // draft / accept calls.  DFlash writes the target's features at their own positions, so unlike EAGLE3 it
+            // has no lagging cell for rollback() to read again
+            p.speculative.types = {!o.mtp.empty()    ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP
+                                   : !o.eagle3.empty() ? COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3
+                                                       : COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+            // --mtp self (or the model's own file): the MTP layer inside the model's GGUF.  Without a draft path
+            // llama.cpp builds the MTP context on the model already loaded; with one it would load the file again
+            const bool own_mtp = !o.mtp.empty() && (o.mtp == "self" || o.mtp == o.gguf);
+            if (!own_mtp) p.speculative.draft.mparams.path = draft_path;
             p.speculative.draft.n_max = o.spec;
             p.speculative.draft.n_gpu_layers = 999;
             p.speculative.draft.cache_type_k = p.cache_type_k;
@@ -723,9 +738,13 @@ struct Engine {
                 }
                 for (size_t i = 0; i + 1 < take; ++i) { S.live.push_back(ids[i]); S.keys.push_back((uint64_t) (uint32_t) ids[i]); }
                 const llama_pos keep = next + (llama_pos) take - 1;     // positions from here on were not emitted
-                // the rejected drafts out again (the recurrent state keeps --spec snapshots for this, n_rs_seq)
-                if (!llama_memory_seq_rm(mem(), sq, keep, -1) ||
-                    (drafts && !llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, keep, -1))) {
+                // the rejected drafts out again (the recurrent state keeps --spec snapshots for this, n_rs_seq).
+                // With no speculation configured (GPT-OSS) nothing ever sits past `keep`, and seq_rm scans every
+                // cache cell (131,072 a token at 128K): skip it then.  With drafts or MTP it runs as before (the
+                // recurrent state's snapshots are rolled back through it).
+                if (drafts &&
+                    (!llama_memory_seq_rm(mem(), sq, keep, -1) ||
+                     (drafts && !llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, keep, -1)))) {
                     common_sampler_free(smpl);
                     clear(sq);
                     return refuse("the rejected drafts could not be taken back out of the state");

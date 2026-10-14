@@ -258,6 +258,33 @@
     <div class="toggle-row" id="mcp-row" hidden><span>Use tools from MCP servers<br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers"></button></div>
+    <div class="mcp-conns" id="mcp-conns" hidden>
+      <div class="mcp-conns__list" id="mcp-conns-list"></div>
+      <details class="mcp-add" id="mcp-add">
+        <summary id="mcp-add-title">Add an MCP server</summary>
+        <form class="mcp-add__form" id="mcp-form" autocomplete="off">
+          <label class="st-label" for="mcp-name">Name</label>
+          <input class="st-input" id="mcp-name" required maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" placeholder="github">
+          <label class="st-label" for="mcp-url">URL <output>Streamable HTTP, often …/mcp</output></label>
+          <input class="st-input" id="mcp-url" type="url" required placeholder="https://example.com/mcp">
+          <label class="st-label" for="mcp-header">Send the API key as</label>
+          <select class="st-input" id="mcp-header">
+            <option value="Authorization">Authorization: Bearer &lt;key&gt;</option>
+            <option value="X-API-Key">X-API-Key: &lt;key&gt;</option>
+            <option value="other">Another header…</option>
+            <option value="none">No key</option>
+          </select>
+          <input class="st-input" id="mcp-header-name" hidden maxlength="64" pattern="[A-Za-z0-9\-]+" placeholder="Header name, e.g. X-Auth-Token" aria-label="Header name">
+          <label class="st-label" for="mcp-key">API key</label>
+          <input class="st-input" id="mcp-key" type="password" maxlength="4096" autocomplete="new-password" placeholder="Paste the key">
+          <span class="muted small">Saved in this server's run config, never shown again; the server sends it to that URL only.</span>
+          <div class="drawer-actions">
+            <button class="st-btn st-btn--secondary" id="mcp-cancel" type="button">Cancel</button>
+            <button class="st-btn st-btn--primary" id="mcp-save" type="submit">Connect</button>
+          </div>
+        </form>
+      </details>
+    </div>
     <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the
       engine's control vector; off = the stock model. Switching reads the chat again once</span></span>
       <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="Experimental speed projection"></button></div>

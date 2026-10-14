@@ -70,6 +70,30 @@ class Parse(unittest.TestCase):
         self.assertEqual(parse_request({"prompt": "x", "steps": 6}, videogen.LIGHTNING)["steps"], 6)
 
 
+@unittest.skipUnless(__import__("shutil").which("ffmpeg"), "no ffmpeg")
+class Mp4(unittest.TestCase):
+    def test_a_webm_clip_becomes_h264_mp4_and_a_bad_one_stays_webm(self):
+        import subprocess
+        gen = VideoGen("x", "x", "x", "x", "x")
+        job = videogen.Job(parse_request({"prompt": "a"}))
+        try:
+            subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=16",
+                            "-frames:v", "17", "-c:v", "libvpx", str(job.file)], check=True)
+            gen.to_mp4(job)
+            self.assertEqual(job.file.name, "out.mp4")
+            self.assertFalse((job.dir / "out.webm").exists())
+            probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,pix_fmt", "-of",
+                                    "csv=p=0", str(job.file)], capture_output=True, text=True).stdout.strip()
+            self.assertEqual(probe, "h264,yuv420p")
+            bad = videogen.Job(parse_request({"prompt": "a"}))
+            bad.file.write_bytes(b"not a video")
+            gen.to_mp4(bad)                                       # the webm stays: nothing is lost
+            self.assertEqual((bad.file.name, bad.file.read_bytes()), ("out.webm", b"not a video"))
+            __import__("shutil").rmtree(bad.dir)
+        finally:
+            __import__("shutil").rmtree(job.dir, ignore_errors=True)
+
+
 class VideoJobs(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
