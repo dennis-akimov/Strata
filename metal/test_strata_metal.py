@@ -260,5 +260,13 @@ class TestStrataMetal(unittest.TestCase):
         self.assertEqual(len(self.e.gen(self.m1, max_new=2)[0]), 2)
 
 
+@unittest.skipUnless(EXE, "set STRATA_METAL_EXE")
+class TestArguments(unittest.TestCase):
+    def test_one_draft_kind_at_a_time(self):
+        for pair in (["--mtp", "a.gguf", "--dflash", "b.gguf"], ["--eagle3", "a.gguf", "--dflash", "b.gguf"]):
+            r = subprocess.run([EXE, "--serve", "--gguf", "x.gguf"] + pair, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(r.returncode, 0, pair)
+            self.assertIn("only one of them", r.stderr, pair)
+
 if __name__ == "__main__":
     unittest.main()

@@ -61,8 +61,10 @@ help:
 	@echo "  make pull          build the engine and download a model, without starting it: make pull MODEL=Q2_0"
 	@echo "                     (from Hugging Face into ../Strata-data, resumable: run it again if it stops)"
 	@echo "                     MODEL: Q2_0 IQ2_XS IQ3_XXS IQ3_S IQ1_M UD-Q4_K_XL UD-IQ4_XS (setup), or GLM-5.3"
-	@echo "                     GPT-OSS-120B NUCLEUS HUNYUAN WAN2.2 (tools/pull_model.sh; NUCLEUS and HUNYUAN convert"
-	@echo "                     too; WAN2.2 builds stable-diffusion.cpp's sd-cli for videos)"
+	@echo "                     GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B NUCLEUS"
+	@echo "                     HUNYUAN WAN2.2"
+	@echo "                     (tools/pull_model.sh; GPT-OSS-120B-DFLASH, NUCLEUS and HUNYUAN convert too; WAN2.2"
+	@echo "                     builds stable-diffusion.cpp's sd-cli for videos)"
 	@echo "  make check         only check what this computer can run"
 	@echo "  make update        update the engine and settings without starting"
 	@echo "  make run           start the model here, in the foreground (Ctrl-C stops it); CONTEXT=131072 sets the"
@@ -85,8 +87,8 @@ setup:
 	./setup.sh --setup $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS)
 
 # setup's own download (Hugging Face, resumable; HF_ENDPOINT for a mirror, SETUP_ARGS="--data-dir DIR" for elsewhere);
-# the models setup does not install (GLM-5.3, GPT-OSS-120B, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.sh
-PULL_EXTRA  := GLM-5.3 GPT-OSS-120B NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b nucleus hunyuan wan2.2
+# the models setup does not install (GLM-5.3, GPT-OSS-120B, GPT-OSS-120B-HERETIC, GPT-OSS-120B-DFLASH, GPT-OSS-20B, QWEN3.6-35B, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.sh
+PULL_EXTRA  := GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b gpt-oss-120b-heretic gpt-oss-120b-dflash gpt-oss-20b qwen3.6-35b nucleus hunyuan wan2.2
 DATA_DIR    ?= ../Strata-data
 pull:
 	$(if $(filter $(MODEL),$(PULL_EXTRA)),./tools/pull_model.sh $(MODEL) $(DATA_DIR),./setup.sh --setup --no-start $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS))

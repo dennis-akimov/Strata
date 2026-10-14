@@ -660,6 +660,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | The same for Prometheus, with vLLM's metric names (asked with `Accept: text/plain` or `?format=prometheus`) | `GET /metrics` |
 | Request totals and what is running in Prometheus' text format, under llama-server's metric names | `GET /metrics/prometheus` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
+| Add or change an MCP server at a URL / remove one (Strata's own page only, as `/config`) | `POST /mcp/servers` `{name, url, key?, header?}`, `DELETE /mcp/servers/<name>` |
 
 `GET /metrics` answers a Prometheus scrape (`Accept: text/plain` or `application/openmetrics-text`) in the text
 format with vLLM's names - `vllm:num_requests_running` / `_waiting`, `vllm:kv_cache_usage_perc`, the token and
@@ -1304,6 +1305,15 @@ also paste as it is (key `"mcpServers"`):
 
 Or keep them in their own file and start the server with `--mcp-config path\to\claude_desktop_config.json` (a file
 with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change.
+
+**From the chat, without editing a file.** The Sampling drawer's **MCP servers** section adds a server at an address:
+a name, its URL (Streamable HTTP, usually ending in `/mcp`), its API key and how to send it (`Authorization: Bearer
+<key>`, `X-API-Key: <key>`, another header, or none). It connects at once, with no restart, and is written into the
+run config's `"mcp_servers"` (`{"url": ..., "headers": {...}}`, the shape above), so the next start has it too. The
+key is never shown again: the list says only which header carries it, and **Edit** keeps it unless you type a new
+one. **Remove** takes it out of the server and the file. Only address servers can be added there; a program
+(`command`) is a config-file entry, and an entry from `--mcp-config` is changed in that file. The run config keeps
+its permissions when the page writes it (setup makes it readable by you only: it holds keys).
 
 - **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
   stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`

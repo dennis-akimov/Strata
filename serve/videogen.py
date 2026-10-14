@@ -30,6 +30,10 @@ from pathlib import Path
 from serve.imagegen import ImageGen, _stop, make_room
 
 MAX_PROMPT_CHARS = 4000
+# sd-cli writes webm (VP8), which QuickTime, Finder and Photos do not play: each clip becomes H.264 MP4 when ffmpeg is
+# there (libx264, else the Mac's hardware encoder), as OpenAI's video API returns.  Without ffmpeg: the webm.
+MP4 = {"libx264": ["-c:v", "libx264", "-crf", "18", "-preset", "medium"],
+       "h264_videotoolbox": ["-c:v", "h264_videotoolbox", "-b:v", "6M"]}
 MAX_JOBS = 8                     # queued + running + kept: more is a 429
 MAX_PIXELS = 1280 * 720
 FPS = 16                         # Wan 2.2 A14B's training rate
@@ -102,7 +106,7 @@ class Job:
         self.cancel = threading.Event()
         self.proc = None                                  # sd-cli while it runs (shutdown() stops it)
         self.dir = Path(tempfile.mkdtemp(prefix="strata-video-"))   # 0700: this user's only
-        self.file = self.dir / "out.webm"
+        self.file = self.dir / "out.webm"                    # out.mp4 once converted (to_mp4)
 
     def view(self, model, keep_s) -> dict:
         return {"id": self.id, "object": "video", "model": model, "status": self.status, "progress": self.progress,
@@ -126,6 +130,8 @@ class VideoGen:
         self.jobs: dict[str, Job] = {}
         self.lock = threading.Lock()
         self.available_gb = ImageGen.available_gb          # make_room's memory reading
+        self.ffmpeg = shutil.which("ffmpeg")
+        self.mp4 = None                                     # the encoder's ffmpeg arguments, chosen at the first clip
 
     @staticmethod
     def from_config(cfg):
@@ -267,6 +273,33 @@ class VideoGen:
         if gone or job.status == "failed":
             shutil.rmtree(job.dir, ignore_errors=True)
 
+    def to_mp4(self, job: Job):
+        """The clip as H.264 MP4 (QuickTime plays it); on any failure the webm stays, and the log says why."""
+        if not self.ffmpeg:
+            return
+        if self.mp4 is None:
+            try:
+                enc = subprocess.run([self.ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True,
+                                     timeout=20).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                enc = ""
+            self.mp4 = next((MP4[e] for e in MP4 if f" {e} " in enc), [])
+        if not self.mp4:
+            return
+        out = job.dir / "out.mp4"
+        try:
+            r = subprocess.run([self.ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(job.file), *self.mp4,
+                                "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)],
+                               capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"[strata] video {job.id}: kept as webm ({e})", flush=True)
+            return
+        if r.returncode == 0 and out.is_file() and out.stat().st_size > 0:
+            job.file.unlink(missing_ok=True)
+            job.file = out
+        else:
+            print(f"[strata] video {job.id}: kept as webm (ffmpeg: {r.stderr.strip()[-200:]})", flush=True)
+
     def command(self, job: Job) -> list:
         p, d = job.p, job.dir
         lora = []
@@ -334,6 +367,7 @@ class VideoGen:
         if proc.returncode != 0 or not job.file.is_file():
             tail = (job.dir / "log.txt").read_bytes()[-400:].decode("utf-8", "replace").replace("\r", "\n").strip()
             return fail(f"sd-cli ended with status {proc.returncode}: {tail[-300:]}")
+        self.to_mp4(job)
         job.status, job.progress, job.completed_at = "completed", 100, int(time.time())
         print(f"[strata] video {job.id}: {job.p['width']}x{job.p['height']}, {job.p['frames']} frames, "
               f"{time.monotonic() - t0:.0f} s", flush=True)

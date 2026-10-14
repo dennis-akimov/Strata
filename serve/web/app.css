@@ -137,6 +137,15 @@ main { flex: 1; min-height: 0; display: flex; }
 .mcp-server:first-child { padding-top: 0; border-top: 0; }
 .mcp-server__head { display: flex; align-items: center; gap: var(--st-s-2); flex-wrap: wrap; font-size: var(--st-fs-sm); }
 .mcp-server__tools { display: flex; flex-wrap: wrap; gap: 6px; }
+.mcp-conns { display: flex; flex-direction: column; gap: var(--st-s-3); font-size: var(--st-fs-sm); }
+.mcp-conns__list { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.mcp-conns__list:empty { display: none; }
+.mcp-conn__where { overflow-wrap: anywhere; }
+.mcp-conn__actions { display: flex; gap: var(--st-s-2); margin-left: auto; }
+.mcp-conn__actions .st-btn { height: 30px; padding: 0 12px; }
+.mcp-add > summary { cursor: pointer; font-weight: 600; }
+.mcp-add__form { display: flex; flex-direction: column; gap: var(--st-s-2); margin-top: var(--st-s-3); }
+.mcp-add__form .st-input { height: 40px; width: 100%; }
 .mcp-server__tools .chip { height: 26px; padding: 0 10px; font-family: var(--st-font-mono); }
 .mcp-note { margin: 0; }
 

@@ -3,7 +3,7 @@
 A short list of documented keys can be read and changed from Strata's own page (GET / POST /config).  Everything
 else in the file - the keys setup writes, the network and security keys (host, api_key, cors_origins,
 trusted_origins, allowed_hosts), the MCP servers and before_load (which run programs), sampling keys not listed
-here - is kept as it is: a change touches only the keys it names (as setup run again keeps the user's keys, #629).
+here - is kept as it is (the page's MCP connections, URL servers only, go through POST /mcp/servers instead): a change touches only the keys it names (as setup run again keeps the user's keys, #629).
 The earlier file is kept as strata-<model>.json.bak.  The server reads the config when it starts, so a change is
 used from the next start on.
 """
@@ -165,9 +165,11 @@ def save(path: str | Path, cfg: dict) -> Path:
     """The config written whole (a temporary file moved over the old one), the earlier one kept as <name>.bak."""
     path = Path(path)
     bak = path.with_name(path.name + ".bak")
-    shutil.copyfile(path, bak)
+    shutil.copy2(path, bak)                             # with its permissions: the file holds keys (0600 stays 0600)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, os.stat(path).st_mode & 0o777)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(cfg, indent=1))
     os.replace(tmp, path)
     return bak
 

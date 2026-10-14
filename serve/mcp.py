@@ -380,9 +380,10 @@ class HttpTransport:
 class McpServer:
     """One configured server: started once (and again after it stopped), with the tools it listed."""
 
-    def __init__(self, name: str, cfg: dict, settings: dict):
+    def __init__(self, name: str, cfg: dict, settings: dict, editable: bool = False):
         self.name, self.cfg, self.settings = name, cfg, settings
         self.kind = "http" if cfg.get("url") else "stdio"
+        self.editable = editable and self.kind == "http"  # the page may change it: a URL in the config's mcp_servers
         self.status = "idle"             # idle -> starting -> ready | failed; ready -> stopped when it ends
         self.error = None
         self.tools: list[dict] = []
@@ -430,6 +431,11 @@ class McpServer:
             return True
         except McpError as e:
             self.status, self.error, self.tools = "failed", str(e), []
+            url = str(self.cfg.get("url") or "")
+            if self.kind == "http" and str(e).startswith("HTTP 404") and \
+                    re.fullmatch(r"https?://[^/?#]+/?", url.split("?", 1)[0]):
+                # the address without a path: most servers answer MCP at /mcp, their root is a 404
+                self.error += f" - the URL has no path; most MCP servers are at {url.split('?', 1)[0].rstrip('/')}/mcp"
             t.close()
             print(f"[strata] MCP server {self.name!r} did not start: {e}. Its tools are left out; the chat works "
                   "without them.", flush=True)
@@ -494,17 +500,42 @@ def _clean(name: str) -> str:
 class McpHub:
     """Every configured server, and the merged, namespaced tool list the model sees."""
 
-    def __init__(self, servers: dict[str, dict], settings: dict | None = None):
+    def __init__(self, servers: dict[str, dict], settings: dict | None = None, editable=()):
         self.settings = {**DEFAULTS, **(settings or {})}
-        self.servers = {name: McpServer(name, cfg, self.settings) for name, cfg in servers.items()}
+        self.servers = {name: McpServer(name, cfg, self.settings, name in editable) for name, cfg in servers.items()}
         self.threads: list[threading.Thread] = []
         self._routes: dict[str, tuple[McpServer, str]] = {}
+        self.lock = threading.Lock()                    # self.servers, changed at run time by put() and remove()
+
+    def put(self, name: str, cfg: dict) -> McpServer:
+        """Add a URL server, or replace one the page may change, and start it in the background (the Settings
+        view's connections: POST /mcp/servers)."""
+        server = McpServer(name, cfg, self.settings, editable=True)
+        with self.lock:
+            old = self.servers.get(name)
+            self.servers = {**self.servers, name: server}
+        if old is not None:
+            threading.Thread(target=old.close, daemon=True).start()
+        t = threading.Thread(target=server.start, daemon=True, name=f"mcp-{name}")
+        self.threads.append(t)
+        t.start()
+        return server
+
+    def remove(self, name: str) -> bool:
+        with self.lock:
+            old = self.servers.get(name)
+            if old is None:
+                return False
+            self.servers = {k: v for k, v in self.servers.items() if k != name}
+        threading.Thread(target=old.close, daemon=True).start()
+        return True
 
     def start(self, wait: bool = False):
         """Start every server on its own thread (npx may download a package first: that must not delay the chat)."""
-        self.threads = [threading.Thread(target=s.start, daemon=True, name=f"mcp-{s.name}")
-                        for s in self.servers.values()]
-        for t in self.threads:
+        threads = [threading.Thread(target=s.start, daemon=True, name=f"mcp-{s.name}")
+                   for s in self.servers.values()]
+        self.threads += threads
+        for t in threads:
             t.start()
         if wait:
             self.wait(None)
@@ -512,14 +543,14 @@ class McpHub:
     def wait(self, timeout: float | None) -> None:
         """Wait (up to `timeout` s in all) for servers that are still starting."""
         end = None if timeout is None else time.monotonic() + timeout
-        for t in self.threads:
+        for t in list(self.threads):
             t.join(None if end is None else max(0.0, end - time.monotonic()))
 
     def routes(self) -> dict[str, tuple[McpServer, str]]:
         """tool name the model sees -> (server, the tool's own name).  A server that stopped after it was ready keeps
         its tools here: a call starts it again."""
         out = {}
-        for s in self.servers.values():
+        for s in list(self.servers.values()):           # put()/remove() swap the dict, never change it in place
             if s.status not in ("ready", "stopped"):
                 continue
             for t in s.tools:
@@ -580,17 +611,22 @@ class McpHub:
         """GET /mcp: every server, its state and its tools (for the web app)."""
         routes = self.routes()
         servers = []
-        for s in self.servers.values():
+        for s in list(self.servers.values()):
             names = {tool: n for n, (srv, tool) in routes.items() if srv is s}
+            where = {}
+            if s.kind == "http":                         # the address without its query (it may hold a token) and
+                url = str(s.cfg.get("url"))              # the names of the headers sent: never their values
+                where = {"url": url.split("?", 1)[0] + ("?…" if "?" in url else ""),
+                         "headers": sorted(str(k) for k in (s.cfg.get("headers") or {}))}
             servers.append({"name": s.name, "transport": s.kind, "status": s.status, "error": s.error,
-                            "info": s.info,
+                            "info": s.info, "editable": s.editable, **where,
                             "tools": [{"name": names.get(t["name"], t["name"]), "tool": t["name"],
                                        "description": str(t.get("description") or "")[:300]} for t in s.tools]})
         return {"servers": servers, "tools": len(routes),
                 "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds")}}
 
     def close(self):
-        for s in self.servers.values():
+        for s in list(self.servers.values()):
             try:
                 s.close()
             except Exception:  # noqa: BLE001 - closing is best effort
@@ -645,6 +681,53 @@ def settings_from(cfg: dict) -> dict:
     return out
 
 
+# headers the transport sets itself (or HTTP owns): a key can't be sent in one of them
+_RESERVED_HEADERS = {"accept", "content-type", "content-length", "host", "connection", "transfer-encoding",
+                     "mcp-session-id", "mcp-protocol-version", "user-agent", "cookie"}
+
+
+def page_entry(req, old: dict | None = None) -> tuple[str, dict]:
+    """POST /mcp/servers from the Settings view -> (name, the "mcp_servers" entry): a URL server only (a program
+    server runs a command, so it stays in the config file).  `key` goes in the `header` the server reads
+    ("Authorization" sends "Bearer <key>"); no `key` keeps the old one (the page never reads it back), "" drops it.
+    ValueError with what is wrong."""
+    if not isinstance(req, dict):
+        raise ValueError("send a JSON object")
+    name = req.get("name")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,39}", name):
+        raise ValueError("name: 1-40 letters, digits, '_', '.', '-' (starting with a letter or digit)")
+    url = req.get("url")
+    if not isinstance(url, str) or len(url) > 2000 or not re.fullmatch(r"https?://[^\s/?#]+[^\s]*", url.strip()):
+        raise ValueError("url: an http:// or https:// address (Streamable HTTP; most servers offer it at /mcp)")
+    header = req.get("header", "Authorization")
+    if not isinstance(header, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", header) or \
+            header.lower() in _RESERVED_HEADERS:
+        raise ValueError("header: a header name such as Authorization or X-API-Key")
+    key = req.get("key")
+    if key is not None and (not isinstance(key, str) or len(key) > 4096 or any(c in key for c in "\r\n\0")):
+        raise ValueError("key: one line of text, at most 4096 characters")
+    entry = {"url": url.strip()}
+    if key is None:                                     # unchanged: the old entry's key, moved to the header asked for
+        old_headers = list(((old or {}).get("headers") or {}).items())
+        if old_headers:
+            old_name, value = str(old_headers[0][0]), str(old_headers[0][1])
+            if old_name.lower() == "authorization" and header.lower() != "authorization":
+                value = value.split(" ", 1)[-1]          # "Bearer abc" -> "abc"
+            elif header.lower() == "authorization" and old_name.lower() != "authorization" and " " not in value:
+                value = f"Bearer {value}"
+            entry["headers"] = {header: value}
+    elif key.strip():
+        key = key.strip()
+        # a key is one token; only Authorization may carry a scheme first ("Bearer abc"): anything else with spaces
+        # is pasted text (the status panel copied by mistake), refused here instead of failing later with a 401
+        if (len(key.split()) > 2 or header.lower() != "authorization") and any(c.isspace() for c in key):
+            raise ValueError("key: paste only the key itself (it has spaces; for Authorization "
+                             "\"<scheme> <token>\" is fine)")
+        value = key if header.lower() != "authorization" or " " in key else f"Bearer {key}"
+        entry["headers"] = {header: value}
+    return name, entry
+
+
 def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | None:
     """The run config's `"mcp_servers"` (or `"mcpServers"`) plus the servers in the --mcp-config file (Claude
     Desktop's format: {"mcpServers": {...}}); a name in both takes the file's entry.  None when there are none."""
@@ -663,7 +746,11 @@ def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | N
         servers.update(servers_from(block, f"--mcp-config {mcp_config_path}"))
     if not servers:
         return None
-    return McpHub(servers, settings_from(cfg))
+    # the page may change a URL server only when it lives in "mcp_servers", the block it writes (not one the
+    # --mcp-config file or a pasted "mcpServers" block overrides)
+    editable = {n for n, c in servers_from(cfg.get("mcp_servers"), "config mcp_servers").items()
+                if c.get("url") and servers.get(n) is c}
+    return McpHub(servers, settings_from(cfg), editable)
 
 
 if __name__ == "__main__":                               # python -m serve.mcp config.json: list what a config offers

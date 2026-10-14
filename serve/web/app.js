@@ -425,12 +425,13 @@ $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (las
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
 // "strata_mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
-let mcpInfo = {servers: [], tools: 0}, mcpRetry = null;
+let mcpInfo = {servers: [], tools: 0}, mcpRetry = null, mcpLoaded = false;
 async function loadMcp() {
   try {
     const r = await fetch("mcp", {headers: headers()});
     if (!r.ok) return;
     mcpInfo = await r.json();
+    mcpLoaded = true;
   } catch (e) { return; /* an older server: no MCP */ }
   renderMcp();
   clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
@@ -442,6 +443,8 @@ function renderMcp() {
   const servers = mcpInfo.servers || [];
   $("mcp-card").hidden = !servers.length;
   $("mcp-row").hidden = !servers.length;
+  $("mcp-conns").hidden = !mcpLoaded;                // connections can be added here even when there are none yet
+  renderMcpConns(servers);
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
   $("mcp-sum").textContent = servers.length ? `${fmt(mcpInfo.tools)} tools · ${ready.length} of ${servers.length} servers connected` : "";
   $("mcp-row-sub").textContent = mcpInfo.tools ? `${fmt(mcpInfo.tools)} tools from ${ready.map((s) => s.name).join(", ")}; the model calls them when it decides to`
@@ -456,6 +459,85 @@ function renderMcp() {
       `</div>`;
   }).join("");
 }
+
+// The chat's own MCP connections (POST /mcp/servers, DELETE /mcp/servers/<name>): a URL and an API key, kept in the
+// server's run config.  The key is write-only: GET /mcp names the header it rides in, never its value.  A program
+// server (a command) or one from --mcp-config is listed but changed in the config file only.
+function renderMcpConns(servers) {
+  $("mcp-conns-list").innerHTML = servers.map((s) => {
+    const [cls, text] = MCP_STATE[s.status] || ["", s.status];
+    const where = s.transport === "http"
+      ? `${esc(s.url || "")} · ${s.headers && s.headers.length ? `key in ${esc(s.headers.join(", "))}` : "no key"}`
+      : "a program on this computer (config file)";
+    const acts = s.editable ? `<span class="mcp-conn__actions"><button class="st-btn st-btn--secondary" type="button" data-mcp-edit="${esc(s.name)}">Edit</button>` +
+      `<button class="st-btn st-btn--secondary" type="button" data-mcp-del="${esc(s.name)}">Remove</button></span>` : "";
+    return `<div class="mcp-server"><div class="mcp-server__head"><span class="st-badge ${cls}">${esc(text)}</span>` +
+      `<strong>${esc(s.name)}</strong><span class="muted small">${fmt(s.tools.length)} tools</span>${acts}</div>` +
+      `<span class="muted small mcp-conn__where">${where}</span>` +
+      (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") + `</div>`;
+  }).join("");
+}
+let mcpEditing = null;                              // the name being changed (its key is kept unless one is typed)
+function mcpForm(s = null) {
+  mcpEditing = s ? s.name : null;
+  $("mcp-add-title").textContent = s ? `Change ${s.name}` : "Add an MCP server";
+  $("mcp-save").textContent = s ? "Save" : "Connect";
+  $("mcp-name").value = s ? s.name : ""; $("mcp-name").readOnly = !!s;
+  $("mcp-url").value = s ? (s.url || "").replace(/\?…$/, "") : "";
+  const h = s && s.headers && s.headers[0];
+  $("mcp-header").value = !s ? "Authorization" : !h ? "none" : ["Authorization", "X-API-Key"].includes(h) ? h : "other";
+  $("mcp-header-name").value = h && !["Authorization", "X-API-Key"].includes(h) ? h : "";
+  $("mcp-header-name").hidden = $("mcp-header").value !== "other";
+  $("mcp-key").value = "";
+  $("mcp-key").placeholder = s && h ? "Unchanged (type a new key to replace it)" : "Paste the key";
+  $("mcp-key").disabled = $("mcp-header").value === "none";
+}
+async function mcpSend(method, path, body) {
+  const r = await fetch(path, {method, headers: headers(body !== undefined),
+                               body: body !== undefined ? JSON.stringify(body) : undefined});
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* not json */ }
+  if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  mcpInfo = j; mcpLoaded = true;
+  renderMcp();
+  clearTimeout(mcpRetry);
+  mcpRetry = setTimeout(loadMcp, 800);              // it connects in the background: watch it get there
+  return j;
+}
+$("mcp-header").onchange = () => {
+  $("mcp-header-name").hidden = $("mcp-header").value !== "other";
+  $("mcp-key").disabled = $("mcp-header").value === "none";
+};
+$("mcp-cancel").onclick = () => { mcpForm(); $("mcp-add").open = false; };
+$("mcp-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const sel = $("mcp-header").value;
+  const body = {name: $("mcp-name").value.trim(), url: $("mcp-url").value.trim()};
+  if (sel === "none") body.key = "";
+  else {
+    body.header = sel === "other" ? $("mcp-header-name").value.trim() : sel;
+    if ($("mcp-key").value.trim()) body.key = $("mcp-key").value.trim();
+  }
+  try {
+    const j = await mcpSend("POST", "mcp/servers", body);
+    toast("success", mcpEditing ? `${body.name} changed` : `${body.name} added`,
+          j.saved ? "Connecting; it stays in the run config." : "Connecting; this server has no run config, so it lasts until it stops.");
+    mcpForm(); $("mcp-add").open = false;
+  } catch (err) { toast("error", "Not saved", err.message, 6000); }
+};
+$("mcp-conns-list").addEventListener("click", async (e) => {
+  const edit = e.target.closest("[data-mcp-edit]"), del = e.target.closest("[data-mcp-del]");
+  if (edit) {
+    mcpForm((mcpInfo.servers || []).find((s) => s.name === edit.dataset.mcpEdit));
+    $("mcp-add").open = true;
+    $("mcp-url").focus();
+  } else if (del && confirm(`Remove the MCP server ${del.dataset.mcpDel}? Its key is removed from the run config too.`)) {
+    try {
+      await mcpSend("DELETE", `mcp/servers/${encodeURIComponent(del.dataset.mcpDel)}`);
+      toast("success", `${del.dataset.mcpDel} removed`);
+    } catch (err) { toast("error", "Not removed", err.message, 6000); }
+  }
+});
 
 // ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
 // A few documented keys of the run config (strata-<model>.json), for every client, from the next start on.  The
@@ -822,7 +904,8 @@ function updateAssistant(el, m, streaming) {
   const bubble = el.querySelector(".st-bubble");
   if (m.cmd === "video" && !m.error) {                  // a clip: the video itself, or the wait with its progress
     if (m.video) {
-      bubble.innerHTML = `<video class="gen-image" controls loop muted playsinline autoplay></video><a class="gen-image__save" download="strata-video.webm">Save</a>`;
+      const ext = m.video.startsWith("data:video/mp4") ? "mp4" : "webm";   // MP4 when the server has ffmpeg
+      bubble.innerHTML = `<video class="gen-image" controls loop muted playsinline autoplay></video><a class="gen-image__save" download="strata-video.${ext}">Save</a>`;
       bubble.firstChild.src = m.video;
       bubble.firstChild.title = m.prompt || "";
       bubble.lastChild.href = m.video;
@@ -1282,7 +1365,8 @@ async function send() {
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
     m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
-             (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
+             (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "") +
+             ` · ${fmt(secs, secs < 10 ? 1 : 0)} s`;              // the writing time the speed is measured over
   } else if (m.stopped) {
     m.meta = "Stopped";
   }

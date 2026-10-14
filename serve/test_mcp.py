@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import mcp_fake_server as fake  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
+from serve.mcp import McpCancelled, McpHub, hub_from_config, page_entry  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,6 +199,115 @@ class HttpClient(unittest.TestCase):
         self.assertIn("timed out", r["text"])
         self.assertEqual(self.hub.servers["down"].status, "failed")
         self.assertIn("could not reach", self.hub.servers["down"].error)
+
+
+class PageConnections(unittest.TestCase):
+    """The Settings view's MCP connections: POST /mcp/servers and DELETE /mcp/servers/<name> - a URL and a key,
+    saved in the run config (its permissions kept), never read back, only from Strata's own page with the API key."""
+
+    def test_what_the_page_may_send(self):
+        self.assertEqual(page_entry({"name": "b", "url": "http://h/mcp", "key": "k", "header": "X-API-Key"}),
+                         ("b", {"url": "http://h/mcp", "headers": {"X-API-Key": "k"}}))
+        self.assertEqual(page_entry({"name": "b", "url": "https://h/mcp", "key": "k"})[1]["headers"],
+                         {"Authorization": "Bearer k"})                      # Authorization: the Bearer scheme
+        self.assertEqual(page_entry({"name": "b", "url": "https://h/mcp", "key": "Basic xyz"})[1]["headers"],
+                         {"Authorization": "Basic xyz"})                     # a scheme given is kept
+        old = {"url": "http://h/mcp", "headers": {"Authorization": "Bearer old"}}
+        self.assertEqual(page_entry({"name": "b", "url": "http://h2/mcp"}, old)[1]["headers"],
+                         {"Authorization": "Bearer old"})                    # no key: the old one stays
+        self.assertNotIn("headers", page_entry({"name": "b", "url": "http://h/mcp", "key": ""}, old)[1])
+        self.assertEqual(page_entry({"name": "b", "url": "http://h/mcp", "header": "X-API-Key"}, old)[1]["headers"],
+                         {"X-API-Key": "old"})                               # the key follows a header change
+        self.assertEqual(page_entry({"name": "b", "url": "http://h/mcp"},
+                                    {"url": "u", "headers": {"X-API-Key": "k"}})[1]["headers"],
+                         {"Authorization": "Bearer k"})
+        for bad in ({"name": "a b", "url": "http://h"}, {"name": "", "url": "http://h"},
+                    {"name": "a", "url": "file:///etc/passwd"}, {"name": "a", "url": "h/mcp"},
+                    {"name": "a", "url": "http://h", "key": "k\r\nX-Evil: 1"},
+                    {"name": "a", "url": "http://h", "key": "k", "header": "Host"},
+                    {"name": "a", "url": "http://h", "key": "k", "header": "Mcp-Session-Id"},
+                    {"name": "a", "url": "http://h", "key": "k", "header": "X Bad"},
+                    {"name": "a", "url": "http://h", "key": "Failed bible 0 tools Edit", "header": "X-API-Key"},
+                    {"name": "a", "url": "http://h", "key": "Failed bible 0 tools Edit"}, ["a"]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                page_entry(bad)
+
+    def test_connect_change_and_remove(self):
+        httpd = fake.http_server(0, key=("X-API-Key", "k1"))
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = Path(d) / "strata-x.json"
+            cfg = {"api_key": "sk-test", "mcp_servers": {"local": stdio()}}
+            cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+            os.chmod(cfg_path, 0o600)
+            tok = ByteTokenizer()
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            svc.api_key, svc.config_path = "sk-test", str(cfg_path)
+            svc.mcp = hub_from_config(cfg)
+            svc.mcp.start(wait=True)
+            server = serve(svc, port=0)
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+
+            def call(method, path, body=None, key="sk-test", origin=None):
+                h = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {}),
+                     **({"Origin": origin} if origin else {})}
+                req = urllib.request.Request(base + path, method=method, headers=h,
+                                             data=json.dumps(body).encode() if body is not None else None)
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    with e:
+                        return e.code, json.loads(e.read() or b"{}")
+
+            def ready(name):
+                for _ in range(100):
+                    _, st = call("GET", "/mcp")
+                    s = next((x for x in st["servers"] if x["name"] == name), None)
+                    if s and s["status"] not in ("starting", "idle"):
+                        return s, st
+                    time.sleep(0.1)
+                self.fail(f"{name} never finished starting")
+
+            try:
+                web = {"name": "web", "url": url, "key": "k1", "header": "X-API-Key"}
+                self.assertEqual(call("POST", "/mcp/servers", web, key=None)[0], 401)          # the API key first
+                self.assertEqual(call("POST", "/mcp/servers", web, origin="http://evil.example")[0], 403)
+                self.assertEqual(call("POST", "/mcp/servers", {**web, "name": "local"})[0], 409)   # a program server
+                code, _ = call("POST", "/mcp/servers", web)
+                self.assertEqual(code, 200)
+                s, st = ready("web")
+                self.assertEqual(s["status"], "ready", s["error"])                  # the key reached the server
+                self.assertTrue(s["editable"] and s["headers"] == ["X-API-Key"] and s["tools"])
+                self.assertNotIn("k1", json.dumps(st))                               # never read back
+                saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["mcp_servers"]["web"], {"url": url, "headers": {"X-API-Key": "k1"}})
+                self.assertEqual(saved["api_key"], "sk-test")                        # the rest of the file kept
+                for f in (cfg_path, cfg_path.with_name(cfg_path.name + ".bak")):
+                    self.assertEqual(os.stat(f).st_mode & 0o777, 0o600, f)           # it holds keys
+                self.assertEqual(call("POST", "/mcp/servers", {"name": "web", "url": url, "header": "X-API-Key"})[0],
+                                 200)                                                 # no key: the old one stays
+                self.assertEqual(ready("web")[0]["status"], "ready")
+                call("POST", "/mcp/servers", {**web, "key": "wrong"})
+                s, _ = ready("web")
+                self.assertEqual(s["status"], "failed")
+                self.assertIn("401", s["error"])
+                call("POST", "/mcp/servers", {**web, "url": url.rsplit("/mcp", 1)[0]})   # the root: a 404
+                s, _ = ready("web")
+                self.assertIn(f"most MCP servers are at {url}", s["error"])
+                self.assertEqual(call("DELETE", "/mcp/servers/local")[0], 409)
+                self.assertEqual(call("DELETE", "/mcp/servers/web", origin="http://evil.example")[0], 403)
+                code, st = call("DELETE", "/mcp/servers/web")
+                self.assertEqual(code, 200)
+                self.assertEqual([x["name"] for x in st["servers"]], ["local"])
+                self.assertNotIn("web", json.loads(cfg_path.read_text(encoding="utf-8"))["mcp_servers"])
+                self.assertEqual(call("DELETE", "/mcp/servers/web")[0], 404)
+            finally:
+                server.shutdown()
+                server.server_close()
+                svc.mcp.close()
+                httpd.shutdown()
+                httpd.server_close()
 
 
 class Config(unittest.TestCase):

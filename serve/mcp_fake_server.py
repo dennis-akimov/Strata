@@ -108,9 +108,10 @@ def stdio():
             answer(msg)
 
 
-def http_server(port: int = 0) -> ThreadingHTTPServer:
+def http_server(port: int = 0, key: tuple[str, str] | None = None) -> ThreadingHTTPServer:
     """Streamable HTTP at /mcp: JSON answers, except tools/call, which answers as an event stream (a progress
-    notification first); a session id from initialize is required afterwards."""
+    notification first); a session id from initialize is required afterwards.  `key`: (header, value) every request
+    must carry, else 401."""
     sessions = set()
 
     class H(BaseHTTPRequestHandler):
@@ -121,6 +122,14 @@ def http_server(port: int = 0) -> ThreadingHTTPServer:
 
         def do_POST(self):
             msg = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            if self.path.split("?", 1)[0] != "/mcp":    # like real servers: MCP at /mcp, the root a 404
+                self.send_response(404)
+                self.end_headers()
+                return
+            if key is not None and self.headers.get(key[0]) != key[1]:
+                self.send_response(401)
+                self.end_headers()
+                return
             if msg.get("method") != "initialize" and self.headers.get("Mcp-Session-Id") not in sessions:
                 self.send_response(400)
                 self.end_headers()

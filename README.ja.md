@@ -25,11 +25,18 @@ M5 Max（40 コア GPU、128 GB）の MacBook Pro、macOS 26.4、省エネルギ
 | モデル | 900 語の回答 | 短い回答 | メモリ上のモデルファイル |
 | --- | ---: | ---: | ---: |
 | **[GPT-OSS 120B](docs/MACOS.md#gpt-oss-120b)**（MXFP4） | 93-100 トークン/秒 | 93-103 トークン/秒 | 63 GB |
+| **[GPT-OSS 120B ＋ DFlash ドラフト](docs/MACOS.md#gpt-oss-120b-with-a-dflash-draft)**‡ | 数学で 122-135 トークン/秒、チャットで 71-77 | - | 65 GB |
 | **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) Q2_0**（`--mtp on`） | 60-69 トークン/秒 | 92-102 トークン/秒 | 38 GB |
 | **Qwen3.8-Flash-Next IQ3_XXS**（`--mtp on`） | 46-48 トークン/秒 | 73-92 トークン/秒 | 47 GB |
 | **[GLM-5.3-Flash](docs/MACOS.md#glm-53-flash) Maya-S24**\* | 13-26 トークン/秒 | 29-32 トークン/秒 | 86 GB |
+| **[GPT-OSS 20B](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b)** (MXFP4)† | 128-139 トークン/秒 | - | 12 GB |
+| **[Qwen3.6-35B-A3B](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b)** (MXFP4_MOE)† | 89-97 トークン/秒 | - | 22 GB |
 
 \* 2026-10-10 に、Docker が約 40 GB を使いスワップが満杯の状態（GPU のクロックが低い）で測定したため、下限の値です。GLM は 1 トークンあたり、ほかのモデルの約 3 倍のアクティブパラメータを読みます。
+
+† 2026-10-12 に 600 語（800 トークン）の回答で測定。それまでの実行で GPU が 1.2-1.5 GHz に抑えられていたため、下限の値です。
+
+‡ 2026-10-13 に 300 トークンの回答で測定。同じ実行でドラフトなしは 91-99 トークン/秒。ドラフトは数学には効きますが、チャットには効きません。
 
 同じ Mac での画像と動画（2026-10-11/12）：
 
@@ -84,7 +91,10 @@ make run                   # モデルを読み込み、準備ができたら ht
 | **Qwen3.8-Flash-Next Q2_0** | 66 GB | 約 60 GB（推定） | 標準で、Mac で最も多くテストしたもの。`make pull MODEL=Q2_0` |
 | Qwen3.8-Flash-Next IQ3_XXS | 76 GB | 65 GB（実測） | Q2_0 より圧縮が少ない。今回の測定では 10〜30 % 遅い。`make pull MODEL=IQ3_XXS` |
 | Qwen3.8-Flash-Next IQ3_S | 84 GB | 74 GB（実測） | さらに圧縮が少ない。A/B テスト 1 回で Q2_0 より約 10 % 遅い。`make pull MODEL=IQ3_S` |
-| **GPT-OSS 120B** | 63 GB | 約 70 GB（推定） | ここで最速（1 トークンあたり約 50 億パラメータが動作）。インストール：`make pull MODEL=GPT-OSS-120B`、続いて[手順](docs/MACOS.md#gpt-oss-120b) |
+| **GPT-OSS 120B** | 63 GB | 約 70 GB（推定） | 1 トークンあたり約 50 億パラメータが動作。インストール：`make pull MODEL=GPT-OSS-120B`、続いて[手順](docs/MACOS.md#gpt-oss-120b) |
+| GPT-OSS 120B ＋ DFlash ドラフト | 1.6 GB 追加 | 約 72 GB（推定） | 数学や段階的な回答で速く（約 +35%）、チャットでは遅く（約 -20%）なります。`make pull MODEL=GPT-OSS-120B-DFLASH`、続いて[手順](docs/MACOS.md#gpt-oss-120b-with-a-dflash-draft) |
+| GPT-OSS 20B | 12 GB | 19 GB（実測） | ここで最速（1 トークンあたり約 36 億パラメータが動作）。120B より性能は低めです。`make pull MODEL=GPT-OSS-20B`、続いて[手順](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
+| Qwen3.6-35B-A3B | 22 GB | 29 GB（実測） | 1 トークンあたり約 30 億パラメータが動作しますが、ここでは GPT-OSS 120B より速くありません。`make pull MODEL=QWEN3.6-35B`、続いて[手順](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
 | GLM-5.3-Flash（Maya-S24） | 95 GB | 32K で 89 GB（実測） | ここで最大（3,200 億パラメータ、1 トークンあたり約 180 億が動作）で、最も遅い。チャット、思考、ツール呼び出しは動作します。インストール：`make pull MODEL=GLM-5.3`、続いて[手順](docs/MACOS.md#glm-53-flash) |
 | HunyuanImage-3.0（画像） | 169 GB をストリーミング（残るのは 54 GB） | 54 GB をマップ + 0.3 GB | 80B。画像 1 枚あたり約 90 秒。ライセンスは EU・英国・韓国では適用されません。`make pull MODEL=HUNYUAN`（約 2 時間） |
 | Nucleus-Image（画像） | 約 50 GB（残るのは 21 GB） | 12 GB をマップ + 2 GB | 17B、Apache-2.0。画像 1 枚あたり約 45 秒。`make pull MODEL=NUCLEUS` |
