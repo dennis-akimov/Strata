@@ -1327,6 +1327,12 @@ nothing.
   stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
   servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
   transport is not supported). `"disabled": true` leaves an entry out.
+- `"tools": ["name", ...]` keeps only those tools of the server. The model neither sees the others nor can call
+  them. For example, to let the chat read a folder but not change it:
+  `"files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem@1.0.0", "/path/to/folder"],
+  "tools": ["read_text_file", "read_multiple_files", "list_directory", "directory_tree", "search_files",
+  "get_file_info", "list_allowed_directories"]}`. Only the listed folders are reachable; the filesystem server refuses
+  `..` and symlinks that lead out. Pin the version: 2025.7.1 fixed a symlink escape (CVE-2025-53109).
 - The servers start with Strata, in the background; the server window says what each one offers
   (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
   without them. The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by

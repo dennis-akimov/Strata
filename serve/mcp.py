@@ -424,6 +424,8 @@ class McpServer:
                 cursor = page.get("nextCursor")
                 if not cursor:
                     break
+            if self.cfg.get("tools") is not None:       # an allowlist: the model neither sees nor calls the others
+                tools = [x for x in tools if x["name"] in self.cfg["tools"]]
             self.tools, self.status = tools, "ready"
             names = ", ".join(x["name"] for x in tools[:8]) + (", ..." if len(tools) > 8 else "")
             print(f"[strata] MCP server {self.name!r}: {len(tools)} tool{'s' * (len(tools) != 1)}"
@@ -637,6 +639,8 @@ class McpHub:
 def _check_server(name, cfg, where) -> dict:
     if not isinstance(cfg, dict):
         raise SystemExit(f"[strata] {where}: MCP server {name!r} must be an object with \"command\" or \"url\"")
+    if "tools" in cfg and not (isinstance(cfg["tools"], list) and all(isinstance(t, str) for t in cfg["tools"])):
+        raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"tools\" must be a list of tool names")
     if cfg.get("url"):
         if cfg.get("type") == "sse":
             raise SystemExit(f"[strata] {where}: MCP server {name!r} uses the old SSE transport (\"type\": \"sse\"); "
