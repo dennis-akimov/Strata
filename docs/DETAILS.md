@@ -1315,6 +1315,14 @@ one. **Remove** takes it out of the server and the file. Only address servers ca
 (`command`) is a config-file entry, and an entry from `--mcp-config` is changed in that file. The run config keeps
 its permissions when the page writes it (setup makes it readable by you only: it holds keys).
 
+Each run config is its own file, so a server added under one model is missing when you start another. The page
+therefore also keeps its connections in the browser (localStorage `strata.mcpConns`). The key is encrypted with
+AES-GCM under a browser key that IndexedDB holds as non-extractable. When the page loads, it adds back every kept
+connection the running server lacks, which also saves it into that model's run config. **Remove** deletes the
+browser's copy as well. The encryption protects a copied localStorage, not a script running on the page. Encryption
+needs a secure context (`localhost`/`127.0.0.1`, or HTTPS); over plain HTTP from another computer, the browser keeps
+nothing.
+
 - **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
   stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
   servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
