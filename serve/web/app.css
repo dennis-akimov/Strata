@@ -64,7 +64,9 @@ main { flex: 1; min-height: 0; display: flex; }
                   font: 400 12.5px/1.5 var(--st-font-mono); color: var(--st-ink-soft); background: var(--st-surface);
                   border: 1px solid var(--st-line-soft); border-radius: var(--st-r-sm); }
 
-.composer-wrap { flex: none; padding: 0 var(--st-s-6) var(--st-s-6); }
+.composer-wrap { flex: none; padding: 0 var(--st-s-6) var(--st-s-6); position: relative; }
+/* shown while the chat is scrolled up; sits just above the composer */
+.jump-bottom { position: absolute; left: 50%; bottom: 100%; transform: translate(-50%, -8px); z-index: 2; box-shadow: 0 2px 8px rgb(0 0 0 / 0.15); }
 .st-composer { max-width: 860px; margin: 0 auto; }
 .st-composer textarea { max-height: 40vh; }
 .st-btn--send { width: 42px; padding: 0; }

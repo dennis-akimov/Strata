@@ -1099,7 +1099,11 @@ function renderChat() {
   scrollDown(true);
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
+function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; jumpButton(); }
+// "Jump to bottom": while the chat is scrolled up (a streaming answer grows below without a scroll event: scrollDown checks too)
+function jumpButton() { $("jump-bottom").hidden = nearBottom(); }
+$("chat-scroll").addEventListener("scroll", jumpButton, {passive: true});
+$("jump-bottom").onclick = () => { const s = $("chat-scroll"); s.scrollTo({top: s.scrollHeight, behavior: "smooth"}); };
 
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
