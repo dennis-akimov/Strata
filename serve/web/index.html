@@ -46,6 +46,10 @@
         </div>
       </div>
     </div>
+    <nav class="outline" id="outline" aria-label="Messages in this chat" hidden>
+      <div class="outline__head">Messages <span class="muted small" id="outline-count"></span></div>
+      <ol class="outline__list" id="outline-list"></ol>
+    </nav>
     <div class="composer-wrap">
       <button class="st-btn st-btn--secondary jump-bottom" id="jump-bottom" type="button" hidden>Jump to bottom &darr;</button>
       <form class="st-composer" id="composer">
@@ -61,6 +65,8 @@
             <svg class="st-icon"><use href="web/sprite.svg#i-clock"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="outline-btn" title="Messages in this chat" aria-label="Messages in this chat" aria-pressed="false">
+            <svg class="st-icon"><use href="web/sprite.svg#i-layers"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
             <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
           <span class="spacer"></span>

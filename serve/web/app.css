@@ -64,6 +64,21 @@ main { flex: 1; min-height: 0; display: flex; }
                   font: 400 12.5px/1.5 var(--st-font-mono); color: var(--st-ink-soft); background: var(--st-surface);
                   border: 1px solid var(--st-line-soft); border-radius: var(--st-r-sm); }
 
+.view--chat { position: relative; }
+/* the chat's outline: one line per question, on the right; click to go there (the one being read is marked) */
+.outline { position: absolute; top: var(--st-s-4); right: var(--st-s-4); z-index: 3; width: 240px;
+           max-height: calc(100% - 200px); display: flex; flex-direction: column; background: var(--st-surface);
+           border: 1px solid var(--st-line); border-radius: 12px; box-shadow: 0 4px 16px rgb(0 0 0 / 0.08); }
+.outline__head { padding: var(--st-s-3) var(--st-s-4) var(--st-s-2); font-weight: var(--st-fw-bold); font-size: var(--st-fs-sm); }
+.outline__list { list-style: none; margin: 0; padding: 0 var(--st-s-2) var(--st-s-2); overflow-y: auto; }
+.outline__list button { display: flex; gap: var(--st-s-2); width: 100%; padding: 6px var(--st-s-2); border: 0;
+                        border-left: 2px solid transparent; border-radius: 6px; background: none; color: var(--st-ink-muted);
+                        font: inherit; font-size: var(--st-fs-xs); text-align: left; cursor: pointer; }
+.outline__list button > span:last-child { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.outline__list button:hover { background: var(--st-surface-2); color: var(--st-ink); }
+.outline__list button[aria-current="true"] { border-left-color: var(--st-accent, currentColor); color: var(--st-ink); background: var(--st-surface-2); }
+.st-msg.is-target .st-bubble { outline: 2px solid var(--st-accent, currentColor); outline-offset: 4px; transition: outline-color .6s; }
+@media (max-width: 1360px) { .outline { box-shadow: 0 8px 28px rgb(0 0 0 / 0.18); } }   /* over the chat, not beside it */
 .composer-wrap { flex: none; padding: 0 var(--st-s-6) var(--st-s-6); position: relative; }
 /* shown while the chat is scrolled up; sits just above the composer */
 .jump-bottom { position: absolute; left: 50%; bottom: 100%; transform: translate(-50%, -8px); z-index: 2; box-shadow: 0 2px 8px rgb(0 0 0 / 0.15); }

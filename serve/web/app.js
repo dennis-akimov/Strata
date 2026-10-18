@@ -1105,6 +1105,57 @@ function jumpButton() { $("jump-bottom").hidden = nearBottom(); }
 $("chat-scroll").addEventListener("scroll", jumpButton, {passive: true});
 $("jump-bottom").onclick = () => { const s = $("chat-scroll"); s.scrollTo({top: s.scrollHeight, behavior: "smooth"}); };
 
+// ------------------------------------------------------------------ outline (the right panel: one line per question)
+// Rebuilt whenever the chat's messages change (render, send, a new chat): a MutationObserver sees every path.  The
+// question being read is the last one whose top is above the upper third of the view.
+const outlineOn = () => store.get("outline", innerWidth >= 1360);    // wide screens: open unless closed once
+function outlineShow(on) {
+  store.set("outline", on);
+  $("outline-btn").setAttribute("aria-pressed", String(on));
+  renderOutline();
+}
+function renderOutline() {
+  const on = outlineOn(), qs = [...$("chat").querySelectorAll(".st-msg--user")];
+  $("outline").hidden = !on || !qs.length;
+  if ($("outline").hidden) return;
+  $("outline-count").textContent = String(qs.length);
+  $("outline-list").innerHTML = qs.map((el, n) => {
+    const m = messages[+el.dataset.i] || {};
+    const text = (m.text || "").replace(/\s+/g, " ").trim() || ((m.images || []).length ? "(picture)" : (m.files || []).length ? "(file)" : "…");
+    return `<li><button type="button" data-goto="${el.dataset.i}" title="${esc(text.slice(0, 300))}">` +
+           `<span class="muted">${n + 1}</span><span>${esc(text.slice(0, 160))}</span></button></li>`;
+  }).join("");
+  outlineCurrent();
+}
+let outlineFrame = 0;
+function outlineCurrent() {
+  if ($("outline").hidden) return;
+  const s = $("chat-scroll"), line = s.getBoundingClientRect().top + s.clientHeight / 3;
+  let cur = null;
+  for (const el of $("chat").querySelectorAll(".st-msg--user")) { if (el.getBoundingClientRect().top <= line) cur = el.dataset.i; else break; }
+  if (cur === null) { const first = $("chat").querySelector(".st-msg--user"); cur = first && first.dataset.i; }
+  for (const b of $("outline-list").querySelectorAll("button")) {
+    const is = b.dataset.goto === cur;
+    if (is && b.getAttribute("aria-current") !== "true") b.scrollIntoView({block: "nearest"});
+    b.setAttribute("aria-current", String(is));
+  }
+}
+$("chat-scroll").addEventListener("scroll", () => {
+  cancelAnimationFrame(outlineFrame);
+  outlineFrame = requestAnimationFrame(outlineCurrent);
+}, {passive: true});
+$("outline-list").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-goto]");
+  const el = b && $("chat").querySelector(`.st-msg[data-i="${b.dataset.goto}"]`);
+  if (!el) return;
+  el.scrollIntoView({behavior: "smooth", block: "start"});
+  el.classList.add("is-target");
+  setTimeout(() => el.classList.remove("is-target"), 1200);
+});
+$("outline-btn").onclick = () => outlineShow(!outlineOn());
+new MutationObserver(renderOutline).observe($("chat"), {childList: true});
+$("outline-btn").setAttribute("aria-pressed", String(outlineOn()));
+
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
   if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
