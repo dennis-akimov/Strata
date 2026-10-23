@@ -6426,7 +6426,23 @@ def check_request_sampling(req) -> None:
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
 
 
+class Stamped:
+    """A stream whose "[strata] " lines carry the time: "[strata] 2026-10-20 14:03:22 done: ..."."""
+    LINE = re.compile(r"(?m)^\[strata\] ")
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, s: str) -> int:
+        self.stream.write(self.LINE.sub(lambda _: f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} ", s))
+        return len(s)
+
+    def __getattr__(self, name):                        # flush, fileno, isatty, encoding ...
+        return getattr(self.stream, name)
+
+
 def main() -> int:
+    sys.stdout, sys.stderr = Stamped(sys.stdout), Stamped(sys.stderr)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
