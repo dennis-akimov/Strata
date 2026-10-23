@@ -61,7 +61,8 @@ class Client(unittest.TestCase):
         cls.log = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
         cls.log.close()
         os.environ["FAKE_MCP_LOG"] = cls.log.name
-        cls.hub = McpHub({"fake": stdio(), "paged": stdio("--page", "4"), "broken": stdio("--crash-at-start"),
+        cls.hub = McpHub({"fake": stdio(), "paged": stdio("--page", "4"),
+                          "readonly": stdio(tools=["echo", "no-such-tool"]), "broken": stdio("--crash-at-start"),
                           "missing": {"command": "strata-no-such-program"}},
                          {"timeout_s": 1.5, "max_result_chars": 1000})
         cls.hub.start(wait=True)
@@ -106,6 +107,13 @@ class Client(unittest.TestCase):
         r = self.hub.call("fake__echo", {"text": "hello wörld"})
         self.assertEqual((r["ok"], r["text"], r["server"], r["tool"]), (True, "hello wörld", "fake", "echo"))
         self.assertEqual(self.hub.call("fake__add", {"a": 2, "b": 40})["text"], "42")
+
+    def test_tools_allowlist(self):
+        self.assertEqual([t["name"] for t in self.hub.servers["readonly"].tools], ["echo"])
+        self.assertEqual(self.hub.call("readonly__echo", {"text": "x"})["text"], "x")
+        r = self.hub.call("readonly__add", {"a": 1, "b": 2})              # listed by the server, not allowed
+        self.assertEqual((r["ok"], r["server"]), (False, None))
+        self.assertIn("no tool named", r["text"])
 
     def test_errors_become_text(self):
         self.hub.routes()
@@ -329,7 +337,8 @@ class Config(unittest.TestCase):
 
     def test_bad_entries_stop_the_start(self):
         for cfg in ({"mcp_servers": {"x": {}}}, {"mcp_servers": {"x": {"command": "a", "args": "b"}}},
-                    {"mcp_servers": ["x"]}, {"mcpServers": {"x": {"url": "http://a", "type": "sse"}}},
+                    {"mcp_servers": ["x"]}, {"mcp_servers": {"x": {"command": "a", "tools": "read_file"}}},
+                    {"mcpServers": {"x": {"url": "http://a", "type": "sse"}}},
                     {"mcp_servers": {"x": {"command": "a"}}, "mcp": {"timeout_s": 0}},
                     {"mcp_servers": {"x": {"command": "a"}}, "mcp": {"max_rounds": 1.5}}):
             with self.subTest(cfg=cfg), self.assertRaises(SystemExit):

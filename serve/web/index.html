@@ -46,7 +46,12 @@
         </div>
       </div>
     </div>
+    <nav class="outline" id="outline" aria-label="Messages in this chat" hidden>
+      <div class="outline__head">Messages <span class="muted small" id="outline-count"></span></div>
+      <ol class="outline__list" id="outline-list"></ol>
+    </nav>
     <div class="composer-wrap">
+      <button class="st-btn st-btn--secondary jump-bottom" id="jump-bottom" type="button" hidden>Jump to bottom &darr;</button>
       <form class="st-composer" id="composer">
         <div class="attachments" id="attachments" hidden></div>
         <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message"></textarea>
@@ -60,6 +65,8 @@
             <svg class="st-icon"><use href="web/sprite.svg#i-clock"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="outline-btn" title="Messages in this chat" aria-label="Messages in this chat" aria-pressed="false">
+            <svg class="st-icon"><use href="web/sprite.svg#i-layers"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
             <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
           <span class="spacer"></span>
@@ -277,7 +284,7 @@
           <input class="st-input" id="mcp-header-name" hidden maxlength="64" pattern="[A-Za-z0-9\-]+" placeholder="Header name, e.g. X-Auth-Token" aria-label="Header name">
           <label class="st-label" for="mcp-key">API key</label>
           <input class="st-input" id="mcp-key" type="password" maxlength="4096" autocomplete="new-password" placeholder="Paste the key">
-          <span class="muted small">Saved in this server's run config, never shown again; the server sends it to that URL only.</span>
+          <span class="muted small">Saved in this server's run config and, encrypted, in this browser (so every model gets it); never shown again; the server sends it to that URL only.</span>
           <div class="drawer-actions">
             <button class="st-btn st-btn--secondary" id="mcp-cancel" type="button">Cancel</button>
             <button class="st-btn st-btn--primary" id="mcp-save" type="submit">Connect</button>

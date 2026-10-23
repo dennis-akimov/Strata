@@ -23,7 +23,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
+from serve.server import (Stamped, CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, model_name_from_args, prompt_progress,
                           prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
@@ -3655,6 +3655,13 @@ class ThinkingBudget(unittest.TestCase):
         code, b = self.openai(max_tokens=3000, reasoning_effort="high")
         self.assertEqual(code, 200, b)
         self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
+
+    def test_strata_log_lines_carry_the_time(self):
+        out = io.StringIO()
+        print("[strata] done: 5 tokens\n[strata] stopping", file=Stamped(out))
+        print("engine: [strata] x", file=Stamped(out))
+        self.assertRegex(out.getvalue(), r"^\[strata\] \d{4}-\d\d-\d\d \d\d:\d\d:\d\d done: 5 tokens\n"
+                                         r"\[strata\] \d{4}-\d\d-\d\d \d\d:\d\d:\d\d stopping\nengine: \[strata\] x\n$")
 
     def test_the_thinking_progress_line_shows_the_budget_not_max_tokens(self):
         """#984: 'thinking: x of max 6400' read as if the budget was ignored; while a budget applies the line shows it."""

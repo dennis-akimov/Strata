@@ -434,6 +434,7 @@ async function loadMcp() {
     mcpLoaded = true;
   } catch (e) { return; /* an older server: no MCP */ }
   renderMcp();
+  if (!mcpRestored) await mcpRestore();
   clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
   if ((mcpInfo.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
 }
@@ -476,6 +477,80 @@ function renderMcpConns(servers) {
       `<span class="muted small mcp-conn__where">${where}</span>` +
       (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") + `</div>`;
   }).join("");
+}
+// The page's connections are also kept in this browser (localStorage "strata.mcpConns": {name: {url, header, key}}),
+// so a server started with another run config gets them back (they were in that model's config only).  The key is
+// AES-GCM sealed with a browser key kept non-extractable in IndexedDB "strata-keys": a copy of localStorage alone
+// doesn't reveal it.  ponytail: a script on this page can still decrypt it; nothing in a browser stops that.
+const mcpVault = (() => {
+  let k = null;
+  const cryptoKey = () => k || (k = new Promise((res) => {
+    try {
+      const r = indexedDB.open("strata-keys", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("keys");
+      r.onerror = r.onblocked = () => res(null);
+      r.onsuccess = () => {
+        const d = r.result, get = d.transaction("keys").objectStore("keys").get("mcp");
+        get.onerror = () => res(null);
+        get.onsuccess = async () => {
+          if (get.result) return res(get.result);
+          try {               // no crypto.subtle (plain http from another computer): throws, nothing is kept
+            const key = await crypto.subtle.generateKey({name: "AES-GCM", length: 256}, false, ["encrypt", "decrypt"]);
+            const t = d.transaction("keys", "readwrite");
+            t.objectStore("keys").put(key, "mcp");
+            t.oncomplete = () => res(key);
+            t.onerror = t.onabort = () => res(null);
+          } catch (e) { res(null); }
+        };
+      };
+    } catch (e) { res(null); }
+  }));
+  const b64 = (u) => btoa(String.fromCharCode(...u)), unb64 = (t) => Uint8Array.from(atob(t), (c) => c.charCodeAt(0));
+  return {
+    async seal(text) {
+      const key = await cryptoKey();
+      if (!key) return null;
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      return `${b64(iv)}.${b64(new Uint8Array(await crypto.subtle.encrypt({name: "AES-GCM", iv}, key, new TextEncoder().encode(text))))}`;
+    },
+    async open(sealed) {
+      const key = await cryptoKey();
+      if (!key) throw new Error("this browser cannot decrypt the saved key here (http from another computer?)");
+      const [iv, ct] = sealed.split(".").map(unb64);
+      return new TextDecoder().decode(await crypto.subtle.decrypt({name: "AES-GCM", iv}, key, ct));
+    },
+  };
+})();
+// after a POST that worked: false when the browser can't keep it (no key known to it, or no crypto)
+async function mcpRemember(body) {
+  const all = store.get("mcpConns", {}), old = all[body.name];
+  let key = old && old.header ? old.key : undefined;
+  if (body.key !== undefined) key = body.key ? await mcpVault.seal(body.key) : "";
+  if (key === null || (body.header && key === undefined)) return false;   // the key is on the server only: retype it
+  all[body.name] = {url: body.url, header: body.key === "" ? "" : body.header, key: key || ""};
+  store.set("mcpConns", all);
+  return true;
+}
+function mcpForget(name) {
+  const all = store.get("mcpConns", {});
+  delete all[name];
+  store.set("mcpConns", all);
+}
+// once a page load: the browser's connections that this server lacks are added (and so saved in its run config)
+let mcpRestored = false;
+async function mcpRestore() {
+  mcpRestored = true;
+  const have = new Set((mcpInfo.servers || []).map((s) => s.name)), added = [];
+  for (const [name, c] of Object.entries(store.get("mcpConns", {}))) {
+    if (have.has(name)) continue;
+    try {
+      const body = {name, url: c.url, key: ""};
+      if (c.header) { body.header = c.header; body.key = c.key ? await mcpVault.open(c.key) : ""; }
+      await mcpSend("POST", "mcp/servers", body);
+      added.push(name);
+    } catch (e) { toast("error", `MCP server ${name} not added back`, (e && e.message) || String(e), 6000); }
+  }
+  if (added.length) toast("info", "MCP servers from this browser", `${added.join(", ")} added to this server`);
 }
 let mcpEditing = null;                              // the name being changed (its key is kept unless one is typed)
 function mcpForm(s = null) {
@@ -520,8 +595,10 @@ $("mcp-form").onsubmit = async (e) => {
   }
   try {
     const j = await mcpSend("POST", "mcp/servers", body);
+    const kept = await mcpRemember(body).catch(() => false);
     toast("success", mcpEditing ? `${body.name} changed` : `${body.name} added`,
-          j.saved ? "Connecting; it stays in the run config." : "Connecting; this server has no run config, so it lasts until it stops.");
+          (j.saved ? "Connecting; it stays in the run config" : "Connecting; this server has no run config") +
+          (kept ? " and in this browser (key encrypted), for every model." : "; not kept in this browser (type the key again to keep it)."));
     mcpForm(); $("mcp-add").open = false;
   } catch (err) { toast("error", "Not saved", err.message, 6000); }
 };
@@ -531,9 +608,10 @@ $("mcp-conns-list").addEventListener("click", async (e) => {
     mcpForm((mcpInfo.servers || []).find((s) => s.name === edit.dataset.mcpEdit));
     $("mcp-add").open = true;
     $("mcp-url").focus();
-  } else if (del && confirm(`Remove the MCP server ${del.dataset.mcpDel}? Its key is removed from the run config too.`)) {
+  } else if (del && confirm(`Remove the MCP server ${del.dataset.mcpDel}? Its key is removed from the run config and this browser too.`)) {
     try {
       await mcpSend("DELETE", `mcp/servers/${encodeURIComponent(del.dataset.mcpDel)}`);
+      mcpForget(del.dataset.mcpDel);
       toast("success", `${del.dataset.mcpDel} removed`);
     } catch (err) { toast("error", "Not removed", err.message, 6000); }
   }
@@ -1021,7 +1099,62 @@ function renderChat() {
   scrollDown(true);
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
+function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; jumpButton(); }
+// "Jump to bottom": while the chat is scrolled up (a streaming answer grows below without a scroll event: scrollDown checks too)
+function jumpButton() { $("jump-bottom").hidden = nearBottom(); }
+$("chat-scroll").addEventListener("scroll", jumpButton, {passive: true});
+$("jump-bottom").onclick = () => { const s = $("chat-scroll"); s.scrollTo({top: s.scrollHeight, behavior: "smooth"}); };
+
+// ------------------------------------------------------------------ outline (the right panel: one line per question)
+// Rebuilt whenever the chat's messages change (render, send, a new chat): a MutationObserver sees every path.  The
+// question being read is the last one whose top is above the upper third of the view.
+const outlineOn = () => store.get("outline", innerWidth >= 1360);    // wide screens: open unless closed once
+function outlineShow(on) {
+  store.set("outline", on);
+  $("outline-btn").setAttribute("aria-pressed", String(on));
+  renderOutline();
+}
+function renderOutline() {
+  const on = outlineOn(), qs = [...$("chat").querySelectorAll(".st-msg--user")];
+  $("outline").hidden = !on || !qs.length;
+  if ($("outline").hidden) return;
+  $("outline-count").textContent = String(qs.length);
+  $("outline-list").innerHTML = qs.map((el, n) => {
+    const m = messages[+el.dataset.i] || {};
+    const text = (m.text || "").replace(/\s+/g, " ").trim() || ((m.images || []).length ? "(picture)" : (m.files || []).length ? "(file)" : "…");
+    return `<li><button type="button" data-goto="${el.dataset.i}" title="${esc(text.slice(0, 300))}">` +
+           `<span class="muted">${n + 1}</span><span>${esc(text.slice(0, 160))}</span></button></li>`;
+  }).join("");
+  outlineCurrent();
+}
+let outlineFrame = 0;
+function outlineCurrent() {
+  if ($("outline").hidden) return;
+  const s = $("chat-scroll"), line = s.getBoundingClientRect().top + s.clientHeight / 3;
+  let cur = null;
+  for (const el of $("chat").querySelectorAll(".st-msg--user")) { if (el.getBoundingClientRect().top <= line) cur = el.dataset.i; else break; }
+  if (cur === null) { const first = $("chat").querySelector(".st-msg--user"); cur = first && first.dataset.i; }
+  for (const b of $("outline-list").querySelectorAll("button")) {
+    const is = b.dataset.goto === cur;
+    if (is && b.getAttribute("aria-current") !== "true") b.scrollIntoView({block: "nearest"});
+    b.setAttribute("aria-current", String(is));
+  }
+}
+$("chat-scroll").addEventListener("scroll", () => {
+  cancelAnimationFrame(outlineFrame);
+  outlineFrame = requestAnimationFrame(outlineCurrent);
+}, {passive: true});
+$("outline-list").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-goto]");
+  const el = b && $("chat").querySelector(`.st-msg[data-i="${b.dataset.goto}"]`);
+  if (!el) return;
+  el.scrollIntoView({behavior: "smooth", block: "start"});
+  el.classList.add("is-target");
+  setTimeout(() => el.classList.remove("is-target"), 1200);
+});
+$("outline-btn").onclick = () => outlineShow(!outlineOn());
+new MutationObserver(renderOutline).observe($("chat"), {childList: true});
+$("outline-btn").setAttribute("aria-pressed", String(outlineOn()));
 
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");

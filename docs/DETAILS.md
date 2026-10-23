@@ -1315,10 +1315,24 @@ one. **Remove** takes it out of the server and the file. Only address servers ca
 (`command`) is a config-file entry, and an entry from `--mcp-config` is changed in that file. The run config keeps
 its permissions when the page writes it (setup makes it readable by you only: it holds keys).
 
+Each run config is its own file, so a server added under one model is missing when you start another. The page
+therefore also keeps its connections in the browser (localStorage `strata.mcpConns`). The key is encrypted with
+AES-GCM under a browser key that IndexedDB holds as non-extractable. When the page loads, it adds back every kept
+connection the running server lacks, which also saves it into that model's run config. **Remove** deletes the
+browser's copy as well. The encryption protects a copied localStorage, not a script running on the page. Encryption
+needs a secure context (`localhost`/`127.0.0.1`, or HTTPS); over plain HTTP from another computer, the browser keeps
+nothing.
+
 - **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
   stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
   servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
   transport is not supported). `"disabled": true` leaves an entry out.
+- `"tools": ["name", ...]` keeps only those tools of the server. The model neither sees the others nor can call
+  them. For example, to let the chat read a folder but not change it:
+  `"files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem@1.0.0", "/path/to/folder"],
+  "tools": ["read_text_file", "read_multiple_files", "list_directory", "directory_tree", "search_files",
+  "get_file_info", "list_allowed_directories"]}`. Only the listed folders are reachable; the filesystem server refuses
+  `..` and symlinks that lead out. Pin the version: 2025.7.1 fixed a symlink escape (CVE-2025-53109).
 - The servers start with Strata, in the background; the server window says what each one offers
   (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
   without them. The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by
