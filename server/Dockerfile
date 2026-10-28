@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # Strata's chat server (the Rust server, server/) in a container.  A Linux container on a Mac has no Metal, so the
 # engine stays on the host: the server starts it through strata-relay (make relay runs the host side; README below).
 #
@@ -18,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/strata-server target/release/strata-relay /usr/local/bin/
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata && rm -rf /var/lib/apt/lists/* && \
     useradd --uid 1000 --create-home strata
 COPY --from=build /usr/local/bin/strata-server /usr/local/bin/strata-relay /usr/local/bin/
 COPY serve/web /strata/serve/web

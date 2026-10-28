@@ -7,7 +7,9 @@
 
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::c_void;
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
