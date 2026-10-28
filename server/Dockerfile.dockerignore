@@ -1,0 +1,7 @@
+# the build context is the repository root: only what the image needs (BuildKit reads <Dockerfile>.dockerignore)
+*
+!server/Cargo.toml
+!server/Cargo.lock
+!server/src
+!serve/web
+!serve/chat_template.jinja

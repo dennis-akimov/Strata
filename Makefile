@@ -26,7 +26,7 @@ CMAKE       := $(if $(wildcard .venv/bin/cmake),.venv/bin/cmake,cmake)
 URL         := http://$(if $(filter 0.0.0.0,$(HOST)),127.0.0.1,$(HOST)):$(PORT)
 AUTH        := $(if $(API_KEY),-H "Authorization: Bearer $(API_KEY)",)
 RUN_ARGS    := --port $(PORT) $(if $(filter-out 127.0.0.1,$(HOST)),--host $(HOST),) $(if $(API_KEY),--api-key $(API_KEY),)
-SERVER_PAT  := serve/server.py --engine strata .*--port $(PORT)
+SERVER_PAT  := strata-server --engine strata .*--port $(PORT)
 
 # fails when another program listens on PORT: names it, and how to pick another port
 PORT_FREE   = @who=$$(lsof -nP -iTCP:$(PORT) -sTCP:LISTEN 2> /dev/null | awk 'NR==2 {print $$1 " (pid " $$2 ")"}'); \
@@ -49,7 +49,7 @@ AB_GGUF     ?=
 AB_PROMPTS  ?=
 AB_ROUNDS   ?= 7
 
-.PHONY: help setup pull check update run start stop status wait chat models build build-ab test test-engine ab clean
+.PHONY: help setup pull check update run start stop status wait chat models build build-ab server test test-server test-engine ab clean
 
 help:
 	@echo "Strata - make targets (variables: PORT=$(PORT) HOST=$(HOST) API_KEY=... MODEL=... SETUP_ARGS=...;"
@@ -150,7 +150,7 @@ chat:
 models:
 	@curl -sS -m 10 $(AUTH) $(URL)/v1/models; echo
 
-build:
+build: server
 ifeq ($(shell uname -s),Darwin)
 	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON
 	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
@@ -158,8 +158,25 @@ else
 	@echo "on Linux / Windows setup builds or downloads the engine: make setup (or ./setup.sh --setup --build)"
 endif
 
-# tools/ and serve/ have no __init__.py, so `unittest discover` will not start in them: the modules are named instead
-TEST_MODULES := $(subst /,.,$(patsubst %.py,%,$(wildcard tools/test_setup_*.py serve/test_*.py))) \
+# the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
+server:
+	cargo build --release --manifest-path server/Cargo.toml
+	mkdir -p engine-metal && cp server/target/release/strata-server engine-metal/strata-server
+
+# the server's tests: its unit and golden tests, then its answers against the Python server's recorded ones
+# (server/golden/e2e.py --replay; the packs it needs are the ones on this Mac, a missing one is skipped)
+PACKS ?= $(HOME)/dennis-akimov/Strata-data/packs
+test-server:
+	cargo test --release --manifest-path server/Cargo.toml
+	cargo build --manifest-path server/Cargo.toml
+	@for p in qwen3.6-35b-a3b gpt-oss-120b-heretic-v2 glm-5.3-flash-maya-s24; do \
+	  if [ -d $(PACKS)/$$p ]; then $(PY) server/golden/e2e.py server/target/debug/strata-server $(PACKS)/$$p/tokenizer --replay mock-$$p || exit 1; fi; done
+	@for p in qwen3.6-35b-a3b gpt-oss-120b-heretic-v2; do \
+	  if [ -d $(PACKS)/$$p ]; then $(PY) server/golden/e2e.py server/target/debug/strata-server $(PACKS)/$$p/tokenizer --engine-strata --replay engine-$$p || exit 1; fi; done
+	@if [ -d $(PACKS)/qwen3.6-35b-a3b ]; then $(PY) server/golden/e2e.py server/target/debug/strata-server $(PACKS)/qwen3.6-35b-a3b/tokenizer --mcp --replay mcp-qwen3.6-35b-a3b; fi
+
+# tools/ has no __init__.py, so `unittest discover` will not start in it: the modules are named instead
+TEST_MODULES := $(subst /,.,$(patsubst %.py,%,$(wildcard tools/test_setup_*.py))) \
                 $(if $(filter Darwin,$(shell uname -s)),metal.test_setup_mac,)
 
 test:

@@ -61,6 +61,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
 MAC = sys.platform == "darwin"   # Apple Silicon: the Metal engine (metal/setup_mac.py, docs/MACOS.md)
+
+
+SERVER_EXE = ROOT / "engine-metal" / "strata-server"   # the server (server/, Rust): make server builds it
+
+
+def server_cmd() -> list:
+    """The server's command line: the Rust strata-server, built with cargo when it is not there yet."""
+    if not SERVER_EXE.is_file():
+        print("building the server (server/, Rust; cargo is needed: https://rustup.rs) ...", flush=True)
+        subprocess.run(["cargo", "build", "--release", "--manifest-path", str(ROOT / "server" / "Cargo.toml")], check=True)
+        SERVER_EXE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / "server" / "target" / "release" / "strata-server", SERVER_EXE)
+    return [str(SERVER_EXE)]
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
 # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
@@ -4303,8 +4316,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
-    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
-           "--port", str(port or cfg.get("port", 8080))]
+    cmd = server_cmd() + ["--engine", "strata", "--config", str(cfg_path),
+                          "--port", str(port or cfg.get("port", 8080))]
     if cfg.get("backend") == "hip":                    # AMD, numbered as HIP numbers them (setup's KFD order)
         if WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461: also fixes a 0.1.34 install
@@ -4711,8 +4724,8 @@ def use_cuda12(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
 
 def write_run_script(model, cfg_path, port, open_browser=True):
     """run-<model>.bat / .sh: the server with this config; `open_browser` False (#609: --no-browser) leaves --open out."""
-    serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
-             "--port", str(port)] + (["--open"] if open_browser else [])
+    serve = server_cmd() + ["--engine", "strata", "--config", str(cfg_path),
+                            "--port", str(port)] + (["--open"] if open_browser else [])
     if WIN:
         script = ROOT / f"run-{model.lower()}.bat"
         script.write_text("@echo off\r\ntitle Strata " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +

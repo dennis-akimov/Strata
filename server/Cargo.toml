@@ -1,0 +1,39 @@
+[package]
+name = "strata-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aho-corasick = "1.1.5"
+anyhow = "1.0.104"
+axum = "0.8"
+base64 = "0.23.1"
+bytes = "1.12.1"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
+fancy-regex = "0.20.0"
+form_urlencoded = "1.2.2"
+futures = "0.3.34"
+hex = "0.4.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "tiff", "gif", "bmp", "ico"] }
+indexmap = "2.14.2"
+jsonschema = { version = "0.60.2", default-features = false }
+kamadak-exif = "0.6.1"
+libc = "0.2.191"
+minijinja = { version = "3.0.4", features = ["loop_controls", "json", "builtins", "preserve_order", "serde"] }
+minijinja-contrib = { version = "3.0.4", features = ["pycompat", "datetime"] }
+percent-encoding = "2.3.2"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-stream = "0.1.19"
+tracing = "0.1.44"
+ureq = "3.5.0"
+uuid = { version = "1.29.0", features = ["v4"] }
+
+[dev-dependencies]
+flate2 = "1.1.10"
