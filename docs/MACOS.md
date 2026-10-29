@@ -12,28 +12,39 @@ them is different: `strata-metal` (`metal/`) runs the model on llama.cpp's Metal
 
 ## Before you start
 
-- An Apple Silicon Mac (M1 or newer; setup refuses Intel Macs) with **64 GB of memory or more**. 64 GB is Strata's
-  floor for a Mac, not a measured minimum: only 128 GB was tried.
-- About **80 GB of free disk** on the internal SSD, and an internet connection for the first run (66 GB download).
-- Apple's Command Line Tools (the compiler and git). You do not need the full Xcode app.
-- Python 3.10 or newer. If it is missing, setup installs it with [Homebrew](https://brew.sh) when Homebrew is there;
-  otherwise install it from [python.org](https://www.python.org/downloads/). Everything else (cmake, ninja, Python
-  packages) setup installs into the Strata folder.
+- An Apple Silicon Mac (M1 or newer; setup refuses Intel Macs). 16 GB runs GPT-OSS 20B at a small context with other
+  apps closed; 24-32 GB runs it comfortably; Qwen3.6-35B wants 32 GB; the Qwen3.8 models, GPT-OSS 120B and GLM-5.3
+  want 64-128 GB. Only an M5 Max with 128 GB and an M1 with 16 GB were tried.
+- Free disk for the model (12-95 GB) on the internal SSD, and an internet connection for the first run.
+- Nothing else: `make setup` installs what is missing.
 - Expect the speed to drop after a few minutes of steady use (on the test Mac the GPU's clock went down; see below).
 
 ## Quick start
 
-In Terminal, one line at a time:
+In Terminal:
 
 ```sh
-xcode-select --install       # a dialog opens: click Install, wait until it finishes (skip if already installed)
-
 git clone https://github.com/dennis-akimov/Strata.git
 cd Strata
-make check                   # what this Mac can run; installs nothing
-make pull MODEL=Q2_0         # builds the engine and downloads the model; asks about images and the context
-make run                     # starts it; open http://127.0.0.1:8080 when it says it is ready
+make setup
 ```
+
+`make setup` (metal/onboard_mac.py, after bootstrap.py) goes step by step and says what it does:
+
+| Step | What happens |
+|---|---|
+| Tools | Apple's Command Line Tools (an installer window opens: click Install; setup waits), Homebrew and Python 3.12 when no Python 3.10+ is there (Homebrew asks for your password), the Python packages in `.venv` (cmake, ninja, ...), Rust (rustup, into `~/.cargo`), aria2 (faster downloads; curl otherwise) |
+| Builds | the Metal engine (3-6 minutes, once), the server and its file tool into `engine-metal/`, `Strata.app` |
+| The model | every chat model with its download, its memory and whether it fits this Mac; the recommended one is preselected (Enter) |
+| Download | resumable, SHA-256 checked, with its tokenizer pack, into `Strata-data/` next to the `Strata` folder |
+| Run config | `strata-<model>.json` with the largest context (and prefill batch) that fits: the engine measures the model's memory (`strata-metal --plan`) against what Metal lets the GPU use and the Mac's memory |
+| First answer | the model loads on a free port and answers one question; if the GPU runs out of memory, setup halves the context and tries again, then says what to close |
+| Strata.app | opens on that model: Start, then Chat |
+
+If anything stops, run `make setup` again: finished steps are skipped and a download continues. `make setup
+MODEL=GPT-OSS-20B SETUP_ARGS=--yes` asks nothing; `SETUP_ARGS="--data-dir /Volumes/X/Strata-data"` puts the models
+elsewhere; `make pull MODEL=...` downloads another model and writes its run config too. Setup.py's own installer
+(the Qwen3.8 quants with the MTP choice and its questions) is still `python3 bootstrap.py --setup`.
 
 `make run` keeps the model running in that Terminal window; Ctrl-C stops it. On the test Mac the engine compiled in
 3-6 minutes (once) and later starts took about 35 seconds.
@@ -56,7 +67,7 @@ run the same command again: it continues where it stopped. Q2_0, IQ3_XXS (`make 
 | use a bigger context window | `make run CONTEXT=131072` (up to 262,144; it stays set, and needs more memory) |
 | download without questions | `make pull MODEL=Q2_0 SETUP_ARGS="--yes"` |
 | try another size (untested on a Mac) | `make pull MODEL=IQ2_XS`, then `make run` |
-| turn on the MTP draft layer | `./setup.sh --setup --mtp on` (see below) |
+| turn on the MTP draft layer | `python3 bootstrap.py --setup --mtp on` (see below) |
 | see every target | `make` |
 
 If setup stops, it says what is missing and the command that fixes it.
@@ -350,7 +361,7 @@ you need Tencent's permission. Read it before you use the model.
 The model file, made once: the converter streams the 32 BF16 shards (169 GB) one at a time, and deletes each shard
 after it is converted. The disk needs room for one shard (5.4 GB) and the output (54 GB, Q4_0 experts). This takes
 about 2 hours at 20 MB/s. `make pull MODEL=HUNYUAN` does both steps below (also `MODEL=NUCLEUS`, `GLM-5.3`,
-`GPT-OSS-120B`, `GPT-OSS-120B-DFLASH`, `GPT-OSS-20B`, `QWEN3.6-35B`: `tools/pull_model.sh`).
+`GPT-OSS-120B`, `GPT-OSS-120B-DFLASH`, `GPT-OSS-20B`, `QWEN3.6-35B`: `tools/pull_model.py`).
 
 ```sh
 M=<a folder>

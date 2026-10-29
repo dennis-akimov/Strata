@@ -27,7 +27,7 @@ Strata, and installs nothing except Python and the `.venv` it needs to run (step
 
 ```
 Windows:  START-HERE.bat --check
-Linux:    ./setup.sh --check
+Linux:    python3 bootstrap.py --check
 ```
 
 To check by hand:
@@ -84,7 +84,7 @@ From the Strata folder (Windows: in `cmd`, or `cmd /c START-HERE.bat ...` from P
 
 ```
 Windows:  START-HERE.bat --yes --family qwen --model IQ2_XS --no-start
-Linux:    ./setup.sh --yes --family qwen --model IQ2_XS --no-start
+Linux:    python3 bootstrap.py --yes --family qwen --model IQ2_XS --no-start
 ```
 
 The flags (all of them: `START-HERE.bat --help`):
@@ -140,7 +140,7 @@ Windows (PowerShell):  Start-Process -FilePath ".\run-iq2_xs.bat"            (op
 Linux:                 nohup ./run-iq2_xs.sh > strata-server.out 2>&1 &
 ```
 
-Or `START-HERE.bat` / `./setup.sh` without flags, which starts the installed model (it asks which one when several are
+Or `START-HERE.bat` / `python3 bootstrap.py` without flags, which starts the installed model (it asks which one when several are
 installed; add `--yes` to take the first). The server opens the user's browser on `http://127.0.0.1:8080` when it is
 ready. Closing its window (or stopping the process) stops the model.
 

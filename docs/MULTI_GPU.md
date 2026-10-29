@@ -13,7 +13,7 @@ is every card's share and skips those probes; there is no per-card setting yet.
 
 ## Using it
 
-**Nothing to type.** `START-HERE.bat` (Linux: `./setup.sh`) lists your NVIDIA cards and says for each one whether
+**Nothing to type.** `START-HERE.bat` (Linux: `python3 bootstrap.py`) lists your NVIDIA cards and says for each one whether
 Strata can use it:
 
 ```
@@ -50,7 +50,7 @@ now on; the answer is kept.
 - a card with less than 8 GB of VRAM, together with others (each card holds a copy of the dense weights and its
   own prompt buffers) - unless you name it with `--gpus`: then setup says the risk and asks (`--yes` with the named
   cards goes ahead);
-- Intel GPUs, and a mix of NVIDIA and AMD cards. (AMD cards share a model among themselves: `./setup.sh --backend
+- Intel GPUs, and a mix of NVIDIA and AMD cards. (AMD cards share a model among themselves: `python3 bootstrap.py --backend
   hip --gpus 1,0`, see [AMD_HIP.md](AMD_HIP.md).)
 
 Or edit an existing config (`strata-*.json`), then restart:

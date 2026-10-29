@@ -49,7 +49,7 @@ Bilder und Videos auf demselben Mac (2026-10-11/12):
 
 Die Videozeiten wurden gemessen, während Docker 76 GB belegte und macOS auslagerte (GPU bei 600-750 MHz): ein Mindestwert.
 
-Die Qwen-Werte nutzen seine MTP-Entwurfsschicht, die optional ist (`./setup.sh --setup --mtp on`, etwa 12 GB mehr
+Die Qwen-Werte nutzen seine MTP-Entwurfsschicht, die optional ist (`python3 bootstrap.py --setup --mtp on`, etwa 12 GB mehr
 Speicherplatz). Der Cache des Kontexts kommt zur Modelldatei hinzu (einige GB; mehr bei langen Kontexten). Im
 Energiemodus *Automatisch* schrieb derselbe Mac lange Antworten 2-3x langsamer. Andere Macs wurden nicht gemessen.
 Alle Werte und wie sie gemessen wurden: [docs/MACOS.md](docs/MACOS.md#measured) (Englisch).

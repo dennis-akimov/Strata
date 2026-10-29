@@ -3,7 +3,7 @@
 `make run CONTEXT=N` calls it.  It changes only --max-context in each strata-*.json (setup's own re-run would also
 redo the questions and can drop hand-set keys such as "parallel"), and it stays set for later starts.  Unlike setup it
 does not check the memory: a bigger context needs more of it (the KV cache grows with it).  Past the model's trained
-262,144 tokens a context needs rope scaling, which setup sets up: ./setup.sh --setup --context N.
+262,144 tokens a context needs rope scaling, which setup sets up: python3 bootstrap.py --setup --context N.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ MIN_CTX = 4096
 def set_context(n: int, root: Path = ROOT) -> list[Path]:
     if not MIN_CTX <= n <= TRAINED_CTX:
         raise ValueError(f"the context must be {MIN_CTX}-{TRAINED_CTX} tokens (got {n}); "
-                         f"past {TRAINED_CTX}: ./setup.sh --setup --context {n} (rope scaling)")
+                         f"past {TRAINED_CTX}: python3 bootstrap.py --setup --context {n} (rope scaling)")
     changed = []
     for p in sorted(root.glob("strata-*.json")):
         cfg = json.loads(p.read_text(encoding="utf-8"))

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Strata one-click setup and start (Windows and Linux, NVIDIA or AMD GPUs).
 
-    START-HERE.bat  (Windows)   /   ./setup.sh  (Linux)      - they install Python if needed and run this file
+    START-HERE.bat  (Windows)   /   python3 bootstrap.py  (Linux)      - they install Python if needed and run this file
 
 The first time it asks four questions - which model (the original Qwen3.8-Flash-Next or the Swift 1.5 fine-tune),
 which size, how much context, and whether the model should also read images - then installs everything and starts the model on http://127.0.0.1:8080 (OpenAI- and Anthropic-compatible
@@ -1245,7 +1245,7 @@ def split_budget(cfg: dict, yes: bool = False, explicit: bool = False) -> bool:
                      f"more); this PC has {ram:.0f} GB. The estimate is a worst case: a 128 GB PC ran it (#737), but "
                      "it may page or stall here.", explicit, yes,
                      f"{model} on several GPUs needs ~{need:.0f} GB of RAM; this PC has {ram:.0f} GB",
-                     "start it on one GPU: START-HERE.bat --gpu N (Linux: ./setup.sh --gpu N)")
+                     "start it on one GPU: START-HERE.bat --gpu N (Linux: python3 bootstrap.py --gpu N)")
     i = a.index("--resident-budget-gib")
     del a[i:i + 2]
     ok(f"{model} on several GPUs: no RAM budget (the engine has none with a layer split) - all its experts are "
@@ -4203,7 +4203,7 @@ def saved_calibration(cfg: dict) -> dict | None:
 
 def setup_calibration(cfg: dict, hip: bool) -> dict | None:
     """The calibration a (re-)install applies to its new config: the one saved for this PC and model.  #566: on Linux
-    HIP too - hardware_key now names the AMD cards, so a `./setup.sh --calibrate` run is matched to its card and
+    HIP too - hardware_key now names the AMD cards, so a `python3 bootstrap.py --calibrate` run is matched to its card and
     model.  Windows HIP keeps the defaults for now (not tried there).  Setup still offers the tuning itself on NVIDIA
     only: each control is verified on HIP first."""
     if hip and WIN:
@@ -4244,7 +4244,7 @@ def update_install(have: list, a) -> int:
     keeps its engine (update_installed_engine says to close it and run this again)."""
     have = [p for p in have if model_config(p)]        # #549: a strata-*.json that is no model config is skipped
     if not have:
-        say("  No model is installed in this Strata folder yet: run START-HERE.bat (Linux: ./setup.sh) to set it up -")
+        say("  No model is installed in this Strata folder yet: run START-HERE.bat (Linux: python3 bootstrap.py) to set it up -")
         say("  it finds an earlier install's model files next to it and reuses them.")
         return 0
     pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
@@ -4261,7 +4261,7 @@ def update_install(have: list, a) -> int:
     ver = engine_version(Path(json.loads(have[0].read_text(encoding="utf-8-sig"))["exe"]))
     say()
     ok("Strata is updated" + (f" (engine {'.'.join(map(str, ver))})" if any(ver) else "") +
-       ". Start the model with " + ("START-HERE.bat" if WIN else "./setup.sh") + " when you want it.")
+       ". Start the model with " + ("START-HERE.bat" if WIN else "python3 bootstrap.py") + " when you want it.")
     return 0
 
 
@@ -4329,7 +4329,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             miss = [x for x in cards if built and x["arch"] not in built]
             if miss:
                 fail("the installed engine has no code for " + ", ".join(f"{x['name']} ({x['arch']})" for x in miss),
-                     "set it up for these cards: ./setup.sh --setup --backend hip --gpus " + ",".join(map(str, gpu)))
+                     "set it up for these cards: python3 bootstrap.py --setup --backend hip --gpus " + ",".join(map(str, gpu)))
             cfg["gpu"], cfg["gpus_asked"] = gpu, True
             cfg["layer_split"] = layer_split or cfg.get("layer_split") or "auto"
             split_budget(cfg, yes, True)               # #498: before it is saved (asks when the RAM is short, #737)
@@ -4476,7 +4476,7 @@ def draft_vocab_note(vram_gb: float, chosen: str | None) -> list[str]:
     --draft-vocab, or kept from an earlier install, gets no note.  [] for every other case."""
     if chosen or not 0 < vram_gb < SMALL_DRAFT_VRAM_GB:
         return []
-    start = "START-HERE.bat" if WIN else "./setup.sh"
+    start = "START-HERE.bat" if WIN else "python3 bootstrap.py"
     return [f"Tip for a {vram_gb:.0f} GB card: the draft layer's default token subset (with Chinese, Japanese and "
             f"Korean) needs up to ~{DRAFT_VOCAB_MIB['cjk']} MiB of VRAM.",
             f"  For English and code answers, {start} --draft-vocab en needs up to ~{DRAFT_VOCAB_MIB['en']} MiB "
@@ -4491,7 +4491,7 @@ def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
     """#496: what frees VRAM on a card under 8 GB when the start stops with "no VRAM is left for the expert cache"
     (the engine already lowers its own reserve on such a card) - a recommendation, setup changes none of it.  (The
     draft layer stays: the server needs it.)"""
-    start = "START-HERE.bat --setup" if WIN else "./setup.sh"
+    start = "START-HERE.bat --setup" if WIN else "python3 bootstrap.py"
     tips = []
     if ctx > 8192:
         tips.append("an 8K context (a smaller KV cache)")
@@ -4621,7 +4621,7 @@ def desktop_reserve_note() -> list[str]:
     fills it, and when the desktop needs more VRAM amdgpu moves the cache to system RAM, where the OOM killer then ends
     the compositor.  A recommendation, setup changes nothing."""
     return [f"If this AMD card also drives your desktop and the desktop or apps crash once the model is loaded, keep "
-            f"more VRAM free: ./setup.sh --vram-reserve-mib {DESKTOP_RESERVE_MIB}",
+            f"more VRAM free: python3 bootstrap.py --vram-reserve-mib {DESKTOP_RESERVE_MIB}",
             "  (remembered for this model; the expert cache gets ~2.3 GB less, a few % of speed)"]
 
 
@@ -5039,7 +5039,7 @@ def main() -> int:
               " - docs/AMD_HIP.md)")
         hip = ask("Which cards?", ["1", "2"], "1", a.yes or a.check) == "2"
         if a.check and not hip:
-            say(f"  (the AMD card: {'START-HERE.bat' if WIN else './setup.sh'} --backend hip)")
+            say(f"  (the AMD card: {'START-HERE.bat' if WIN else 'python3 bootstrap.py'} --backend hip)")
     cuda_tk = 13                                       # NVIDIA: the toolkit of this model's engine (cuda_choice)
     if hip:                                            # AMD: compiled here; Windows: ready-made
         if WIN and a.gpus:
@@ -5818,7 +5818,7 @@ def main() -> int:
     if a.host and a.host not in ("127.0.0.1", "localhost"):
         say(f"  Other devices:    the server window prints this PC's address (http://<IP>:{port}/)"
             + ("" if a.api_key else " - no API key set: anyone on your network can use it"))
-    say(f"  Next time:        just run {'START-HERE.bat' if WIN else './setup.sh'} (or {script.name}) - it starts right away")
+    say(f"  Next time:        just run {'START-HERE.bat' if WIN else 'python3 bootstrap.py'} (or {script.name}) - it starts right away")
     if vision != "none":
         say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
     if a.parallel is None:                             # #465: the opt-in, said once (nothing changes)
@@ -5827,7 +5827,7 @@ def main() -> int:
             say("  " + line)
     if tuned is False:                                 # #447: a failed tuning is repeated here, not only above
         say("  Tuning:           FAILED (the reason is above): the default settings stay - "
-            f"{'START-HERE.bat' if WIN else './setup.sh'} --calibrate tries again")
+            f"{'START-HERE.bat' if WIN else 'python3 bootstrap.py'} --calibrate tries again")
     if a.no_start:
         return 0
     return start(cfg_path, port)

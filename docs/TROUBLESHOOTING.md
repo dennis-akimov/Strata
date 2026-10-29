@@ -13,7 +13,7 @@ PC, close other programs (browsers use a lot of RAM) and try again. If it keeps 
 or IQ2_XS).
 
 **It stopped while downloading or installing.**
-Run `START-HERE.bat` (Linux: `./setup.sh`) again. It continues where it stopped.
+Run `START-HERE.bat` (Linux: `python3 bootstrap.py`) again. It continues where it stopped.
 
 **It says the NVIDIA driver is too old.**
 Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), restart the PC, and run
@@ -52,11 +52,11 @@ Install what it names (links are printed), then run it again. Everything already
 **Linux: the engine does not compile (`unsupported GNU version`, or `exception specification is incompatible` for
 `cospi`/`sinpi`/`rsqrt`).** Two known mismatches between the CUDA toolkit and a new Linux (#601):
 - gcc newer than 14 (Ubuntu 26.04's default 15): CUDA 12.x and 13.0 refuse it. Install g++-14 and run
-  `CXX=g++-14 ./setup.sh` (CC, CXX and CUDAHOSTCXX name the build's compilers; setup passes them to CMake itself,
+  `CXX=g++-14 python3 bootstrap.py` (CC, CXX and CUDAHOSTCXX name the build's compilers; setup passes them to CMake itself,
   so an already-configured build folder picks them up too, #1645).
 - glibc 2.43 with CUDA 12.9: the toolkit's math headers clash with glibc's, already in CMake's first test compile.
   Use CUDA 12.8 or 13.x instead. Setup takes the newest toolkit it finds; `STRATA_NVCC=/usr/local/cuda-12.8/bin/nvcc
-  ./setup.sh` makes it use that one (only that one).
+  python3 bootstrap.py` makes it use that one (only that one).
 
 **The first start takes minutes.**
 It is reading 34-55 GB into RAM; the second start is faster while the files are in the OS cache. Started from Task
@@ -143,7 +143,7 @@ lists every card it found and whether Strata can use it.
 
 **The engine stops at start with the card's name, its architecture and the build's list.**
 The engine was compiled for another card (for example after moving the Strata folder to another PC). Run
-`./setup.sh --setup --backend hip`: it compiles the engine for this card's architecture.
+`python3 bootstrap.py --setup --backend hip`: it compiles the engine for this card's architecture.
 
 **On Windows the engine exits with `0xC0000005` in `amdhip64_7.dll` before it prints anything (#654).**
 Two things in your environment can cause it, and the server now repairs both before it starts the engine (it says so in

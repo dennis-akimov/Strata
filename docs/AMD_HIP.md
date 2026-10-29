@@ -23,7 +23,7 @@ On Linux with an RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9
 the kernel's amdgpu driver (no ROCm install needed):
 
 ```sh
-./setup.sh --backend hip
+python3 bootstrap.py --backend hip
 ```
 
 - **Detection:** setup finds the card through the kernel's KFD topology. Integrated Radeon GPUs are listed as not
@@ -44,14 +44,14 @@ the kernel's amdgpu driver (no ROCm install needed):
   Otherwise it says so and the prompt's dense matrix products use plain hipBLAS (slower prompts, same answers).
   A table's solution ids are valid only for that pair, and the engine refuses any other table.
 - **Several cards:** setup takes one card (the one with the most VRAM, or `--gpu N`) unless you name more:
-  `./setup.sh --backend hip --gpus 1,0` splits the model's layers across them, the first one the main card (numbers
+  `python3 bootstrap.py --backend hip --gpus 1,0` splits the model's layers across them, the first one the main card (numbers
   as setup lists them; `--gpus all` = every supported card, the most VRAM first). Every chosen card must be one of the
   architectures above; the engine is compiled for each of them (cards of two families, e.g. gfx1100 + gfx1201, need
   a system ROCm 7: AMD's wheels hold one family). A split pays only when no single card holds the model's experts
   (see RDNA4 below).
 - **Limits for now:** images only through the CPU encoder (`--vision cpu`, 0.1.32). Setup does not offer the tuning
   (calibration) on AMD yet: its controls are being checked on HIP one at a time (#566). Since 0.1.39 a tuning run by
-  hand (`./setup.sh --calibrate`) is saved for the AMD card it ran on and reused when setup runs again. The Monitor
+  hand (`python3 bootstrap.py --calibrate`) is saved for the AMD card it ran on and reused when setup runs again. The Monitor
   shows the card's load, VRAM, temperature and power from Linux sysfs (0.1.32).
 
 The rest of setup is the same as on NVIDIA: the model download, the start script, the server.
@@ -196,7 +196,7 @@ The 4K context is a smoke-test starting point, not a model limit. The expert cac
 sizes itself automatically and leaves 1 GiB of VRAM headroom.
 
 **The card also drives a Linux desktop (#560 #516):** keep more VRAM free than the default 700 MiB, e.g.
-`./setup.sh --vram-reserve-mib 3072`. With the cache filling the card, the desktop's next VRAM need makes amdgpu move
+`python3 bootstrap.py --vram-reserve-mib 3072`. With the cache filling the card, the desktop's next VRAM need makes amdgpu move
 GPU memory to system RAM (GTT), the OOM killer then ends KWin/plasmashell or `systemd-oomd` ends apps, or the
 compositor fails with "Failed to pin framebuffer with error -12".
 
@@ -370,7 +370,7 @@ hipBLASLt table for gfx1200 (the numbers below); gfx1101 has none (make one with
 and compare the prompt speed with and without it).
 
 - **gfx1101, RX 7800 XT 16 GB** (jhohertz, #254; engine 0.1.29, Ryzen 9 5950X, 121 GiB RAM, system ROCm with
-  hipBLASLt 1.4.1): `./setup.sh --backend hip` detected the card and compiled the engine; `strata-device --selftest`
+  hipBLASLt 1.4.1): `python3 bootstrap.py --backend hip` detected the card and compiled the engine; `strata-device --selftest`
   passed; ctest 30/32 (`ple_parity` needs the Q2_0 fixture, `platform_memory_test` the memlock limit). Coder IQ1_M,
   64K context, MTP, with a table the owner calibrated: fresh prompts of 4K-9K tokens at 898-953 tok/s, decode
   38-44 tok/s (128 tokens).

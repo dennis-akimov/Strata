@@ -50,7 +50,7 @@ Imágenes y videos en el mismo Mac (2026-10-11/12):
 
 Los tiempos de video se midieron mientras Docker ocupaba 76 GB y macOS usaba swap (la GPU a 600-750 MHz): son un mínimo.
 
-Las cifras de Qwen usan su capa de borrador MTP, que es opcional (`./setup.sh --setup --mtp on`, unos 12 GB más de
+Las cifras de Qwen usan su capa de borrador MTP, que es opcional (`python3 bootstrap.py --setup --mtp on`, unos 12 GB más de
 disco). La caché del contexto se suma al archivo del modelo (unos pocos GB; más con contextos largos). En el modo de
 energía *Automático*, el mismo Mac escribía las respuestas largas de 2 a 3 veces más lento. No se midieron otros Mac.
 Todas las cifras y cómo se midieron: [docs/MACOS.md](docs/MACOS.md#measured) (en inglés).

@@ -46,11 +46,11 @@ On Ubuntu 24.04 or newer, from nothing. The Intel GPU driver (the `xe` or `i915`
 2. **Get Strata and build the engine** ("How to build it" below, about 10 minutes the first time).
 3. **Run setup:**
 
-        ./setup.sh --backend sycl [setup.py's options, e.g. --model IQ3_S --context 32768 --port 8085]
+        python3 bootstrap.py --backend sycl [setup.py's options, e.g. --model IQ3_S --context 32768 --port 8085]
 
-   `setup.sh` makes its own Python environment in `.venv`, so Ubuntu's "externally managed" system Python is not
+   `bootstrap.py` makes its own Python environment in `.venv`, so Ubuntu's "externally managed" system Python is not
    touched. **Do not run `python3 sycl/setup_intel.py` yourself:** it installs setup's packages into whichever Python runs
-   it, and Ubuntu's refuses (`externally-managed-environment`). `./setup.sh --backend sycl` is the one command, for the
+   it, and Ubuntu's refuses (`externally-managed-environment`). `python3 bootstrap.py --backend sycl` is the one command, for the
    first install and every later start.
 
 Setup is upstream's `setup.py` with the Intel steps swapped in (`sycl/setup_intel.py` imports it and replaces those steps;
@@ -80,7 +80,7 @@ checkout, or `STRATA_SYCL_ROOT`). An earlier Strata install on the same PC keeps
 `~/.config/strata/settings.json`; pass `--data-dir <folder above the checkout>/Strata-data` to put this one under the
 mount. A symlink to a folder outside the mount does not work in the container; a hard link does.
 
-Then `run-<model>.sh` (or `./setup.sh --backend sycl` again) starts the model. The first start of a 30 GB model
+Then `run-<model>.sh` (or `python3 bootstrap.py --backend sycl` again) starts the model. The first start of a 30 GB model
 takes about two minutes. `--port N` and `--host 0.0.0.0` work as in upstream's setup.
 
 ## How to build it
@@ -678,7 +678,7 @@ test an SM-holding NVIDIA bench (not built). Outputs identical to 0.1.33 (Coder 
 ## Arc A750 and the other Alchemist cards (`i915`, 2026-10-07)
 
 Measured on an Arc A750 (8 GB, `i915`, PCIe 4.0) with the Flash-Next IQ3_XXS in a PC with 64 GB of RAM, a Ryzen 5 5600X
-(AVX2, no AVX-512). `./setup.sh --backend sycl` writes a different config for an `i915` card (and a 300 MiB VRAM reserve and
+(AVX2, no AVX-512). `python3 bootstrap.py --backend sycl` writes a different config for an `i915` card (and a 300 MiB VRAM reserve and
 `--draft-vocab en` for any card under 12 GB):
 
 | | Arc Pro B70 (`xe`, 32 GB) | Arc A750 (`i915`, 8 GB) |

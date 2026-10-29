@@ -689,7 +689,7 @@ class Strata:
                          "older CPU (10-20 minutes), and the CPU's share of the experts runs a few times slower")
         if backend == "hip":
             notes.append("AMD (experimental, Linux): the engine is compiled during setup; no images")
-        cmd = (("START-HERE.bat --setup" if WIN else "./setup.sh --setup") +
+        cmd = (("START-HERE.bat --setup" if WIN else "python3 bootstrap.py --setup") +
                f" --yes --family {fam} --model {model} --context {ctx}" + (" --backend hip" if backend == "hip" else ""))
         return {"family": fam, "model": model, "title": families[fam]["title"] + " " + model, "context": ctx,
                 "backend": backend, "gpu": {k: best.get(k) for k in ("index", "name", "vram_gb")},
@@ -1211,7 +1211,7 @@ class Tools:
                             "series or newer card")
         if sys.version_info < (3, 10) or (WIN and sys.maxsize <= 2**32):
             raise ToolError("this Python is too old or 32-bit: Strata's setup needs 64-bit Python 3.10+; run "
-                            + ("START-HERE.bat" if WIN else "./setup.sh") + " once instead (it installs Python)")
+                            + ("START-HERE.bat" if WIN else "python3 bootstrap.py") + " once instead (it installs Python)")
         hw = s.hardware()
         rec = s.recommend(hw)
         if model is None and family is None:
@@ -1277,7 +1277,7 @@ class Tools:
                 "context": context, "images": vision or "no", "download_gb": models[model]["download_gb"],
                 "partly_downloaded": partly, "ram": fit, "data_folder": str(target), "disk_free_gb": free,
                 "disk_needed_gb": round(need), "disk_short": short, "already_installed": installed,
-                "setup_command": ("START-HERE.bat " if WIN else "./setup.sh ") + " ".join(args),
+                "setup_command": ("START-HERE.bat " if WIN else "python3 bootstrap.py ") + " ".join(args),
                 "takes": "about 20-90 minutes, mostly the download; the PC stays usable",
                 "recommended_for_this_pc": rec if rec.get("model") else None}
         if installed:
@@ -1674,7 +1674,7 @@ class McpServer:
 # ------------------------------------------------------------------------------------------------ the install job
 def install_job(spec_path: str) -> int:
     """The background half of strata_install (this file started again with --install-job): make .venv like
-    START-HERE.bat / setup.sh do when it is missing, run setup, record its exit code."""
+    START-HERE.bat / bootstrap.py do when it is missing, run setup, record its exit code."""
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     root = Path(spec["root"])
     result = Path(spec["result"])
@@ -1700,7 +1700,7 @@ def install_job(spec_path: str) -> int:
                 r = subprocess.run([spec["base_python"], "-m", "venv", str(venv)])
                 if r.returncode or not py.exists():
                     print("\n  [X]  could not create the Python environment (.venv)", flush=True)
-                    print("       Linux: install python3-venv (sudo apt install python3-venv) or run ./setup.sh "
+                    print("       Linux: install python3-venv (sudo apt install python3-venv) or run python3 bootstrap.py "
                           "once in a terminal", flush=True)
                     record(exit_code=1, ended=time.strftime("%Y-%m-%d %H:%M:%S"))
                     return 1

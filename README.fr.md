@@ -50,7 +50,7 @@ Images et vidéos sur le même Mac (2026-10-11/12) :
 
 Les durées vidéo ont été mesurées alors que Docker occupait 76 Go et que macOS utilisait le swap (GPU à 600-750 MHz) : un plancher.
 
-Les chiffres de Qwen utilisent sa couche de brouillon MTP, qui est optionnelle (`./setup.sh --setup --mtp on`, environ
+Les chiffres de Qwen utilisent sa couche de brouillon MTP, qui est optionnelle (`python3 bootstrap.py --setup --mtp on`, environ
 12 Go de disque en plus). Le cache du contexte s'ajoute au fichier du modèle (quelques Go ; davantage pour les longs
 contextes). En mode d'énergie *Automatique*, le même Mac écrivait les longues réponses 2 à 3 fois plus lentement.
 Aucun autre Mac n'a été mesuré. Tous les chiffres et leur méthode : [docs/MACOS.md](docs/MACOS.md#measured) (en anglais).

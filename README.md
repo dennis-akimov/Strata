@@ -49,7 +49,7 @@ Pictures and videos on the same Mac (2026-10-11/12):
 
 The video times were measured while Docker held 76 GB and macOS was swapping (the GPU at 600-750 MHz), so a floor.
 
-The Qwen numbers use its MTP draft layer, which is opt-in (`./setup.sh --setup --mtp on`, about 12 GB more disk).
+The Qwen numbers use its MTP draft layer, which is opt-in (`python3 bootstrap.py --setup --mtp on`, about 12 GB more disk).
 The context's cache comes on top of the model file (a few GB; more for long contexts). In the *Automatic* energy mode
 the same Mac wrote long answers 2-3x slower. Other Macs were not measured. Every number and how it was measured:
 [docs/MACOS.md](docs/MACOS.md#measured).
@@ -59,9 +59,9 @@ the same Mac wrote long answers 2-3x slower. Other Macs were not measured. Every
 | | |
 | --- | --- |
 | **Mac** | Apple Silicon (M1 or newer). Only one M5 Max with 128 GB was tested; other chips and sizes are expected to work but were not tried. |
-| **Memory** | Enough for the model file plus its cache, inside what macOS lets the GPU use (on the tested 128 GB Mac: 107.5 GB). Setup's check counts 64 GB as the minimum. `make check` estimates what fits on yours; see [Which model?](#which-model) |
+| **Memory** | Enough for the model file plus its cache, inside what macOS lets the GPU use (on the tested 128 GB Mac: 107.5 GB). 16 GB runs GPT-OSS 20B at a small context with other apps closed; 24-32 GB runs it comfortably; the Qwen3.8 models want 64 GB or more. `make setup` shows what fits yours; see [Which model?](#which-model) |
 | **Disk** | The model's download plus a few GB (70-100 GB per model), on the internal SSD. |
-| **Software** | Apple's Command Line Tools (`xcode-select --install`, wait until it finishes) and Python 3.10 or newer (if it is missing, setup installs it with Homebrew when Homebrew is there). Tested on macOS 26.4. |
+| **Software** | Nothing beforehand: `make setup` installs Apple's Command Line Tools, Homebrew and Python (when missing), Rust, the build tools and aria2. Tested on macOS 26.4 and 27.0. |
 
 ## Install
 
@@ -70,13 +70,15 @@ In Terminal:
 ```sh
 git clone https://github.com/dennis-akimov/Strata.git
 cd Strata
-make check                 # what this Mac can run; installs nothing
-make pull MODEL=Q2_0       # builds the engine and downloads the model (66 GB)
-make run                   # loads the model and opens http://127.0.0.1:8080 when it is ready
+make setup                 # everything: tools, builds, a model that fits this Mac, a first answer, Strata.app
 ```
 
-`make pull` asks a few questions (context size, pictures); Enter takes the recommended answer. If the download stops,
-run it again: it continues where it stopped. Loading takes a minute or so each start. `make run` keeps Terminal busy
+`make setup` installs what is missing (Apple's Command Line Tools open an installer window; Homebrew asks for your
+password), builds the engine, the server and Strata.app, lists the models with whether each fits this Mac (the best
+one is preselected: Enter takes it), downloads it, writes its run config with the largest context that fits (the
+engine measures it), checks that the model answers, and opens Strata.app on it. If anything stops, run `make setup`
+again: finished steps are skipped and downloads continue. `make setup MODEL=GPT-OSS-20B SETUP_ARGS=--yes` asks
+nothing. Without the app: `make run PORT=8090` and http://127.0.0.1:8090. Loading takes a minute or so each start. `make run` keeps Terminal busy
 while Strata runs; press Ctrl+C to stop it, or use `make start` / `make stop` to run it in the background. Every
 option, the limits and the warnings: **[docs/MACOS.md](docs/MACOS.md)**.
 

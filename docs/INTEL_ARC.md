@@ -60,7 +60,7 @@ images (not wired on Intel).
 - **Intel oneAPI**: the DPC++ compiler (`icpx`, 2025.3 or newer; 2026.1 is what was built here) and **oneMKL**. About 5 GB.
 - `cmake` 3.24+, `ninja`, `git` (the build fetches ggml unless you point `STRATA_GGML_DIR` at a llama.cpp checkout),
   Python 3.
-- For `./setup.sh --backend sycl` today: **Docker**, and nothing else from the list above except the GPU driver.
+- For `python3 bootstrap.py --backend sycl` today: **Docker**, and nothing else from the list above except the GPU driver.
   `sycl/setup_intel.py` runs the engine in the `strata-sycl-dev` image built from `sycl/tools/Dockerfile`, and the
   engine is built in that image too ("Build with Docker" below). On Ubuntu: `sudo apt install docker.io git`, then
   `sudo usermod -aG docker,render $USER` and log in again. Note that the Dockerfile starts from a community
@@ -82,8 +82,8 @@ docker run --rm -u $(id -u):$(id -g) -v "$PWD/..:/work" -e AOT=bmg-g31 -e REPO=/
     -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash sycl/tools/build.sh strata"
 ```
 
-Then `./setup.sh --backend sycl` (below). Do not run `python3 sycl/setup_intel.py` by hand: on Ubuntu it fails with
-`externally-managed-environment`; `setup.sh` runs it in its own `.venv`.
+Then `python3 bootstrap.py --backend sycl` (below). Do not run `python3 sycl/setup_intel.py` by hand: on Ubuntu it fails with
+`externally-managed-environment`; `bootstrap.py` runs it in its own `.venv`.
 
 ## Build without Docker (Linux)
 
@@ -123,7 +123,7 @@ top-level option the engine is at `build-sycl/sycl/strata`, so either use `-S sy
 ## Setup and running
 
 ```sh
-./setup.sh --backend sycl [setup's usual options, e.g. --model IQ2_XS --context 32768]
+python3 bootstrap.py --backend sycl [setup's usual options, e.g. --model IQ2_XS --context 32768]
 ```
 
 This prints the experimental warning and continues with `sycl/setup_intel.py` (in setup's own Python environment).

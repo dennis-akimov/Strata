@@ -179,7 +179,7 @@ pub fn sampling_keys(s: &Map<String, Value>) -> String {
 
 // ------------------------------------------------------------------------------------------------ start helpers
 const DRAFT_HEAD_FAIL: &str = "the draft head does not fit";
-const DRAFT_HEAD_HINT: &str = "a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic script) or --draft-vocab en (English and code, ~215 MiB less than the default). Start once with it - START-HERE.bat --draft-vocab en (Windows) or ./setup.sh --draft-vocab en - and the model keeps it; or a smaller --context in setup.";
+const DRAFT_HEAD_HINT: &str = "a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic script) or --draft-vocab en (English and code, ~215 MiB less than the default). Start once with it - START-HERE.bat --draft-vocab en (Windows) or python3 bootstrap.py --draft-vocab en - and the model keeps it; or a smaller --context in setup.";
 
 fn read_from(path: &str, offset: u64, max: Option<u64>) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
@@ -424,6 +424,22 @@ impl ConvCacheLog {
 }
 
 // ------------------------------------------------------------------------------------------------ the process
+/// An engine ERR line as a failure.  llama_process failed (-3) is llama.cpp's GGML_STATUS_FAILED: on a Mac, Metal ran
+/// out of memory (the engine log says kIOGPUCommandBufferCallbackErrorOutOfMemory) - not the request's fault (503),
+/// said with what to change (Strata.app finds this line in the server's output and offers a context that fits).
+pub fn engine_err(line: &str, context: i64) -> Fail {
+    let why = py::strip(line.get(4..).unwrap_or("")).to_string();
+    if why.contains("llama_process failed (-3)") {
+        let m = format!(
+            "the GPU ran out of memory (Metal) at a context of {context} tokens: lower the context (Strata.app > Context, \
+             or \"--max-context\" in the run config), add \"--prefill-batch\", \"512\" to its args, close other apps, or pick a smaller model"
+        );
+        say(&m);
+        return Fail::GpuBusy(m);
+    }
+    Fail::Value(why)
+}
+
 pub struct Spawn {
     pub exe: String,
     pub args: Vec<String>,
@@ -1098,7 +1114,7 @@ impl StrataEngine {
                     return Ok(());
                 } else if line.starts_with("ERR") {
                     done = true;
-                    return Err(Stop::Err(Fail::Value(py::strip(line.get(4..).unwrap_or("")).to_string())));
+                    return Err(Stop::Err(engine_err(&line, self.max_context.load(SeqCst))));
                 }
             }
         };
@@ -1804,7 +1820,7 @@ impl StrataEngine {
                 }
             } else if line.starts_with("ERR") {
                 self.ctl_state.lock().unwrap().erred = true;
-                return Err(Stop::Err(Fail::Value(py::strip(line.get(4..).unwrap_or("")).to_string())));
+                return Err(Stop::Err(engine_err(&line, self.max_context.load(SeqCst))));
             }
             if line.starts_with("DONE") && self.ctl_state.lock().unwrap().mode == "solo" {
                 self.ctl_state.lock().unwrap().result = Some(("done".into(), false));
@@ -2120,5 +2136,17 @@ impl Engine {
     }
     pub fn unloaded(&self) -> bool {
         self.strata().map(|s| s.unloaded.load(SeqCst)).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod engine_err_tests {
+    use super::*;
+
+    #[test]
+    fn oom_is_said_with_a_fix() {
+        let e = engine_err("ERR llama_process failed (-3)", 8192);
+        assert!(matches!(&e, Fail::GpuBusy(m) if m.contains("ran out of memory") && m.contains("8192") && m.contains("--prefill-batch")), "{e:?}");
+        assert_eq!(engine_err("ERR unknown command: X", 8192), Fail::Value("unknown command: X".into()));
     }
 }

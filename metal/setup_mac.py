@@ -109,6 +109,7 @@ def build_engine(*_a, **_k) -> Path:
     S.run([cmake, "--build", str(build), "--target", EXE, S.VEXE, IEXE, "-j", str(os.cpu_count() or 8)], quiet=True)
     ENGINE.mkdir(exist_ok=True)
     for exe in (EXE, S.VEXE, IEXE):                    # the engine, the image encoder (tools/vision) and strata-image
+        (ENGINE / exe).unlink(missing_ok=True)   # a new file: macOS kills a program whose binary was rewritten in place
         shutil.copy2(build / "metal" / exe, ENGINE / exe)
     info.write_text(json.dumps(meta, indent=1), encoding="utf-8")
     return ENGINE
@@ -210,7 +211,7 @@ def install(argv) -> None:
             return                                      # not fetched (run_mac skips it)
         if "MTP draft layer: " in msg:
             msg = msg.split("MTP")[0] + ("MTP draft layer: on (--mtp on; it is converted for llama.cpp at the end)"
-                                         if MTP["on"] else "MTP draft layer: off (./setup.sh --setup --mtp on: 1.2-1.5x "
+                                         if MTP["on"] else "MTP draft layer: off (python3 bootstrap.py --setup --mtp on: 1.2-1.5x "
                                          "faster answers, which can differ from the plain ones after many tokens)")
         say(msg)
     S.say = say_mac

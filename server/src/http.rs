@@ -138,6 +138,7 @@ pub async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<
             Some(Frame::Head(..)) => Some((Ok(Bytes::new()), (rx, g))),
             None => {
                 g.1 = false; // the answer is complete: no hang-up
+                drop(g);
                 None
             }
         }

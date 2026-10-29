@@ -824,6 +824,18 @@ function budgetProblem(max, budget) {
   return "";
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// The model's own sampling (the run config's "sampling": GPT-OSS 1.0 / 1.0, Qwen 0.6 / 0.95 / 20) until this browser
+// saves its own: DEFAULTS are Qwen's.  A model whose config names no top_k samples without one (0: off).
+async function modelSampling() {
+  if (store.get("sampling", null)) return;
+  try {
+    const r = await fetch("props", {headers: headers(), cache: "no-store"});
+    if (!r.ok) return;
+    const p = (await r.json()).default_generation_settings?.params || {};
+    if (p.temperature === undefined) return;
+    Object.assign(settings, {temperature: p.temperature, top_p: p.top_p ?? 1, top_k: p.top_k ?? 0});
+  } catch (e) { /* the page's defaults stay */ }
+}
 let messages = [];                    // the open chat (chatsReady loads it)
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
@@ -1802,6 +1814,6 @@ setBusy(false);
 renderChat();                         // empty until chatsReady has the open chat
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-Promise.all([chatsReady, loadHealth()]).then(loadMcp).then(() => { refreshContext(); if (startQuestion) { $("input").value = startQuestion; send(); } });
+Promise.all([chatsReady, loadHealth()]).then(modelSampling).then(loadMcp).then(() => { refreshContext(); if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();

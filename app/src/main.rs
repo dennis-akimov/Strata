@@ -28,6 +28,9 @@ const KEY_SCRIPT: &str = r#"{ const u = new URL(location.href), k = u.searchPara
 
 enum Ev {
     Status(Value),
+    Memory(Value),
+    Alert(Value),
+    Page(Value),
     Log(String),
     Ipc(Value),
     Menu(MenuEvent),
@@ -57,7 +60,8 @@ fn save_settings(v: &Value) {
     let _ = std::fs::write(p, serde_json::to_string_pretty(v).unwrap_or_default());
 }
 
-/// The run configs setup wrote (strata-<model>.json), newest first.
+/// The run configs setup wrote (strata-<model>.json) that name an engine, newest first; [`problem`] says which of
+/// them cannot run yet.
 fn configs(root: &Path) -> Vec<PathBuf> {
     let mut v: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(root)
         .into_iter()
@@ -68,17 +72,187 @@ fn configs(root: &Path) -> Vec<PathBuf> {
             let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             n.starts_with("strata-") && n.ends_with(".json") && !n.contains(".shared-settings")
         })
-        .filter(|p| runnable(&read_config(p)))
+        .filter(|p| read_config(p).get("exe").is_some())
         .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p))
         .collect();
     v.sort_by(|a, b| b.0.cmp(&a.0));
     v.into_iter().map(|(_, p)| p).collect()
 }
 
-/// A config the server can run: it names an engine and every model file it points at is on disk.
+/// A config the server can run: it names an engine and every file it needs is on disk.
 fn runnable(c: &Value) -> bool {
+    c.get("exe").is_some() && problem(c).is_none()
+}
+
+/// Why a config cannot run yet, with the command that fixes it.
+fn problem(c: &Value) -> Option<String> {
     let args: Vec<&str> = c["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-    c.get("exe").is_some() && args.windows(2).filter(|w| matches!(w[0], "--gguf" | "--model" | "--pack")).all(|w| Path::new(w[1]).exists())
+    let exe = c["exe"].as_str().unwrap_or("");
+    if !Path::new(exe).is_file() {
+        return Some(format!("the engine {} is missing: run make build", Path::new(exe).file_name().unwrap_or_default().to_string_lossy()));
+    }
+    let pull = |path: &str| {
+        // the folder tools/pull_model.py downloads each model into
+        let dir = Path::new(path).parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let model = [("glm-5.3", "GLM-5.3"), ("gpt-oss-120b-heretic", "GPT-OSS-120B-HERETIC"), ("gpt-oss-120b-dflash", "GPT-OSS-120B-DFLASH"),
+            ("gpt-oss-120b", "GPT-OSS-120B"), ("gpt-oss-20b", "GPT-OSS-20B"), ("qwen3.6-35b", "QWEN3.6-35B"), ("nucleus", "NUCLEUS"),
+            ("hunyuan", "HUNYUAN"), ("wan2.2", "WAN2.2"), ("iq3_xxs", "IQ3_XXS"), ("iq3_s", "IQ3_S"), ("iq2_xs", "IQ2_XS"), ("q2_0", "Q2_0")]
+            .iter()
+            .find(|(d, _)| dir.starts_with(d))
+            .map(|(_, m)| *m);
+        match model {
+            Some(m) => format!("the model is not downloaded: run make pull MODEL={m}"),
+            None => format!("{path} is missing"),
+        }
+    };
+    if let Some(w) = args.windows(2).find(|w| matches!(w[0], "--gguf" | "--model" | "--pack") && !Path::new(w[1]).exists()) {
+        return Some(pull(w[1]));
+    }
+    match c["tokenizer"].as_str() {
+        Some(t) if !Path::new(t).exists() => Some(format!("its tokenizer pack is missing ({t}): run make pull for this model again")),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------- memory
+
+/// Whether this engine binary knows --plan (an older one would take it as an unknown flag and load the whole model).
+fn plans(exe: &Path) -> bool {
+    std::fs::read(exe).map(|b| b.windows(6).any(|w| w == b"--plan")).unwrap_or(false)
+}
+
+fn mtime(p: &Path) -> std::time::SystemTime {
+    std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// The engine's own measure of what this config needs (`<exe> --plan <args>`: llama.cpp lays the model and its
+/// buffers out without reading the weights, < 1 s), cached per config and engine file.
+fn plan(cfg_path: &Path) -> Result<Value, String> {
+    static CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<(PathBuf, std::time::SystemTime, std::time::SystemTime), Value>>> =
+        std::sync::LazyLock::new(Default::default);
+    let c = read_config(cfg_path);
+    let exe = PathBuf::from(c["exe"].as_str().unwrap_or(""));
+    let key = (cfg_path.to_path_buf(), mtime(cfg_path), mtime(&exe));
+    if let Some(v) = CACHE.lock().unwrap().get(&key) {
+        return Ok(v.clone());
+    }
+    if let Some(p) = problem(&c) {
+        return Err(p);
+    }
+    if !plans(&exe) {
+        return Err("this engine is older than its memory check (--plan): run make build".into());
+    }
+    let args: Vec<String> = c["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).filter(|a| *a != "--serve").map(String::from).collect()).unwrap_or_default();
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--plan").args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    if let Some(cwd) = c["cwd"].as_str().filter(|d| Path::new(d).is_dir()) {
+        cmd.current_dir(cwd);
+    }
+    let out = cmd.output().map_err(|e| format!("the engine could not be asked: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: Value = text.lines().find(|l| l.starts_with('{')).and_then(|l| serde_json::from_str(l).ok()).ok_or_else(|| {
+        let err = text.lines().find(|l| l.starts_with("ERR")).unwrap_or("no answer").trim_start_matches("ERR ").to_string();
+        format!("the engine could not measure this model: {err}")
+    })?;
+    CACHE.lock().unwrap().insert(key, v.clone());
+    Ok(v)
+}
+
+/// Memory macOS can give a program now without swapping much: free, inactive (file cache, idle apps), speculative
+/// and purgeable pages (vm_stat).
+fn ram_available() -> u64 {
+    let out = Command::new("/usr/bin/vm_stat").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let page = out.split("page size of ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(16384);
+    let pages = |name: &str| out.lines().find(|l| l.starts_with(name)).and_then(|l| l.rsplit(':').next()).and_then(|n| n.trim().trim_end_matches('.').parse::<u64>().ok()).unwrap_or(0);
+    (pages("Pages free") + pages("Pages inactive") + pages("Pages speculative") + pages("Pages purgeable")) * page
+}
+
+const CONTEXTS: [u64; 8] = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
+
+/// What a config needs against what this Mac has: the GPU's share must fit Metal's working set, and everything must
+/// fit the memory free now (when the server is not running: a running engine already holds its share).  For each
+/// context size the need follows the engine's per-token cost; a smaller --prefill-batch shrinks the work buffers
+/// (their size is the batch x the vocabulary's logits).
+fn memory(cfg_path: &Path, running: bool) -> Value {
+    let p = match plan(cfg_path) {
+        Ok(p) => p,
+        Err(e) => return json!({"config": cfg_path, "error": e}),
+    };
+    let n = |v: &Value| v.as_f64().unwrap_or(0.0);
+    let (g, h) = (&p["gpu"], &p["host"]);
+    let ctx = n(&p["context"]);
+    let per_token = n(&p["per_token"]);
+    let limit = n(&g["limit"]);
+    let gpu_need = n(&g["model"]) + n(&g["context"]) + n(&g["compute"]);
+    let need = gpu_need + n(&h["model"]) + n(&h["context"]) + n(&h["compute"]);
+    let pb = n(&p["prefill_batch"]).max(1.0);
+    // the work buffers at a batch of 512: they scale with the batch (measured 1702 -> 424 MiB, 2048 -> 512)
+    let saved_512 = if pb > 512.0 { (n(&g["compute"]) + n(&h["compute"])) * (1.0 - 512.0 / pb) } else { 0.0 };
+    let avail = if running { f64::INFINITY } else { ram_available() as f64 };
+    let train = n(&p["n_ctx_train"]);
+    let mut sizes: Vec<u64> = CONTEXTS.iter().copied().filter(|c| train <= 0.0 || (*c as f64) <= train).collect();
+    if !sizes.contains(&(ctx as u64)) {
+        sizes.push(ctx as u64);
+        sizes.sort();
+    }
+    let fits = |gpu: f64, total: f64| gpu <= limit && total <= avail;
+    let mut options: Vec<Value> = sizes
+        .iter()
+        .map(|&c| {
+            let d = per_token * (c as f64 - ctx);
+            let (gpu, total) = (gpu_need + d, need + d);
+            let ok = fits(gpu, total);
+            let ok512 = !ok && saved_512 > 0.0 && fits(gpu - saved_512, total - saved_512);
+            json!({"ctx": c, "need": if ok512 { total - saved_512 } else { total }, "fits": ok || ok512, "batch512": ok512})
+        })
+        .collect();
+    let best = options.iter().rposition(|o| o["fits"] == true);
+    if let Some(i) = best {
+        options[i]["recommended"] = json!(true);
+    }
+    let state = if gpu_need > limit {
+        "red"
+    } else if need > avail {
+        "amber"
+    } else {
+        "green"
+    };
+    let gb = |b: f64| format!("{:.1} GB", b / 1e9);
+    let advice = match state {
+        "green" if running => "running".to_string(),
+        "green" => "fits".to_string(),
+        "amber" => format!("fits the GPU, but only {} is free now: close other apps to free {}", gb(avail), gb(need - avail)),
+        _ => match best {
+            Some(i) => format!("too big for this Mac at this context (the GPU can use {}): use a context of {}{}", gb(limit), options[i]["ctx"], if options[i]["batch512"] == true { " with a prefill batch of 512" } else { "" }),
+            None if n(&g["model"]) > limit => format!("the model alone ({}) is more than this Mac's GPU can use ({}): pick a smaller model", gb(n(&g["model"])), gb(limit)),
+            None => "no context size fits: close other apps or pick a smaller model".into(),
+        },
+    };
+    json!({"config": cfg_path, "context": ctx, "n_ctx_train": train, "prefill_batch": pb, "need": need, "gpu_need": gpu_need, "limit": limit,
+        "avail": if running { Value::Null } else { json!(avail) }, "running": running,
+        "weights": n(&g["model"]) + n(&h["model"]), "cache": n(&g["context"]) + n(&h["context"]), "work": n(&g["compute"]) + n(&h["compute"]),
+        "state": state, "advice": advice, "options": options, "recommended": best.map(|i| options[i].clone())})
+}
+
+/// Rewrite a config's --max-context (and --prefill-batch), keeping its key order and indentation.
+fn set_context(cfg_path: &Path, ctx: u64, batch: Option<u64>) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
+    for (flag, val) in [("--max-context", Some(ctx)), ("--prefill-batch", batch)] {
+        let Some(val) = val else { continue };
+        match args.iter().position(|a| a == flag) {
+            Some(i) if i + 1 < args.len() => args[i + 1] = json!(val.to_string()),
+            _ => args.extend([json!(flag), json!(val.to_string())]),
+        }
+    }
+    let indent = text.lines().nth(1).map(|l| l.len() - l.trim_start().len()).filter(|n| *n > 0).unwrap_or(1);
+    let mut out = vec![];
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(&b"        "[..indent.min(8)]);
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
+    serde::Serialize::serialize(&v, &mut ser).map_err(|e| e.to_string())?;
+    out.push(b'\n');
+    std::fs::write(cfg_path, out).map_err(|e| e.to_string())
 }
 
 fn config_port(c: &Path) -> u16 {
@@ -351,13 +525,42 @@ fn snapshot(st: &Shared) -> Value {
         .iter()
         .map(|p| {
             let c = read_config(p);
-            json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"]})
+            json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"], "problem": problem(&c)})
         })
         .collect();
     let settings = load_settings();
     json!({"root": s.root, "configs": list, "config": s.config, "port": s.port, "phase": s.phase,
         "running": s.child.is_some(), "log": s.log.iter().cloned().collect::<Vec<_>>(), "status": s.last,
         "key": s.api_key(), "autostart": settings["autostart"].as_bool().unwrap_or(false), "server": server_exe(&s.root).is_file()})
+}
+
+/// The memory check of the selected config, off the UI thread; `alert`: also say it as a problem (a chat failed).
+fn check_memory(st: &Shared, proxy: &EventLoopProxy<Ev>, alert: Option<String>) {
+    let (cfg, running) = {
+        let s = st.lock().unwrap();
+        (s.config.clone(), s.child.is_some())
+    };
+    let Some(cfg) = cfg else { return };
+    let p = proxy.clone();
+    std::thread::spawn(move || {
+        let m = memory(&cfg, running && alert.is_none());
+        let _ = p.send_event(match alert {
+            Some(why) => Ev::Alert(json!({"why": why, "memory": m})),
+            None => Ev::Memory(m),
+        });
+    });
+}
+
+/// A line of the server's output that means the model did not fit: Metal ran out of memory, or the engine ended
+/// while loading.
+fn trouble(line: &str) -> Option<&'static str> {
+    if line.contains("ran out of memory") || line.contains("Insufficient Memory") || line.contains("llama_process failed (-3)") {
+        Some("The GPU ran out of memory while answering.")
+    } else if line.contains("the engine exited before it was ready") {
+        Some("The engine stopped while loading the model.")
+    } else {
+        None
+    }
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> wry::Rect {
@@ -418,9 +621,10 @@ fn main() {
     app_menu.init_for_nsapp();
 
     let control_win = WindowBuilder::new().with_title("Strata").with_inner_size(tao::dpi::LogicalSize::new(1280.0, 900.0)).build(&event_loop).expect("window");
-    // two views in the window: the server's own page (Chat, Monitor, About) under the control bar; the bar covers the
-    // whole window while the server is down or its log is open
-    let page = WebViewBuilder::new().with_initialization_script(KEY_SCRIPT).with_bounds(rect(0.0, BAR, 1280.0, 900.0 - BAR)).with_visible(false).build_as_child(&control_win).expect("webview");
+    // two views in the window: the control bar, and the server's own page (Chat, Monitor, Firewall, About) under it.
+    // The bar covers the whole window while the server is down, its log is open or there is a problem to show; the
+    // page is hidden then.  The page is made last, so it is the top view whenever it shows: it never depends on the
+    // bar view keeping to its 44 px.
     let full = std::cell::Cell::new(true);
     let control_view = {
         let p = proxy.clone();
@@ -435,6 +639,24 @@ fn main() {
             .build_as_child(&control_win)
             .expect("webview")
     };
+    let page = {
+        let p = proxy.clone();
+        WebViewBuilder::new()
+            .with_initialization_script(KEY_SCRIPT)
+            .with_bounds(rect(0.0, BAR, 1280.0, 900.0 - BAR))
+            .with_visible(false)
+            .with_on_page_load_handler(move |e, url| {
+                let event = match e {
+                    wry::PageLoadEvent::Started => "started",
+                    wry::PageLoadEvent::Finished => "finished",
+                };
+                let _ = p.send_event(Ev::Page(json!({"event": event, "url": url})));
+            })
+            .build_as_child(&control_win)
+            .expect("webview")
+    };
+    // the page's loads: a load that never finishes (10 s) or finishes empty is said, with Open in browser and Retry
+    let (navs, loaded) = (Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
     // the menu bar
     let m_show = MenuItem::new("Show Strata", true, None);
@@ -465,7 +687,35 @@ fn main() {
         let act = |cmd: &str, v: &Value| {
             let note = |msg: &str| js_call(&control_view, "note", &json!(msg));
             match cmd {
-                "init" => js_call(&control_view, "init", &snapshot(&st)),
+                "init" => {
+                    js_call(&control_view, "init", &snapshot(&st));
+                    check_memory(&st, &proxy, None);
+                }
+                "memory" => check_memory(&st, &proxy, None),
+                "set_context" => {
+                    // a new context (and prefill batch) in the config; a running server restarts with it
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let (ctx, batch) = (v["ctx"].as_u64().unwrap_or(0).max(2048), v["batch512"].as_bool().unwrap_or(false).then_some(512));
+                    let running = st.lock().unwrap().child.is_some();
+                    let start_after = running || v["start"].as_bool().unwrap_or(false);
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let msg = match set_context(&cfg, ctx, batch) {
+                            Ok(()) => format!("── context set to {ctx}{} in {} ──", batch.map(|b| format!(", prefill batch {b}")).unwrap_or_default(), cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        if start_after {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                        check_memory(&st2, &p2, None);
+                    });
+                }
                 "select" => {
                     let mut s = st.lock().unwrap();
                     if let Some(c) = v["config"].as_str() {
@@ -477,6 +727,7 @@ fn main() {
                     save_settings(&set);
                     drop(s);
                     js_call(&control_view, "init", &snapshot(&st));
+                    check_memory(&st, &proxy, None);
                 }
                 "autostart" => {
                     let mut set = load_settings();
@@ -515,7 +766,18 @@ fn main() {
                         let s = st.lock().unwrap();
                         (s.base(), s.api_key())
                     };
-                    let _ = page.load_url(&format!("{base}/?strata-key={}#{}", query_escape(&key), v["tab"].as_str().unwrap_or("monitor")));
+                    let url = format!("{base}/?strata-key={}#{}", query_escape(&key), v["tab"].as_str().unwrap_or("monitor"));
+                    let n = navs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if let Err(e) = page.load_url(&url) {
+                        let _ = proxy.send_event(Ev::Page(json!({"event": "failed", "url": base, "why": e.to_string()})));
+                    }
+                    let (p2, loaded2) = (proxy.clone(), loaded.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(10));
+                        if loaded2.load(std::sync::atomic::Ordering::SeqCst) < n {
+                            let _ = p2.send_event(Ev::Page(json!({"event": "timeout", "url": base})));
+                        }
+                    });
                 }
                 "chat" => {
                     control_win.set_visible(true);
@@ -565,7 +827,24 @@ fn main() {
             Event::UserEvent(Ev::Log(line)) => {
                 st.lock().unwrap().push_log(line.clone());
                 js_call(&control_view, "log", &json!(line));
+                if let Some(why) = trouble(&line) {
+                    check_memory(&st, &proxy, Some(why.into()));
+                }
             }
+            Event::UserEvent(Ev::Memory(m)) => js_call(&control_view, "memory", &m),
+            Event::UserEvent(Ev::Page(e)) => {
+                if e["event"] == "finished" {
+                    loaded.store(navs.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
+                    layout(full.get()); // the bounds again, now that the page has content (a first layout can come too early)
+                    // a page that loaded but shows nothing (a blocked or empty answer) counts as not loaded
+                    let p = proxy.clone();
+                    let _ = page.evaluate_script_with_callback("(document.body && document.body.innerText.trim().length) || 0", move |chars| {
+                        let _ = p.send_event(Ev::Page(json!({"event": "checked", "chars": chars.trim().parse::<u64>().unwrap_or(0)})));
+                    });
+                }
+                js_call(&control_view, "pageEvent", &e);
+            }
+            Event::UserEvent(Ev::Alert(a)) => js_call(&control_view, "trouble", &a),
             Event::UserEvent(Ev::Status(s)) => {
                 let phase = s["phase"].as_str().unwrap_or("stopped").to_string();
                 js_call(&control_view, "status", &s);
@@ -617,4 +896,34 @@ fn main() {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_context_keeping_the_config() {
+        let p = std::env::temp_dir().join(format!("strata-app-test-{}.json", std::process::id()));
+        std::fs::write(&p, "{\n \"exe\": \"x\",\n \"args\": [\"--gguf\", \"m.gguf\", \"--max-context\", \"131072\", \"--kv\", \"f16\"],\n \"port\": 8090\n}\n").unwrap();
+        set_context(&p, 8192, Some(512)).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["args"], json!(["--gguf", "m.gguf", "--max-context", "8192", "--kv", "f16", "--prefill-batch", "512"]));
+        assert!(text.starts_with("{\n \"exe\""), "key order and 1-space indent kept: {text}");
+        set_context(&p, 4096, Some(256)).unwrap(); // a second change replaces, never appends twice
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["args"].as_array().unwrap().iter().filter(|a| *a == "--prefill-batch").count(), 1);
+        assert_eq!(v["args"][3], "4096");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn spots_out_of_memory_lines() {
+        assert!(trouble("[strata] the GPU ran out of memory (Metal) at a context of 8192 tokens: ...").is_some());
+        assert!(trouble("error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)").is_some());
+        assert!(trouble("[strata] 2026-10-29 10:20:54 the engine exited before it was ready").is_some());
+        assert!(trouble("[strata] 200 POST /v1/chat/completions").is_none());
+        assert!(problem(&json!({"exe": "/nope/strata-metal", "args": []})).unwrap().contains("make build"));
+    }
 }

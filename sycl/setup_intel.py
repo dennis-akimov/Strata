@@ -1,6 +1,6 @@
 """setup.py for an Intel Arc: upstream's installer, steered onto the SYCL port from outside.
 
-    ./setup.sh --backend sycl [setup.py's options]       (this file, run through setup.sh's virtual environment)
+    python3 bootstrap.py --backend sycl [setup.py's options]       (this file, run through bootstrap.py's virtual environment)
 
 The SYCL port keeps out of the shared files (upstream merges stay clean), so this does not edit setup.py: it imports
 it and replaces the few steps that are NVIDIA/AMD-specific, then runs setup's own main().  Everything else - the
@@ -202,7 +202,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
 def install(argv) -> None:
     intel = [] if S.WIN else intel_gpus()
     if not intel:
-        S.fail("no Intel Arc found (an xe or i915 card in /sys/class/drm)", "on an NVIDIA or AMD card, run ./setup.sh")
+        S.fail("no Intel Arc found (an xe or i915 card in /sys/class/drm)", "on an NVIDIA or AMD card, run python3 bootstrap.py")
     exe, why = sycl_engine()
     if exe is None:
         S.fail(f"Strata's SYCL engine cannot be used: {why}", "docs/INTEL.md: build it, then run this again")
@@ -230,7 +230,7 @@ def install(argv) -> None:
     def say_intel(msg=""):
         """setup's words for its AMD path and its RAM rule, said for the Intel card."""
         msg = str(msg).replace("(AMD, experimental: docs/AMD_HIP.md)", "(Intel Arc: the SYCL port, docs/INTEL.md)")
-        msg = msg.replace("Your AMD GPUs:", "Your Intel GPUs:").replace("just run ./setup.sh", "just run ./setup.sh --backend sycl")
+        msg = msg.replace("Your AMD GPUs:", "Your Intel GPUs:").replace("just run python3 bootstrap.py", "just run python3 bootstrap.py --backend sycl")
         msg = re.sub(r"\b(xe|i915) \(AMD: docs/AMD_HIP\.md\)", r"\1 driver (Intel Arc: docs/INTEL.md)", msg)
         where = ("the experts the card does not hold are computed on the CPU" if alch
                  else "the experts are streamed into VRAM")

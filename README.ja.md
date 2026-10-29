@@ -49,7 +49,7 @@ M5 Max（40 コア GPU、128 GB）の MacBook Pro、macOS 26.4、省エネルギ
 
 動画の時間は Docker が 76 GB を使い macOS がスワップしている状態（GPU は 600〜750 MHz）で測定したため、下限の値です。
 
-Qwen の数値は MTP ドラフト層を使っています。MTP は任意で、有効にするには `./setup.sh --setup --mtp on`（ディスクを
+Qwen の数値は MTP ドラフト層を使っています。MTP は任意で、有効にするには `python3 bootstrap.py --setup --mtp on`（ディスクを
 約 12 GB 追加で使用）。コンテキストのキャッシュはモデルファイルとは別に必要です（数 GB、長いコンテキストではさらに
 多く）。省エネルギーモードが *自動* のときは、同じ Mac で長い回答が 2〜3 倍遅くなりました。ほかの Mac では測定して
 いません。すべての数値と測定方法：[docs/MACOS.md](docs/MACOS.md#measured)（英語）。
