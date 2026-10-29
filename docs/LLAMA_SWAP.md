@@ -7,7 +7,7 @@ clients reaching the machine by its host name.
 
 ## The entry
 
-Set Strata up as usual first (`./setup.sh --no-start ...`), then point llama-swap at the server directly. The start script
+Set Strata up as usual first (`python3 bootstrap.py --no-start ...`), then point llama-swap at the server directly. The start script
 setup writes (`run-<model>.sh`) fixes the port at 8080, so call `serve/server.py` with llama-swap's port instead:
 
 ```yaml

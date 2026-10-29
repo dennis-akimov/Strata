@@ -47,7 +47,7 @@ Strata 在你自己的电脑上运行大型 AI 模型：它们能聊天、写代
 
 视频时间是在 Docker 占用 76 GB、macOS 正在使用交换空间（GPU 频率 600-750 MHz）时测得的，因此是下限。
 
-Qwen 的数字使用了它的 MTP 草稿层，这是可选功能（`./setup.sh --setup --mtp on`，多占约 12 GB 磁盘）。上下文缓存
+Qwen 的数字使用了它的 MTP 草稿层，这是可选功能（`python3 bootstrap.py --setup --mtp on`，多占约 12 GB 磁盘）。上下文缓存
 另外占用内存（几 GB；上下文越长越多）。在 *自动* 能耗模式下，同一台 Mac 写长回答要慢 2-3 倍。没有在其他 Mac 上
 测量过。全部数字及测量方法：[docs/MACOS.md](docs/MACOS.md#measured)（英文）。
 

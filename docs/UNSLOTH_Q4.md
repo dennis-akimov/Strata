@@ -13,7 +13,7 @@ the 3-bit models'.
 
 ## Setup
 
-`START-HERE.bat --setup` (Linux: `./setup.sh --setup`) and choose **Qwen3.8-Flash-Next (Unsloth)**, marked
+`START-HERE.bat --setup` (Linux: `python3 bootstrap.py --setup`) and choose **Qwen3.8-Flash-Next (Unsloth)**, marked
 `[experimental]`; or directly:
 
 ```sh

@@ -4,12 +4,14 @@
 :root{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mute:#6e6e73;--line:#d2d2d7;--acc:#0a84ff;--log:#1d1d1f;--logfg:#e5e5ea}
 @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--fg:#f5f5f7;--mute:#98989d;--line:#3a3a3c;--log:#000;--logfg:#d1d1d6}}
 *{box-sizing:border-box}[hidden]{display:none!important}html,body{height:100%}body{margin:0;font:12.5px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
-#bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:wrap}
+#bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:nowrap;white-space:nowrap;height:44px;overflow:visible}
+#bar>*{flex-shrink:0}#bar>#cfg,#bar>#ctx{flex-shrink:1;min-width:90px}
+@media (max-width:1400px){#url{display:none}}@media (max-width:1150px){#rate,.sep{display:none}#mem{max-width:110px;overflow:hidden;text-overflow:ellipsis}}
 select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
 button{cursor:pointer}button:hover:not(:disabled){border-color:var(--acc)}button:disabled{opacity:.4;cursor:default}
 button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{border-color:var(--acc);color:var(--acc)}
 .dot{width:9px;height:9px;border-radius:50%;background:#8e8e93;flex:none}#phase{font-weight:600;text-transform:capitalize;min-width:62px}
-#cfg{max-width:340px}.mute{color:var(--mute)}#rate{font-variant-numeric:tabular-nums;min-width:60px}
+#cfg{max-width:300px}.mute{color:var(--mute)}#rate{font-variant-numeric:tabular-nums;min-width:60px}
 #more{position:relative}#menu{display:none;position:absolute;right:0;top:28px;z-index:9;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px;min-width:220px;box-shadow:0 6px 24px #0003}
 #menu.open{display:block}#menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:6px 8px}#menu button:hover{background:var(--bg)}
 #menu label{display:block;padding:6px 8px}
@@ -18,12 +20,26 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
 #idle h2{margin:0;font-size:20px}#note{color:#ff453a;min-height:1em}
 #log{height:38%;margin:0;background:var(--log);color:var(--logfg);padding:8px 10px;overflow:auto;font:11.5px ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;display:none;border-top:1px solid var(--line)}
 #log.open{display:block}body.down #log.open{flex:1;height:auto}
+.chip{border:1px solid var(--line);border-radius:10px;padding:2px 8px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.chip.green{border-color:#34c759;color:#248a3d}.chip.amber{border-color:#ff9f0a;color:#c27a00}.chip.red{border-color:#ff453a;color:#d70015}
+#ctx{max-width:230px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;max-width:620px;width:100%;text-align:left}
+.card h3{margin:0 0 6px;font-size:14px}.card .bars{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--bg);margin:8px 0 4px;position:relative}
+.bars span{display:block;height:100%}.b-w{background:#0a84ff}.b-c{background:#bf5af2}.b-k{background:#ff9f0a}
+.bars i{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--fg)}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11.5px}.legend b{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
+.verdict{margin-top:6px;font-weight:600}.verdict.green{color:#248a3d}.verdict.amber{color:#c27a00}.verdict.red{color:#d70015}
+#notready{font-size:12px;max-width:620px;text-align:left}#notready div{margin:2px 0}
+#alert{flex:1;display:flex;align-items:center;justify-content:center;padding:16px}
+#alert .card{border-color:#ff453a}#alert .acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 </style></head><body class="down">
 <div id="bar">
   <span class="dot" id="dot"></span><span id="phase">stopped</span>
   <select id="cfg" title="run config (strata-*.json in the Strata folder; port from the config)"></select>
+  <select id="ctx" title="the context window: the longest conversation the model keeps (more needs more memory)"></select>
+  <span id="mem" class="chip" title="what this model needs at this context, against what this Mac has">memory …</span>
   <button class="main" id="start">Start</button><button id="stop">Stop</button><button id="restart">Restart</button>
-  <span class="mute">|</span><button id="load">Load model</button><button id="unload">Unload</button>
+  <span class="mute sep">|</span><button id="load">Load model</button><button id="unload">Unload</button>
   <span id="rate" class="mute"></span><span style="flex:1"></span>
   <span class="mute" id="url"></span>
   <button id="logbtn" title="the server's output">Log</button>
@@ -35,16 +51,25 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   </div></span>
 </div>
 <div id="main">
+  <div id="alert" hidden><div class="card"><h3 id="alerttitle"></h3><div id="alerttext"></div><div class="acts" id="alertacts"></div></div></div>
   <div id="idle"><h2 id="idletitle">The server is stopped</h2><div class="mute" id="where"></div><div id="note"></div>
-    <button class="main" id="start2">Start the server</button><a href="#" id="showlog" class="mute">show the server's log</a></div>
+    <div class="card" id="memcard" hidden></div>
+    <button class="main" id="start2">Start the server</button><a href="#" id="showlog" class="mute">show the server's log</a>
+    <div id="notready" class="mute"></div></div>
   <pre id="log"></pre>
 </div>
 <script>
 const $=id=>document.getElementById(id), send=(cmd,o={})=>window.ipc.postMessage(JSON.stringify({cmd,...o}));
 const COLORS={ready:'#34c759',busy:'#0a84ff',starting:'#ff9f0a',stopping:'#ff9f0a',unloaded:'#bf5af2',stopped:'#8e8e93'};
 let base='',up=false;
+const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const gb=b=>b==null?'–':(b/1e9).toFixed(1)+' GB', k=c=>c>=1048576&&c%1048576===0?c/1048576+'M':c>=1024?Math.round(c/1024)+'K':c;
+let mem=null,running=false;
 function init(s){
-  $('cfg').innerHTML=s.configs.map(c=>`<option value="${c.path}">${c.name.replace(/^strata-|\.json$/g,'')}${c.model?' — '+c.model:''}</option>`).join('')||'<option>no runnable config (model files missing)</option>';
+  const name=c=>c.name.replace(/^strata-|\.json$/g,'')+(c.model?' — '+c.model:'');
+  $('cfg').innerHTML=s.configs.map(c=>`<option value="${esc(c.path)}"${c.problem?' disabled':''}>${esc(name(c))}${c.problem?' (not ready)':''}</option>`).join('')||'<option>no run config yet: make setup</option>';
+  const bad=s.configs.filter(c=>c.problem);
+  $('notready').innerHTML=bad.length?'<b>Not ready yet:</b>'+bad.map(c=>`<div>${esc(name(c))}: ${esc(c.problem)}</div>`).join(''):'';
   if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;
   base=`http://127.0.0.1:${s.port}`;$('url').textContent=`127.0.0.1:${s.port}`;
   $('log').textContent='';(s.log||[]).forEach(log);
@@ -52,24 +77,83 @@ function init(s){
   status({...s.status,phase:s.phase,running:s.running});
 }
 function status(s){
-  const ph=s.phase||'stopped',running=!!s.running;
+  const ph=s.phase||'stopped';const was=running;running=!!s.running;if(was!==running)send('memory');
   $('phase').textContent=ph;$('dot').style.background=COLORS[ph]||COLORS.stopped;
   $('start').disabled=running;$('start2').hidden=running;$('stop').disabled=!running||ph==='stopping';$('restart').disabled=!running;
   $('load').disabled=ph!=='unloaded';$('unload').disabled=!(ph==='ready'||ph==='busy');$('cfg').disabled=running;
+  $('ctx').disabled=ph==='starting'||ph==='stopping';$('ctx').title=running?'changing it restarts the server':'the context window: the longest conversation the model keeps';
   for(const id of ['browser','copy_key'])$(id).disabled=!running;
   $('rate').textContent=s.tok_s!=null?`${s.tok_s} tok/s`:(s.prompt_total?`reading ${s.prompt_read}/${s.prompt_total}`:'');
   const serving=['ready','busy','unloaded'].includes(ph);
   if(serving&&!up){up=true;send('page',{tab:'monitor'});}   // the server's own page: Chat, Monitor, About
   if(!running&&up)up=false;
-  $('idle').hidden=up;document.body.classList.toggle('down',!up);layout();
+  $('idle').hidden=up||!$('alert').hidden;document.body.classList.toggle('down',!up);layout();
   $('idletitle').textContent={starting:'Starting… loading the model',stopping:'Stopping… the engine frees its memory'}[ph]||'The server is stopped';
   if(ph!=='stopped')$('note').textContent='';
 }
-let full=null;function layout(){const f=!up||$('log').classList.contains('open');if(f!==full){full=f;send('layout',{full:f});}}
+let full=null;function layout(){const f=!up||$('log').classList.contains('open')||!$('alert').hidden;if(f!==full){full=f;send('layout',{full:f});}}
+// the memory check of the selected config (the engine's --plan, and the memory free now)
+function memory(m){
+  mem=m;const chip=$('mem');
+  if(m.error){chip.className='chip red';chip.textContent='memory ?';chip.title=m.error;$('ctx').innerHTML='';$('memcard').hidden=false;
+    $('memcard').innerHTML=`<h3>Memory</h3><div class="verdict red">${esc(m.error)}</div>`;return;}
+  chip.className='chip '+m.state;   // what it needs next to what this Mac has: the GPU's share, and what is free right now
+  chip.textContent=`needs ${gb(m.need)} · GPU has ${gb(m.limit)}`+(m.avail!=null?` · ${gb(m.avail)} free`:'')+(m.state==='green'?'':m.state==='amber'?' · tight':' · too big');
+  chip.title=m.advice;
+  $('ctx').innerHTML=m.options.map(o=>`<option value="${o.ctx}" data-b="${o.batch512?1:0}"${o.ctx===m.context?' selected':''}>context ${k(o.ctx)} · ${gb(o.need)}${o.recommended?' · recommended':o.fits?'':' · too big'}${o.batch512?' (batch 512)':''}</option>`).join('');
+  const tot=Math.max(m.need,m.limit),pct=b=>(100*b/tot).toFixed(1)+'%';
+  $('memcard').hidden=false;
+  $('memcard').innerHTML=`<h3>Memory for this model at a context of ${m.context.toLocaleString()} tokens</h3>
+    <div class="bars"><span class="b-w" style="width:${pct(m.weights)}"></span><span class="b-c" style="width:${pct(m.cache)}"></span><span class="b-k" style="width:${pct(m.work)}"></span><i style="left:${pct(m.limit)}" title="what the GPU may use"></i></div>
+    <div class="legend"><span><b class="b-w"></b>weights ${gb(m.weights)}</span><span><b class="b-c"></b>conversation cache ${gb(m.cache)}</span><span><b class="b-k"></b>work buffers ${gb(m.work)}</span>
+    <span>│ the GPU can use ${gb(m.limit)}</span>${m.avail!=null?`<span>free now ${gb(m.avail)}</span>`:''}</div>
+    <div class="verdict ${m.state}">${m.state==='green'?'✓ ':'⚠ '}${esc(m.advice)}</div>
+    ${m.recommended&&m.recommended.ctx!==m.context?`<div class="acts" style="margin-top:8px"><button id="userec">Use context ${k(m.recommended.ctx)}${m.recommended.batch512?' with batch 512':''} (${gb(m.recommended.need)})</button></div>`:''}`;
+  if($('userec'))$('userec').onclick=()=>setCtx(m.recommended);
+}
+function setCtx(o,start){if(!o)return;send('set_context',{ctx:o.ctx,batch512:!!o.batch512,start:!!start});$('mem').textContent='memory …';closeAlert();}
+// a chat failed for memory, or the engine ended while loading: what to do, one click each
+function trouble(a){
+  $('alert').dataset.kind='memory';const m=a.memory||{};$('alerttitle').textContent=a.why;
+  const r=m.recommended;let t='';
+  if(m.error)t=esc(m.error);
+  else t=`At a context of ${(m.context||0).toLocaleString()} tokens this model needs ${gb(m.need)}; the GPU can use ${gb(m.limit)}${m.avail!=null?' and '+gb(m.avail)+' is free now':''}. ${esc(m.advice)}.`;
+  $('alerttext').innerHTML=t;
+  const acts=[];
+  if(r&&r.ctx<m.context)acts.push(`<button class="main" data-a="rec">Use context ${k(r.ctx)}${r.batch512?' with batch 512':''} and restart</button>`);
+  else if(m.options){const lo=m.options.find(o=>o.ctx<m.context&&o.fits)||m.options[0];if(lo&&lo.ctx<m.context)acts.push(`<button class="main" data-a="low" data-c="${lo.ctx}">Try context ${k(lo.ctx)} and restart</button>`);}
+  if(m.avail!=null&&m.need>m.avail)acts.push(`<button data-a="apps">Close other apps to free ${gb(m.need-m.avail)}, then Start</button>`);
+  acts.push('<button data-a="log">Show the log</button><button data-a="close">Dismiss</button>');
+  $('alertacts').innerHTML=acts.join('');
+  $('alertacts').onclick=e=>{const b=e.target.closest('button');if(!b)return;const a2=b.dataset.a;
+    if(a2==='rec')setCtx(r,true);else if(a2==='low')setCtx({ctx:+b.dataset.c,batch512:true},true);
+    else if(a2==='log'){closeAlert();if(!$('log').classList.contains('open'))$('logbtn').click();}
+    else if(a2==='apps'){closeAlert();send('memory');}else closeAlert();};
+  $('alert').hidden=false;$('idle').hidden=true;layout();
+}
+// the server's page in this window: its loads, and what to do when one does not show
+function pageEvent(e){
+  if(e.event==='started'||e.event==='finished')return;
+  if(e.event==='checked'){if(e.chars>0){if($('alert').dataset.kind==='page')closeAlert();}else pageTrouble(base,'The page loaded but shows nothing.');return;}
+  log(`── the page did not open (${e.event}${e.why?': '+e.why:''}) ──`);
+  pageTrouble(e.url||base,e.event==='timeout'?'The page did not load within 10 seconds.':'The page could not be loaded'+(e.why?': '+e.why:'.'));
+}
+function pageTrouble(url,why){
+  if(!up)return;
+  $('alert').dataset.kind='page';$('alerttitle').textContent="The server's page did not open in this window";
+  $('alerttext').innerHTML=`${esc(why)} The server answers at <b>${esc(url)}</b>: open it in your browser, or try again here.`;
+  $('alertacts').innerHTML='<button class="main" data-a="browser">Open in browser</button><button data-a="retry">Try again</button><button data-a="log">Show the log</button><button data-a="close">Dismiss</button>';
+  $('alertacts').onclick=ev=>{const b=ev.target.closest('button');if(!b)return;const a=b.dataset.a;
+    if(a==='browser')send('browser');else if(a==='retry'){closeAlert();send('page',{tab:'monitor'});}
+    else if(a==='log'){closeAlert();if(!$('log').classList.contains('open'))$('logbtn').click();}else closeAlert();};
+  $('alert').hidden=false;$('idle').hidden=true;layout();
+}
+function closeAlert(){$('alert').dataset.kind='';$('alert').hidden=true;$('idle').hidden=up;layout();}
 function log(line){const l=$('log'),end=l.scrollTop+l.clientHeight>=l.scrollHeight-20;l.append(line+'\n');
   while(l.childNodes.length>2000)l.firstChild.remove();if(end)l.scrollTop=l.scrollHeight;}
 function note(m){$('note').textContent=m;if(up&&!$('log').classList.contains('open'))$('logbtn').click();log('── '+m+' ──');}
 $('cfg').onchange=()=>send('select',{config:$('cfg').value});
+$('ctx').onchange=()=>{const o=mem&&mem.options.find(o=>o.ctx===+$('ctx').value);if(o)setCtx(o);};
 $('autostart').onchange=e=>send('autostart',{on:e.target.checked});
 $('start2').onclick=()=>send('start');$('showlog').onclick=e=>{e.preventDefault();$('logbtn').click();};
 $('logbtn').onclick=()=>{$('log').classList.toggle('open');$('logbtn').classList.toggle('on');$('log').scrollTop=1e9;layout();};

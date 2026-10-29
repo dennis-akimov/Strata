@@ -25,6 +25,7 @@
 // Batch slots (--batch N, the server's "parallel"): BGEN admissions into sequences 1..N, decoded together a token a
 // window between commands (BT / BDONE); BSTOP ends one.  Not here: the expert cache (VRAM), BYIELD (never gives way).
 #include "common.h"
+#include "fit.h"
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -139,6 +140,7 @@ struct Options {
     std::string ablate;
     int ablate_layers = 0;
     float ablate_scale = 1.0f;
+    bool plan = false;                                 // --plan: print the memory this model needs (JSON) and exit
 };
 
 bool parse_ids(const char* s, std::vector<llama_token>& v) {
@@ -162,6 +164,7 @@ bool parse_args(int argc, char** argv, Options& o) {
             return argv[++i];
         };
         if (a == "--serve") continue;
+        else if (a == "--plan") o.plan = true;
         else if (a == "--gguf") o.gguf = val("--gguf");
         else if (a == "--mtp") o.mtp = val("--mtp");
         else if (a == "--eagle3") o.eagle3 = val("--eagle3");
@@ -325,6 +328,45 @@ struct Engine {
 
     llama_memory_t mem() const { return llama_get_memory(ctx); }
 
+    // --plan: the memory this model needs with these options, measured by llama.cpp without reading the weights
+    // (no_alloc: the model's tensors and the context's buffers are laid out, not filled), as one JSON line on stdout.
+    // The GPU's share (weights, KV cache, compute buffers) is what must fit Metal's working set (the device's
+    // "total"); measured at two context sizes, the difference per token gives the largest context that fits.  The
+    // draft model of --mtp/--eagle3/--dflash is not counted.  Setup, the app and the server's errors read it.
+    bool plan(common_params& p, std::string& err) {
+        const llama_model_params mp = common_model_params_to_llama(p);
+        uint32_t n_train = 0;
+        auto measure = [&](int64_t n_ctx, common_device_memory_data& gpu, common_device_memory_data& host) {
+            p.n_ctx = (int32_t) (n_ctx * p.n_parallel);
+            const llama_context_params cp = common_context_params_to_llama(p);
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t ngl = 0, nex = 0;
+            const auto d = common_get_device_memory_data(p.model.path.c_str(), &mp, &cp, devs, ngl, n_train, nex, GGML_LOG_LEVEL_ERROR);
+            gpu = d.size() > 1 ? d[0] : common_device_memory_data{};
+            host = d.back();
+        };
+        try {
+            common_device_memory_data g{}, h{}, g2{}, h2{};
+            const int64_t c = o.max_context, c2 = c > 4096 ? 4096 : 8192;
+            measure(c, g, h);
+            measure(c2, g2, h2);
+            const auto need = [](const common_device_memory_data& d) { return (int64_t) (d.model + d.context + d.compute); };
+            const double per_token = (double) (need(g) - need(g2)) / (double) (c - c2);
+            int64_t fits = per_token > 0 ? c + (int64_t) ((double) (g.total - need(g)) / per_token) : (need(g) <= g.total ? (int64_t) n_train : 0);
+            fits = std::max<int64_t>(0, std::min<int64_t>(fits, n_train > 0 ? (int64_t) n_train : fits)) / 1024 * 1024;
+            if (need(g) - (int64_t) g.context - (int64_t) g.compute > g.total) fits = 0;   // the weights alone do not fit
+            out("{\"plan\": 1, \"context\": %lld, \"n_ctx_train\": %u, \"kv\": \"%s\", \"prefill_batch\": %d, "
+                "\"gpu\": {\"model\": %zu, \"context\": %zu, \"compute\": %zu, \"limit\": %lld, \"free\": %lld}, "
+                "\"host\": {\"model\": %zu, \"context\": %zu, \"compute\": %zu}, \"per_token\": %.1f, \"max_context\": %lld}\n",
+                (long long) c, n_train, o.kv.c_str(), o.n_batch, g.model, g.context, g.compute, (long long) g.total,
+                (long long) g.free, h.model, h.context, h.compute, per_token, (long long) fits);
+            return true;
+        } catch (const std::exception& e) {
+            err = std::string("could not measure the model: ") + e.what();
+            return false;
+        }
+    }
+
     bool load(std::string& err) {
         common_params& p = params;
         p.model.path = o.gguf;
@@ -368,6 +410,7 @@ struct Engine {
             p.n_outputs_max = lim.total;
             p.n_outputs_max_per_seq = lim.per_seq;
         }
+        if (o.plan) return plan(p, err);
         init = common_init_from_params(p);
         model = init ? init->model() : nullptr;
         ctx = init ? init->context() : nullptr;
@@ -883,6 +926,7 @@ int main(int argc, char** argv) {
         out("ERR %s\n", err.c_str());
         return 1;
     }
+    if (e.o.plan) return 0;
     out("INFO engine=" STRATA_VERSION "-metal backend=metal llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
         "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d\n", (long long) e.o.max_context,
         e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0, e.spec ? e.o.spec : 0);

@@ -62,7 +62,7 @@ ARG BUILD_VISION=1
 RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
     && .venv/bin/pip install --no-cache-dir -r requirements.txt \
-    && chmod +x setup.sh docker-entrypoint.sh
+    && chmod +x bootstrap.py docker-entrypoint.sh
 
 # llama.cpp at the pinned commit, then the engine and the image encoder, built
 # exactly the way setup.py builds them: native code for the CPU that builds the

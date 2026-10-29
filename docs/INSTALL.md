@@ -49,17 +49,17 @@ start is 24x slower: [Running it at startup](DETAILS.md#running-it-at-startup-ta
 ## Linux
 
 ```bash
-./setup.sh
+python3 bootstrap.py
 ```
 
 The same questions, the same automatic install (it uses `sudo apt` for Python and, only if it has to compile, for
-the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./setup.sh` (or `./run-<model>.sh`)
-start the model directly; `./setup.sh --setup` installs another model or changes the settings. Other distributions,
+the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `python3 bootstrap.py` (or `./run-<model>.sh`)
+start the model directly; `python3 bootstrap.py --setup` installs another model or changes the settings. Other distributions,
 WSL and compiling: [details](DETAILS.md#linux).
 
 ## AMD cards
 
-The steps are the same as with NVIDIA: `START-HERE.bat` on Windows, `./setup.sh` on Linux. Setup finds the Radeon
+The steps are the same as with NVIDIA: `START-HERE.bat` on Windows, `python3 bootstrap.py` on Linux. Setup finds the Radeon
 card and chooses the AMD (HIP) engine by itself on a PC with no NVIDIA card Strata can use; `--backend hip` chooses
 it on a PC that has both. Supported cards: RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT
 (gfx1200), RX 9070 / 9070 XT and Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030). Integrated
@@ -177,7 +177,7 @@ usual. In a copy that was downloaded as a zip it says to download the new zip (b
 itself.
 
 Or by hand: download the new version and unzip it anywhere (or `git pull`), then run `START-HERE.bat` (Linux:
-`./setup.sh`) in it. The model files are kept in a `Strata-data` folder next to your Strata folder, so a new copy
+`python3 bootstrap.py`) in it. The model files are kept in a `Strata-data` folder next to your Strata folder, so a new copy
 finds them and sets itself up the same way - nothing big is downloaded again. On Linux after a `git pull`, setup
 compiles the engine again when its source changed (a minute or two for the changed files); if that compile fails, it
 says so and starts the engine you had.
@@ -221,7 +221,7 @@ With `--yes` setup takes the recommended answer to every question.
 
 ## Tuning for your PC
 
-Every PC is different: `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) measures a few engine settings
+Every PC is different: `START-HERE.bat --calibrate` (Linux: `python3 bootstrap.py --calibrate`) measures a few engine settings
 on yours and keeps the fastest (about 15-30 minutes, longer on a slow card; on an RTX 5070 with a Ryzen 5 7600 it made the Coder 7% faster).
 It keeps a setting only when it is more than 3% faster, and the result is remembered per PC and model, so updates
 keep it. Measuring the CPU worker count needs a fresh engine, so the model is loaded more than once: the PC is
@@ -252,7 +252,7 @@ START-HERE.bat --check                          only check this PC
 
 **Leaving VRAM for other programs (#493):** Strata fills the graphics card's free VRAM with experts (the expert cache)
 and leaves `--vram-reserve-mib` MiB free: 700 by default. For a game, a 3D program or another model beside it, leave
-more: `START-HERE.bat --vram-reserve-mib 2048` (Linux: `./setup.sh --vram-reserve-mib 2048`) writes it into the
+more: `START-HERE.bat --vram-reserve-mib 2048` (Linux: `python3 bootstrap.py --vram-reserve-mib 2048`) writes it into the
 model's `strata-<model>.json` and starts it; at setup (`--setup --vram-reserve-mib 2048`) it goes into the new config.
 By hand: add `"--vram-reserve-mib", "2048"` to the config's `"args"` list and restart. The expert cache is then that
 much smaller, so answers can be a little slower. The engine sizes its cache from the VRAM free when it starts: what
@@ -261,7 +261,7 @@ another program already holds then is left alone anyway; the reserve is room for
 **An AMD card that also drives a Linux desktop (#560 #516):** with the default reserve the expert cache fills the
 card, and when the desktop (the compositor, a browser, a new app) needs more VRAM, the amdgpu driver moves GPU memory
 to system RAM, which the model's experts already fill: the OOM killer then ends the desktop session (KWin, plasmashell)
-or the compositor fails ("Failed to pin framebuffer"). `./setup.sh --vram-reserve-mib 3072` fixed it in both reports
+or the compositor fails ("Failed to pin framebuffer"). `python3 bootstrap.py --vram-reserve-mib 3072` fixed it in both reports
 (about 2.3 GB fewer experts in VRAM, a few % of speed). Setup and the server window say so on such a PC.
 
 **A card under 8 GB (#496):** when the default reserve leaves the expert cache too little room, the engine lowers the
@@ -290,5 +290,5 @@ pinned checkpoint's own hashes, as from Hugging Face; setup says so when you cho
 China on 2026-10-05: 11-14 MB/s; the Q2_0 and IQ3_S files matched their published SHA-256, and Q2_0's shard 1 matched
 the copy from hf-mirror.com.
 
-On Linux the same options go to `./setup.sh`. `START-HERE.bat --help` lists them all. The server's own settings
+On Linux the same options go to `python3 bootstrap.py`. `START-HERE.bat --help` lists them all. The server's own settings
 (sharing the GPU with games, MCP tools, CORS, API keys, the API itself) are in the [details](DETAILS.md#using-it).

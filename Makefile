@@ -63,7 +63,7 @@ help:
 	@echo "                     MODEL: Q2_0 IQ2_XS IQ3_XXS IQ3_S IQ1_M UD-Q4_K_XL UD-IQ4_XS (setup), or GLM-5.3"
 	@echo "                     GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B NUCLEUS"
 	@echo "                     HUNYUAN WAN2.2"
-	@echo "                     (tools/pull_model.sh; GPT-OSS-120B-DFLASH, NUCLEUS and HUNYUAN convert too; WAN2.2"
+	@echo "                     (tools/pull_model.py; GPT-OSS-120B-DFLASH, NUCLEUS and HUNYUAN convert too; WAN2.2"
 	@echo "                     builds stable-diffusion.cpp's sd-cli for videos)"
 	@echo "  make check         only check what this computer can run"
 	@echo "  make update        update the engine and settings without starting"
@@ -89,18 +89,30 @@ help:
 	@echo "  make ab            A/B two engines: AB_GGUF=<shard 1> AB_PROMPTS=<ids.json> [AB_A=... AB_B=...]"
 	@echo "  make clean         remove the build folders"
 
+# on a Mac: metal/onboard_mac.py does everything (tools, builds, the model, its run config, a first answer, the app);
+# elsewhere setup.py.  python3 bootstrap.py --setup is setup.py's installer on a Mac too (the Qwen3.8 quants, MTP)
 setup:
-	./setup.sh --setup $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS)
+ifeq ($(shell uname -s),Darwin)
+	python3 bootstrap.py --onboard $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS)
+else
+	python3 bootstrap.py --setup $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS)
+endif
 
 # setup's own download (Hugging Face, resumable; HF_ENDPOINT for a mirror, SETUP_ARGS="--data-dir DIR" for elsewhere);
-# the models setup does not install (GLM-5.3, GPT-OSS-120B, GPT-OSS-120B-HERETIC, GPT-OSS-120B-DFLASH, GPT-OSS-20B, QWEN3.6-35B, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.sh
+# the models setup does not install (GLM-5.3, GPT-OSS-120B, GPT-OSS-120B-HERETIC, GPT-OSS-120B-DFLASH, GPT-OSS-20B, QWEN3.6-35B, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.py
 PULL_EXTRA  := GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b gpt-oss-120b-heretic gpt-oss-120b-dflash gpt-oss-20b qwen3.6-35b nucleus hunyuan wan2.2
 DATA_DIR    ?= ../Strata-data
 pull:
-	$(if $(filter $(MODEL),$(PULL_EXTRA)),./tools/pull_model.sh $(MODEL) $(DATA_DIR),./setup.sh --setup --no-start $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS))
+	$(if $(filter $(MODEL),$(PULL_EXTRA)),$(PY) tools/pull_model.py $(MODEL) $(DATA_DIR),python3 bootstrap.py --setup --no-start $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS))
+ifeq ($(shell uname -s),Darwin)
+	@# a chat model pulled by hand gets its run config too (the context the engine measures to fit this Mac)
+	@if [ -n "$(filter $(MODEL),$(PULL_EXTRA))" ] && [ -x engine-metal/strata-metal ]; then \
+	  .venv/bin/python metal/onboard_mac.py --config-only $(MODEL) --data-dir $(DATA_DIR); \
+	elif [ -n "$(filter $(MODEL),$(PULL_EXTRA))" ]; then echo "next: make build, then make pull MODEL=$(MODEL) again (it writes the run config)"; fi
+endif
 
 check:
-	./setup.sh --check
+	python3 bootstrap.py --check
 
 update:
 	./update.sh
@@ -108,13 +120,13 @@ update:
 run:
 	$(PORT_FREE)
 	$(SET_CONTEXT)
-	./setup.sh $(RUN_ARGS) $(SETUP_ARGS)
+	python3 bootstrap.py $(RUN_ARGS) $(SETUP_ARGS)
 
 start:
 	$(PORT_FREE)
 	$(SET_CONTEXT)
 	@echo "starting Strata on $(URL) (log: strata-run.log) ..."
-	@nohup ./setup.sh $(RUN_ARGS) --no-browser $(SETUP_ARGS) > strata-run.log 2>&1 &
+	@nohup python3 bootstrap.py $(RUN_ARGS) --no-browser $(SETUP_ARGS) > strata-run.log 2>&1 &
 	@$(MAKE) --no-print-directory wait
 
 # /health says 503 while the model loads, 200 once it is ready
@@ -160,14 +172,17 @@ build: server
 ifeq ($(shell uname -s),Darwin)
 	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON
 	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
+	@# installed where the run configs point; rm first: macOS kills a program whose binary was rewritten in place
+	rm -f engine-metal/strata-metal engine-metal/strata-vision
+	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
 else
-	@echo "on Linux / Windows setup builds or downloads the engine: make setup (or ./setup.sh --setup --build)"
+	@echo "on Linux / Windows setup builds or downloads the engine: make setup (or python3 bootstrap.py --setup --build)"
 endif
 
 # the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
 server:
 	cargo build --release --manifest-path server/Cargo.toml
-	# rm first: a new file (macOS kills a program whose binary was rewritten in place)
+	@# rm first: a new file (macOS kills a program whose binary was rewritten in place)
 	mkdir -p engine-metal && rm -f engine-metal/strata-server engine-metal/strata-files && cp server/target/release/strata-server server/target/release/strata-files engine-metal/
 
 # the Mac app (app/, Rust): Strata.app in this folder runs the server as its child with full control (config, port,

@@ -133,7 +133,7 @@ Every result is JSON with a one-line `summary`. It is sent both as text and as M
 The first call returns the plan: the download size (58-111 GB), the free disk space, the RAM check, and the exact
 setup command. The assistant should show you the plan and call again with `confirm: true` once you agree.
 
-It then runs the same steps `START-HERE.bat` / `setup.sh` run:
+It then runs the same steps `START-HERE.bat` / `bootstrap.py` run:
 
 1. It creates `.venv` with the Python it runs on, if `.venv` is missing.
 2. It runs `setup.py --yes --no-start --family ... --model ... --context ... --vision ...` as a background process.

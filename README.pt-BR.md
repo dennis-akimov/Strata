@@ -50,7 +50,7 @@ Imagens e vídeos no mesmo Mac (2026-10-11/12):
 
 Os tempos de vídeo foram medidos enquanto o Docker ocupava 76 GB e o macOS usava swap (a GPU a 600-750 MHz): são um piso.
 
-Os números do Qwen usam a camada de rascunho MTP dele, que é opcional (`./setup.sh --setup --mtp on`, cerca de 12 GB a
+Os números do Qwen usam a camada de rascunho MTP dele, que é opcional (`python3 bootstrap.py --setup --mtp on`, cerca de 12 GB a
 mais de disco). O cache do contexto se soma ao arquivo do modelo (alguns GB; mais em contextos longos). No modo de
 energia *Automático*, o mesmo Mac escrevia respostas longas de 2 a 3 vezes mais devagar. Outros Macs não foram
 medidos. Todos os números e como foram medidos: [docs/MACOS.md](docs/MACOS.md#measured) (em inglês).
