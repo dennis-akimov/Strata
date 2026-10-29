@@ -180,6 +180,11 @@ impl Service {
         queued(1);
 
         let cut = |stops: &mut Option<StopMatcher>, evs: Vec<Event>| -> Vec<Event> {
+            for c in evs.iter().filter(|e| e.kind == Kind::ToolCall).filter_map(|e| e.call.as_ref()) {
+                if !self.mcp.as_ref().is_some_and(|h| h.routes().contains_key(&c.name)) {
+                    crate::firewall::model_call(&c.name, &c.arguments); // Strata's own tool calls are noted where they run
+                }
+            }
             let Some(sm) = stops.as_mut() else { return evs };
             let mut out = vec![];
             for ev in evs {

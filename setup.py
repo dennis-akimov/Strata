@@ -72,7 +72,8 @@ def server_cmd() -> list:
         print("building the server (server/, Rust; cargo is needed: https://rustup.rs) ...", flush=True)
         subprocess.run(["cargo", "build", "--release", "--manifest-path", str(ROOT / "server" / "Cargo.toml")], check=True)
         SERVER_EXE.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ROOT / "server" / "target" / "release" / "strata-server", SERVER_EXE)
+        for exe in ("strata-server", "strata-files"):    # strata-files: the read-only filesystem MCP server
+            shutil.copy2(ROOT / "server" / "target" / "release" / exe, SERVER_EXE.parent / exe)
     return [str(SERVER_EXE)]
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any

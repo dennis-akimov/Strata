@@ -28,7 +28,7 @@ def quiet(fn, *args, **kw):
 
 
 USER = {"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0},
-        "mcp_servers": {"files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}},
+        "mcp_servers": {"files": {"command": "engine-metal/strata-files", "args": ["."]}},
         "mcp": {"timeout_s": 60, "max_result_chars": 16000, "max_rounds": 8},
         "cors_origins": ["http://localhost:3000"], "reasoning_effort": "low"}
 

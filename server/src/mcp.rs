@@ -11,7 +11,7 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -105,7 +105,8 @@ impl Stdio_ {
         let path = env.get("PATH").cloned().unwrap_or_default();
         let exe = which(&command, &path).unwrap_or_else(|| command.clone());
         let args: Vec<String> = get(&self.cfg, "args").as_array().map(|a| a.iter().map(py::py_str).collect()).unwrap_or_default();
-        let mut cmd = Command::new(&exe);
+        let jail = get(&self.cfg, "network") != &json!(true);
+        let mut cmd = crate::firewall::command(&exe, jail);
         cmd.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).env_clear().envs(&env);
         if let Some(cwd) = get(&self.cfg, "cwd").as_str().filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
@@ -113,6 +114,7 @@ impl Stdio_ {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0); // its own process group, so close() ends its children too
         let mut child = cmd.spawn().map_err(|e| McpErr::Err(format!("could not start {}: {e}", py::py_repr(&json!(command)))))?;
+        crate::firewall::protect(std::path::Path::new(&exe).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default().as_str(), child.id() as i32, jail, &format!("MCP server {}", self.name));
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         *self.stdin.lock().unwrap() = child.stdin.take();
@@ -436,6 +438,9 @@ impl McpServer {
         st.status = "starting".into();
         st.error = None;
         st.last_start = Instant::now();
+        if self.kind == "http" {
+            crate::firewall::expect(&py::py_str(get(&self.cfg, "url")));
+        }
         let t = Arc::new(if self.kind == "http" {
             Transport::Http(Arc::new(Http {
                 url: py::py_str(get(&self.cfg, "url")),
@@ -734,6 +739,12 @@ impl McpHub {
             None => (format!("error: there is no tool named {}", py::py_repr(&json!(name))), false),
             Some((s, tool)) => {
                 let args = if arguments.is_object() { arguments.clone() } else { json!({}) };
+                let (url, jailed) = (get(&s.cfg, "url").as_str().unwrap_or("").to_string(), s.kind != "http" && get(&s.cfg, "network") != &json!(true));
+                if let Some(why) = crate::firewall::refuse(tool, &args) {
+                    crate::firewall::tool_run(&s.name, tool, &url, jailed, &args, "blocked");
+                    (format!("error: Strata's firewall refused this call ({why})"), false)
+                } else {
+                crate::firewall::tool_run(&s.name, tool, &url, jailed, &args, "ok");
                 match s.call(tool, &args, self.settings["timeout_s"].as_f64().unwrap_or(60.0), cancel) {
                     Ok(res) => {
                         let text = result_text(&res);
@@ -742,6 +753,7 @@ impl McpHub {
                     }
                     Err(McpErr::Cancelled) => return Err(McpErr::Cancelled),
                     Err(e) => (format!("error: {e}"), false),
+                }
                 }
             }
         };

@@ -85,13 +85,14 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "monitor", "firewall", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "monitor", "firewall", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
   if (tab === "about") loadConfig();
+  if (tab === "firewall") loadFirewall();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -192,6 +193,71 @@ async function poll() {
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
   setTimeout(poll, 1000);
 }
+
+// ------------------------------------------------------------------ firewall
+// GET connections: this server's sockets (and its children's, or every process's with all=1), folded x N server-side
+const FW_KIND = {connection: ["Connection", "st-badge--queued"], blocked: ["Blocked", "st-badge--queued"], tool: ["Tool call", "st-badge--reading"],
+  "client tool": ["To API client", "st-badge--generating"]};
+let fwHist = null;
+const fwWhen = (t) => { const d = new Date(t * 1000); return (Date.now() - d < 86400000 ? "" : d.toLocaleDateString() + " ") + d.toLocaleTimeString(); };
+const FW_DIR = {listen: ["Listening", "st-badge--generating"], in: ["Incoming", "st-badge--reading"], out: ["Outgoing", "st-badge--queued"], open: ["Open (UDP)", ""]};
+let fwRows = [], fwTimer = 0;
+async function loadFirewall() {
+  clearTimeout(fwTimer);
+  if (tab !== "firewall") return;
+  try {
+    const h = await fetch("firewall?limit=1000", {headers: headers(), cache: "no-store"});
+    if (h.ok) fwHist = await h.json();
+    const r = await fetch("connections" + ($("fw-all").checked ? "?all=1" : ""), {headers: headers(), cache: "no-store"});
+    if (r.status === 401) throw new Error("401");
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error?.message || `HTTP ${r.status}`);
+    fwRows = d.rows || [];
+    $("fw-sum").textContent = `${d.sockets} socket${d.sockets === 1 ? "" : "s"} in ${fwRows.length} row${fwRows.length === 1 ? "" : "s"}, ${d.processes} process${d.processes === 1 ? "" : "es"}` +
+      ` \u00b7 ${fwRows.filter((x) => x.scope === "internet").reduce((n, x) => n + x.count, 0)} to or from the internet`;
+    renderFirewall();
+  } catch (e) {
+    $("fw-sum").textContent = e.message === "401" ? "API key needed: add it under About > Settings." : `Could not read the connections: ${e.message}`;
+  }
+  fwTimer = setTimeout(loadFirewall, 3000);
+}
+function renderFirewall() {
+  const q = $("fw-filter").value.trim().toLowerCase();
+  renderFwHistory(q);
+  const rows = fwRows.filter((x) => !q || [x.process, x.local, x.remote, x.state, x.proto, x.scope, x.dir, ...x.pids].join(" ").toLowerCase().includes(q));
+  $("fw-body").innerHTML = rows.length ? rows.map((x) => {
+    const [label, cls] = FW_DIR[x.dir] || [x.dir, ""];
+    return `<tr><td><span class="st-badge ${cls}">${label}</span></td><td title="pid ${esc(x.pids.join(", "))}">${esc(x.process)}</td>` +
+      `<td>${esc(x.proto)}</td><td class="addr">${esc(x.local || "\u2013")}</td><td class="addr">${esc(x.remote || "\u2013")}</td>` +
+      `<td class="${x.scope === "internet" ? "fw-where-internet" : "muted"}">${esc(x.scope || "\u2013")}</td><td>${esc(x.state || "\u2013")}</td>` +
+      `<td class="num fw-count">${x.count > 1 ? "\u00d7" + x.count : "1"}</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="muted">${fwRows.length ? "Nothing matches the filter" : "No network connections"}</td></tr>`;
+}
+function renderFwHistory(q) {
+  if (!fwHist) return;
+  const prot = fwHist.protected || [];
+  $("fw-mode").textContent = !fwHist.sandbox ? "sandbox-exec missing: processes run with the network"
+    : fwHist.block ? "strange tool calls are refused" : "strange tool calls are marked, not refused (\"firewall\": {\"block\": true} refuses them)";
+  $("fw-prot").innerHTML = prot.length ? prot.map((p) => `<div><b>${esc(p.process)}</b><span class="muted small">${esc(p.role)} \u00b7 pid ${esc(p.pid)}</span>` +
+    `<span class="${p.network ? "fw-bad" : "fw-ok"}">${p.network ? "has the network" : "no network (kernel sandbox)"}</span></div>`).join("") +
+    (fwHist.expected || []).map((h) => `<div><b>${esc(h)}</b><span class="muted small">an MCP server the server calls</span><span class="muted">expected destination</span></div>`).join("")
+    : `<span class="muted">Nothing started yet</span>`;
+  $("fw-file").textContent = fwHist.file || "memory only (a test server)";
+  const match = (e) => !q || [e.kind, e.process, e.dest, e.detail, e.strange || ""].join(" ").toLowerCase().includes(q);
+  const row = (e, why) => { const [label, cls] = FW_KIND[e.kind] || [e.kind, ""];
+    return `<tr class="${e.strange ? "strange" : ""}"><td class="when">${esc(fwWhen(e.last))}</td><td><span class="st-badge ${cls}">${label}</span></td>` +
+      `<td>${esc(e.process)}</td><td class="addr">${esc(e.dest)}</td><td class="detail">${esc(why ? e.strange : e.detail)}</td>` +
+      `<td class="num fw-count">${e.count > 1 ? "\u00d7" + e.count : "1"}</td></tr>`; };
+  const alerts = fwHist.events.filter((e) => e.strange && match(e));
+  $("fw-alerts-card").hidden = !fwHist.alerts;
+  $("fw-alerts-sum").textContent = `${fwHist.alerts} kept`;
+  $("fw-alerts").innerHTML = alerts.map((e) => row(e, true)).join("") || `<tr><td colspan="6" class="muted">Nothing matches the filter</td></tr>`;
+  const hist = fwHist.events.filter(match);
+  $("fw-hist-sum").textContent = `${fwHist.kept} kept`;
+  $("fw-hist").innerHTML = hist.map((e) => row(e, false)).join("") || `<tr><td colspan="6" class="muted">${fwHist.kept ? "Nothing matches the filter" : "No outgoing activity yet"}</td></tr>`;
+}
+$("fw-filter").oninput = renderFirewall;
+$("fw-all").onchange = loadFirewall;
 
 function setPill(state, text) {
   $("pill").dataset.state = state === "error" ? "queued" : state;
@@ -435,7 +501,7 @@ async function loadMcp() {
   } catch (e) { return; /* an older server: no MCP */ }
   renderMcp();
   if (!mcpRestored) await mcpRestore();
-  clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
+  clearTimeout(mcpRetry);                          // right after the start, servers may still be starting
   if ((mcpInfo.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
 }
 const MCP_STATE = {ready: ["st-badge--generating", "Connected"], starting: ["st-badge--reading", "Starting"],

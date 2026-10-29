@@ -49,7 +49,7 @@ AB_GGUF     ?=
 AB_PROMPTS  ?=
 AB_ROUNDS   ?= 7
 
-.PHONY: help setup pull check update run start stop status wait chat models build build-ab server test test-server test-engine ab clean
+.PHONY: help setup pull check update run start stop status wait chat models build build-ab server app app-run app-stop test test-server test-engine ab clean
 
 help:
 	@echo "Strata - make targets (variables: PORT=$(PORT) HOST=$(HOST) API_KEY=... MODEL=... SETUP_ARGS=...;"
@@ -72,6 +72,12 @@ help:
 	@echo "  make start         start it in the background (log: strata-run.log) and wait until it answers"
 	@echo "  make status        is it up?  (GET /health)"
 	@echo "  make stop          stop the background server"
+	@echo "  make server        build the server (server/, Rust) into engine-metal/strata-server"
+	@echo "  make app           build Strata.app (the server, then the app): one window with the server's page (Chat,"
+	@echo "                     Monitor, Firewall, About) under a control bar (model, start/stop/restart, load/unload, log)"
+	@echo "                     and a menu-bar icon; the server is its child on the config's port (8090)"
+	@echo "  make app-run       build it, stop a running Strata.app (and its server) and open the new one"
+	@echo "  make app-stop      quit Strata.app: its server sends QUIT to the engine and frees its memory first"
 	@echo "  make chat          one chat request: make chat PROMPT=\"Write a haiku\" [MAX_TOKENS=100 EFFORT=none|low|medium|high]"
 	@echo "                     REASONING_BUDGET=N: at most N tokens of thinking, then it answers (0: no cap; it counts"
 	@echo "                     toward MAX_TOKENS, so keep it 64+ below; EFFORT=none turns thinking off)"
@@ -161,7 +167,27 @@ endif
 # the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
 server:
 	cargo build --release --manifest-path server/Cargo.toml
-	mkdir -p engine-metal && cp server/target/release/strata-server engine-metal/strata-server
+	# rm first: a new file (macOS kills a program whose binary was rewritten in place)
+	mkdir -p engine-metal && rm -f engine-metal/strata-server engine-metal/strata-files && cp server/target/release/strata-server server/target/release/strata-files engine-metal/
+
+# the Mac app (app/, Rust): Strata.app in this folder runs the server as its child with full control (config, port,
+# start/stop/restart, load/unload, live status, log, chat window, menu-bar icon); quitting it stops the server
+app: server
+	cargo build --release --manifest-path app/Cargo.toml
+	rm -rf Strata.app && mkdir -p Strata.app/Contents/MacOS
+	cp app/target/release/strata-app Strata.app/Contents/MacOS/Strata
+	cp app/Info.plist Strata.app/Contents/Info.plist
+	codesign --force --sign - Strata.app
+	@echo "built Strata.app: make app-run, or open Strata.app (or drag it to /Applications; it runs the server from $(CURDIR))"
+
+# SIGTERM is the app's Quit: it stops its server the server's way (the engine frees its memory) and exits
+APP_PAT = Strata.app/Contents/MacOS/Strata$$
+app-stop:
+	@if pkill -TERM -f '$(APP_PAT)'; then printf 'stopping Strata.app'; \
+	  while pgrep -f '$(APP_PAT)' >/dev/null; do printf .; sleep 1; done; echo ' stopped'; else echo 'Strata.app is not running'; fi
+
+app-run: app app-stop
+	open Strata.app
 
 # the server's tests: its unit and golden tests, then its answers against the Python server's recorded ones
 # (server/golden/e2e.py --replay; the packs it needs are the ones on this Mac, a missing one is skipped)

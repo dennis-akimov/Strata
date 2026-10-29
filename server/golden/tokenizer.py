@@ -23,7 +23,7 @@ def corpus(tok):
              "<|start|>assistant<|channel|>final<|message|>hi<|end|>", "<tool_call>\n<function=f>\n</tool_call>"]
     texts += list(tok.special_tokens)[:300]
     rnd = random.Random(7)
-    for f in sorted(ROOT.glob("README*.md")) + [ROOT / "serve/frontend.py", ROOT / "serve/web/app.js", ROOT / "docs/DETAILS.md"]:
+    for f in sorted(ROOT.glob("README*.md")) + [ROOT / "serve/frontend.py", ROOT / "server/web/app.js", ROOT / "docs/DETAILS.md"]:
         if not f.exists():
             continue
         t = f.read_text(encoding="utf-8")

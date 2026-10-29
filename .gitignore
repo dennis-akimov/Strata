@@ -69,3 +69,5 @@ build-vision-cuda12.bat
 engine-metal/BUILD.json
 server/target
 server/tests
+/Strata.app
+server/tests/golden

@@ -12,7 +12,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -267,7 +267,7 @@ impl ImageGen {
         args.extend(["--steps".into(), p.steps.to_string(), "--cfg".into(), crate::pyjson::float_repr(p.cfg), "--seed".into(), p.seed.to_string(), "--out".into(), d.join("out.png").to_string_lossy().into_owned(), "--watch-stdin".into(), "1".into()]);
         let Ok(errf) = std::fs::File::create(d.join("stderr.txt")) else { return (500, None, error("strata-image could not start (stderr)", "server_error")) };
         use std::os::unix::process::CommandExt;
-        let mut child = match Command::new(&self.exe).args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(errf).process_group(0).spawn() {
+        let mut child = match crate::firewall::command(&self.exe, true).args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(errf).process_group(0).spawn() {
             Ok(c) => c,
             Err(e) => return (500, None, error(&format!("strata-image could not start ({e})"), "server_error")),
         };

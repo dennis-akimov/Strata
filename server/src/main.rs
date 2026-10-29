@@ -312,6 +312,7 @@ fn main() {
         cfg.insert("gpu".into(), g.trim().parse::<i64>().map(Value::from).unwrap_or(json!(g)));
     }
     let cfgv = Value::Object(cfg.clone());
+    strata_server::firewall::start(get(&cfgv, "firewall"), a.engine == "strata"); // history, connection sampler, the kernel's sandbox log
     let host = a.host.clone().or_else(|| get(&cfgv, "host").as_str().filter(|h| !h.is_empty()).map(String::from)).unwrap_or_else(|| "127.0.0.1".into());
     // before the minutes of loading: is the port free?
     let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.clone() }, a.port);
@@ -400,15 +401,7 @@ fn main() {
         effort_end = effort_end_args(&cfgv, &exe, &*tok).unwrap_or_else(|e| exit_msg(&format!("[strata] config {e}")));
         let mut args = engine_args(&cfgv);
         args.extend(effort_end.clone().unwrap_or_default());
-        // in a container the engine runs on the host: strata-relay carries the line protocol there (server/README)
-        let exe = match std::env::var("STRATA_ENGINE_RELAY").ok().filter(|r| !r.is_empty()) {
-            Some(relay) => {
-                say(&format!("the engine runs on the host through strata-relay at {relay}"));
-                std::env::var("STRATA_RELAY_BIN").unwrap_or_else(|_| "strata-relay".into())
-            }
-            None => exe,
-        };
-        let spawn = Spawn { exe, args, cwd: cwd.clone(), log: get(&cfgv, "log").as_str().map(String::from), env };
+        let spawn = Spawn { exe, args, cwd: cwd.clone(), log: get(&cfgv, "log").as_str().map(String::from), env, jail: get(&cfgv, "sandbox") != &json!(false) };
         let e = match StrataEngine::new(spawn, lazy) {
             Ok(e) => e,
             Err(err) => exit_msg(&format!("[strata] {err}")),
@@ -423,7 +416,7 @@ fn main() {
         engine = Engine::Mock(Arc::new(MockEngine::new(&*tok, &scripts, 32768, 0.0)));
     }
     let tpl_path = tpath.join("chat_template.jinja");
-    let tpl_path = if tpl_path.exists() { tpl_path } else { root().join("serve/chat_template.jinja") };
+    let tpl_path = if tpl_path.exists() { tpl_path } else { root().join("server/chat_template.jinja") };
     let template = strata_server::template::ChatTemplate::load(&tpl_path).unwrap_or_else(|e| exit_msg(&format!("[strata] the chat template {}: {e}", tpl_path.display())));
     // ------------------------------------------------------------------ the settings
     let mut set = Settings { sampling_defaults, fit_max_tokens: a.fit_max_tokens || get(&cfgv, "fit_max_tokens") == &json!(true), ..Default::default() };

@@ -136,6 +136,27 @@ main { flex: 1; min-height: 0; display: flex; }
 }
 .req-head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); }
 .table-wrap.all { max-height: 420px; overflow-y: auto; }
+/* Firewall: connections folded x N */
+.fw-prot { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--st-s-2); }
+.fw-prot > div { border: 1px solid var(--st-line); border-radius: var(--st-r-md); padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
+.fw-prot b { font-weight: var(--st-fw-bold); }
+.fw-ok { color: var(--st-accent-text); font-weight: var(--st-fw-medium); }
+.fw-bad { color: var(--st-warn-text); font-weight: var(--st-fw-medium); }
+.fw-alerts { border-color: var(--st-warn); }
+.fw-scroll { max-height: 420px; overflow-y: auto; }
+.fw-table th, .fw-table td { padding-inline: 8px; vertical-align: top; }
+.fw-table td.when { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.fw-table td.detail { font-family: var(--st-font-mono, ui-monospace, Menlo, monospace); font-size: var(--st-fs-xs); word-break: break-all; min-width: 220px; }
+.fw-table tr.strange td { background: color-mix(in srgb, var(--st-warn) 8%, transparent); }
+.fw-tools { display: flex; align-items: center; gap: var(--st-s-3); flex-wrap: wrap; }
+.fw-filter { height: 34px; width: 280px; max-width: 100%; }
+.fw-all { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+#fw-wrap .st-table th, #fw-wrap .st-table td { white-space: nowrap; padding-inline: 8px; }
+#fw-wrap .st-table td.addr { font-family: var(--st-font-mono, ui-monospace, Menlo, monospace); font-size: var(--st-fs-sm); }
+#fw-wrap { max-height: calc(100vh - 260px); overflow-y: auto; }
+.fw-count { font-weight: var(--st-fw-bold); font-variant-numeric: tabular-nums; }
+.fw-where-internet { color: var(--st-warn-text); font-weight: var(--st-fw-medium); }
+.fw-note { margin: 0; }
 .req-totals { margin: 0; font-size: var(--st-fs-sm); }
 .req-totals:empty { display: none; }
 .cc-card { display: flex; flex-direction: column; gap: var(--st-s-3); }

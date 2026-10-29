@@ -25,6 +25,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
+    <button class="st-tab" role="tab" id="tab-btn-firewall" aria-controls="view-firewall" aria-selected="false" data-tab="firewall">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-shield"/></svg>Firewall</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
   </nav>
@@ -156,6 +158,58 @@
         <div class="mcp-list" id="mcp-list"></div>
         <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
           (in this page's chat only; switch it off in Sampling).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ Firewall ============================ -->
+  <section class="view view--firewall" id="view-firewall" role="tabpanel" aria-labelledby="tab-btn-firewall" hidden>
+    <div class="monitor">
+      <div class="st-card req-card">
+        <div class="req-head"><span class="card-title">Protection</span><span class="muted small" id="fw-mode"></span></div>
+        <div class="fw-prot" id="fw-prot"><span class="muted">Loading&hellip;</span></div>
+      </div>
+
+      <div class="st-card req-card fw-alerts" id="fw-alerts-card" hidden>
+        <div class="req-head"><span class="card-title">Strange activity</span><span class="muted small" id="fw-alerts-sum"></span></div>
+        <div class="table-wrap fw-scroll">
+          <table class="st-table fw-table">
+            <thead><tr><th>Last seen</th><th>What</th><th>Process</th><th>Destination</th><th>Why it stands out</th><th class="num">Count</th></tr></thead>
+            <tbody id="fw-alerts"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="st-card req-card">
+        <div class="req-head"><span class="card-title">Network connections</span>
+          <span class="fw-tools">
+            <input class="st-input fw-filter" id="fw-filter" type="search" placeholder="Filter: process, address, port, state" aria-label="Filter connections">
+            <label class="muted small fw-all"><input type="checkbox" id="fw-all"> Every process on this Mac</label>
+          </span></div>
+        <div class="fw-sum muted small" id="fw-sum">&ndash;</div>
+        <div class="table-wrap" id="fw-wrap">
+          <table class="st-table">
+            <thead><tr><th>Direction</th><th>Process</th><th>Proto</th><th>Local</th><th>Remote</th><th>Where</th><th>State</th><th class="num">Count</th></tr></thead>
+            <tbody id="fw-body"><tr><td colspan="8" class="muted">Loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+        <p class="muted small fw-note">Strata's own sockets: this server and what it started (engine, encoder, MCP servers); tick the box
+          for every process you may see.  The same process, peer, port and state is one row &times;N: a client's own port and the
+          local port of a call out change per connection and are left out.  Refreshes every 3 s while this tab is open.</p>
+      </div>
+
+      <div class="st-card req-card">
+        <div class="req-head"><span class="card-title">Outgoing history</span><span class="muted small" id="fw-hist-sum"></span></div>
+        <div class="table-wrap fw-scroll">
+          <table class="st-table fw-table">
+            <thead><tr><th>Last seen</th><th>Kind</th><th>Process</th><th>Destination</th><th>Details</th><th class="num">Count</th></tr></thead>
+            <tbody id="fw-hist"><tr><td colspan="6" class="muted">Loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+        <p class="muted small fw-note">Every new outgoing connection of Strata's processes (sampled every 2 s), every network
+          attempt the kernel refused a jailed process (from its sandbox log, so even a DNS lookup or a ping that lasts
+          microseconds), every tool call Strata ran for the model and every tool call the model handed to an API client.
+          Kept across restarts in <span id="fw-file"></span>.  The same event within 10 minutes is one row &times;N.</p>
       </div>
     </div>
   </section>

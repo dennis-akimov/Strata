@@ -2,6 +2,7 @@ pub mod api;
 pub mod bias;
 pub mod engine;
 pub mod errors;
+pub mod firewall;
 pub mod frontend;
 pub mod http;
 pub mod imagegen;

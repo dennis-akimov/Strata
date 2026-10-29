@@ -364,7 +364,7 @@ impl VideoGen {
         let t0 = Instant::now();
         let cmd = self.command(job);
         use std::os::unix::process::CommandExt;
-        let mut child = match Command::new(&cmd[0]).args(&cmd[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn() {
+        let mut child = match crate::firewall::command(&cmd[0], true).args(&cmd[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn() {
             Ok(c) => c,
             Err(e) => return job.fail(&format!("sd-cli could not start ({e})")),
         };

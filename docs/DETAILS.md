@@ -1297,14 +1297,14 @@ also paste as it is (key `"mcpServers"`):
 
 ```json
 "mcp_servers": {
-  "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\me\\Documents\\notes"]},
+  "files": {"command": "/path/to/Strata/engine-metal/strata-files", "args": ["/Users/me/Documents/notes"]},
   "search": {"url": "http://127.0.0.1:3000/mcp", "headers": {"Authorization": "Bearer ..."}}
 },
 "mcp": {"timeout_s": 60, "max_result_chars": 20000, "max_rounds": 8}
 ```
 
 Or keep them in their own file and start the server with `--mcp-config path\to\claude_desktop_config.json` (a file
-with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change.
+with an `mcpServers` block; add it to the `strata-server` line of your run script). Restart Strata after a change.
 
 **From the chat, without editing a file.** The Sampling drawer's **MCP servers** section adds a server at an address:
 a name, its URL (Streamable HTTP, usually ending in `/mcp`), its API key and how to send it (`Authorization: Bearer
@@ -1324,15 +1324,27 @@ needs a secure context (`localhost`/`127.0.0.1`, or HTTPS); over plain HTTP from
 nothing.
 
 - **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
-  stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
-  servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
+  stdin/stdout; a bare name is looked up on `PATH`, so any MCP server program works (Strata's own needs no Node.js
+  or Python: see `strata-files` below). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
   transport is not supported). `"disabled": true` leaves an entry out.
 - `"tools": ["name", ...]` keeps only those tools of the server. The model neither sees the others nor can call
-  them. For example, to let the chat read a folder but not change it:
-  `"files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem@1.0.0", "/path/to/folder"],
-  "tools": ["read_text_file", "read_multiple_files", "list_directory", "directory_tree", "search_files",
-  "get_file_info", "list_allowed_directories"]}`. Only the listed folders are reachable; the filesystem server refuses
-  `..` and symlinks that lead out. Pin the version: 2025.7.1 fixed a symlink escape (CVE-2025-53109).
+  them.
+- **`strata-files`** (`engine-metal/strata-files`, built with the server; Rust, in `server/src/bin/strata-files.rs`)
+  lets the chat read folders and nothing else: `"files": {"command": "/path/to/Strata/engine-metal/strata-files",
+  "args": ["/path/to/folder", ...]}`. Its tools are the read tools of `@modelcontextprotocol/server-filesystem` with
+  the same names, inputs and answers (`read_text_file`, `read_multiple_files`, `list_directory`, `directory_tree`,
+  `search_files`, `get_file_info`, `list_allowed_directories`); it has no write tools. Only the listed folders are
+  reachable: it refuses `..` and symlinks that lead out. Unlike `npx`, it starts without Node.js and without asking
+  the npm registry for the package each time.
+- **No network for what the model drives.** The engine, the image/video/vision encoders and every MCP program start
+  under a macOS kernel sandbox (Seatbelt: `(deny network*)`): a connection, a DNS lookup or a ping fails in the
+  kernel, and the kernel's refusal shows in the page's **Firewall** tab. An MCP program that needs the network (a web
+  search server, say) gets it with `"network": true` in its entry; `"sandbox": false` at the top of the run config
+  gives the engine the network back. Every tool call is recorded there too, Strata's own and the ones the model hands
+  to an API client (whose shell or files run them), and one carrying a URL, a public IP, a cloud bucket or paste host,
+  a network command (`curl`, `ping`, `nc`, ...), a sensitive file (`/etc/resolv.conf`, `~/.ssh`, ...) or a long
+  encoded blob is marked strange; `"firewall": {"block": true}` makes Strata refuse such a call instead of running it.
+  The history is kept in `~/Library/Application Support/Strata/firewall.jsonl`.
 - The servers start with Strata, in the background; the server window says what each one offers
   (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
   without them. The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by

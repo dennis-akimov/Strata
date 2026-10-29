@@ -77,7 +77,7 @@ def case(tpl, tags, api, req, think_unasked=True):
 
 packs = pathlib.Path(sys.argv[1])
 tpls = [(p.name, p / "tokenizer/chat_template.jinja", p / "tokenizer/token_type.json", p / "tokenizer/vocab.json") for p in sorted(packs.iterdir())]
-tpls.append(("serve", ROOT / "serve/chat_template.jinja", None, None))
+tpls.append(("serve", ROOT / "server/chat_template.jinja", None, None))
 out = []
 for name, path, types, vocab in tpls:
     if not path.exists():

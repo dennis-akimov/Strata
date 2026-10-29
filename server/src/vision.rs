@@ -8,7 +8,7 @@ use base64::Engine as _;
 use sha2::Digest;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -96,7 +96,7 @@ impl Vision {
             Some(l) => std::fs::OpenOptions::new().create(true).append(true).open(l).map(Stdio::from).unwrap_or(Stdio::null()),
             None => Stdio::null(),
         };
-        let mut child = Command::new(&self.args[0])
+        let mut child = crate::firewall::command(&self.args[0], true)
             .args(&self.args[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

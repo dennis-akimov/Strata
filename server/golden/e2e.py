@@ -35,6 +35,7 @@ def start(cmd, port, env=None):
         return _None()
     if RECORD and cmd[0] == RUST:
         return _None()
+    env = {**(env or os.environ), "STRATA_FIREWALL_LOG": ""}   # test traffic stays out of the user's firewall history
     p = subprocess.Popen(cmd + ["--port", str(port)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=ROOT)
     for _ in range(200):
         try:

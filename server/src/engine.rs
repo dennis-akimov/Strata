@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -430,6 +430,8 @@ pub struct Spawn {
     pub cwd: Option<String>,
     pub log: Option<String>,
     pub env: HashMap<String, String>,
+    /// no network for the engine (Seatbelt, firewall::command); the run config's "sandbox": false turns it off
+    pub jail: bool,
 }
 
 struct Proc {
@@ -587,7 +589,7 @@ impl StrataEngine {
             let _ = f.flush();
         }
         self.max_context.store(0, SeqCst);
-        let mut cmd = Command::new(&self.spawn.exe);
+        let mut cmd = crate::firewall::command(&self.spawn.exe, self.spawn.jail);
         cmd.arg("--serve").args(&self.spawn.args).stdin(Stdio::piped()).stdout(Stdio::piped());
         cmd.stderr(match logf {
             Some(f) => Stdio::from(f),
@@ -598,6 +600,8 @@ impl StrataEngine {
             cmd.current_dir(cwd);
         }
         let mut child = cmd.spawn().map_err(|e| Fail::Died(format!("the engine could not be started: {e}")))?;
+        let name = std::path::Path::new(&self.spawn.exe).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        crate::firewall::protect(&name, child.id() as i32, self.spawn.jail, "engine (the model)");
         let stdout = child.stdout.take().expect("stdout");
         let stdin = child.stdin.take();
         let (tx, rx) = unbounded::<Line>();

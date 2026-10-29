@@ -456,7 +456,7 @@ fn dispatch(mut c: Ctx) {
 }
 
 fn web_dir() -> std::path::PathBuf {
-    crate::root().join("serve").join("web")
+    crate::root().join("server").join("web")
 }
 
 /// The web app's files as one short hash (a tab left open across an update reloads itself).
@@ -514,6 +514,20 @@ fn get_(c: &mut Ctx) {
         if c.authorized() {
             let m = svc.metrics(c.raw_path.contains("requests=all"));
             c.json(200, m);
+        }
+        return;
+    }
+    if path == "/firewall" {
+        if c.authorized() {
+            let limit = c.query_param("limit").and_then(|v| v.parse().ok()).unwrap_or(500);
+            c.json(200, crate::firewall::history(limit));
+        }
+        return;
+    }
+    if path == "/connections" {
+        if c.authorized() {
+            let all = c.query_param("all").is_some_and(|v| v == "1");
+            c.json(200, crate::firewall::connections(all));
         }
         return;
     }
