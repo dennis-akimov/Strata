@@ -431,7 +431,14 @@ def test(cfg_path: Path, yes: bool) -> bool:
                         "or type s to skip", "", False)
                 if a.lower() != "s":
                     continue
-            warn("it did not fit: quit other apps, or pick a smaller model (`make setup` again)")
+            cfg = json.loads(cfg_path.read_text())
+            a = cfg["args"]
+            p = plan(Path(a[a.index("--gguf") + 1]), int(a[a.index("--max-context") + 1]),
+                     int(a[a.index("--prefill-batch") + 1]) if "--prefill-batch" in a else 2048)
+            total = need(p, p["context"])[1]
+            warn(f"it did not fit: the model needs about {total / GIB:.1f} GB and {free_now() / GIB:.1f} GB is free; "
+                 f"quit apps to free {max(0.1, (total - free_now()) / GIB):.1f} GB more (browsers, editors, Docker), "
+                 "then `make setup` again - or pick a smaller model")
             return False
         warn(f"the first answer failed: {said}")
         return False

@@ -659,6 +659,7 @@ fn main() {
                     wry::PageLoadEvent::Started => "started",
                     wry::PageLoadEvent::Finished => "finished",
                 };
+                eprintln!("strata-app: page {event} {url}"); // a trace a run from Terminal shows (no window needed)
                 let _ = p.send_event(Ev::Page(json!({"event": event, "url": url})));
             })
             .build_as_child(&control_win)
