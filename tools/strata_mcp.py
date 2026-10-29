@@ -1347,11 +1347,10 @@ class Tools:
                         "server": info}
             if info or not port_free(port):
                 raise ToolError(f"port {port} is used by another program; choose another port (port=...)")
-            py = s.run_python()
-            if not Path(py).exists():
-                raise ToolError("Strata's Python environment (.venv) is missing: run the install again")
-            cmd = [py, str(s.root / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
-                   "--port", str(port)]
+            exe = s.root / "engine-metal" / "strata-server"
+            if not exe.exists():
+                raise ToolError("Strata's server (engine-metal/strata-server) is missing: run `make server` (or the install again)")
+            cmd = [str(exe), "--engine", "strata", "--config", str(cfg_path), "--port", str(port)]
             if gpu is not None:
                 cmd += ["--gpu", str(gpu)]
             log_path = s.state_dir / "server.log"
@@ -1731,8 +1730,8 @@ def main(argv=None) -> int:
         log("Python 3.10 or newer is needed")
         return 2
     root = Path(a.root).expanduser().resolve() if a.root else DEFAULT_ROOT
-    if not (root / "setup.py").is_file() or not (root / "serve" / "server.py").is_file():
-        log(f"{root} is not a Strata folder (no setup.py / serve/server.py)")
+    if not (root / "setup.py").is_file() or not (root / "server" / "Cargo.toml").is_file():
+        log(f"{root} is not a Strata folder (no setup.py / server/Cargo.toml)")
         return 2
     out = sys.stdout.buffer
     sys.stdout = sys.stderr                             # stray prints must never corrupt the protocol stream

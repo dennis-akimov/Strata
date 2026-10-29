@@ -1,0 +1,81 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Strata</title>
+<style>
+:root{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mute:#6e6e73;--line:#d2d2d7;--acc:#0a84ff;--log:#1d1d1f;--logfg:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--fg:#f5f5f7;--mute:#98989d;--line:#3a3a3c;--log:#000;--logfg:#d1d1d6}}
+*{box-sizing:border-box}[hidden]{display:none!important}html,body{height:100%}body{margin:0;font:12.5px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
+#bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:wrap}
+select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+button{cursor:pointer}button:hover:not(:disabled){border-color:var(--acc)}button:disabled{opacity:.4;cursor:default}
+button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{border-color:var(--acc);color:var(--acc)}
+.dot{width:9px;height:9px;border-radius:50%;background:#8e8e93;flex:none}#phase{font-weight:600;text-transform:capitalize;min-width:62px}
+#cfg{max-width:340px}.mute{color:var(--mute)}#rate{font-variant-numeric:tabular-nums;min-width:60px}
+#more{position:relative}#menu{display:none;position:absolute;right:0;top:28px;z-index:9;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px;min-width:220px;box-shadow:0 6px 24px #0003}
+#menu.open{display:block}#menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:6px 8px}#menu button:hover{background:var(--bg)}
+#menu label{display:block;padding:6px 8px}
+#main{flex:1;display:flex;flex-direction:column;min-height:0}
+#idle{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:16px;text-align:center}
+#idle h2{margin:0;font-size:20px}#note{color:#ff453a;min-height:1em}
+#log{height:38%;margin:0;background:var(--log);color:var(--logfg);padding:8px 10px;overflow:auto;font:11.5px ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;display:none;border-top:1px solid var(--line)}
+#log.open{display:block}body.down #log.open{flex:1;height:auto}
+</style></head><body class="down">
+<div id="bar">
+  <span class="dot" id="dot"></span><span id="phase">stopped</span>
+  <select id="cfg" title="run config (strata-*.json in the Strata folder; port from the config)"></select>
+  <button class="main" id="start">Start</button><button id="stop">Stop</button><button id="restart">Restart</button>
+  <span class="mute">|</span><button id="load">Load model</button><button id="unload">Unload</button>
+  <span id="rate" class="mute"></span><span style="flex:1"></span>
+  <span class="mute" id="url"></span>
+  <button id="logbtn" title="the server's output">Log</button>
+  <span id="more"><button id="morebtn">More ▾</button><div id="menu">
+    <button id="browser">Open in browser</button><button id="edit_config">Edit config</button>
+    <button id="reveal">Show config in Finder</button><button id="engine_log">Engine log in Console</button>
+    <button id="copy_key">Copy API key</button>
+    <label><input type="checkbox" id="autostart"> Start the server when the app opens</label>
+  </div></span>
+</div>
+<div id="main">
+  <div id="idle"><h2 id="idletitle">The server is stopped</h2><div class="mute" id="where"></div><div id="note"></div>
+    <button class="main" id="start2">Start the server</button><a href="#" id="showlog" class="mute">show the server's log</a></div>
+  <pre id="log"></pre>
+</div>
+<script>
+const $=id=>document.getElementById(id), send=(cmd,o={})=>window.ipc.postMessage(JSON.stringify({cmd,...o}));
+const COLORS={ready:'#34c759',busy:'#0a84ff',starting:'#ff9f0a',stopping:'#ff9f0a',unloaded:'#bf5af2',stopped:'#8e8e93'};
+let base='',up=false;
+function init(s){
+  $('cfg').innerHTML=s.configs.map(c=>`<option value="${c.path}">${c.name.replace(/^strata-|\.json$/g,'')}${c.model?' — '+c.model:''}</option>`).join('')||'<option>no runnable config (model files missing)</option>';
+  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;
+  base=`http://127.0.0.1:${s.port}`;$('url').textContent=`127.0.0.1:${s.port}`;
+  $('log').textContent='';(s.log||[]).forEach(log);
+  $('where').textContent=s.server?`${s.root}`:'engine-metal/strata-server is missing: run `make server` in '+s.root;
+  status({...s.status,phase:s.phase,running:s.running});
+}
+function status(s){
+  const ph=s.phase||'stopped',running=!!s.running;
+  $('phase').textContent=ph;$('dot').style.background=COLORS[ph]||COLORS.stopped;
+  $('start').disabled=running;$('start2').hidden=running;$('stop').disabled=!running||ph==='stopping';$('restart').disabled=!running;
+  $('load').disabled=ph!=='unloaded';$('unload').disabled=!(ph==='ready'||ph==='busy');$('cfg').disabled=running;
+  for(const id of ['browser','copy_key'])$(id).disabled=!running;
+  $('rate').textContent=s.tok_s!=null?`${s.tok_s} tok/s`:(s.prompt_total?`reading ${s.prompt_read}/${s.prompt_total}`:'');
+  const serving=['ready','busy','unloaded'].includes(ph);
+  if(serving&&!up){up=true;send('page',{tab:'monitor'});}   // the server's own page: Chat, Monitor, About
+  if(!running&&up)up=false;
+  $('idle').hidden=up;document.body.classList.toggle('down',!up);layout();
+  $('idletitle').textContent={starting:'Starting… loading the model',stopping:'Stopping… the engine frees its memory'}[ph]||'The server is stopped';
+  if(ph!=='stopped')$('note').textContent='';
+}
+let full=null;function layout(){const f=!up||$('log').classList.contains('open');if(f!==full){full=f;send('layout',{full:f});}}
+function log(line){const l=$('log'),end=l.scrollTop+l.clientHeight>=l.scrollHeight-20;l.append(line+'\n');
+  while(l.childNodes.length>2000)l.firstChild.remove();if(end)l.scrollTop=l.scrollHeight;}
+function note(m){$('note').textContent=m;if(up&&!$('log').classList.contains('open'))$('logbtn').click();log('── '+m+' ──');}
+$('cfg').onchange=()=>send('select',{config:$('cfg').value});
+$('autostart').onchange=e=>send('autostart',{on:e.target.checked});
+$('start2').onclick=()=>send('start');$('showlog').onclick=e=>{e.preventDefault();$('logbtn').click();};
+$('logbtn').onclick=()=>{$('log').classList.toggle('open');$('logbtn').classList.toggle('on');$('log').scrollTop=1e9;layout();};
+$('morebtn').onclick=e=>{e.stopPropagation();$('menu').classList.toggle('open');};
+document.onclick=()=>$('menu').classList.remove('open');$('menu').onclick=e=>e.stopPropagation();
+for(const id of ['start','stop','restart','load','unload','browser','edit_config','reveal','engine_log','copy_key'])
+  $(id).onclick=()=>{$('menu').classList.remove('open');send(id);};
+send('init');
+</script></body></html>

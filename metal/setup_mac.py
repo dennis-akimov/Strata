@@ -47,8 +47,17 @@ def sysctl(name: str) -> str:
 
 def metal_working_set_gb() -> float:
     """Metal's recommendedMaxWorkingSetSize in GiB (serve/telemetry.py asks it); 0.0 when it cannot be asked."""
-    from serve.telemetry import metal_working_set_bytes
-    return metal_working_set_bytes() / 2**30
+    try:                                          # Metal's MTLDevice.recommendedMaxWorkingSetSize (the server reads it too)
+        import ctypes
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.dylib")
+        metal = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Metal.framework/Metal")
+        metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+        dev = metal.MTLCreateSystemDefaultDevice()
+        send = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+        return (int(send(dev, objc.sel_registerName(b"recommendedMaxWorkingSetSize"))) if dev else 0) / 2**30
+    except (OSError, AttributeError):
+        return 0.0
 
 
 def apple_gpu(ram: float) -> dict:

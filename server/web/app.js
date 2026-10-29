@@ -1,0 +1,1807 @@
+// serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
+// The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+// the icon sprite, put into the page once: a <use> of another file is fetched again for every copy the page builds (an
+// answer is rebuilt on each repaint while it streams: ~20 sprite requests a second), one of this page's ids never is.
+// Until it is in (or if it cannot be fetched), icons use the file.
+let SPRITE = "web/sprite.svg";
+fetch(SPRITE).then((r) => (r.ok ? r.text() : "")).then((svg) => {
+  if (!svg.includes("<symbol")) return;
+  const box = document.createElement("div");
+  box.hidden = true;
+  box.innerHTML = svg;
+  document.body.prepend(box);
+  SPRITE = "";
+}).catch(() => { /* keep the file */ });
+const icon = (name, cls = "st-icon") => `<svg class="${cls}" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
+const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
+// a context size: 32768 -> "32K" (powers of two), else like kfmt
+const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
+const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
+
+let webVersion = null;                                 // the page code this tab runs (/health's "web" at load)
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+};
+
+// ------------------------------------------------------------------ toasts
+function toast(kind, title, text = "", ms = 3500, action = null) {
+  const names = {info: "info", success: "check", warn: "warning", error: "error"};
+  const el = document.createElement("div");
+  el.className = `st-toast st-toast--${kind}`;
+  el.innerHTML = `${icon(names[kind] || "info")}<div><div class="st-toast__title"></div><div class="t-text"></div></div>`;
+  el.querySelector(".st-toast__title").textContent = title;
+  el.querySelector(".t-text").textContent = text;
+  if (action) {
+    const b = document.createElement("button");
+    b.className = "st-btn st-btn--secondary";
+    b.style.height = "32px";
+    b.style.marginLeft = "auto";
+    b.textContent = action.label;
+    b.onclick = () => { action.run(); el.remove(); };
+    el.appendChild(b);
+  }
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {                                   // http on another host: no async clipboard
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove();
+  }
+  if (btn) {
+    const use = btn.querySelector("use");
+    use.setAttribute("href", `${SPRITE}#i-check`);
+    setTimeout(() => use.setAttribute("href", `${SPRITE}#i-copy`), 1500);
+  }
+  toast("success", "Copied to clipboard", "", 1800);
+}
+
+// ------------------------------------------------------------------ theme and tabs
+// the system's theme until the user picks one (only a click is saved)
+function setTheme(t, save) {
+  document.documentElement.dataset.theme = t;
+  if (save) try { localStorage.setItem("strata.theme", t); } catch (e) { /* ignore */ }
+  $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
+  $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
+}
+const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
+$("theme-btn").onclick = flipTheme;
+$("dark-toggle").onclick = flipTheme;
+setTheme(document.documentElement.dataset.theme || "light", false);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+  let saved = null;
+  try { saved = localStorage.getItem("strata.theme"); } catch (err) { /* ignore */ }
+  if (!saved) setTheme(e.matches ? "dark" : "light", false);
+});
+
+let tab = "chat";
+function showTab(name) {
+  tab = ["chat", "monitor", "firewall", "about"].includes(name) ? name : "chat";
+  for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  for (const v of ["chat", "monitor", "firewall", "about"]) $(`view-${v}`).hidden = v !== tab;
+  if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
+  if (tab === "chat") $("input").focus();
+  if (tab === "monitor") loadMcp();
+  if (tab === "about") loadConfig();
+  if (tab === "firewall") loadFirewall();
+  if (lastMetrics) render(lastMetrics);
+}
+for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
+window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
+
+// ------------------------------------------------------------------ server access
+function headers(json = false) {
+  const h = {};
+  const key = store.get("apikey", "");
+  if (key) h.Authorization = "Bearer " + key;
+  if (json) h["Content-Type"] = "application/json";
+  if (webVersion) h["X-Strata-Web"] = webVersion;      // the page code this tab runs: the server spots an old tab
+  return h;
+}
+$("api-key").value = store.get("apikey", "");
+if (store.get("draft", "")) { $("input").value = store.get("draft", ""); store.set("draft", ""); }   // kept over a reload
+$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+
+let health = {model: "strata", images: false, max_context: 0};
+async function loadHealth() {
+  try {
+    health = await (await fetch("health")).json();
+    if (webVersion === null) webVersion = health.web || "";
+    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
+                                          : "Attach a text file (or drop it here)";
+    const make = [health.image_generation && "/image and a description for a picture",
+                  health.video_generation && "/video and a description for a short clip"].filter(Boolean);
+    $("chat-empty-sub").textContent = make.length
+      ? `Type ${make.join(", or ")}. ${health.model} answers chat messages` +
+        `${health.loaded ? "" : " (it loads with the first one)"}. All on this PC.`
+      : `${health.model} runs on this PC. Nothing leaves it.`;
+    setBusy(!!busy);                                    // the hint: /image when this server makes pictures
+  } catch (e) {
+    setTimeout(loadHealth, 2000);
+  }
+}
+
+// ------------------------------------------------------------------ Monitor
+const METRICS = [
+  {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
+  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
+  {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
+  {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
+  {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
+  {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
+  {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
+  {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
+];
+$("metrics").innerHTML = METRICS.map((m) => `
+  <div class="st-card metric-card"><div class="st-metric">
+    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+    ${m.key === "speed" ? `<div class="speed-values">
+      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
+      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
+    </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
+    <span class="st-metric__sub" id="ms-${m.key}"></span>`}
+    <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
+      <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
+      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+      ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
+        <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
+        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
+  </div></div>`).join("");
+
+function spark(id, values, max) {
+  const svg = $(id);
+  const v = (values || []).map((x) => (x == null ? 0 : x));
+  if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
+  const top = Math.max(max || 0, ...v, 1);
+  const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
+  const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
+  svg.querySelector(".line").setAttribute("d", line);
+  svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
+}
+function setMetric(key, value, unit, sub) {
+  $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
+  $(`ms-${key}`).textContent = sub || "";
+}
+
+let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
+let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+async function poll() {
+  try {
+    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+    if (r.status === 401) {
+      setPill("error", "API key needed");
+      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+    } else if (r.ok) {
+      lastMetrics = await r.json();
+      metricsFailures = 0;
+      render(lastMetrics);
+    } else {
+      throw new Error(`HTTP ${r.status}`);
+    }
+  } catch (e) {
+    if (++metricsFailures === 3) setPill("error", "Server not reachable");
+  }
+  if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
+  setTimeout(poll, 1000);
+}
+
+// ------------------------------------------------------------------ firewall
+// GET connections: this server's sockets (and its children's, or every process's with all=1), folded x N server-side
+const FW_KIND = {connection: ["Connection", "st-badge--queued"], blocked: ["Blocked", "st-badge--queued"], tool: ["Tool call", "st-badge--reading"],
+  "client tool": ["To API client", "st-badge--generating"]};
+let fwHist = null;
+const fwWhen = (t) => { const d = new Date(t * 1000); return (Date.now() - d < 86400000 ? "" : d.toLocaleDateString() + " ") + d.toLocaleTimeString(); };
+const FW_DIR = {listen: ["Listening", "st-badge--generating"], in: ["Incoming", "st-badge--reading"], out: ["Outgoing", "st-badge--queued"], open: ["Open (UDP)", ""]};
+let fwRows = [], fwTimer = 0;
+async function loadFirewall() {
+  clearTimeout(fwTimer);
+  if (tab !== "firewall") return;
+  try {
+    const h = await fetch("firewall?limit=1000", {headers: headers(), cache: "no-store"});
+    if (h.ok) fwHist = await h.json();
+    const r = await fetch("connections" + ($("fw-all").checked ? "?all=1" : ""), {headers: headers(), cache: "no-store"});
+    if (r.status === 401) throw new Error("401");
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error?.message || `HTTP ${r.status}`);
+    fwRows = d.rows || [];
+    $("fw-sum").textContent = `${d.sockets} socket${d.sockets === 1 ? "" : "s"} in ${fwRows.length} row${fwRows.length === 1 ? "" : "s"}, ${d.processes} process${d.processes === 1 ? "" : "es"}` +
+      ` \u00b7 ${fwRows.filter((x) => x.scope === "internet").reduce((n, x) => n + x.count, 0)} to or from the internet`;
+    renderFirewall();
+  } catch (e) {
+    $("fw-sum").textContent = e.message === "401" ? "API key needed: add it under About > Settings." : `Could not read the connections: ${e.message}`;
+  }
+  fwTimer = setTimeout(loadFirewall, 3000);
+}
+function renderFirewall() {
+  const q = $("fw-filter").value.trim().toLowerCase();
+  renderFwHistory(q);
+  const rows = fwRows.filter((x) => !q || [x.process, x.local, x.remote, x.state, x.proto, x.scope, x.dir, ...x.pids].join(" ").toLowerCase().includes(q));
+  $("fw-body").innerHTML = rows.length ? rows.map((x) => {
+    const [label, cls] = FW_DIR[x.dir] || [x.dir, ""];
+    return `<tr><td><span class="st-badge ${cls}">${label}</span></td><td title="pid ${esc(x.pids.join(", "))}">${esc(x.process)}</td>` +
+      `<td>${esc(x.proto)}</td><td class="addr">${esc(x.local || "\u2013")}</td><td class="addr">${esc(x.remote || "\u2013")}</td>` +
+      `<td class="${x.scope === "internet" ? "fw-where-internet" : "muted"}">${esc(x.scope || "\u2013")}</td><td>${esc(x.state || "\u2013")}</td>` +
+      `<td class="num fw-count">${x.count > 1 ? "\u00d7" + x.count : "1"}</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="muted">${fwRows.length ? "Nothing matches the filter" : "No network connections"}</td></tr>`;
+}
+function renderFwHistory(q) {
+  if (!fwHist) return;
+  const prot = fwHist.protected || [];
+  $("fw-mode").textContent = !fwHist.sandbox ? "sandbox-exec missing: processes run with the network"
+    : fwHist.block ? "strange tool calls are refused" : "strange tool calls are marked, not refused (\"firewall\": {\"block\": true} refuses them)";
+  $("fw-prot").innerHTML = prot.length ? prot.map((p) => `<div><b>${esc(p.process)}</b><span class="muted small">${esc(p.role)} \u00b7 pid ${esc(p.pid)}</span>` +
+    `<span class="${p.network ? "fw-bad" : "fw-ok"}">${p.network ? "has the network" : "no network (kernel sandbox)"}</span></div>`).join("") +
+    (fwHist.expected || []).map((h) => `<div><b>${esc(h)}</b><span class="muted small">an MCP server the server calls</span><span class="muted">expected destination</span></div>`).join("")
+    : `<span class="muted">Nothing started yet</span>`;
+  $("fw-file").textContent = fwHist.file || "memory only (a test server)";
+  const match = (e) => !q || [e.kind, e.process, e.dest, e.detail, e.strange || ""].join(" ").toLowerCase().includes(q);
+  const row = (e, why) => { const [label, cls] = FW_KIND[e.kind] || [e.kind, ""];
+    return `<tr class="${e.strange ? "strange" : ""}"><td class="when">${esc(fwWhen(e.last))}</td><td><span class="st-badge ${cls}">${label}</span></td>` +
+      `<td>${esc(e.process)}</td><td class="addr">${esc(e.dest)}</td><td class="detail">${esc(why ? e.strange : e.detail)}</td>` +
+      `<td class="num fw-count">${e.count > 1 ? "\u00d7" + e.count : "1"}</td></tr>`; };
+  const alerts = fwHist.events.filter((e) => e.strange && match(e));
+  $("fw-alerts-card").hidden = !fwHist.alerts;
+  $("fw-alerts-sum").textContent = `${fwHist.alerts} kept`;
+  $("fw-alerts").innerHTML = alerts.map((e) => row(e, true)).join("") || `<tr><td colspan="6" class="muted">Nothing matches the filter</td></tr>`;
+  const hist = fwHist.events.filter(match);
+  $("fw-hist-sum").textContent = `${fwHist.kept} kept`;
+  $("fw-hist").innerHTML = hist.map((e) => row(e, false)).join("") || `<tr><td colspan="6" class="muted">${fwHist.kept ? "Nothing matches the filter" : "No outgoing activity yet"}</td></tr>`;
+}
+$("fw-filter").oninput = renderFirewall;
+$("fw-all").onchange = loadFirewall;
+
+function setPill(state, text) {
+  $("pill").dataset.state = state === "error" ? "queued" : state;
+  $("pill-text").textContent = text;
+}
+
+function render(m) {
+  const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
+  const last = (m.requests || [])[0];
+  // the header pill
+  if (live.state === "reading") {
+    const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
+    setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
+  } else if (live.state === "generating") {
+    setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+  } else {
+    setPill("idle", "Idle");
+  }
+  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "about") renderAbout(eng, hw, st);
+}
+
+// #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
+// conversations it parks in RAM when "--conversation-cache-mib N" is in the run config's args (opt-in)
+function since(t) {
+  if (!t) return "";
+  const s = Math.max(0, Date.now() / 1000 - t);
+  return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
+}
+function renderConvCache(c) {
+  $("cc-card").hidden = !c;
+  if (!c) return;                                  // an older server
+  const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
+  $("cc-bars").hidden = !c.enabled;
+  if (c.enabled) {
+    $("cc-slots-text").textContent = `${fmt(c.parked)} / ${fmt(c.slots)}`;
+    $("cc-slots-bar").style.width = pct(c.parked, c.slots);
+    const budget = c.budget_mib * 1048576;
+    $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
+    $("cc-mem-bar").style.width = pct(c.bytes, budget);
+  }
+  $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
+  const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
+  const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
+  facts($("cc-facts"), [
+    ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
+    ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
+    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
+    ["Last switch", c.enabled ? event : null],
+  ]);
+  $("cc-note").textContent = c.enabled
+    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
+    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+}
+
+function renderTotals(t) {
+  if (!t || !t.requests) return "";
+  const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
+  const read = t.prompt_tokens - t.reused;
+  const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
+  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
+  return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
+         `${fmt(t.output_tokens)} written${oSpeed}`;
+}
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+  // model state
+  const on = live.queued > 0 ? "queued" : live.state;
+  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
+  const prog = $("state-progress");
+  let label = "Waiting for a request", detail = "", pct = 0;
+  if (live.state === "reading") {
+    label = "Reading prompt";
+    prog.dataset.tone = "info";
+    if (live.prompt_total) {
+      pct = (100 * live.prompt_read) / live.prompt_total;
+      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
+    } else {
+      detail = `${fmt(live.prompt_tokens)} tokens`;
+    }
+  } else if (live.state === "generating") {
+    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
+    delete prog.dataset.tone;
+    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
+    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+  } else if (last) {
+    delete prog.dataset.tone;
+    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+  }
+  $("state-label").textContent = label;
+  $("state-detail").textContent = detail;
+  $("state-bar").style.width = `${pct}%`;
+
+  // the eight cards
+  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
+  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
+            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
+  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
+  setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
+            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+  spark("sp-speed", h.tok_s);
+  spark("sp-prefill", h.prefill_tok_s_mean);
+  // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
+  const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
+  const multi = (hw.gpus || []).length > 1;
+  setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
+            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));
+  spark("sp-gpu", h.gpu_util, 100);
+  setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
+            multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
+                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
+  spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+  setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
+            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`))
+                  : hw.gpu_unified && hw.gpu_temp != null ? "highest chip die sensor, not a GPU-only one" : "");
+  spark("sp-temp", h.gpu_temp, 90);
+  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power, hw.gpu_power < 10 ? 1 : 0), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
+  spark("sp-power", h.gpu_power, hw.gpu_power_limit);
+  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
+  if (hw.gpu_unified) setMetric("pcie", "n/a", "", "integrated GPU: no PCIe link, it shares the system's memory");
+  else setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
+            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
+            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
+  spark("sp-pcie", h.gpu_pcie_rx_mb);
+  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
+  spark("sp-cpu", h.cpu, 100);
+  if (hw.disk_read_mb == null) {
+    setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
+  } else {
+    const big = hw.disk_read_mb >= 1000;
+    setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
+              hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
+  }
+  spark("sp-disk", h.disk_read_mb);
+
+  // context fill: the running request, else the last one
+  const ctx = eng.max_context || 0;
+  let used = 0;
+  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+  const frac = ctx ? Math.min(1, used / ctx) : 0;
+  $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
+  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
+  $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
+  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
+  $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
+  $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
+  $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
+  const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
+  $("ram-bar").style.width = `${ramPct}%`;
+  if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
+  $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
+  $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
+
+  // recent requests
+  const body = $("req-body");
+  if (!requests.length) {
+    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+  } else {
+    const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
+                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
+      const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
+      const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+      const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
+      // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
+      const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
+        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
+      // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
+      const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
+      const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
+      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
+        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+    }).join("");
+  }
+  const all = $("req-all");
+  kept = kept == null ? requests.length : kept;
+  all.hidden = kept <= 12;
+  all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
+  $("req-wrap").classList.toggle("all", reqShowAll);
+  $("req-totals").textContent = renderTotals(totals);
+}
+
+function facts(el, rows) {
+  el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
+    `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="Copy">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
+}
+// INFO cvec=project:4-44[:singleL] | add:A-B | 0
+function projectionText(c) {
+  if (!c || c === "0" || c === 0) return null;
+  const [mode, range, single] = String(c).split(":");
+  const [a, b] = (range || "").split("-");
+  return `${mode === "project" ? "Projection" : "Additive"} control vector on layers ${a}–${b}` +
+         `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
+         "describes the vector as a refusal-direction projection; measure the speed yourself";
+}
+function renderAbout(eng, hw, st) {
+  const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  facts($("facts-engine"), [
+    ["Model", eng.model],
+    ["Engine", eng.version ? `v${eng.version}` : "built from source"],
+    ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
+    ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
+    ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
+    ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
+    ["Images", eng.images ? "on" : "off"],
+    ["Experimental speed projection", projectionText(eng.cvec)],
+  ]);
+  facts($("facts-hw"), [
+    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
+    ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
+    ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
+  ]);
+  const base = location.origin;
+  facts($("facts-api"), [
+    ["OpenAI base URL", `${base}/v1`, true],
+    ["Anthropic base URL", base, true],
+    ["Model name", eng.model, true],
+  ]);
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-copy]");
+  if (b) copyText(b.dataset.copy, b);
+});
+$("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+
+// ------------------------------------------------------------------ MCP servers (GET /mcp)
+// Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
+// "strata_mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
+let mcpInfo = {servers: [], tools: 0}, mcpRetry = null, mcpLoaded = false;
+async function loadMcp() {
+  try {
+    const r = await fetch("mcp", {headers: headers()});
+    if (!r.ok) return;
+    mcpInfo = await r.json();
+    mcpLoaded = true;
+  } catch (e) { return; /* an older server: no MCP */ }
+  renderMcp();
+  if (!mcpRestored) await mcpRestore();
+  clearTimeout(mcpRetry);                          // right after the start, servers may still be starting
+  if ((mcpInfo.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
+}
+const MCP_STATE = {ready: ["st-badge--generating", "Connected"], starting: ["st-badge--reading", "Starting"],
+                   failed: ["st-badge--error", "Failed"], stopped: ["st-badge--queued", "Stopped"], idle: ["", "Waiting"]};
+function renderMcp() {
+  const servers = mcpInfo.servers || [];
+  $("mcp-card").hidden = !servers.length;
+  $("mcp-row").hidden = !servers.length;
+  $("mcp-conns").hidden = !mcpLoaded;                // connections can be added here even when there are none yet
+  renderMcpConns(servers);
+  const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
+  $("mcp-sum").textContent = servers.length ? `${fmt(mcpInfo.tools)} tools · ${ready.length} of ${servers.length} servers connected` : "";
+  $("mcp-row-sub").textContent = mcpInfo.tools ? `${fmt(mcpInfo.tools)} tools from ${ready.map((s) => s.name).join(", ")}; the model calls them when it decides to`
+                                               : "no server is connected yet (see the Monitor)";
+  $("mcp-list").innerHTML = servers.map((s) => {
+    const [cls, text] = MCP_STATE[s.status] || ["", s.status];
+    const info = s.info && s.info.name ? ` · ${s.info.name}${s.info.version ? ` ${s.info.version}` : ""}` : "";
+    return `<div class="mcp-server"><div class="mcp-server__head"><span class="st-badge ${cls}">${esc(text)}</span>` +
+      `<strong>${esc(s.name)}</strong><span class="muted small">${esc(s.transport)} · ${fmt(s.tools.length)} tools${esc(info)}</span></div>` +
+      (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") +
+      (s.tools.length ? `<div class="mcp-server__tools">${s.tools.map((t) => `<span class="chip" title="${esc(t.description || "")}">${esc(t.tool)}</span>`).join("")}</div>` : "") +
+      `</div>`;
+  }).join("");
+}
+
+// The chat's own MCP connections (POST /mcp/servers, DELETE /mcp/servers/<name>): a URL and an API key, kept in the
+// server's run config.  The key is write-only: GET /mcp names the header it rides in, never its value.  A program
+// server (a command) or one from --mcp-config is listed but changed in the config file only.
+function renderMcpConns(servers) {
+  $("mcp-conns-list").innerHTML = servers.map((s) => {
+    const [cls, text] = MCP_STATE[s.status] || ["", s.status];
+    const where = s.transport === "http"
+      ? `${esc(s.url || "")} · ${s.headers && s.headers.length ? `key in ${esc(s.headers.join(", "))}` : "no key"}`
+      : "a program on this computer (config file)";
+    const acts = s.editable ? `<span class="mcp-conn__actions"><button class="st-btn st-btn--secondary" type="button" data-mcp-edit="${esc(s.name)}">Edit</button>` +
+      `<button class="st-btn st-btn--secondary" type="button" data-mcp-del="${esc(s.name)}">Remove</button></span>` : "";
+    return `<div class="mcp-server"><div class="mcp-server__head"><span class="st-badge ${cls}">${esc(text)}</span>` +
+      `<strong>${esc(s.name)}</strong><span class="muted small">${fmt(s.tools.length)} tools</span>${acts}</div>` +
+      `<span class="muted small mcp-conn__where">${where}</span>` +
+      (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") + `</div>`;
+  }).join("");
+}
+// The page's connections are also kept in this browser (localStorage "strata.mcpConns": {name: {url, header, key}}),
+// so a server started with another run config gets them back (they were in that model's config only).  The key is
+// AES-GCM sealed with a browser key kept non-extractable in IndexedDB "strata-keys": a copy of localStorage alone
+// doesn't reveal it.  ponytail: a script on this page can still decrypt it; nothing in a browser stops that.
+const mcpVault = (() => {
+  let k = null;
+  const cryptoKey = () => k || (k = new Promise((res) => {
+    try {
+      const r = indexedDB.open("strata-keys", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("keys");
+      r.onerror = r.onblocked = () => res(null);
+      r.onsuccess = () => {
+        const d = r.result, get = d.transaction("keys").objectStore("keys").get("mcp");
+        get.onerror = () => res(null);
+        get.onsuccess = async () => {
+          if (get.result) return res(get.result);
+          try {               // no crypto.subtle (plain http from another computer): throws, nothing is kept
+            const key = await crypto.subtle.generateKey({name: "AES-GCM", length: 256}, false, ["encrypt", "decrypt"]);
+            const t = d.transaction("keys", "readwrite");
+            t.objectStore("keys").put(key, "mcp");
+            t.oncomplete = () => res(key);
+            t.onerror = t.onabort = () => res(null);
+          } catch (e) { res(null); }
+        };
+      };
+    } catch (e) { res(null); }
+  }));
+  const b64 = (u) => btoa(String.fromCharCode(...u)), unb64 = (t) => Uint8Array.from(atob(t), (c) => c.charCodeAt(0));
+  return {
+    async seal(text) {
+      const key = await cryptoKey();
+      if (!key) return null;
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      return `${b64(iv)}.${b64(new Uint8Array(await crypto.subtle.encrypt({name: "AES-GCM", iv}, key, new TextEncoder().encode(text))))}`;
+    },
+    async open(sealed) {
+      const key = await cryptoKey();
+      if (!key) throw new Error("this browser cannot decrypt the saved key here (http from another computer?)");
+      const [iv, ct] = sealed.split(".").map(unb64);
+      return new TextDecoder().decode(await crypto.subtle.decrypt({name: "AES-GCM", iv}, key, ct));
+    },
+  };
+})();
+// after a POST that worked: false when the browser can't keep it (no key known to it, or no crypto)
+async function mcpRemember(body) {
+  const all = store.get("mcpConns", {}), old = all[body.name];
+  let key = old && old.header ? old.key : undefined;
+  if (body.key !== undefined) key = body.key ? await mcpVault.seal(body.key) : "";
+  if (key === null || (body.header && key === undefined)) return false;   // the key is on the server only: retype it
+  all[body.name] = {url: body.url, header: body.key === "" ? "" : body.header, key: key || ""};
+  store.set("mcpConns", all);
+  return true;
+}
+function mcpForget(name) {
+  const all = store.get("mcpConns", {});
+  delete all[name];
+  store.set("mcpConns", all);
+}
+// once a page load: the browser's connections that this server lacks are added (and so saved in its run config)
+let mcpRestored = false;
+async function mcpRestore() {
+  mcpRestored = true;
+  const have = new Set((mcpInfo.servers || []).map((s) => s.name)), added = [];
+  for (const [name, c] of Object.entries(store.get("mcpConns", {}))) {
+    if (have.has(name)) continue;
+    try {
+      const body = {name, url: c.url, key: ""};
+      if (c.header) { body.header = c.header; body.key = c.key ? await mcpVault.open(c.key) : ""; }
+      await mcpSend("POST", "mcp/servers", body);
+      added.push(name);
+    } catch (e) { toast("error", `MCP server ${name} not added back`, (e && e.message) || String(e), 6000); }
+  }
+  if (added.length) toast("info", "MCP servers from this browser", `${added.join(", ")} added to this server`);
+}
+let mcpEditing = null;                              // the name being changed (its key is kept unless one is typed)
+function mcpForm(s = null) {
+  mcpEditing = s ? s.name : null;
+  $("mcp-add-title").textContent = s ? `Change ${s.name}` : "Add an MCP server";
+  $("mcp-save").textContent = s ? "Save" : "Connect";
+  $("mcp-name").value = s ? s.name : ""; $("mcp-name").readOnly = !!s;
+  $("mcp-url").value = s ? (s.url || "").replace(/\?…$/, "") : "";
+  const h = s && s.headers && s.headers[0];
+  $("mcp-header").value = !s ? "Authorization" : !h ? "none" : ["Authorization", "X-API-Key"].includes(h) ? h : "other";
+  $("mcp-header-name").value = h && !["Authorization", "X-API-Key"].includes(h) ? h : "";
+  $("mcp-header-name").hidden = $("mcp-header").value !== "other";
+  $("mcp-key").value = "";
+  $("mcp-key").placeholder = s && h ? "Unchanged (type a new key to replace it)" : "Paste the key";
+  $("mcp-key").disabled = $("mcp-header").value === "none";
+}
+async function mcpSend(method, path, body) {
+  const r = await fetch(path, {method, headers: headers(body !== undefined),
+                               body: body !== undefined ? JSON.stringify(body) : undefined});
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* not json */ }
+  if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  mcpInfo = j; mcpLoaded = true;
+  renderMcp();
+  clearTimeout(mcpRetry);
+  mcpRetry = setTimeout(loadMcp, 800);              // it connects in the background: watch it get there
+  return j;
+}
+$("mcp-header").onchange = () => {
+  $("mcp-header-name").hidden = $("mcp-header").value !== "other";
+  $("mcp-key").disabled = $("mcp-header").value === "none";
+};
+$("mcp-cancel").onclick = () => { mcpForm(); $("mcp-add").open = false; };
+$("mcp-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const sel = $("mcp-header").value;
+  const body = {name: $("mcp-name").value.trim(), url: $("mcp-url").value.trim()};
+  if (sel === "none") body.key = "";
+  else {
+    body.header = sel === "other" ? $("mcp-header-name").value.trim() : sel;
+    if ($("mcp-key").value.trim()) body.key = $("mcp-key").value.trim();
+  }
+  try {
+    const j = await mcpSend("POST", "mcp/servers", body);
+    const kept = await mcpRemember(body).catch(() => false);
+    toast("success", mcpEditing ? `${body.name} changed` : `${body.name} added`,
+          (j.saved ? "Connecting; it stays in the run config" : "Connecting; this server has no run config") +
+          (kept ? " and in this browser (key encrypted), for every model." : "; not kept in this browser (type the key again to keep it)."));
+    mcpForm(); $("mcp-add").open = false;
+  } catch (err) { toast("error", "Not saved", err.message, 6000); }
+};
+$("mcp-conns-list").addEventListener("click", async (e) => {
+  const edit = e.target.closest("[data-mcp-edit]"), del = e.target.closest("[data-mcp-del]");
+  if (edit) {
+    mcpForm((mcpInfo.servers || []).find((s) => s.name === edit.dataset.mcpEdit));
+    $("mcp-add").open = true;
+    $("mcp-url").focus();
+  } else if (del && confirm(`Remove the MCP server ${del.dataset.mcpDel}? Its key is removed from the run config and this browser too.`)) {
+    try {
+      await mcpSend("DELETE", `mcp/servers/${encodeURIComponent(del.dataset.mcpDel)}`);
+      mcpForget(del.dataset.mcpDel);
+      toast("success", `${del.dataset.mcpDel} removed`);
+    } catch (err) { toast("error", "Not removed", err.message, 6000); }
+  }
+});
+
+// ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
+// A few documented keys of the run config (strata-<model>.json), for every client, from the next start on.  The
+// server lists them, checks every value and keeps every other key of the file as it is.
+let cfgKeys = [];
+async function loadConfig() {
+  let r;
+  try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
+  if (!r.ok) { $("cfg-card").hidden = true; return; }       // no run config, an older server, or no key yet
+  const c = await r.json();
+  cfgKeys = c.keys || [];
+  $("cfg-file").textContent = c.file || "";
+  $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
+    const id = `cfg-${i}`, v = k.value;
+    let input;
+    if (k.kind === "bool" || k.kind === "enum") {
+      const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
+      const cur = v == null ? "" : String(v);
+      input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
+        opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
+    } else {
+      const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
+      input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
+        `value="${esc(text)}" placeholder="default" autocomplete="off">`;
+    }
+    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+  }).join("");
+  $("cfg-card").hidden = false;
+}
+function configValue(k, el) {
+  const s = el.value.trim();
+  if (s === "") return null;
+  if (k.kind === "bool") return s === "true";
+  if (k.kind === "number") return Number(s);
+  return s;                                         // enum, or names (the server splits them at commas)
+}
+$("cfg-save").addEventListener("click", async () => {
+  const set = {};
+  cfgKeys.forEach((k, i) => {
+    const v = configValue(k, $(`cfg-${i}`));
+    const old = Array.isArray(k.value) ? k.value.join(", ") : k.value;
+    if (JSON.stringify(v) !== JSON.stringify(old ?? null)) set[k.key] = v;
+  });
+  if (!Object.keys(set).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
+  try {
+    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
+    const b = await r.json();
+    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+    $("cfg-msg").textContent = b.changed.length
+      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
+    loadConfig();
+  } catch (e) {
+    $("cfg-msg").textContent = "";
+    toast("error", "Not saved", String(e.message || e), 6000);
+  }
+});
+
+// ------------------------------------------------------------------ Markdown (escaped first, then formatted)
+function inline(s) {
+  const codes = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  s = esc(s)
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1<em>$2</em>")
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
+}
+function codeBlock(lang, code) {
+  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span>` +
+    `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></div>` +
+    `<pre><code>${esc(code)}</code></pre></div>`;
+}
+function blocks(text) {
+  const out = [], lines = text.split("\n");
+  let para = [], list = null;
+  const flushPara = () => { if (para.length) out.push(`<p>${para.map(inline).join("<br>")}</p>`); para = []; };
+  const flushList = () => { if (list) out.push(`<${list.tag}>${list.items.map((i) => `<li>${inline(i)}</li>`).join("")}</${list.tag}>`); list = null; };
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    let m;
+    if (!l.trim()) { flushPara(); flushList(); continue; }
+    if ((m = l.match(/^(#{1,6})\s+(.*)$/))) { flushPara(); flushList(); out.push(`<${m[1].length <= 2 ? "h3" : "h4"}>${inline(m[2])}</${m[1].length <= 2 ? "h3" : "h4"}>`); continue; }
+    if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(l)) { flushPara(); flushList(); out.push("<hr>"); continue; }
+    if ((m = l.match(/^>\s?(.*)$/))) { flushPara(); flushList(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); continue; }
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])) {
+      flushPara(); flushList();
+      const cells = (row) => row.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim()));
+      let html = `<table><thead><tr>${cells(l).map((c) => `<th>${c}</th>`).join("")}</tr></thead><tbody>`;
+      i += 2;
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) html += `<tr>${cells(lines[i++]).map((c) => `<td>${c}</td>`).join("")}</tr>`;
+      i--;
+      out.push(html + "</tbody></table>");
+      continue;
+    }
+    if ((m = l.match(/^\s*(?:[-*+]|(\d+)[.)])\s+(.*)$/))) {
+      flushPara();
+      const tag = m[1] ? "ol" : "ul";
+      if (!list || list.tag !== tag) { flushList(); list = {tag, items: []}; }
+      list.items.push(m[2]);
+      continue;
+    }
+    if (list && /^\s{2,}\S/.test(l)) { list.items[list.items.length - 1] += " " + l.trim(); continue; }
+    flushList();
+    para.push(l);
+  }
+  flushPara(); flushList();
+  return out.join("");
+}
+function markdown(text) {
+  let html = "", rest = text;
+  for (;;) {
+    const m = rest.match(/(^|\n)```([^\n`]*)\n/);
+    if (!m) { html += blocks(rest); break; }
+    html += blocks(rest.slice(0, m.index));
+    rest = rest.slice(m.index + m[0].length);
+    const end = rest.match(/(^|\n)```[ \t]*(\n|$)/);
+    if (!end) { html += codeBlock(m[2].trim(), rest); break; }         // still streaming
+    html += codeBlock(m[2].trim(), rest.slice(0, end.index));
+    rest = rest.slice(end.index + end[0].length);
+  }
+  return html;
+}
+
+// ------------------------------------------------------------------ Chat
+const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", budget: "", seed: "", show: true,
+                  esp: true, mcp: true};
+const ANSWER_ROOM = 64;               // tools/chat.py's: a thinking budget leaves at least this much of max tokens to answer
+// The thinking budget (#123's reasoning_budget_tokens): at most this many tokens of thinking, then the server closes it and
+// the model answers.  Empty or 0: no limit.  Thinking off: nothing to cap.
+function budgetFields(s) {
+  return +s.budget > 0 && s.thinking !== "none" ? {reasoning_budget_tokens: +s.budget} : {};
+}
+// what is wrong with a max tokens / budget pair, or "" (the budget counts toward max tokens)
+function budgetProblem(max, budget) {
+  if (!budget || budget === "0") return "";                  // no limit, as the server reads 0
+  if (!/^[1-9][0-9]*$/.test(budget)) return "The thinking budget is a whole number of tokens (empty: no limit).";
+  if (max && +budget > +max - ANSWER_ROOM)
+    return `The thinking counts toward max tokens: with ${max}, the budget can be at most ${Math.max(0, +max - ANSWER_ROOM)} so ` +
+           `${ANSWER_ROOM} tokens are left for the answer.`;
+  return "";
+}
+let settings = {...DEFAULTS, ...store.get("sampling", {})};
+let messages = [];                    // the open chat (chatsReady loads it)
+let attachments = [];                 // {name, url}
+let busy = null;                      // {controller, msg}
+
+// ------------------------------------------------------------------ chat history
+// Every chat is kept in this browser (IndexedDB "strata", store "chats": {id, title, updated, messages}); the server
+// keeps none, so it stays stateless.  localStorage would hold ~5 MB, a few dozen long answers.  Without IndexedDB (a
+// private window, the tests) the chats last until the page is closed.
+const chatsDb = (() => {
+  let opened = null;
+  const mem = new Map();
+  const db = () => opened || (opened = new Promise((res) => {
+    try {
+      const r = indexedDB.open("strata", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("chats", {keyPath: "id"});
+      r.onsuccess = () => res(r.result);
+      r.onerror = r.onblocked = () => res(null);
+    } catch (e) { res(null); }
+  }));
+  const run = (mode, fn) => db().then((d) => (d ? new Promise((res, rej) => {
+    const t = d.transaction("chats", mode), req = fn(t.objectStore("chats"));
+    t.oncomplete = () => res(req.result);
+    t.onerror = t.onabort = () => rej(t.error);
+  }) : undefined));
+  return {
+    all: () => run("readonly", (st) => st.getAll()).then((v) => v || [...mem.values()]),
+    get: (id) => run("readonly", (st) => st.get(id)).then((v) => v || mem.get(id)),
+    put: (c) => { mem.set(c.id, c); return run("readwrite", (st) => st.put(c)); },
+    del: (id) => { mem.delete(id); return run("readwrite", (st) => st.delete(id)); },
+  };
+})();
+const newChatId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+let chatId = store.get("chatId", "") || newChatId();
+
+function chatRecord() {                // pictures and files by name only (they can be large)
+  const kept = messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
+                                     files: (m.files || []).map((f) => ({name: f.name}))}));
+  const first = kept.find((m) => m.role === "user");
+  return {id: chatId, title: ((first && first.text) || "Chat").replace(/\s+/g, " ").trim().slice(0, 80) || "Chat",
+          updated: Date.now(), messages: kept};
+}
+function saveChat() {
+  store.set("chatId", chatId);
+  if (!messages.length) return;        // an empty chat is not kept
+  chatsDb.put(chatRecord()).catch((e) => toast("error", "The chat could not be saved",
+                                               `${(e && e.message) || e} (the browser's storage may be full: delete old chats in History)`));
+}
+function openChat(id, msgs) { chatId = id; store.set("chatId", id); messages = msgs; renderChat(); }
+
+// the open chat, after a reload; the one chat older versions kept in localStorage moves into the history
+const chatsReady = (async () => {
+  const legacy = store.get("chat", null);
+  if (Array.isArray(legacy) && legacy.length) {
+    chatId = newChatId();
+    messages = legacy;
+    try {
+      await chatsDb.put(chatRecord());
+      localStorage.removeItem("strata.chat");
+    } catch (e) { /* kept where it was: tried again on the next load */ }
+  }
+  const c = await chatsDb.get(chatId).catch(() => null);
+  if (c && !messages.length) messages = c.messages;
+  store.set("chatId", chatId);
+  renderChat();
+})();
+
+function openHistory(open) {
+  $("history").dataset.open = String(open);
+  $("history").setAttribute("aria-hidden", String(!open));
+  $("scrim").hidden = !open;
+  if (open) { renderHistory(); $("history-search").focus(); }
+}
+async function renderHistory() {
+  const q = $("history-search").value.trim().toLowerCase();
+  const has = (c) => !q || c.title.toLowerCase().includes(q) ||
+                     c.messages.some((m) => ((m.text || "") + (m.reasoning || "")).toLowerCase().includes(q));
+  const chats = (await chatsDb.all().catch(() => [])).filter(has).sort((a, b) => b.updated - a.updated);
+  const list = $("history-list");
+  list.innerHTML = chats.length ? "" : `<div class="muted">${q ? "No chat matches." : "No chats yet."}</div>`;
+  for (const c of chats) {
+    const row = document.createElement("div");
+    row.className = "history-item" + (c.id === chatId ? " is-current" : "");
+    row.dataset.id = c.id;
+    row.innerHTML = `<button type="button" class="history-open"><span class="history-title"></span>` +
+      `<span class="history-meta"></span></button>` +
+      `<button type="button" class="st-btn st-btn--icon history-del" title="Delete" aria-label="Delete this chat">${icon("trash")}</button>`;
+    row.querySelector(".history-title").textContent = c.title;
+    const n = c.messages.filter((m) => m.role === "user").length;
+    row.querySelector(".history-meta").textContent =
+      `${new Date(c.updated).toLocaleString([], {dateStyle: "medium", timeStyle: "short"})} · ${n} question${n === 1 ? "" : "s"}`;
+    list.appendChild(row);
+  }
+}
+$("history-list").onclick = async (e) => {
+  const row = e.target.closest(".history-item");
+  if (!row) return;
+  const id = row.dataset.id;
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  const c = await chatsDb.get(id);
+  if (!c) { renderHistory(); return; }
+  if (e.target.closest(".history-del")) {
+    await chatsDb.del(id);
+    if (id === chatId) openChat(newChatId(), []);
+    renderHistory();
+    toast("info", "Chat deleted", c.title, 6000, {label: "Undo", run: () => chatsDb.put(c).then(renderHistory)});
+    return;
+  }
+  saveChat();
+  openChat(id, c.messages);
+  openHistory(false);
+};
+$("history-search").addEventListener("input", () => renderHistory());
+$("history-btn").onclick = () => openHistory(true);
+$("history-close").onclick = () => openHistory(false);
+function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
+
+function msgEl(m, i) {
+  const el = document.createElement("div");
+  el.className = `st-msg st-msg--${m.role}`;
+  el.dataset.i = i;
+  if (m.role === "user") {
+    if (m.files && m.files.length) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg-images";
+      for (const f of m.files) {
+        const c = document.createElement("span");
+        c.className = "chip";
+        c.innerHTML = icon("attach", "st-icon st-icon--sm");
+        c.append(f.name);
+        wrap.appendChild(c);
+      }
+      el.appendChild(wrap);
+    }
+    if (m.images && m.images.length) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg-images";
+      for (const im of m.images) {
+        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || "image"; wrap.appendChild(img); }
+        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || "image"); wrap.appendChild(c); }
+      }
+      el.appendChild(wrap);
+    }
+    const b = document.createElement("div");
+    b.className = "st-bubble";
+    b.textContent = m.text;
+    el.appendChild(b);
+    const meta = document.createElement("div");
+    meta.className = "st-msg__meta";
+    meta.textContent = `You · ${timeStr(m.time)}`;
+    el.appendChild(meta);
+  } else {
+    el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
+      `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
+      `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
+    updateAssistant(el, m, false);
+  }
+  return el;
+}
+// One MCP tool call in the answer: a compact block (name, state, a one-line preview) that opens to the arguments and
+// the result as the model read it.  Its body is built only while open: a result can be 20,000 characters.
+const TOOL_STATE = {writing: ["st-badge--reading", "Writing"], running: ["st-badge--generating", "Running"], done: ["", "Done"],
+                    error: ["st-badge--error", "Error"], skipped: ["st-badge--queued", "Not run"]};
+function toolHtml(t, k) {
+  const [cls, label] = TOOL_STATE[t.state] || ["", t.state];
+  const args = t.arguments == null ? "" : JSON.stringify(t.arguments, null, 2);
+  const preview = t.result != null ? t.result : args.replace(/\s+/g, " ");
+  let body = "";
+  if (t.open) {
+    body = `<div class="tool-call__label">Arguments</div><pre class="tool-call__pre">${esc(args || "(being written)")}</pre>`;
+    if (t.result != null) {
+      body += `<div class="tool-call__label">${t.ok ? "Result" : "Error"}${t.chars ? ` · ${fmt(t.chars)} characters` : ""}` +
+              `${t.truncated ? ", cut for the model" : ""}</div><pre class="tool-call__pre">${esc(t.result)}</pre>`;
+    }
+  }
+  return `<details class="st-collapse tool-call" data-tool="${k}" data-state="${esc(t.state)}"${t.open ? " open" : ""}>` +
+    `<summary>${icon("tool", "st-icon st-icon--sm")}<span class="tool-call__name" title="${esc(t.name || "")}">${esc(t.tool || t.name || "tool")}</span>` +
+    (t.server ? `<span class="muted small">${esc(t.server)}</span>` : "") +
+    `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
+    `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
+    `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
+}
+// the answer's text with the tool blocks where the model called them
+function answerHtml(m) {
+  if (!m.tools || !m.tools.length) return markdown(m.text || "");
+  let html = "", pos = 0;
+  m.tools.forEach((t, k) => {
+    const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
+    if (at > pos) html += markdown(m.text.slice(pos, at));
+    pos = at;
+    html += toolHtml(t, k);
+  });
+  return html + markdown(m.text.slice(pos));
+}
+// a tool event from the stream (the `strata_mcp` field of a chunk)
+function onTool(m, x) {
+  if (x.event === "limit") { m.limit = x.max_rounds; return; }
+  m.tools = m.tools || [];
+  let t = m.tools.find((y) => y.id === x.id);
+  if (!t) { t = {id: x.id, name: x.name, at: m.text.length, rat: m.reasoning.length, state: "writing"}; m.tools.push(t); }
+  if (x.event === "call") {
+    Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
+  } else if (x.event === "result") {
+    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
+                      state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
+  }
+}
+function updateAssistant(el, m, streaming) {
+  const det = el.querySelector("details.think");
+  if (m.reasoning) {
+    det.hidden = false;
+    const thinkingNow = streaming && !m.text;
+    el.querySelector(".think-title").textContent = thinkingNow ? "Thinking…" :
+      m.thinkSecs != null ? `Thought for ${fmt(m.thinkSecs, 1)} s` : "Thoughts";
+    const body = el.querySelector(".thinking");
+    if (det.open || thinkingNow) body.textContent = m.reasoning;
+    else body.dataset.pending = "1";
+    // open while it streams (if wanted), closed once the answer starts - unless the user toggled it themselves
+    if (thinkingNow && settings.show && !det.dataset.touched && !det.open) { det._auto = true; det.open = true; }
+    if (!thinkingNow && det.open && !det.dataset.touched) { det._auto = true; det.open = false; }
+  }
+  const bubble = el.querySelector(".st-bubble");
+  if (m.cmd === "video" && !m.error) {                  // a clip: the video itself, or the wait with its progress
+    if (m.video) {
+      const ext = m.video.startsWith("data:video/mp4") ? "mp4" : "webm";   // MP4 when the server has ffmpeg
+      bubble.innerHTML = `<video class="gen-image" controls loop muted playsinline autoplay></video><a class="gen-image__save" download="strata-video.${ext}">Save</a>`;
+      bubble.firstChild.src = m.video;
+      bubble.firstChild.title = m.prompt || "";
+      bubble.lastChild.href = m.video;
+    } else {
+      bubble.innerHTML = streaming ? `<span class="muted cursor"></span>` : `<span class="muted">${m.stopped ? "Stopped" : "No video"}</span>`;
+      if (streaming) bubble.firstChild.textContent = m.progress ? `Making the video · ${m.progress} %` : "Making the video (waiting for its turn)";
+    }
+    el.querySelector(".meta-text").textContent = m.meta || "";
+    el.querySelector("[data-msg-copy]").hidden = true;
+    return;
+  }
+  if (m.cmd === "image" && !m.error) {                  // a picture: the image itself, or the wait for it
+    if (m.image) {
+      bubble.innerHTML = `<img class="gen-image" alt=""><a class="gen-image__save" download="strata-picture.png">Save</a>`;
+      bubble.firstChild.src = m.image;
+      bubble.firstChild.alt = m.prompt || "";
+      bubble.lastChild.href = m.image;
+    } else {
+      bubble.innerHTML = streaming ? `<span class="muted cursor">Making the picture</span>` : `<span class="muted">${m.stopped ? "Stopped" : "No picture"}</span>`;
+    }
+    el.querySelector(".meta-text").textContent = m.meta || "";
+    el.querySelector("[data-msg-copy]").hidden = true;
+    return;
+  }
+  if (m.error) {                                   // the answer that arrived, then the error
+    bubble.innerHTML = `${m.text ? answerHtml(m) : ""}<div class="msg-error"></div>`;
+    bubble.lastChild.textContent = m.error;
+  } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
+    bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>`
+      : `<span class="muted cursor">${esc(m.wait || "")}</span>`;      // what the server is doing before a word comes
+  } else {
+    bubble.innerHTML = answerHtml(m);
+    if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
+  }
+  el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
+  el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
+}
+// ------------------------------------------------------------------ context window: the ring by the composer
+// What the next request puts in the model's context, by part: POST /context renders and tokenizes the same body send()
+// would post (plus the text being typed) with the model's own template and tokenizer; the model does not run.
+const CTX_PARTS = [["formatting", "Template and system text"], ["system", "System prompt"], ["tools", "Tool definitions"],
+                   ["user", "Your messages"], ["assistant", "Answers"], ["tool_io", "Tool calls and results"],
+                   ["draft", "Being typed"], ["writing", "Being written"]];
+let ctxInfo = null, ctxTimer = 0, ctxSeq = 0;
+function contextBody() {
+  const msgs = apiMessages(), draft = $("input").value.trim();
+  const b = {model: health.model, messages: msgs, reasoning_effort: settings.thinking};
+  if (draft) { msgs.push({role: "user", content: draft}); b.strata_draft = true; }
+  if (settings.mcp !== false && mcpInfo.tools > 0) b.strata_mcp = true;
+  return b;
+}
+function refreshContext(delay = 0) {
+  clearTimeout(ctxTimer);
+  ctxTimer = setTimeout(async () => {
+    if (busy) return;                          // counted again when the answer ends
+    const seq = ++ctxSeq;
+    try {
+      const r = await fetch("context", {method: "POST", headers: headers(true), body: JSON.stringify(contextBody())});
+      if (!r.ok || seq !== ctxSeq) return;
+      ctxInfo = await r.json();
+      paintContext();
+    } catch (e) { /* an older server, or offline: the ring keeps its last value */ }
+  }, delay);
+}
+function paintContext(writing = 0) {
+  const c = ctxInfo;
+  if (!c) return;
+  const max = c.max_context || health.max_context || 0, used = c.total + writing;
+  const pct = max ? Math.min(100, (used / max) * 100) : 0;
+  const btn = $("cw-btn");
+  btn.hidden = !max;
+  $("cw-fill").setAttribute("stroke-dasharray", `${used ? Math.max(pct, 2) : 0} 100`);
+  btn.dataset.level = pct >= 90 ? "full" : pct >= 75 ? "high" : "";
+  const label = `Context: ${fmt(used)} of ${fmt(max)} tokens (${fmt(pct, pct < 10 ? 1 : 0)}%)`;
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  if (!$("cw-pop").matches(":popover-open")) return;        // the popover is filled only while it shows
+  const parts = {...c.parts, writing};
+  const rows = CTX_PARTS.filter(([k]) => parts[k] > 0);
+  const share = (n) => (!max ? "" : n && (n / max) * 100 < 0.1 ? "<0.1%" : `${fmt((n / max) * 100, n / max < 0.1 ? 1 : 0)}%`);
+  const live = (k) => (k === "draft" || k === "writing" ? ` is-live${k === "writing" ? " is-writing" : ""}` : "");
+  $("cw-pct").textContent = `${fmt(pct, pct < 10 ? 1 : 0)}%`;
+  $("cw-total").innerHTML = `<b>${fmt(used)}</b> of ${fmt(max)} tokens used`;
+  $("cw-bar").innerHTML = rows.map(([k]) => `<i class="${live(k).trim()}" style="--c: var(--c-${k}); flex: 0 0 ${(parts[k] / max) * 100}%"></i>`).join("");
+  const free = Math.max(0, max - used);
+  $("cw-legend").innerHTML = rows.map(([k, label]) =>
+    `<li class="${live(k).trim()}" style="--c: var(--c-${k})"><span class="ctx-sw"></span><span>${label}</span>` +
+    `<span class="ctx-n">${fmt(parts[k])}</span><span class="ctx-p">${share(parts[k])}</span></li>`).join("") +
+    `<li class="ctx-free"><span class="ctx-sw"></span><span>Free</span><span class="ctx-n">${fmt(free)}</span><span class="ctx-p">${share(free)}</span></li>`;
+  const notes = ["Counted with the model's own tokenizer and chat template."];
+  if (c.images) notes.push(`${c.images} picture${c.images > 1 ? "s are" : " is"} not counted here (the image encoder adds their tokens).`);
+  notes.push(settings.thinking !== "none" ? "Earlier thinking is not sent back to the model; a new answer's thinking counts while it is written."
+                                          : "A new answer takes its room from what is free.");
+  if (pct >= 90) notes.push("Almost full: start a new chat so the next answer has room.");
+  $("cw-note").textContent = notes.join(" ");
+}
+$("cw-pop").addEventListener("toggle", (e) => {
+  if (e.newState !== "open") return;
+  paintContext();
+  const b = $("cw-btn").getBoundingClientRect(), p = $("cw-pop");       // above the ring, kept on screen
+  p.style.left = `${Math.max(8, Math.min(innerWidth - p.offsetWidth - 8, b.right - p.offsetWidth))}px`;
+  p.style.top = `${Math.max(8, b.top - p.offsetHeight - 10)}px`;
+  refreshContext();
+});
+$("input").addEventListener("input", () => refreshContext(600));
+
+function renderChat() {
+  refreshContext();
+  const chat = $("chat");
+  chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
+  $("chat-empty").hidden = messages.length > 0;
+  messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
+  scrollDown(true);
+}
+function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
+function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; jumpButton(); }
+// "Jump to bottom": while the chat is scrolled up (a streaming answer grows below without a scroll event: scrollDown checks too)
+function jumpButton() { $("jump-bottom").hidden = nearBottom(); }
+$("chat-scroll").addEventListener("scroll", jumpButton, {passive: true});
+$("jump-bottom").onclick = () => { const s = $("chat-scroll"); s.scrollTo({top: s.scrollHeight, behavior: "smooth"}); };
+
+// ------------------------------------------------------------------ outline (the right panel: one line per question)
+// Rebuilt whenever the chat's messages change (render, send, a new chat): a MutationObserver sees every path.  The
+// question being read is the last one whose top is above the upper third of the view.
+const outlineOn = () => store.get("outline", innerWidth >= 1360);    // wide screens: open unless closed once
+function outlineShow(on) {
+  store.set("outline", on);
+  $("outline-btn").setAttribute("aria-pressed", String(on));
+  renderOutline();
+}
+function renderOutline() {
+  const on = outlineOn(), qs = [...$("chat").querySelectorAll(".st-msg--user")];
+  $("outline").hidden = !on || !qs.length;
+  if ($("outline").hidden) return;
+  $("outline-count").textContent = String(qs.length);
+  $("outline-list").innerHTML = qs.map((el, n) => {
+    const m = messages[+el.dataset.i] || {};
+    const text = (m.text || "").replace(/\s+/g, " ").trim() || ((m.images || []).length ? "(picture)" : (m.files || []).length ? "(file)" : "…");
+    return `<li><button type="button" data-goto="${el.dataset.i}" title="${esc(text.slice(0, 300))}">` +
+           `<span class="muted">${n + 1}</span><span>${esc(text.slice(0, 160))}</span></button></li>`;
+  }).join("");
+  outlineCurrent();
+}
+let outlineFrame = 0;
+function outlineCurrent() {
+  if ($("outline").hidden) return;
+  const s = $("chat-scroll"), line = s.getBoundingClientRect().top + s.clientHeight / 3;
+  let cur = null;
+  for (const el of $("chat").querySelectorAll(".st-msg--user")) { if (el.getBoundingClientRect().top <= line) cur = el.dataset.i; else break; }
+  if (cur === null) { const first = $("chat").querySelector(".st-msg--user"); cur = first && first.dataset.i; }
+  for (const b of $("outline-list").querySelectorAll("button")) {
+    const is = b.dataset.goto === cur;
+    if (is && b.getAttribute("aria-current") !== "true") b.scrollIntoView({block: "nearest"});
+    b.setAttribute("aria-current", String(is));
+  }
+}
+$("chat-scroll").addEventListener("scroll", () => {
+  cancelAnimationFrame(outlineFrame);
+  outlineFrame = requestAnimationFrame(outlineCurrent);
+}, {passive: true});
+$("outline-list").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-goto]");
+  const el = b && $("chat").querySelector(`.st-msg[data-i="${b.dataset.goto}"]`);
+  if (!el) return;
+  el.scrollIntoView({behavior: "smooth", block: "start"});
+  el.classList.add("is-target");
+  setTimeout(() => el.classList.remove("is-target"), 1200);
+});
+$("outline-btn").onclick = () => outlineShow(!outlineOn());
+new MutationObserver(renderOutline).observe($("chat"), {childList: true});
+$("outline-btn").setAttribute("aria-pressed", String(outlineOn()));
+
+$("chat").addEventListener("click", (e) => {
+  const cc = e.target.closest("[data-code-copy]");
+  if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
+  const mc = e.target.closest("[data-msg-copy]");
+  if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
+  // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
+  const sum = e.target.closest(".tool-call > summary");
+  if (sum) {
+    e.preventDefault();
+    const el = sum.closest(".st-msg"), m = messages[+el.dataset.i], t = m && m.tools && m.tools[+sum.parentElement.dataset.tool];
+    if (!t) return;
+    t.open = !t.open;
+    updateAssistant(el, m, !!busy && busy.msg === m);
+  }
+});
+$("chat").addEventListener("toggle", (e) => {
+  const d = e.target;
+  if (d.tagName !== "DETAILS" || !d.classList.contains("think")) return;
+  if (d._auto) { d._auto = false; return; }          // our own open/close, not the user's
+  d.dataset.touched = "1";
+  const body = d.querySelector(".thinking");
+  if (d.open && body.dataset.pending) { body.textContent = messages[+d.closest(".st-msg").dataset.i].reasoning; delete body.dataset.pending; }
+}, true);
+
+function apiMessages() {
+  const out = [];
+  for (const m of messages) {
+    if (m.cmd === "image" || m.cmd === "video") continue;   // a picture or a clip, and its prompt, are not chat
+    if (m.role === "user") {
+      const imgs = (m.images || []).filter((i) => i.url);
+      const text = userText(m);
+      out.push({role: "user", content: imgs.length ? [{type: "text", text},
+        ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
+    } else if (!(busy && busy.msg === m)) {            // the answer being asked for now is not history yet
+      out.push(...assistantMessages(m));
+    }
+  }
+  return out;
+}
+// An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and
+// their results (as the model read them), then the rest - so the next question can build on what the tools found.
+function assistantMessages(m) {
+  const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
+  // #1392: a turn with no answer text (only reasoning, a stop before the first content token, or an error) still goes
+  // back as an assistant turn, so the history keeps alternating and a reasoning model sees that it already answered.
+  // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
+  if (!ran.length) {
+    const msg = {role: "assistant", content: m.text || ""};
+    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
+    return [msg];
+  }
+  const out = [];
+  let pos = 0;
+  for (const r of [...new Set(ran.map((t) => t.round))]) {
+    const calls = ran.filter((t) => t.round === r);
+    const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
+    out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
+              tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
+    for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
+    pos = at;
+  }
+  const rest = m.text.slice(pos).trim();
+  if (rest) out.push({role: "assistant", content: rest});
+  return out;
+}
+
+function setBusy(on) {
+  $("stop-btn").hidden = !on;
+  $("send-btn").disabled = on;
+  $("composer-hint").textContent = on ? "" : ["Shift+Enter: new line", health.image_generation && "/image: a picture",
+                                               health.video_generation && "/video: a clip"].filter(Boolean).join(" · ");
+}
+
+// "/image <prompt>": a picture from the server (strata-image; POST v1/images/generations, docs/MACOS.md), kept in the
+// chat and its history but never sent to the chat model (apiMessages leaves both messages out)
+const IMAGE_CMD = /^\/image\s+([\s\S]+)$/i;
+// ...and a message that plainly asks for one ("draw a sweet cat", "create an image of ...", "picture of ...") when the
+// server makes pictures: the chat model cannot draw, so sending it there only loads it for nothing
+const DRAW_ASK = /^(?:please\s+)?(?:draw|paint|sketch|illustrate)\s+(?:me\s+)?([\s\S]+)$|^(?:please\s+)?(?:make|create|generate|show\s+me)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|drawing|photo|illustration)\s+(?:of\s+)?([\s\S]+)$|^(?:an?\s+)?(?:image|picture|photo)\s+of\s+([\s\S]+)$/i;
+// fetch rejects with a TypeError ("Failed to fetch", "Load failed") when no server answers: say that, not the browser's
+// two words - the page stays open after its server stops (Ctrl+C, a restart, the Mac asleep)
+function requestError(e) {
+  return e instanceof TypeError
+    ? `The server at ${location.host} does not answer (${e.message}). Is Strata running? Start it again, then send this again.`
+    : e.message || String(e);
+}
+
+async function makePicture(prompt, text) {
+  messages.push({role: "user", text, cmd: "image", time: Date.now()});
+  $("input").value = "";
+  autosize();
+  const m = {role: "assistant", text: "", reasoning: "", cmd: "image", prompt, time: Date.now()};
+  messages.push(m);
+  renderChat();
+  const el = $("chat").lastElementChild;
+  const controller = new AbortController();
+  const rid = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  busy = {controller, msg: m};
+  setBusy(true);
+  updateAssistant(el, m, true);
+  const t0 = performance.now();
+  try {
+    const r = await fetch("v1/images/generations", {method: "POST", signal: controller.signal,
+      headers: {...headers(true), "X-Strata-Request-Id": rid}, body: JSON.stringify({prompt, size: "1024x1024"})});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    m.image = `data:image/png;base64,${j.data[0].b64_json}`;
+    m.meta = `1024×1024 · ${fmt((performance.now() - t0) / 1000, 0)} s`;
+  } catch (e) {
+    fetch("cancel", {method: "POST", headers: headers(true), body: JSON.stringify({id: rid})}).catch(() => {});
+    if (e.name === "AbortError") m.stopped = true;
+    else { m.error = requestError(e); toast("error", "No picture", m.error, 8000); }
+  }
+  busy = null;
+  setBusy(false);
+  updateAssistant(el, m, false);
+  saveChat();
+  scrollDown();
+}
+
+// "/video <prompt>": a clip from the server (sd-cli, Wan 2.2; POST v1/videos is a job, polled until it is done, then
+// its webm is kept in the chat as a data: URL).  Stop deletes the job, which stops the render.
+const VIDEO_CMD = /^\/video\s+([\s\S]+)$/i;
+async function makeVideo(prompt, text) {
+  messages.push({role: "user", text, cmd: "video", time: Date.now()});
+  $("input").value = "";
+  autosize();
+  const m = {role: "assistant", text: "", reasoning: "", cmd: "video", prompt, progress: 0, time: Date.now()};
+  messages.push(m);
+  renderChat();
+  const el = $("chat").lastElementChild;
+  const controller = new AbortController();
+  busy = {controller, msg: m};
+  setBusy(true);
+  updateAssistant(el, m, true);
+  const t0 = performance.now();
+  let id = null;
+  try {
+    // not aborted mid-way: a job the server made must get its id here, or Stop could not delete it (it answers at once)
+    const r = await fetch("v1/videos", {method: "POST", headers: headers(true),
+                                        body: JSON.stringify({prompt, size: "832x480", seconds: 2})});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    id = j.id;
+    if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");   // Stop while it was posted
+    for (;;) {                                         // poll the job (minutes): its progress shows in the bubble
+      await new Promise((ok, no) => {
+        const t = setTimeout(ok, 3000);
+        controller.signal.addEventListener("abort", () => { clearTimeout(t); no(new DOMException("stopped", "AbortError")); }, {once: true});
+      });
+      const s = await fetch(`v1/videos/${id}`, {signal: controller.signal, headers: headers(true)});
+      const v = await s.json().catch(() => ({}));
+      if (!s.ok) throw new Error((v.error && v.error.message) || `HTTP ${s.status}`);
+      if (v.status === "failed") throw new Error((v.error && v.error.message) || "the video failed");
+      m.progress = v.progress;
+      updateAssistant(el, m, true);
+      if (v.status === "completed") break;
+    }
+    const c = await fetch(`v1/videos/${id}/content`, {signal: controller.signal, headers: headers(true)});
+    if (!c.ok) throw new Error(`HTTP ${c.status}`);
+    const blob = await c.blob();
+    m.video = await new Promise((ok) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.readAsDataURL(blob); });
+    m.meta = `832×480 · 2 s · ${fmt((performance.now() - t0) / 1000, 0)} s`;
+    fetch(`v1/videos/${id}`, {method: "DELETE", headers: headers(true)}).catch(() => {});   // kept here now
+  } catch (e) {
+    if (id) fetch(`v1/videos/${id}`, {method: "DELETE", headers: headers(true)}).catch(() => {});
+    if (e.name === "AbortError") m.stopped = true;
+    else { m.error = requestError(e); toast("error", "No video", m.error, 8000); }
+  }
+  busy = null;
+  setBusy(false);
+  updateAssistant(el, m, false);
+  saveChat();
+  scrollDown();
+}
+
+// Before each message: the server may have been updated (this tab would run old code) or restarted with another setup
+// (/image or /video added or gone).  Newer page code: reload, the typed text kept as a draft.  Else take its abilities.
+async function freshHealth() {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 3000);       // a slow /health must not hold the message back
+  const h = await fetch("health", {signal: ctl.signal}).then((r) => r.json()).catch(() => null);
+  clearTimeout(t);
+  if (!h) return true;                                 // no answer: send() reports that on its own request
+  if (webVersion && h.web && h.web !== webVersion) {
+    const draft = $("input").value;
+    store.set("draft", draft);
+    if (attachments.length || store.get("draft", null) !== draft) {   // a reload would lose them: say so instead
+      toast("warn", "This page is out of date", "Strata was updated or restarted. Save your text and attachments, then reload the page.", 10000);
+      return false;
+    }
+    location.reload();
+    return false;
+  }
+  health = {...health, ...h};
+  return true;
+}
+
+let sending = false;                                   // between Enter and the request: a second Enter waits
+async function send() {
+  if ((!$("input").value.trim() && !attachments.length) || busy || sending) return;
+  sending = true;
+  try {
+    if (!(await freshHealth())) return;
+  } finally {
+    sending = false;
+  }
+  const text = $("input").value.trim();                // what is in the box now (it may have changed meanwhile)
+  if ((!text && !attachments.length) || busy) return;
+  const vid = VIDEO_CMD.exec(text);
+  if (vid && !attachments.length) {
+    if (!health.video_generation) { toast("warn", "No videos here", "This server is not set up for videos (docs/MACOS.md)."); return; }
+    return makeVideo(vid[1].trim(), text);
+  }
+  const pic = IMAGE_CMD.exec(text);
+  if (pic && !attachments.length) {
+    if (!health.image_generation) { toast("warn", "No pictures here", "This server is not set up for pictures (docs/MACOS.md)."); return; }
+    return makePicture(pic[1].trim(), text);
+  }
+  const ask = health.image_generation && !attachments.length ? DRAW_ASK.exec(text) : null;
+  if (ask) return makePicture((ask[1] || ask[2] || ask[3]).trim(), text);
+  messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
+                 files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
+  attachments = [];
+  renderAttachments();
+  $("input").value = "";
+  autosize();
+  const m = {role: "assistant", text: "", reasoning: "", time: Date.now(), wait: ""};
+  messages.push(m);
+  renderChat();
+  const el = $("chat").lastElementChild;
+  const controller = new AbortController();
+  // 128 random bits (crypto.randomUUID needs https; this page is often plain http on the LAN): POST /cancel ends the
+  // request on the server when the stream breaks but the socket does not close, so the GPU is not busy for nothing
+  const rid = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  busy = {controller, msg: m};
+  setBusy(true);
+  // until the first word: what it is waiting for (the chat model may have to load first: ~a minute), with the seconds
+  const waitStart = performance.now();
+  let waitWhat = health.loaded === false ? "Loading the chat model (about a minute)" : "Reading your message";
+  fetch("health").then((r) => r.json()).then((h) => { health.loaded = h.loaded;
+    if (!h.loaded) waitWhat = "Loading the chat model (about a minute)"; }).catch(() => {});
+  const waitTimer = setInterval(() => {
+    if (m.text || m.reasoning || m.error) { clearInterval(waitTimer); return; }
+    m.wait = `${waitWhat} · ${Math.round((performance.now() - waitStart) / 1000)} s`;
+    updateAssistant(el, m, true);
+  }, 1000);
+
+  const body = {model: health.model, messages: apiMessages(), stream: true,
+                reasoning_effort: settings.thinking};
+  if (settings.temperature > 0) {
+    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
+  } else {
+    body.temperature = 0;
+  }
+  if (settings.seed) body.seed = +settings.seed;
+  if (settings.max) body.max_tokens = +settings.max;
+  Object.assign(body, budgetFields(settings));
+  if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
+  if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+
+  let firstAt = null, thinkStart = null, usage = null, frame = 0, ended = false, cost = 0, painted = 0, streamed = 0;
+  if (ctxInfo) { ctxInfo.parts.user += ctxInfo.parts.draft; ctxInfo.parts.draft = 0; }   // the draft is sent now
+  // a repaint rebuilds the whole answer from its markdown, so it costs more as the answer grows: the next one waits 4x
+  // the last one's cost (painting keeps under ~20% of the page's time), else a long answer's repaints fill every frame
+  const paint = () => {
+    if (ended) return;
+    frame = 0;
+    const t = performance.now();
+    updateAssistant(el, m, true);
+    scrollDown();
+    paintContext(streamed);
+    painted = performance.now();
+    cost = painted - t;
+  };
+  const schedule = () => {
+    const wait = 4 * cost - (performance.now() - painted);
+    frame = wait > 0 ? setTimeout(() => requestAnimationFrame(paint), wait) : requestAnimationFrame(paint);
+  };
+  try {
+    const r = await fetch("v1/chat/completions", {method: "POST", headers: {...headers(true), "X-Strata-Request-Id": rid},
+                                                   body: JSON.stringify(body), signal: controller.signal});
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
+      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+      throw new Error(msg);
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;              // ": keep-alive" comments while a long prompt is read
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        let j;
+        try { j = JSON.parse(data); } catch (e) { continue; }
+        if (j.error) throw new Error(j.error.message || "the engine reported an error");
+        if (j.usage) usage = j.usage;
+        if (j.strata_mcp) onTool(m, j.strata_mcp);
+        const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
+        const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
+        if (d.reasoning_content || d.content) streamed++;   // ~ a token a delta: the ring grows while it writes
+        if (d.reasoning_content) {
+          if (!firstAt) firstAt = performance.now();
+          if (!thinkStart) thinkStart = performance.now();
+          if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n";
+          m.reasoning += d.reasoning_content;
+        }
+        if (d.content) {
+          if (!firstAt) firstAt = performance.now();
+          if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
+          if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
+          m.text += d.content;
+        }
+        if (!frame) schedule();
+      }
+    }
+  } catch (e) {
+    // Stop, or a broken stream: either way the server may still be writing this answer (a browser can fail the read and
+    // keep the socket open, so the server never sees a hang-up) - end it there too
+    fetch("cancel", {method: "POST", headers: headers(true), body: JSON.stringify({id: rid})}).catch(() => {});
+    if (e.name === "AbortError") m.stopped = true;
+    else {
+      const lost = e instanceof TypeError && (m.text || m.reasoning);   // fetch's "network error" mid-answer
+      m.error = lost ? `The connection broke while the answer was being written (${e.message}); what arrived is ` +
+                       "kept above, and the server was asked to stop it. Send it again to retry."
+                     : requestError(e);
+      toast("error", lost ? "The connection broke" : "The request failed", m.error, 8000);
+    }
+  }
+  if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
+  const n = usage ? usage.completion_tokens : null;
+  if (n && firstAt) {
+    const secs = (performance.now() - firstAt) / 1000;
+    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+             (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "") +
+             ` · ${fmt(secs, secs < 10 ? 1 : 0)} s`;              // the writing time the speed is measured over
+  } else if (m.stopped) {
+    m.meta = "Stopped";
+  }
+  for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
+  const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
+  if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
+  if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
+  busy = null;
+  setBusy(false);
+  ended = true;                                   // a repaint still scheduled does nothing
+  clearInterval(waitTimer);
+  delete m.wait;
+  updateAssistant(el, m, false);
+  saveChat();
+  scrollDown();
+  refreshContext();                               // counted exactly again, with this answer in it
+}
+
+$("composer").onsubmit = (e) => { e.preventDefault(); send(); };
+$("stop-btn").onclick = () => { if (busy) busy.controller.abort(); };
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
+$("input").addEventListener("input", autosize);
+
+$("new-btn").onclick = () => {
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (!messages.length) return;
+  saveChat();
+  openChat(newChatId(), []);
+  toast("info", "New chat", "The last one is in History.");
+};
+$("export-btn").onclick = () => {
+  if (!messages.length) { toast("info", "Nothing to save yet"); return; }
+  const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
+    `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
+    `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("");
+  const md = messages.map((m) => m.role === "user" ? `## You\n\n${m.text}\n` :
+    `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
+  a.download = `strata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+
+// pictures and text files: the attach button, dropping them on the chat, or pasting a picture (issue #30)
+const TEXT_EXT = /\.(txt|md|markdown|rst|tex|py|pyi|ipynb|js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|jsonl|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|less|c|cc|cpp|cxx|h|hh|hpp|cu|cuh|rs|go|java|kt|kts|swift|rb|php|pl|lua|r|jl|scala|sql|sh|bash|zsh|fish|ps1|psm1|bat|cmd|diff|patch|gradle|cmake|mk|dockerfile|gitignore|proto|graphql)$/i;
+const MAX_TEXT_FILE = 512 * 1024;
+function isTextFile(f) {
+  return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
+         TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
+}
+function addFiles(files) {
+  for (const f of files) {
+    if (f.type.startsWith("image/")) {
+      if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
+      if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
+      const r = new FileReader();
+      r.onload = () => { attachments.push({kind: "image", name: f.name || "pasted image", url: r.result}); renderAttachments(); };
+      r.readAsDataURL(f);
+      continue;
+    }
+    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
+    if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
+    const r = new FileReader();
+    r.onload = () => {
+      const text = String(r.result);
+      if (text.includes("\u0000")) { toast("warn", "Not a text file", `${f.name} looks like a binary file.`); return; }
+      attachments.push({kind: "file", name: f.name, text});
+      renderAttachments();
+    };
+    r.readAsText(f);
+  }
+}
+// a file's text in the message, fenced with more backticks than it contains itself
+function fileBlock(f) {
+  const longest = Math.max(2, ...(f.text.match(/`+/g) || []).map((s) => s.length));
+  const fence = "`".repeat(longest + 1);
+  return `File: ${f.name}\n${fence}\n${f.text}\n${fence}`;
+}
+function userText(m) {
+  const files = (m.files || []).filter((f) => f.text != null);
+  return [m.text, ...files.map(fileBlock)].filter((s) => s).join("\n\n");
+}
+function renderAttachments() {
+  const box = $("attachments");
+  box.hidden = !attachments.length;
+  box.innerHTML = "";
+  attachments.forEach((a, i) => {
+    const c = document.createElement("span");
+    c.className = "chip";
+    c.innerHTML = icon(a.kind === "file" ? "attach" : "image", "st-icon st-icon--sm");
+    c.append(a.name);
+    const x = document.createElement("button");
+    x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
+    x.innerHTML = icon("trash");
+    x.onclick = () => { attachments.splice(i, 1); renderAttachments(); };
+    c.appendChild(x);
+    box.appendChild(c);
+  });
+}
+$("attach-btn").onclick = () => $("file").click();
+// drop files on the chat or the message box
+for (const id of ["chat", "composer"]) {
+  const el = $(id);
+  el.addEventListener("dragover", (e) => {
+    if (![...(e.dataTransfer || {}).types || []].includes("Files")) return;
+    e.preventDefault();
+    $("composer").classList.add("dragging");
+  });
+  el.addEventListener("dragleave", () => $("composer").classList.remove("dragging"));
+  el.addEventListener("drop", (e) => {
+    $("composer").classList.remove("dragging");
+    if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+    e.preventDefault();
+    addFiles(e.dataTransfer.files);
+    $("input").focus();
+  });
+}
+$("file").onchange = () => { addFiles($("file").files); $("file").value = ""; };
+$("input").addEventListener("paste", (e) => {
+  if (!health.images) return;
+  const files = [...(e.clipboardData || {}).files || []].filter((f) => f.type.startsWith("image/"));
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+
+// ------------------------------------------------------------------ the sampling drawer
+function openDrawer(open) {
+  $("drawer").dataset.open = String(open);
+  $("drawer").setAttribute("aria-hidden", String(!open));
+  $("scrim").hidden = !open;
+  if (open) { loadDrawer(); loadShared(); loadMcp(); }
+}
+function loadDrawer(s = settings) {
+  for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === s.thinking));
+  $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
+  $("s-max").value = s.max; $("s-budget").value = s.budget || ""; $("s-seed").value = s.seed;
+  $("s-show").setAttribute("aria-checked", String(!!s.show));
+  $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
+  $("esp-row").hidden = !projectionLoaded();
+  $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
+  $("s-share").setAttribute("aria-checked", String(sharedOn));
+  outputs();
+}
+// "Use for other apps too": the server keeps these settings as every client's defaults (GET/POST /settings)
+let sharedOn = false;
+async function loadShared() {
+  try {
+    const r = await fetch("settings", {headers: headers()});
+    if (r.ok) sharedOn = !!(await r.json()).shared;
+  } catch (e) { /* an older server: the switch just stays off */ }
+  $("s-share").setAttribute("aria-checked", String(sharedOn));
+}
+function sharedDefaults(s) {
+  const d = {reasoning_effort: s.thinking, temperature: +s.temperature};
+  if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p, top_k: +s.top_k});
+  if (s.seed) d.seed = +s.seed;
+  if (s.max) d.max_tokens = +s.max;
+  Object.assign(d, budgetFields(s));
+  if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
+  return d;
+}
+async function saveShared(on, s) {
+  const r = await fetch("settings", {method: "POST", headers: headers(true),
+                                      body: JSON.stringify({defaults: on ? sharedDefaults(s) : null})});
+  if (!r.ok) {
+    let msg = `HTTP ${r.status}`;
+    try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
+    throw new Error(msg);
+  }
+  sharedOn = !!(await r.json()).shared;
+}
+// the engine was started with the experimental-speed-projection control vector (INFO cvec=...)
+function projectionLoaded() {
+  const c = lastMetrics && lastMetrics.engine ? lastMetrics.engine.cvec : 0;
+  return !!c && c !== "0";
+}
+function outputs() {
+  const t = +$("s-temp").value;
+  $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
+  $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
+  $("o-topk").textContent = $("s-topk").value;
+  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
+  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
+  for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
+  $("s-budget").disabled = !!sel && sel.dataset.v === "none";   // thinking off: no budget to set
+}
+for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
+$("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
+$("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
+$("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
+$("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
+$("s-reset").onclick = () => loadDrawer(DEFAULTS);
+$("s-apply").onclick = async () => {
+  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
+  const problem = budgetProblem($("s-max").value.trim(), $("s-budget").value.trim());
+  if (problem) { toast("error", "Not saved", problem, 6000); return; }
+  settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+              top_k: +$("s-topk").value, max: $("s-max").value.trim(), budget: $("s-budget").value.trim(),
+              seed: $("s-seed").value.trim(),
+              show: $("s-show").getAttribute("aria-checked") === "true",
+              esp: $("s-esp").getAttribute("aria-checked") === "true",
+              mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
+  store.set("sampling", settings);
+  refreshContext();                               // the thinking level and the MCP tools change the prompt
+  const share = $("s-share").getAttribute("aria-checked") === "true";
+  openDrawer(false);
+  if (share || sharedOn) {
+    try {
+      await saveShared(share, settings);
+      toast("success", "Sampling saved", share ? "Other apps (omp, API clients) use these settings from their next request."
+                                               : "Other apps use their own settings again.");
+    } catch (e) {
+      toast("error", "Saved here, but not for other apps", e.message, 6000);
+    }
+    return;
+  }
+  toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
+};
+$("sampling-btn").onclick = () => openDrawer(true);
+$("drawer-close").onclick = () => openDrawer(false);
+$("scrim").onclick = () => { openDrawer(false); openHistory(false); };
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if ($("drawer").dataset.open === "true") openDrawer(false);
+  if ($("history").dataset.open === "true") openHistory(false);
+});
+
+// ------------------------------------------------------------------ start
+setBusy(false);
+renderChat();                         // empty until chatsReady has the open chat
+const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
+if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
+Promise.all([chatsReady, loadHealth()]).then(loadMcp).then(() => { refreshContext(); if (startQuestion) { $("input").value = startQuestion; send(); } });
+showTab(location.hash.slice(1) || "chat");
+poll();

@@ -114,7 +114,7 @@ def main():
     tok_path = Path(cfg['tokenizer'])
     tok = load_tokenizer(tok_path)
     tpl_path = tok_path / 'chat_template.jinja'
-    tpl = ChatTemplate(tpl_path if tpl_path.exists() else ROOT / 'serve/chat_template.jinja')
+    tpl = ChatTemplate(tpl_path if tpl_path.exists() else ROOT / 'server/chat_template.jinja')
     def encode(text):
         return tok.encode(text, parse_special=True)
     def prompt(text):
