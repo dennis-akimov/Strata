@@ -63,7 +63,7 @@ const $=id=>document.getElementById(id), send=(cmd,o={})=>window.ipc.postMessage
 const COLORS={ready:'#34c759',busy:'#0a84ff',starting:'#ff9f0a',stopping:'#ff9f0a',unloaded:'#bf5af2',stopped:'#8e8e93'};
 let base='',up=false;
 const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const gb=b=>b==null?'–':(b/1e9).toFixed(1)+' GB', k=c=>c>=1024?Math.round(c/1024)+'K':c;
+const gb=b=>b==null?'–':(b/1e9).toFixed(1)+' GB', k=c=>c>=1048576&&c%1048576===0?c/1048576+'M':c>=1024?Math.round(c/1024)+'K':c;
 let mem=null,running=false;
 function init(s){
   const name=c=>c.name.replace(/^strata-|\.json$/g,'')+(c.model?' — '+c.model:'');

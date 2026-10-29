@@ -468,8 +468,9 @@ def main() -> None:
     step(1, total, "This Mac")
     if platform.machine() != "arm64":
         fail("this Mac has an Intel processor", "Strata's Metal engine runs on Apple Silicon (M1 or newer) only.")
-    ok(f"{me['chip']}, {me['ram'] / GB:.0f} GB of memory, macOS {me['macos']}")
-    ok(f"the GPU may use {me['limit'] / GIB:.1f} GB; {free_now() / GB:.1f} GB is free right now; "
+    # memory in binary GB, as macOS names it (a "16 GB" Mac has 17.2e9 bytes); disk in decimal GB, as Finder does
+    ok(f"{me['chip']}, {me['ram'] / GIB:.0f} GB of memory, macOS {me['macos']}")
+    ok(f"the GPU may use {me['limit'] / GIB:.1f} GB; {free_now() / GIB:.1f} GB is free right now; "
        f"{disk_free(data) / GB:.0f} GB free disk for {data}")
 
     step(2, total, "Tools")

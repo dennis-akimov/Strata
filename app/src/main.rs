@@ -167,7 +167,8 @@ fn ram_available() -> u64 {
     (pages("Pages free") + pages("Pages inactive") + pages("Pages speculative") + pages("Pages purgeable")) * page
 }
 
-const CONTEXTS: [u64; 8] = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
+// up to 1M: GLM-5.3 is trained for 1,048,576; the menu stops at each model's own (gpt-oss 131,072, Qwen 262,144)
+const CONTEXTS: [u64; 10] = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
 
 /// What a config needs against what this Mac has: the GPU's share must fit Metal's working set, and everything must
 /// fit the memory free now (when the server is not running: a running engine already holds its share).  For each
@@ -193,8 +194,16 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
     let mut sizes: Vec<u64> = CONTEXTS.iter().copied().filter(|c| train <= 0.0 || (*c as f64) <= train).collect();
     if !sizes.contains(&(ctx as u64)) {
         sizes.push(ctx as u64);
-        sizes.sort();
     }
+    // the largest context that fits exactly, in 16K steps, when it falls between two of the steps above (GLM: ~384K)
+    if per_token > 0.0 {
+        let room = (limit - gpu_need).min(avail - need);
+        let exact = ((ctx + room / per_token).min(if train > 0.0 { train } else { f64::MAX }) as u64) / 16384 * 16384;
+        if exact > 16384 && !sizes.contains(&exact) {
+            sizes.push(exact);
+        }
+    }
+    sizes.sort();
     let fits = |gpu: f64, total: f64| gpu <= limit && total <= avail;
     let mut options: Vec<Value> = sizes
         .iter()

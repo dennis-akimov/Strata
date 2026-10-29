@@ -182,7 +182,7 @@ endif
 # the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
 server:
 	cargo build --release --manifest-path server/Cargo.toml
-	# rm first: a new file (macOS kills a program whose binary was rewritten in place)
+	@# rm first: a new file (macOS kills a program whose binary was rewritten in place)
 	mkdir -p engine-metal && rm -f engine-metal/strata-server engine-metal/strata-files && cp server/target/release/strata-server server/target/release/strata-files engine-metal/
 
 # the Mac app (app/, Rust): Strata.app in this folder runs the server as its child with full control (config, port,
