@@ -163,10 +163,42 @@ def memory_apps(n: int = 5) -> list[tuple[str, float]]:
     return [(Path(b).stem + ("" if b.endswith(".app") else " (background)"), v) for b, v in sorted(big, key=lambda kv: -kv[1])[:n]]
 
 
+def gpu_limit(ram: float) -> tuple[float, int, int]:
+    """What the GPU may really hold: iogpu.wired_limit_mb when set; else macOS's default, about two thirds of the memory
+    on Macs up to 36 GB, below Metal's recommendedMaxWorkingSetSize (a 16 GB M1: 12.4 GiB recommended, out of memory
+    at 11.7).  (bytes, the sysctl's MB, a value to suggest: the memory less 3 GB or 15% for macOS)"""
+    wired = int(sysctl("iogpu.wired_limit_mb") or 0)
+    ram_mb = int(ram) >> 20
+    suggest = ram_mb - max(3072, ram_mb * 15 // 100)
+    recommended = metal_limit() or 0.75 * ram
+    # 1 GB of the limit stays for the others the GPU holds memory for (the window server's buffers, Metal itself): a
+    # 16 GB M1 at a 13 GB limit ran out at 12.8 GiB and answered at 11.7
+    if wired:
+        return wired * 2**20 - GIB, wired, suggest if suggest > wired else 0
+    return (min(recommended, ram * 2 / 3) if ram <= 36 * GIB else recommended) - GIB, 0, suggest
+
+
+def power() -> list[str]:
+    """Energy-mode advice (pmset): Low Power slows the GPU; High Power (MacBook Pro with Max, 2024+ Pro, Mac mini Pro,
+    Mac Studio 2026: a `powermode` line in pmset) keeps its clock under long answers; a battery holds it back."""
+    g = subprocess.run(["pmset", "-g"], capture_output=True, text=True).stdout
+    batt = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
+    field = {l.split()[0]: l.split()[1] for l in g.splitlines() if len(l.split()) >= 2}
+    tips = []
+    if field.get("lowpowermode") == "1" or field.get("powermode") == "1":
+        tips.append("Low Power Mode is on and slows the GPU: sudo pmset -a lowpowermode 0 (or System Settings > Battery)")
+    if "powermode" in field and field["powermode"] != "2":
+        tips.append("this Mac has High Power Mode: System Settings > Battery > Energy Mode, or sudo pmset -a powermode 2")
+    if "'Battery Power'" in batt:
+        tips.append("on battery: plug in the power adapter for full speed")
+    return tips
+
+
 def mac() -> dict:
     ram = float(sysctl("hw.memsize") or 0)
-    limit = metal_limit() or 0.75 * ram
+    limit, wired, suggest = gpu_limit(ram)
     return {"chip": sysctl("machdep.cpu.brand_string") or "Apple Silicon", "ram": ram, "limit": limit,
+            "wired_mb": wired, "suggest_mb": suggest,
             "usable": min(limit, ram - max(3 * GB, 0.15 * ram)), "macos": platform.mac_ver()[0]}
 
 
@@ -298,8 +330,9 @@ def plan(gguf: Path, ctx: int, pb: int) -> dict:
 def need(p: dict, ctx: int) -> tuple[float, float]:
     """(GPU bytes, all bytes) at a context of ctx tokens, from one plan (linear in the context)."""
     g, h = p["gpu"], p["host"]
-    gpu = g["model"] + g["context"] + g["compute"] + p["per_token"] * (ctx - p["context"])
-    return gpu, gpu + h["model"] + h["context"] + h["compute"]
+    # Metal maps the whole model file: the part llama.cpp counts on the CPU side is in the GPU's share too
+    gpu = g["model"] + h["model"] + g["context"] + g["compute"] + p["per_token"] * (ctx - p["context"])
+    return gpu, gpu + h["context"] + h["compute"]
 
 
 def size_context(gguf: Path, want: int, me: dict) -> tuple[int, int, float]:
@@ -449,8 +482,16 @@ def test(cfg_path: Path, yes: bool) -> bool:
             ok(f"it answers: {said!r}")
             return True
         if out_of_memory(said):
-            avail = free_now() / GB
+            avail = free_now() / GIB
             warn(f"the GPU ran out of memory ({avail:.1f} GB free right now)")
+            me = mac()
+            if me["suggest_mb"] and me["wired_mb"] < me["suggest_mb"] and sys.stdin.isatty() and ask(
+                    f"macOS lets the GPU hold {me['limit'] / GIB:.1f} GB{'' if me['wired_mb'] else ' by default'}. Raise it to "
+                    f"{me['suggest_mb'] / 1024:.1f} GB until the Mac restarts (sudo sysctl iogpu.wired_limit_mb="
+                    f"{me['suggest_mb']}; it asks for your password)? (y/n)", "y", yes).lower() == "y":
+                if subprocess.run(["sudo", "sysctl", f"iogpu.wired_limit_mb={me['suggest_mb']}"]).returncode == 0:
+                    ok(f"the GPU may hold {me['suggest_mb'] / 1024:.1f} GB now (until the Mac restarts)")
+                    continue
             if shrink(cfg_path):
                 continue
             if not yes and sys.stdin.isatty():
@@ -534,6 +575,8 @@ def main() -> None:
     print()
     if good:
         print(f"{GREEN}{BOLD}Strata is ready.{END}")
+    for t in power():
+        warn(t)
     print(f"  model:   {m['title']}  ({cfg.name})\n  app:     open Strata.app   (or: make app-run)\n"
           f"  browser: make run PORT=8090, then http://127.0.0.1:8090\n  another model: make setup")
     if not a.no_open:

@@ -267,8 +267,10 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
     let (g, h) = (&p["gpu"], &p["host"]);
     let ctx = n(&p["context"]);
     let per_token = n(&p["per_token"]);
-    let limit = n(&g["limit"]);
-    let gpu_need = n(&g["model"]) + n(&g["context"]) + n(&g["compute"]);
+    let (limit, wired_mb, suggest_mb) = gpu_limit(n(&g["limit"]));
+    // Metal maps the whole model file: the part llama.cpp counts on the CPU side (token embeddings) is in the GPU's
+    // share too (measured on an M1: MTL0_Mapped 11,536 MiB = 10,949 + 587)
+    let gpu_need = n(&g["model"]) + n(&h["model"]) + n(&g["context"]) + n(&g["compute"]);
     let need = gpu_need + n(&h["model"]) + n(&h["context"]) + n(&h["compute"]);
     let pb = n(&p["prefill_batch"]).max(1.0);
     // the work buffers at a batch of 512: they scale with the batch (measured 1702 -> 424 MiB, 2048 -> 512)
@@ -324,7 +326,43 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
     json!({"config": cfg_path, "context": ctx, "n_ctx_train": train, "prefill_batch": pb, "need": need, "gpu_need": gpu_need, "limit": limit,
         "avail": if running { Value::Null } else { json!(avail) }, "running": running,
         "weights": n(&g["model"]) + n(&h["model"]), "cache": n(&g["context"]) + n(&h["context"]), "work": n(&g["compute"]) + n(&h["compute"]),
-        "state": state, "advice": advice, "options": options, "recommended": best.map(|i| options[i].clone())})
+        "state": state, "advice": advice, "options": options, "recommended": best.map(|i| options[i].clone()),
+        "wired_mb": wired_mb, "suggest_limit_mb": if suggest_mb > 0 && gpu_need > limit { json!(suggest_mb) } else { Value::Null },
+        "power": power()})
+}
+
+/// What the GPU may really hold: iogpu.wired_limit_mb when it is set; else macOS's default, which on Macs up to 36 GB
+/// is about two thirds of the memory, below Metal's recommendedMaxWorkingSetSize (a 16 GB M1: 12.4 GiB recommended,
+/// ran out at 11.7).  (limit bytes, the sysctl's MB, a value to suggest: the memory less 3 GB or 15% for macOS)
+fn gpu_limit(recommended: f64) -> (f64, u64, u64) {
+    let sysctl = |k: &str| Command::new("/usr/sbin/sysctl").args(["-n", k]).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
+    let (wired, ram) = (sysctl("iogpu.wired_limit_mb"), sysctl("hw.memsize"));
+    let ram_mb = ram >> 20;
+    let suggest = ram_mb.saturating_sub((ram_mb * 15 / 100).max(3072));
+    // 1 GB of the limit stays for the others the GPU holds memory for (the window server's buffers, Metal itself): a
+    // 16 GB M1 at a 13 GB limit ran out at 12.8 GiB and answered at 11.7
+    const OTHERS: f64 = 1073741824.0;
+    if wired > 0 {
+        return (wired as f64 * 1048576.0 - OTHERS, wired, if suggest > wired { suggest } else { 0 });
+    }
+    let default = if ram <= 36 << 30 { (ram as f64 * 2.0 / 3.0).min(recommended) } else { recommended };
+    (default - OTHERS, 0, suggest)
+}
+
+/// The Mac's energy mode (pmset): Low Power slows the GPU; High Power (MacBook Pro with Max, 2024+ Pro, Mac mini Pro,
+/// Mac Studio 2026: their pmset has a `powermode` line, 0 automatic / 1 low / 2 high) lets its fans hold the clock.
+fn power() -> Value {
+    let g = Command::new("/usr/bin/pmset").arg("-g").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let batt = Command::new("/usr/bin/pmset").args(["-g", "batt"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let field = |k: &str| g.lines().find_map(|l| { let mut f = l.split_whitespace(); (f.next() == Some(k)).then(|| f.next().and_then(|v| v.parse::<u8>().ok())).flatten() });
+    json!({"low": field("lowpowermode") == Some(1) || field("powermode") == Some(1), "high_capable": field("powermode").is_some(),
+           "high": field("powermode") == Some(2), "battery": batt.contains("'Battery Power'")})
+}
+
+/// A system setting through macOS's own administrator dialog (osascript "with administrator privileges").
+fn admin(shell: &str) -> bool {
+    let script = format!("do shell script \"{}\" with administrator privileges", shell.replace('\\', "\\\\").replace('"', "\\\""));
+    Command::new("/usr/bin/osascript").args(["-e", &script]).status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// Rewrite a config's --max-context (and --prefill-batch), keeping its key order and indentation.
@@ -786,6 +824,25 @@ fn main() {
                     check_memory(&st, &proxy, None);
                 }
                 "memory" => check_memory(&st, &proxy, None),
+                "raise_limit" | "power_high" | "low_power_off" => {
+                    let shell = match cmd {
+                        "raise_limit" => format!("sysctl iogpu.wired_limit_mb={}", v["mb"].as_u64().unwrap_or(0)),
+                        "power_high" => "pmset -a powermode 2".to_string(),
+                        _ => "pmset -a lowpowermode 0".to_string(),
+                    };
+                    let (p, st2, restart) = (proxy.clone(), st.clone(), cmd == "raise_limit");
+                    std::thread::spawn(move || {
+                        let ok = admin(&shell);
+                        let _ = p.send_event(Ev::Log(format!("── {}: {} ──", shell, if ok { "done" } else { "not changed" })));
+                        if ok && restart && st2.lock().unwrap().child.is_some() {
+                            stop_and_wait(&st2); // the engine reads the limit when it loads
+                            if let Err(e) = start(&st2, &p) {
+                                let _ = p.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                        check_memory(&st2, &p, None);
+                    });
+                }
                 "apps" => {
                     let p = proxy.clone();
                     std::thread::spawn(move || {

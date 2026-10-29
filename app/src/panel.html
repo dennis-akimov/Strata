@@ -30,6 +30,8 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
 .legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11.5px}.legend b{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
 .verdict{margin-top:6px;font-weight:600}.verdict.green{color:#248a3d}.verdict.amber{color:#c27a00}.verdict.red{color:#d70015}
 #notready{font-size:12px;max-width:620px;text-align:left}#notready div{margin:2px 0}
+.tips{margin-top:8px;display:flex;flex-direction:column;gap:6px}.tips div{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.tips code{font:11px ui-monospace,Menlo,monospace;background:var(--bg);padding:1px 5px;border-radius:4px;user-select:all}
 .applist table{width:100%;border-collapse:collapse;margin-top:6px}.applist td{padding:4px 2px;border-top:1px solid var(--line)}
 .applist td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.applist td.b{text-align:right;white-space:nowrap}
 .applist button{padding:2px 8px}.applist button.force{border-color:#ff453a;color:#ff453a}
@@ -113,6 +115,7 @@ function memory(m){
     <span>│ the GPU can use ${gb(m.limit)}</span>${m.avail!=null?`<span>free now ${gb(m.avail)}</span>`:''}</div>
     <div class="verdict ${m.state}">${m.state==='green'?'✓ ':'⚠ '}${esc(m.advice)}</div>
     ${m.recommended&&m.recommended.ctx!==m.context?`<div class="acts" style="margin-top:8px"><button id="userec">Use context ${k(m.recommended.ctx)}${m.recommended.batch512?' with batch 512':''} (${gb(m.recommended.need)})</button></div>`:''}`;
+  $('memcard').insertAdjacentHTML('beforeend',tips(m));
   if($('userec'))$('userec').onclick=()=>setCtx(m.recommended);
   if(m.state!=='green'||m.avail!=null&&m.need>m.avail*0.9)send('apps');else for(const el of document.querySelectorAll('.applist'))el.hidden=true;
 }
@@ -134,6 +137,22 @@ document.addEventListener('click',e=>{const b=e.target.closest('.applist button'
   if(b.dataset.f&&!confirm(`Force quit ${x.name}? Unsaved work in it is lost.`))return;
   b.disabled=true;b.textContent=b.dataset.f?'Ending…':'Quitting…';if(b.dataset.f)stillRunning=null;
   send('quit_app',{bundle:x.bundle,pid:x.pid,force:!!b.dataset.f});});
+// what else would let it fit or run faster: macOS's GPU memory limit, the energy mode (one click each: macOS asks
+// for an administrator's password; the Terminal command beside it for those who prefer it)
+function tips(m){
+  const t=[],pw=m.power||{};
+  if(m.suggest_limit_mb)t.push(`<div>⚡ macOS lets the GPU hold ${gb(m.limit)}${m.wired_mb?'':' by default'}; this model needs ${gb(m.gpu_need)}.
+    <button data-tip="raise_limit" data-mb="${m.suggest_limit_mb}">Raise it to ${(m.suggest_limit_mb/1024).toFixed(1)} GB</button>
+    <span class="mute">until the Mac restarts · <code>sudo sysctl iogpu.wired_limit_mb=${m.suggest_limit_mb}</code> · keep other apps closed</span></div>`);
+  if(pw.low)t.push(`<div>🐢 Low Power Mode is on: it slows the GPU. <button data-tip="low_power_off">Turn it off</button>
+    <span class="mute"><code>sudo pmset -a lowpowermode 0</code></span></div>`);
+  if(pw.high_capable&&!pw.high)t.push(`<div>🚀 This Mac has High Power Mode (its fans hold the GPU's clock under long answers). <button data-tip="power_high">Turn it on</button>
+    <span class="mute">System Settings › Battery › Energy Mode · <code>sudo pmset -a powermode 2</code></span></div>`);
+  if(pw.battery)t.push(`<div>🔌 On battery: plug in the power adapter for full speed.</div>`);
+  return t.length?`<div class="tips">${t.join('')}</div>`:'';
+}
+document.addEventListener('click',e=>{const b=e.target.closest('button[data-tip]');if(!b)return;
+  b.disabled=true;b.textContent='Asking macOS…';send(b.dataset.tip,b.dataset.mb?{mb:+b.dataset.mb}:{});});
 function setCtx(o,start){if(!o)return;send('set_context',{ctx:o.ctx,batch512:!!o.batch512,start:!!start});$('mem').textContent='memory …';closeAlert();}
 // a chat failed for memory, or the engine ended while loading: what to do, one click each
 function trouble(a){
@@ -141,7 +160,7 @@ function trouble(a){
   const r=m.recommended;let t='';
   if(m.error)t=esc(m.error);
   else t=`At a context of ${(m.context||0).toLocaleString()} tokens this model needs ${gb(m.need)}; the GPU can use ${gb(m.limit)}${m.avail!=null?' and '+gb(m.avail)+' is free now':''}. ${esc(m.advice)}.`;
-  $('alerttext').innerHTML=t;
+  $('alerttext').innerHTML=t+(m.error?'':tips(m));
   const acts=[];
   if(r&&r.ctx<m.context)acts.push(`<button class="main" data-a="rec">Use context ${k(r.ctx)}${r.batch512?' with batch 512':''} and restart</button>`);
   else if(m.options){const lo=m.options.find(o=>o.ctx<m.context&&o.fits)||m.options[0];if(lo&&lo.ctx<m.context)acts.push(`<button class="main" data-a="low" data-c="${lo.ctx}">Try context ${k(lo.ctx)} and restart</button>`);}

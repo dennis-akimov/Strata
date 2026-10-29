@@ -118,6 +118,14 @@ If setup stops, it says what is missing and the command that fixes it.
 
 ### If a model does not fit
 
+Strata.app and `make setup` check this for you: the app's memory card lists what the model needs against what the GPU
+may hold and what is free, the apps using the most memory (with Quit), and, when macOS's GPU limit is the wall, a
+**Raise it** button (macOS asks for your password) for the command below; `make setup` offers the same after an
+out-of-memory. On Macs up to 36 GB macOS's default limit is about two thirds of the memory, below what Metal reports:
+a 16 GB M1 ran GPT-OSS 20B (8K context) only after `sudo sysctl iogpu.wired_limit_mb=13312`. They also say when Low
+Power Mode is on, when High Power Mode is available (MacBook Pro with a Max chip, 2024+ Pro/Max, Mac mini with Pro,
+Mac Studio 2026: `pmset -g` shows `powermode`; `sudo pmset -a powermode 2`), and when the Mac is on battery.
+
 Pick a smaller size or a smaller context first. If you know what you are doing, you can raise Metal's limit; the
 setting lasts until the Mac restarts:
 
