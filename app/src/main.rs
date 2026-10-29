@@ -5,7 +5,7 @@
 //! memory), a stray Strata server on the port is replaced (--replace).
 
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
@@ -29,6 +29,7 @@ const KEY_SCRIPT: &str = r#"{ const u = new URL(location.href), k = u.searchPara
 enum Ev {
     Status(Value),
     Memory(Value),
+    Apps(Value),
     Alert(Value),
     Page(Value),
     Log(String),
@@ -158,6 +159,89 @@ fn plan(cfg_path: &Path) -> Result<Value, String> {
     Ok(v)
 }
 
+/// The apps using the most memory now, the ones a person can quit to give the model room: each app's processes added
+/// up (Chrome's helpers count as Chrome), from top's MEM (it counts compressed memory, unlike ps's RSS) and ps's paths.
+/// macOS's own (/System) and Strata are left out.  [{name, bundle, pid, bytes}], largest first, 150 MB or more.
+fn memory_apps() -> Vec<Value> {
+    let me = unsafe { libc::getuid() }.to_string();
+    let ps = Command::new("/bin/ps").args(["-axo", "pid=,uid=,comm="]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let top = Command::new("/usr/bin/top").args(["-l", "1", "-stats", "pid,mem"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let unit = |m: &str| -> u64 {
+        let m = m.trim_end_matches(['+', '-']);
+        let (n, u) = m.split_at(m.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(m.len()));
+        let n: f64 = n.parse().unwrap_or(0.0);
+        (n * match u { "K" => 1024.0, "M" => 1048576.0, "G" => 1073741824.0, _ => 1.0 }) as u64
+    };
+    let mem: HashMap<u32, u64> = top.lines().filter_map(|l| {
+        let mut f = l.split_whitespace();
+        Some((f.next()?.parse().ok()?, unit(f.next()?)))
+    }).collect();
+    let mut apps: HashMap<String, (u64, u32)> = HashMap::new();
+    for l in ps.lines() {
+        // "  296   501 /Applications/X.app/Contents/MacOS/X": columns padded with spaces, the path may hold spaces too
+        let Some((pid, rest)) = l.trim_start().split_once(' ') else { continue };
+        let Some((uid, path)) = rest.trim_start().split_once(' ') else { continue };
+        let path = path.trim();
+        let Ok(pid) = pid.parse::<u32>() else { continue };
+        if uid != me || path.starts_with("/System/") || path.starts_with("/usr/libexec/") || path.starts_with("/usr/sbin/") {
+            continue;
+        }
+        // an app's processes group under its bundle; any other process (a service, a node server) under its own path,
+        // listed but never quit from here: ending a service can do harm a person does not see (an LLM server, a database)
+        let bundle = match path.find(".app/") {
+            Some(i) => &path[..i + 4],
+            None => path,
+        };
+        let name = Path::new(bundle).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if bundle.ends_with("/Strata.app") || name.starts_with("strata-") || pid == std::process::id() {
+            continue;
+        }
+        let e = apps.entry(bundle.to_string()).or_insert((0, 0));
+        e.0 += mem.get(&pid).copied().unwrap_or(0);
+        if (path == bundle || path.starts_with(&format!("{bundle}/Contents/MacOS/"))) && (e.1 == 0 || pid < e.1) {
+            e.1 = pid; // the app's own process (not a helper): the one quitting reaches
+        }
+    }
+    let mut v: Vec<(String, u64, u32)> = apps
+        .into_iter()
+        .filter(|(k, (b, pid))| if k.ends_with(".app") { *b >= 150 << 20 && *pid > 0 } else { *b >= 300 << 20 })
+        .map(|(k, (b, p))| (k, b, p))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.into_iter().take(8).map(|(bundle, bytes, pid)| {
+        let app = bundle.ends_with(".app");
+        let name = Path::new(&bundle).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        json!({"name": name, "bundle": bundle, "pid": pid, "bytes": bytes, "app": app})
+    }).collect()
+}
+
+/// Quit an app the way the Dock does (it may ask to save); `force`: SIGKILL its processes (unsaved work is lost).
+/// Some(still running) after up to 8 s.
+fn quit_app(bundle: &str, pid: u32, force: bool) -> bool {
+    if !bundle.ends_with(".app") {
+        return true; // a service or a command-line process: never ended from here
+    }
+    if force {
+        let _ = Command::new("/usr/bin/pkill").args(["-KILL", "-f", &format!("^{}/", regex_escape(bundle))]).status();
+    } else {
+        let id = Command::new("/usr/bin/defaults").args(["read", &format!("{bundle}/Contents/Info"), "CFBundleIdentifier"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let script = if id.is_empty() { format!("tell application \"{bundle}\" to quit") } else { format!("tell application id \"{id}\" to quit") };
+        let _ = Command::new("/usr/bin/osascript").args(["-e", &script]).status();
+    }
+    for _ in 0..16 {
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    true
+}
+
+fn regex_escape(s: &str) -> String {
+    s.chars().map(|c| if "\\.+*?()|[]{}^$".contains(c) { format!("\\{c}") } else { c.to_string() }).collect()
+}
+
 /// Memory macOS can give a program now without swapping much: free, inactive (file cache, idle apps), speculative
 /// and purgeable pages (vm_stat).
 fn ram_available() -> u64 {
@@ -168,7 +252,7 @@ fn ram_available() -> u64 {
 }
 
 // up to 1M: GLM-5.3 is trained for 1,048,576; the menu stops at each model's own (gpt-oss 131,072, Qwen 262,144)
-const CONTEXTS: [u64; 10] = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+const CONTEXTS: [u64; 12] = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
 
 /// What a config needs against what this Mac has: the GPU's share must fit Metal's working set, and everything must
 /// fit the memory free now (when the server is not running: a running engine already holds its share).  For each
@@ -702,6 +786,21 @@ fn main() {
                     check_memory(&st, &proxy, None);
                 }
                 "memory" => check_memory(&st, &proxy, None),
+                "apps" => {
+                    let p = proxy.clone();
+                    std::thread::spawn(move || {
+                        let _ = p.send_event(Ev::Apps(json!({"apps": memory_apps()})));
+                    });
+                }
+                "quit_app" => {
+                    let (p, st2) = (proxy.clone(), st.clone());
+                    let (bundle, pid, force) = (v["bundle"].as_str().unwrap_or("").to_string(), v["pid"].as_u64().unwrap_or(0) as u32, v["force"] == true);
+                    std::thread::spawn(move || {
+                        let still = !bundle.is_empty() && pid > 0 && quit_app(&bundle, pid, force);
+                        let _ = p.send_event(Ev::Apps(json!({"apps": memory_apps(), "still": if still { json!(bundle) } else { Value::Null }})));
+                        check_memory(&st2, &p, None);
+                    });
+                }
                 "set_context" => {
                     // a new context (and prefill batch) in the config; a running server restarts with it
                     let Some(cfg) = st.lock().unwrap().config.clone() else { return };
@@ -842,6 +941,7 @@ fn main() {
                 }
             }
             Event::UserEvent(Ev::Memory(m)) => js_call(&control_view, "memory", &m),
+            Event::UserEvent(Ev::Apps(a)) => js_call(&control_view, "apps", &a),
             Event::UserEvent(Ev::Page(e)) => {
                 if e["event"] == "finished" {
                     loaded.store(navs.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
@@ -935,5 +1035,15 @@ mod tests {
         assert!(trouble("[strata] 2026-10-29 10:20:54 the engine exited before it was ready").is_some());
         assert!(trouble("[strata] 200 POST /v1/chat/completions").is_none());
         assert!(problem(&json!({"exe": "/nope/strata-metal", "args": []})).unwrap().contains("make build"));
+    }
+
+    #[test]
+    fn lists_the_apps_using_memory() {
+        let apps = memory_apps();
+        for w in apps.windows(2) {
+            assert!(w[0]["bytes"].as_u64() >= w[1]["bytes"].as_u64());
+        }
+        assert!(apps.iter().all(|a| !a["bundle"].as_str().unwrap().starts_with("/System/") && a["name"] != "Strata"));
+        eprintln!("{}", apps.iter().map(|a| format!("{} {:.1} GB", a["name"].as_str().unwrap(), a["bytes"].as_f64().unwrap() / 1e9)).collect::<Vec<_>>().join(", "));
     }
 }

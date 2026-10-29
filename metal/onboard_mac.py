@@ -136,6 +136,33 @@ def free_now() -> float:
     return float(sum(pages.values()) * page)
 
 
+def memory_apps(n: int = 5) -> list[tuple[str, float]]:
+    """The apps using the most memory (an app's processes added up; top's MEM counts compressed memory): the ones to
+    quit.  macOS's own and Strata are left out.  [(name, bytes)], largest first."""
+    units = {"K": 2**10, "M": 2**20, "G": 2**30}
+    top = subprocess.run(["top", "-l", "1", "-stats", "pid,mem"], capture_output=True, text=True).stdout
+    mem = {}
+    for line in top.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit():
+            v = f[1].rstrip("+-")
+            mem[int(f[0])] = float(v[:-1] or 0) * units.get(v[-1:], 1) if v[-1:] in units else float(v or 0)
+    apps: dict[str, float] = {}
+    uid = str(os.getuid())
+    for line in subprocess.run(["ps", "-axo", "pid=,uid=,comm="], capture_output=True, text=True).stdout.splitlines():
+        f = line.split(None, 2)
+        if len(f) < 3 or f[1] != uid or f[2].startswith(("/System/", "/usr/libexec/", "/usr/sbin/")):
+            continue
+        # an app's processes under its bundle; a service or a command-line process under its own path (named
+        # "(background)": setup never ends anything, and a service may be something the user must not stop)
+        bundle = f[2][:f[2].index(".app/") + 4] if ".app/" in f[2] else f[2]
+        if bundle.endswith("/Strata.app") or Path(bundle).name.startswith("strata-"):
+            continue
+        apps[bundle] = apps.get(bundle, 0) + mem.get(int(f[0]), 0)
+    big = [(b, v) for b, v in apps.items() if v >= (150 if b.endswith(".app") else 300) * 2**20]
+    return [(Path(b).stem + ("" if b.endswith(".app") else " (background)"), v) for b, v in sorted(big, key=lambda kv: -kv[1])[:n]]
+
+
 def mac() -> dict:
     ram = float(sysctl("hw.memsize") or 0)
     limit = metal_limit() or 0.75 * ram
@@ -427,8 +454,9 @@ def test(cfg_path: Path, yes: bool) -> bool:
             if shrink(cfg_path):
                 continue
             if not yes and sys.stdin.isatty():
-                a = ask("Quit other apps (browsers, editors, Docker) to free memory, then press Enter to try again, "
-                        "or type s to skip", "", False)
+                hogs = ", ".join(f"{name} {b / GIB:.1f} GB" for name, b in memory_apps())
+                a = ask(f"Quit apps to free memory ({hogs or 'browsers, editors, Docker'}), then press Enter to try "
+                        "again, or type s to skip", "", False)
                 if a.lower() != "s":
                     continue
             cfg = json.loads(cfg_path.read_text())
@@ -436,9 +464,11 @@ def test(cfg_path: Path, yes: bool) -> bool:
             p = plan(Path(a[a.index("--gguf") + 1]), int(a[a.index("--max-context") + 1]),
                      int(a[a.index("--prefill-batch") + 1]) if "--prefill-batch" in a else 2048)
             total = need(p, p["context"])[1]
+            hogs = ", ".join(f"{name} {b / GIB:.1f} GB" for name, b in memory_apps())
             warn(f"it did not fit: the model needs about {total / GIB:.1f} GB and {free_now() / GIB:.1f} GB is free; "
-                 f"quit apps to free {max(0.1, (total - free_now()) / GIB):.1f} GB more (browsers, editors, Docker), "
-                 "then `make setup` again - or pick a smaller model")
+                 f"quit apps to free {max(0.1, (total - free_now()) / GIB):.1f} GB more"
+                 + (f" (using the most now: {hogs})" if hogs else "") +
+                 ", then `make setup` again (or Start in Strata.app, which lists them with Quit buttons)")
             return False
         warn(f"the first answer failed: {said}")
         return False
