@@ -429,7 +429,9 @@ impl Tokenize for ByteTokenizer {
     }
 
     fn token_bytes(&self, id: u32) -> Vec<u8> {
-        if id >= 256 {
+        if id >= crate::engine::CHUNK_BASE {
+            crate::engine::chunk_bytes(id) // a piece of text Apple's model streamed (engine::AfmEngine)
+        } else if id >= 256 {
             BYTE_SPECIALS.get(id as usize - 256).map(|s| s.as_bytes().to_vec()).unwrap_or_default()
         } else {
             vec![id as u8]

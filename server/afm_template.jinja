@@ -1,0 +1,3 @@
+{#- Apple's on-device model (a config with "engine": "afm"): the conversation as JSON for strata-afm, which builds the
+    model's own session from it (engine::afm_request) -#}
+{{- {"messages": messages, "tools": tools if tools is defined else none} | tojson -}}

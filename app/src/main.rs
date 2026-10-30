@@ -260,6 +260,12 @@ const CONTEXTS: [u64; 12] = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 1
 /// context size the need follows the engine's per-token cost; a smaller --prefill-batch shrinks the work buffers
 /// (their size is the batch x the vocabulary's logits).
 fn memory(cfg_path: &Path, running: bool) -> Value {
+    // Apple's on-device model: macOS runs it (its own memory, outside the GPU limit Strata plans for), at a context
+    // Apple sets (4,096 tokens on M1/M2, 8,192 on M3 and later)
+    if read_config(cfg_path)["engine"] == "afm" {
+        return json!({"config": cfg_path, "afm": true, "state": "green", "running": running, "options": [],
+                      "advice": "Apple's on-device model (FoundationModels): macOS runs it in its own memory, no download"});
+    }
     let p = match plan(cfg_path) {
         Ok(p) => p,
         Err(e) => return json!({"config": cfg_path, "error": e}),
@@ -1068,16 +1074,28 @@ fn main() {
                 }
                 "select" => {
                     let mut s = st.lock().unwrap();
-                    if let Some(c) = v["config"].as_str() {
-                        s.config = Some(PathBuf::from(c));
-                        s.port = config_port(Path::new(c));
+                    let changed = v["config"].as_str().map(PathBuf::from).filter(|c| s.config.as_ref() != Some(c));
+                    if let Some(c) = &changed {
+                        s.config = Some(c.clone());
+                        s.port = config_port(c);
                     }
                     let mut set = load_settings();
                     set["config"] = json!(s.config);
                     save_settings(&set);
+                    // another model picked while one runs: stop it and start the new one (the list stays open then)
+                    let switch = changed.is_some() && s.child.is_some();
                     drop(s);
                     js_call(&control_view, "init", &snapshot(&st));
                     check_memory(&st, &proxy, None);
+                    if switch {
+                        let (st2, p2) = (st.clone(), proxy.clone());
+                        std::thread::spawn(move || {
+                            stop_and_wait(&st2);
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        });
+                    }
                 }
                 "autostart" => {
                     let mut set = load_settings();

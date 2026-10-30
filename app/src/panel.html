@@ -80,7 +80,7 @@ const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&g
 const gb=b=>b==null?'–':(b/1e9).toFixed(1)+' GB', k=c=>c>=1048576&&c%1048576===0?c/1048576+'M':c>=1024?Math.round(c/1024)+'K':c;
 let mem=null,running=false;
 function init(s){
-  const name=c=>c.name.replace(/^strata-|\.json$/g,'')+(c.model?' — '+c.model:'');
+  const name=c=>{const n=c.name.replace(/^strata-|\.json$/g,'');return n==='apple-afm'?"Apple's on-device model (apple-afm)":n+(c.model&&c.model!==n?' — '+c.model:'');};
   $('cfg').innerHTML=s.configs.map(c=>`<option value="${esc(c.path)}"${c.problem?' disabled':''}>${esc(name(c))}${c.problem?' (not ready)':''}</option>`).join('')||'<option>no run config yet: make setup</option>';
   const bad=s.configs.filter(c=>c.problem);
   $('notready').innerHTML=bad.length?'<b>Not ready yet:</b>'+bad.map(c=>`<div>${esc(name(c))}: ${esc(c.problem)}</div>`).join(''):'';
@@ -94,7 +94,7 @@ function status(s){
   const ph=s.phase||'stopped';const was=running;running=!!s.running;if(was!==running)send('memory');
   $('phase').textContent=ph;$('dot').style.background=COLORS[ph]||COLORS.stopped;
   $('start').disabled=running;$('start2').hidden=running;$('stop').disabled=!running||ph==='stopping';$('restart').disabled=!running;
-  $('load').disabled=ph!=='unloaded';$('unload').disabled=!(ph==='ready'||ph==='busy');$('cfg').disabled=running;
+  $('load').disabled=ph!=='unloaded';$('unload').disabled=!(ph==='ready'||ph==='busy');$('cfg').disabled=ph==='stopping';
   $('ctx').disabled=ph==='starting'||ph==='stopping';$('ctx').title=running?'changing it restarts the server':'the context window: the longest conversation the model keeps';
   for(const id of ['browser','copy_key'])$(id).disabled=!running;
   $('rate').textContent=s.tok_s!=null?`${s.tok_s} tok/s`:(s.prompt_total?`reading ${s.prompt_read}/${s.prompt_total}`:'');
@@ -109,6 +109,8 @@ let full=null;function layout(){const f=!up||$('log').classList.contains('open')
 // the memory check of the selected config (the engine's --plan, and the memory free now)
 function memory(m){
   mem=m;const chip=$('mem');
+  if(m.afm){chip.className='chip green';chip.textContent="Apple's on-device model";chip.title=m.advice;$('ctx').innerHTML='';
+    $('memcard').hidden=false;$('memcard').innerHTML=`<h3>Memory</h3><div class="verdict green">✓ ${esc(m.advice)}</div>`;return;}
   if(m.error){chip.className='chip red';chip.textContent='memory ?';chip.title=m.error;$('ctx').innerHTML='';$('memcard').hidden=false;
     $('memcard').innerHTML=`<h3>Memory</h3><div class="verdict red">${esc(m.error)}</div>`;return;}
   chip.className='chip '+m.state;   // what it needs next to what this Mac has: the GPU's share, and what is free right now

@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use strata_server::engine::{py_g, Engine, MockEngine, Spawn, StrataEngine, ENGINE_SILENCE_S};
+use strata_server::engine::{py_g, AfmEngine, Engine, MockEngine, Spawn, StrataEngine, ENGINE_SILENCE_S};
 use strata_server::py::{self, get, truthy};
 use strata_server::service::{clean_shared_defaults, sampling_defaults_from_config, Service, Settings, REPEAT_STOP_TOKENS};
 use strata_server::tokenizer::{ByteTokenizer, Tokenize, Tokenizer};
@@ -365,11 +365,14 @@ fn main() {
         }
         say(&format!("port {} is free", a.port));
     }
+    // "engine": "afm": Apple's on-device model (metal/afm/strata-afm, FoundationModels): text in and out, so bytes for
+    // tokens and the conversation as JSON for a prompt
+    let afm = a.engine == "strata" && get(&cfgv, "engine") == &json!("afm");
     let tpath = PathBuf::from(get(&cfgv, "tokenizer").as_str().map(String::from).or(a.tokenizer.clone()).unwrap_or_else(|| root().join("pack/full/tokenizer").to_string_lossy().into_owned()));
-    if a.engine == "strata" && !tpath.join("vocab.json").exists() {
+    if a.engine == "strata" && !afm && !tpath.join("vocab.json").exists() {
         die(&format!("strata-server: error: the model's tokenizer is missing ({}); run setup again", tpath.join("vocab.json").display()));
     }
-    let tok: Arc<dyn Tokenize> = if tpath.join("vocab.json").exists() {
+    let tok: Arc<dyn Tokenize> = if !afm && tpath.join("vocab.json").exists() {
         match Tokenizer::from_dir(&tpath) {
             Ok(t) => Arc::new(t),
             Err(e) => die(&format!("strata-server: error: the tokenizer in {}: {e}", tpath.display())),
@@ -386,7 +389,13 @@ fn main() {
     let sampling_defaults;
     let engine: Engine;
     let effort_end;
-    if a.engine == "strata" {
+    if afm {
+        effort_end = None;
+        sampling_defaults = sampling_defaults_from_config(&cfgv).unwrap_or_else(|e| exit_msg(&e));
+        let exe = get(&cfgv, "exe").as_str().unwrap_or("").to_string();
+        println!("starting Apple's on-device model ...");
+        engine = Engine::Afm(Arc::new(AfmEngine::new(&exe).unwrap_or_else(|e| exit_msg(&format!("[strata] {e}")))));
+    } else if a.engine == "strata" {
         if cfg.is_empty() {
             die("strata-server: error: --engine strata needs --config");
         }
@@ -448,7 +457,7 @@ fn main() {
         engine = Engine::Mock(Arc::new(MockEngine::new(&*tok, &scripts, 32768, 0.0)));
     }
     let tpl_path = tpath.join("chat_template.jinja");
-    let tpl_path = if tpl_path.exists() { tpl_path } else { root().join("server/chat_template.jinja") };
+    let tpl_path = if afm { root().join("server/afm_template.jinja") } else if tpl_path.exists() { tpl_path } else { root().join("server/chat_template.jinja") };
     let template = strata_server::template::ChatTemplate::load(&tpl_path).unwrap_or_else(|e| exit_msg(&format!("[strata] the chat template {}: {e}", tpl_path.display())));
     // ------------------------------------------------------------------ the settings
     let mut set = Settings { sampling_defaults, fit_max_tokens: a.fit_max_tokens || get(&cfgv, "fit_max_tokens") == &json!(true), ..Default::default() };

@@ -166,6 +166,7 @@ in your browser.
 | GPT-OSS 120B + DFlash draft | 1.6 GB more | about 72 GB (estimate) | Faster on math and step-by-step answers (about +35%), slower on chat (about -20%). `make pull MODEL=GPT-OSS-120B-DFLASH`, then [steps](docs/MACOS.md#gpt-oss-120b-with-a-dflash-draft) |
 | GPT-OSS 20B | 12 GB | 19 GB (measured) | The fastest here (about 3.6B parameters active per token), less capable than the 120B. `make pull MODEL=GPT-OSS-20B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
 | Qwen3.6-35B-A3B | 22 GB | 29 GB (measured) | About 3B parameters active per token, but no faster than GPT-OSS 120B here. `make pull MODEL=QWEN3.6-35B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
+| Apple's on-device model (AFM 3 Core on macOS 27) | none (part of macOS) | macOS's own | 3B dense, 4,096-token context on M1/M2 (8,192 on M3 and later); about 30 tokens/s on the 16 GB M1. Small: on the M1's checks it got arithmetic, Russian and code right, Australia's capital and the r's in "strawberry" wrong, and it does not call tools through Strata yet. Needs macOS 26 or later and Apple Intelligence on. `make afm` (it writes `strata-apple-afm.json`), then pick it in Strata.app |
 | LFM2.5-8B-A1B | 9.0 GB | about 13 GB at 128K (measured) | LiquidAI's, 1.5B parameters active per token, thinks before answering; 22.9 tokens/s on the 16 GB M1 under Linux. `make pull MODEL=LFM2.5-8B` (it writes its run config) |
 | LFM2.5-24B-A2B | 11.5 GB | about 13 GB at 32K (measured) | LiquidAI's, 2.45B active, thinks before answering; 12.2 tokens/s on the M1 under Linux. `make pull MODEL=LFM2.5-24B` |
 | GLM-5.3-Flash (Maya-S24) | 95 GB | 89 GB at 32K (measured) | The largest here (320B parameters, about 18B active per token), and the slowest. Chat, thinking and tool calls work. Install: `make pull MODEL=GLM-5.3`, then [steps](docs/MACOS.md#glm-53-flash) |
@@ -203,7 +204,7 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   LoRAs included), then [steps](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b).
 - **Free memory for the model** (Strata.app's **System** button, or its card when the server is stopped): toggles that
   keep Apple Intelligence & Siri off (its on-device model holds about 0.4 GB; Apple Intelligence's own switch opens
-  in System Settings), keep the moving (aerial) wallpaper off, and set the GPU's memory limit at every startup (a
+  in System Settings; leave it on to use Apple's model in Strata), keep the moving (aerial) wallpaper off, and set the GPU's memory limit at every startup (a
   LaunchDaemon for `iogpu.wired_limit_mb`; macOS asks for your password). While the app runs it keeps the first two
   off. The memory card also lists the apps using the most memory, with **Quit**.
 - **In the terminal:** `make tui` is Strata.app for a terminal (Linux on an Apple Silicon Mac, or over SSH): a bar with

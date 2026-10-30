@@ -447,6 +447,24 @@ def config_path(key: str) -> Path:
     return ROOT / f"strata-{MODELS[key]['name']}.json"
 
 
+def write_afm_config() -> None:
+    """Apple's on-device model (FoundationModels: AFM 3 Core on macOS 27; 4,096 tokens on M1/M2, 8,192 on M3+ with
+    12 GB): engine-metal/strata-afm (make build) and strata-apple-afm.json, with no download.  It needs Apple
+    Intelligence on."""
+    exe = ENGINE / "strata-afm"
+    if not exe.exists():
+        fail("engine-metal/strata-afm is missing", "make build compiles it (macOS 26 or later, with Xcode or the Command Line Tools)")
+    hello = subprocess.run([str(exe)], input="", capture_output=True, text=True, errors="replace", timeout=60).stdout
+    v = json.loads(next((l for l in hello.splitlines() if l.startswith("{")), '{"error": "no answer"}'))
+    if "error" in v:
+        fail("Apple's on-device model is not available", v["error"])
+    path = ROOT / "strata-apple-afm.json"
+    cfg = {"engine": "afm", "exe": str(exe), "cwd": str(ROOT), "model_name": "apple-afm", "port": 8090,
+           "host": "127.0.0.1", "log": str(ROOT / "strata-apple-afm.log"), "sampling": {"temperature": 0.7}}
+    path.write_text(json.dumps(cfg, indent=1) + "\n")
+    ok(f"{path.name}: Apple's on-device model, a {v['context']:,}-token context, no download (macOS runs it)")
+
+
 def write_config(key: str, data: Path, me: dict) -> Path:
     m = MODELS[key]
     gguf = data / "models" / m["gguf"]
@@ -650,7 +668,9 @@ def main() -> None:
     me = mac()
     if a.config_only:
         key = a.config_only.upper()
-        if key in MODELS and MODELS[key]["how"] == "pull":
+        if key == "AFM":
+            write_afm_config()
+        elif key in MODELS and MODELS[key]["how"] == "pull":
             write_config(key, data, me)
         return
 

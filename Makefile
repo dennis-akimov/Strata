@@ -56,7 +56,7 @@ AB_GGUF     ?=
 AB_PROMPTS  ?=
 AB_ROUNDS   ?= 7
 
-.PHONY: help setup pull check update run start stop status wait chat models build build-ab server app app-run app-stop tui tui-build test test-server test-engine ab clean
+.PHONY: help setup pull check update run start stop status wait chat models build build-ab server afm app app-run app-stop tui tui-build test test-server test-engine ab clean
 
 help:
 	@echo "Strata - make targets (variables: PORT=$(PORT) HOST=$(HOST) API_KEY=... MODEL=... SETUP_ARGS=...;"
@@ -189,8 +189,10 @@ ifeq ($(shell uname -s),Darwin)
 	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON
 	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
 	@# installed where the run configs point; rm first: macOS kills a program whose binary was rewritten in place
-	rm -f engine-metal/strata-metal engine-metal/strata-vision
+	rm -f engine-metal/strata-metal engine-metal/strata-vision engine-metal/strata-afm
 	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
+	@# Apple's on-device model (macOS 26+): strata-afm for "engine": "afm" configs (make afm); skipped without FoundationModels
+	@swiftc -O -parse-as-library metal/afm/strata_afm.swift -o engine-metal/strata-afm 2>/dev/null || echo "strata-afm not built: Apple's on-device model needs macOS 26 or later"
 else ifeq ($(APPLE_LINUX),1)
 	@# Linux on Apple Silicon: llama.cpp's Vulkan backend (metal/CMakeLists.txt picks it off macOS)
 	$(CMAKE) -S . -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON
@@ -209,6 +211,11 @@ server:
 
 # the Mac app (app/, Rust): Strata.app in this folder runs the server as its child with full control (config, port,
 # start/stop/restart, load/unload, live status, log, chat window, menu-bar icon); quitting it stops the server
+# Apple's on-device model (macOS 26+, Apple Intelligence on): its run config strata-apple-afm.json, no download
+afm:
+	@swiftc -O -parse-as-library metal/afm/strata_afm.swift -o engine-metal/strata-afm.new && mv -f engine-metal/strata-afm.new engine-metal/strata-afm
+	.venv/bin/python metal/onboard_mac.py --config-only AFM
+
 app: server
 	$(CARGO) build --release --manifest-path app/Cargo.toml
 	rm -rf Strata.app && mkdir -p Strata.app/Contents/MacOS
