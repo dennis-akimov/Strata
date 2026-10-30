@@ -46,8 +46,8 @@ same Mac:
 | Model | macOS 27 (Metal) | Linux, Debian + Asahi kernel 7.1.13 (Vulkan, Mesa 26.1) | Model file |
 | --- | ---: | ---: | ---: |
 | **GPT-OSS 20B** (MXFP4) | 16.8-19.9 tokens/s at an 8-16K context § | 13.3-13.7 tokens/s at a 32K context ¶ | 12 GB |
-| **LFM2.5-8B-A1B** (LiquidAI Q8_0) | not measured | 22.9 tokens/s at a 128K context; prompt 185 tokens/s | 9.0 GB |
-| **LFM2.5-24B-A2B** (mradermacher Q3_K_M) | not measured | 12.2 tokens/s at a 32K context; prompt 61 tokens/s ‖ | 11.5 GB |
+| **LFM2.5-8B-A1B** (LiquidAI Q8_0) | 27.6 tokens/s at a 32K context; prompt 528-574 tokens/s | 22.9 tokens/s at a 128K context; prompt 185 tokens/s | 9.0 GB |
+| **LFM2.5-24B-A2B** (mradermacher Q3_K_M) | 28.7 tokens/s at a 16K context; prompt 248-267 tokens/s | 12.2 tokens/s at a 32K context; prompt 61 tokens/s ‖ | 11.5 GB |
 
 § Only after raising macOS's GPU memory limit (`sudo sysctl iogpu.wired_limit_mb=13312`, until the next restart): by
 default macOS lets the GPU of a Mac up to 36 GB hold about two thirds of the memory, too little for the model's 11 GB of
@@ -202,6 +202,20 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   [lightx2v's Lightning LoRAs](https://huggingface.co/lightx2v/Wan2.2-Lightning) (4 steps instead of 18, one pass a step). A 2 s 832x480 video takes about
   7 minutes (49 without the LoRAs) and 30 GB of memory at its peak. Install: `make pull MODEL=WAN2.2` (29 GB, the
   LoRAs included), then [steps](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b).
+- **Voice ("Hey Strata", macOS 26 or later):** the microphone button in the chat's bar. Say the wake phrase and your
+  question: with the chat page open, the question goes into the chat as yours and the answer streams there like a
+  typed one (the chat keeps both, with its history and settings), then is read aloud in macOS's voice; with no page
+  open, the helper asks the model itself and reads the answer. Voice stays on across restarts. Apple's on-device dictation
+  hears it (`SpeechAnalyzer`, no network, no Apple Intelligence and none of its memory); the model you run answers. The
+  panel has the switch, **Allow microphone & speech** (macOS asks once for Strata.app; refused, it opens the page in
+  System Settings), and the **wake phrase** (1-4 words; its last word wakes it as the first or second word said, heard
+  a little off too: "Heyden" as "Hayden", "Haydn" or "hey den"). `engine-metal/strata-voice` (`make build`,
+  metal/voice/strata_voice.swift) runs as the server's child; `GET /voice` (`?page=1`: an open
+  page takes the questions) and `POST /voice` (`{"on": true}`, `{"phrase": "..."}`, `{"say": "..."}`, `{"hush": true}`,
+  `{"permissions": true}`) are what the button uses. The panel shows what was heard last: a wake phrase heard as
+  another word shows there. No sound at all from the Mac (`say` hangs, coreaudiod logs `'what'`, 2003329396): `sudo
+  killall coreaudiod`. Tested on the 16 GB M1 with LFM2.5-24B: "Hey
+  Strata, what is two plus two?" answered in about 3 s.
 - **Free memory for the model** (Strata.app's **System** button, or its card when the server is stopped): toggles that
   keep Apple Intelligence & Siri off (its on-device model holds about 0.4 GB; Apple Intelligence's own switch opens
   in System Settings; leave it on to use Apple's model in Strata), keep the moving (aerial) wallpaper off, and set the GPU's memory limit at every startup (a

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key><string>us.tottle.strata.voice</string>
+	<key>CFBundleName</key><string>strata-voice</string>
+	<key>NSMicrophoneUsageDescription</key><string>Strata listens for its wake phrase ("Hey Strata") and your question, on this Mac.</string>
+	<key>NSSpeechRecognitionUsageDescription</key><string>Strata turns what you say after "Hey Strata" into text with Apple's on-device speech recognition.</string>
+</dict>
+</plist>

@@ -1462,6 +1462,7 @@ async function send() {
   $("input").value = "";
   autosize();
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now(), wait: ""};
+  if (voiceNext) { m.voice = true; voiceNext = false; }   // asked by voice: its answer is read aloud when done
   messages.push(m);
   renderChat();
   const el = $("chat").lastElementChild;
@@ -1594,6 +1595,7 @@ async function send() {
   saveChat();
   scrollDown();
   refreshContext();                               // counted exactly again, with this answer in it
+  if (m.voice) voicePost({say: m.text || (m.error ? `Sorry: ${m.error}` : "")});
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -1817,3 +1819,71 @@ if (startQuestion) history.replaceState(null, "", location.pathname + location.h
 Promise.all([chatsReady, loadHealth()]).then(modelSampling).then(loadMcp).then(() => { refreshContext(); if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
+
+// ------------------------------------------------------------------ voice ("Hey Strata": GET / POST voice)
+// strata-voice listens on this Mac (macOS 26+); the button shows only where the server has it
+let voiceTimer = null, voiceSeen = null, voiceNext = false;
+const voiceQueue = [];
+// a question voice heard while this page checked in (by: "page"): sent through this chat like a typed one, so the
+// chat keeps it (history, context, settings); send() reads the answer back aloud (POST voice {"say"})
+async function voiceRun() {
+  if (!voiceQueue.length) return;
+  if (busy || sending) { setTimeout(voiceRun, 800); return; }
+  const q = voiceQueue.shift();
+  showTab("chat");
+  $("input").value = q;
+  voiceNext = true;
+  await send();
+  voiceNext = false;                              // send() returned early (an image command...): not the next typed one
+  voiceRun();
+}
+async function loadVoice() {
+  let v;
+  // a visible page checks in, and takes the questions (a hidden tab leaves them to the helper)
+  try { v = await (await fetch(document.hidden ? "voice" : "voice?page=1", {headers: headers(), cache: "no-store"})).json(); } catch (e) { return; }
+  const evs = v.events || [], top = evs.length ? evs[evs.length - 1].n : 0;
+  if (voiceSeen === null) voiceSeen = top;        // what happened before this page opened is not replayed
+  for (const e of evs) if (e.n > voiceSeen && e.event === "command" && e.by === "page" && e.text) voiceQueue.push(e.text);
+  voiceSeen = Math.max(voiceSeen, top);
+  voiceRun();
+  $("voice-btn").hidden = !v.available;
+  $("voice-btn").setAttribute("aria-pressed", v.on ? "true" : "false");
+  $("voice-on").checked = !!v.on;
+  const ph = v.phrase || "hey strata", quoted = `\u201c${ph.replace(/\b\w/g, (c) => c.toUpperCase())}\u201d`;
+  $("voice-on-label").textContent = quoted;
+  $("voice-btn").title = `Voice: ${quoted}`;
+  if (document.activeElement !== $("voice-phrase")) $("voice-phrase").value = ph;
+  const ev = v.events || [], last = ev[ev.length - 1] || {};
+  const said = {starting: "Starting\u2026", listening: `Listening for ${quoted}.`, wake: `Heard ${quoted}: go on\u2026`,
+                command: "Asking the model\u2026", answer: `Listening for ${quoted}.`, off: "Off.",
+                downloading: "Downloading Apple\u2019s dictation model\u2026", "wake-timeout": `Listening for ${quoted}.`};
+  if (v.on || last.event === "error" || last.event === "permissions") {
+    $("voice-state").textContent = last.event === "error" ? last.text
+      : last.event === "permissions" ? `Microphone: ${last.microphone ? "allowed" : "not allowed (System Settings opened)"}; speech recognition: ${last.speech ? "allowed" : "not allowed"}.`
+      : (said[last.event] || "Listening.");
+  }
+  if (v.on && v.heard) $("voice-state").textContent += ` Last heard: \u201c${v.heard}\u201d`;
+  $("voice-log").innerHTML = ev.filter((e) => ["command", "answer", "error"].includes(e.event)).slice(-12).reverse().map((e) =>
+    `<li class="${e.event === "command" ? "q" : e.event === "error" ? "err" : ""}">${esc(e.text || "")}</li>`).join("");
+  clearTimeout(voiceTimer);
+  voiceTimer = setTimeout(loadVoice, v.on || $("voice-pop").matches(":popover-open") ? 1500 : 10000);
+}
+async function voicePost(body) {
+  try {
+    const r = await fetch("voice", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) $("voice-state").textContent = (j.error && j.error.message) || `HTTP ${r.status}`;
+  } catch (e) { $("voice-state").textContent = String(e); }
+  loadVoice();
+}
+$("voice-on").onchange = (e) => voicePost({on: e.target.checked});
+$("voice-phrase-form").onsubmit = (e) => { e.preventDefault(); voicePost({phrase: $("voice-phrase").value}); };
+$("voice-allow").onclick = () => { $("voice-state").textContent = "macOS asks now (its window may be behind this one)\u2026"; voicePost({permissions: true}); };
+$("voice-pop").addEventListener("toggle", (e) => {
+  if (e.newState !== "open") return;
+  const b = $("voice-btn").getBoundingClientRect(), p = $("voice-pop");      // above the button, kept on screen
+  p.style.left = `${Math.max(8, Math.min(innerWidth - p.offsetWidth - 8, b.left))}px`;
+  p.style.top = `${Math.max(8, b.top - p.offsetHeight - 10)}px`;
+  loadVoice();
+});
+loadVoice();

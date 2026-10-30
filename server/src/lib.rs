@@ -23,6 +23,7 @@ pub mod template;
 pub mod tokenizer;
 pub mod videogen;
 pub mod vision;
+pub mod voice;
 
 /// A "[strata] " line on stdout, with the time (the Python server's Stamped stream).
 pub fn say(msg: &str) {

@@ -71,6 +71,8 @@
             <svg class="st-icon"><use href="web/sprite.svg#i-layers"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
             <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon voice-btn" id="voice-btn" popovertarget="voice-pop" title="Voice: &ldquo;Hey Strata&rdquo;" aria-label="Voice" aria-pressed="false" hidden>
+            <svg class="st-icon"><use href="web/sprite.svg#i-mic"/></svg></button>
           <span class="spacer"></span>
           <span class="composer-hint" id="composer-hint"></span>
           <button type="button" class="ctx-ring" id="cw-btn" popovertarget="cw-pop" aria-label="Context window" hidden>
@@ -260,6 +262,22 @@
   <div class="ctx-bar" id="cw-bar" aria-hidden="true"></div>
   <ul class="ctx-legend" id="cw-legend"></ul>
   <div class="ctx-pop__note" id="cw-note"></div>
+</div>
+
+<!-- ============================ Voice ("Hey Strata", the mic by the composer) ============================ -->
+<div popover id="voice-pop" class="ctx-pop voice-pop" role="dialog" aria-label="Voice">
+  <div class="ctx-pop__head"><span class="ctx-pop__title">Voice</span>
+    <label class="voice-switch"><input type="checkbox" id="voice-on"> <span id="voice-on-label">&ldquo;Hey Strata&rdquo;</span></label></div>
+  <form class="voice-phrase" id="voice-phrase-form" autocomplete="off">
+    <label for="voice-phrase">Wake phrase</label>
+    <input class="st-input" id="voice-phrase" maxlength="40" placeholder="hey strata" aria-describedby="voice-phrase-hint">
+    <button class="st-btn st-btn--secondary" type="submit">Save</button>
+    <span class="muted small" id="voice-phrase-hint">1-4 words; the last one wakes it, as the first or second word you say</span>
+  </form>
+  <div class="ctx-pop__note" id="voice-state">Say &ldquo;Hey Strata&rdquo; and your question; the answer is read aloud.
+    Apple&rsquo;s on-device dictation hears it (no Apple Intelligence needed); this model answers.</div>
+  <button type="button" class="st-btn st-btn--secondary" id="voice-allow">Allow microphone &amp; speech</button>
+  <ol class="voice-log" id="voice-log"></ol>
 </div>
 
 <!-- ============================ Chat history (kept in this browser) ============================ -->
