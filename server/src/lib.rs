@@ -16,6 +16,7 @@ pub mod pyjson;
 pub mod responses;
 pub mod run;
 pub mod runconfig;
+pub mod schedules;
 pub mod service;
 pub mod structured;
 pub mod sync;

@@ -1935,3 +1935,109 @@ if (window.ipc && window.ipc.postMessage) {
   $("web-btn").onclick = () => window.ipc.postMessage(JSON.stringify({cmd: "web"}));
 }
 window.strataWeb = (open) => $("web-btn").setAttribute("aria-pressed", open ? "true" : "false");
+
+// ------------------------------------------------------------------ scheduled prompts (GET / POST / DELETE schedules)
+let schedTimer = null, schedData = {schedules: []};
+const schedWhen = {daily: ["time"], weekdays: ["time"], weekly: ["dow", "time"], monthly: ["dom", "time"], hourly: ["min"],
+                   minutes: ["every"], once: ["at"], cron: ["cron"]};
+function schedShowWhen() {
+  const k = $("sf-kind").value;
+  for (const l of document.querySelectorAll(".sched-when label")) l.hidden = !l.dataset.for.split(" ").includes(k);
+}
+$("sf-kind").onchange = schedShowWhen;
+function openSched(open) {
+  $("sched").dataset.open = String(open);
+  $("sched").setAttribute("aria-hidden", String(!open));
+  $("scrim").hidden = !open;
+  clearTimeout(schedTimer);
+  if (open) loadSched();
+}
+const when = (t) => t ? new Date(t * 1000).toLocaleString([], {weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}) : "";
+async function loadSched() {
+  try { schedData = await (await fetch("schedules", {headers: headers(), cache: "no-store"})).json(); } catch (e) { return; }
+  const l = schedData.schedules || [];
+  $("sched-btn").setAttribute("aria-pressed", l.some((s) => s.enabled) ? "true" : "false");
+  $("sched-list").innerHTML = l.length ? l.map((s) => {
+    const last = (s.history || [])[0];
+    const state = s.running ? "running now\u2026" : s.enabled ? `next: ${when(s.next_run)}` : "paused";
+    return `<div class="sched-item${s.enabled ? "" : " off"}"><div class="sched-item__head"><strong>${esc(s.name)}</strong>` +
+      `<span class="muted small">${esc(s.when_text)}</span></div><span class="muted small">${esc(state)}${s.tools ? " \u00b7 may use tools" : ""}</span>` +
+      (last ? `<div class="muted small">last run ${when(last.at)} \u00b7 ${last.secs} s${last.ok ? "" : " \u00b7 failed"}</div>` +
+              `<div class="sched-run${last.ok ? "" : " err"}">${esc(last.text)}</div>` : "") +
+      `<div class="sched-item__acts"><button class="st-btn st-btn--secondary" data-sr="${esc(s.id)}"${s.running ? " disabled" : ""}>Run now</button>` +
+      `<button class="st-btn st-btn--secondary" data-st="${esc(s.id)}">${s.enabled ? "Pause" : "Resume"}</button>` +
+      `<button class="st-btn st-btn--secondary" data-se="${esc(s.id)}">Edit</button>` +
+      (last && last.ok ? `<button class="st-btn st-btn--secondary" data-so="${esc(s.id)}">Open in chat</button>` : "") +
+      `<button class="st-btn st-btn--secondary" data-sd="${esc(s.id)}">Delete</button></div></div>`;
+  }).join("") : `<div class="muted">Nothing scheduled yet. New: a prompt that runs at set times, like "every weekday at 8:00: my reminders and the weather".</div>`;
+  if ($("sched").dataset.open === "true") schedTimer = setTimeout(loadSched, l.some((s) => s.running) ? 2000 : 15000);
+}
+async function schedPost(method, path, body) {
+  const r = await fetch(path, {method, headers: headers(body !== undefined), body: body !== undefined ? JSON.stringify(body) : undefined});
+  let j = {}; try { j = await r.json(); } catch (e) { /* none */ }
+  if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  return j;
+}
+function schedEdit(s) {
+  $("sched-form").hidden = false;
+  $("sf-id").value = s ? s.id : "";
+  $("sf-name").value = s ? s.name : "";
+  $("sf-prompt").value = s ? s.prompt : "";
+  $("sf-tools").checked = s ? !!s.tools : true;
+  const w = (s && s.when) || {kind: "daily", time: "08:00"};
+  $("sf-kind").value = w.kind;
+  if (w.time) $("sf-time").value = w.time;
+  if (w.day != null) { $("sf-dow").value = String(w.day); $("sf-dom").value = w.day; }
+  if (w.minute != null) $("sf-min").value = w.minute;
+  if (w.every != null) $("sf-every").value = w.every;
+  if (w.at) $("sf-at").value = w.at.replace(" ", "T");
+  if (w.cron) $("sf-cron").value = w.cron;
+  schedShowWhen();
+  $("sf-name").focus();
+}
+$("sched-btn").onclick = () => openSched(true);
+$("sched-close").onclick = () => openSched(false);
+$("sched-new").onclick = () => schedEdit(null);
+$("sf-cancel").onclick = () => { $("sched-form").hidden = true; };
+$("sched-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const k = $("sf-kind").value, w = {kind: k};
+  if (schedWhen[k].includes("time")) w.time = $("sf-time").value;
+  if (k === "weekly") w.day = +$("sf-dow").value;
+  if (k === "monthly") w.day = +$("sf-dom").value;
+  if (k === "hourly") w.minute = +$("sf-min").value;
+  if (k === "minutes") w.every = +$("sf-every").value;
+  if (k === "once") w.at = $("sf-at").value.replace("T", " ");
+  if (k === "cron") w.cron = $("sf-cron").value.trim();
+  try {
+    const old = (schedData.schedules || []).find((x) => x.id === $("sf-id").value);
+    await schedPost("POST", "schedules", {id: $("sf-id").value || undefined, name: $("sf-name").value, prompt: $("sf-prompt").value,
+                                          when: w, tools: $("sf-tools").checked, enabled: old ? old.enabled : true});
+    $("sched-form").hidden = true;
+    loadSched();
+  } catch (err) { toast("error", "Not saved", err.message, 6000); }
+};
+$("sched-list").onclick = async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  const s = (schedData.schedules || []).find((x) => x.id === (b.dataset.sr || b.dataset.st || b.dataset.se || b.dataset.so || b.dataset.sd));
+  if (!s) return;
+  try {
+    if (b.dataset.sr) { await schedPost("POST", "schedules", {run: s.id}); toast("info", "Running", s.name); }
+    if (b.dataset.st) await schedPost("POST", "schedules", {...s, enabled: !s.enabled});
+    if (b.dataset.se) return schedEdit(s);
+    if (b.dataset.sd && confirm(`Delete "${s.name}"?`)) await schedPost("DELETE", `schedules/${encodeURIComponent(s.id)}`);
+    if (b.dataset.so) {
+      // the prompt and its last answer, as a new chat to go on with
+      const last = s.history[0];
+      if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+      saveChat();
+      openChat(newChatId(), [{role: "user", text: s.prompt, time: last.at * 1000}, {role: "assistant", text: last.text, time: last.at * 1000}]);
+      openSched(false);
+      saveChat();
+      return;
+    }
+  } catch (err) { toast("error", s.name, err.message, 6000); }
+  loadSched();
+};
+$("scrim").addEventListener("click", () => { if ($("sched").dataset.open === "true") openSched(false); });
+loadSched();

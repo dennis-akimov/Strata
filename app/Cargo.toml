@@ -12,3 +12,7 @@ tao = "0.37.2"
 tray-icon = "0.26.1"
 ureq = "3.5.0"
 wry = "0.57.1"
+
+[dev-dependencies]
+# the page scripts' tests drive headless Chrome over the DevTools protocol (a websocket); skipped without Chrome
+tungstenite = "0.24"

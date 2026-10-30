@@ -225,6 +225,15 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   these tools (app/src/browser_mcp.rs: MCP on 127.0.0.1 with a key made at each start) and hands them to the server it
   starts as the MCP server `browser` (not saved; only there while the app runs). Tried on the M1 with LFM2.5-24B:
   opened example.com, read it, clicked "Learn more", read IANA's page.
+- **Scheduled prompts:** the calendar button by the chat's message box. A prompt that runs at
+  set times: once, every N minutes (5 or more), hourly, daily, weekdays, weekly, monthly, or a cron expression
+  (`minute hour day-of-month month day-of-week`, with `*`, lists, ranges, `*/N`, names; both day fields set: either
+  matches, as POSIX says). Each run asks this server's chat (with the tools, when allowed: "every weekday at 8:00, my
+  open reminders and the weather in Paris"); its answer comes as a macOS notification and is kept (the last 10), with
+  Run now, Pause, Edit, **Open in chat** (go on from it) and Delete. They run in the server, whatever started it; a run
+  missed while it was off or the Mac asleep runs once when it is back. Kept in `.strata-schedules.json` (git ignores
+  it); `GET /schedules`, `POST /schedules` (`{"run": id}` runs one now), `DELETE /schedules/<id>`. For a job outside
+  Strata, macOS's own scheduler is launchd (`~/Library/LaunchAgents`, `StartCalendarInterval`).
 - **`.env` (optional, a convenience):** `cp .env.example .env; chmod 600 .env`. `API_KEY=` is one more key the
   server accepts for `/v1` and the chat page, next to the run config's `"api_key"`, `--api-key` and
   `STRATA_API_KEY` (none of them is replaced; Strata.app and the TUI send it when their config has none; it is never

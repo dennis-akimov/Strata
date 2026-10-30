@@ -73,3 +73,7 @@ server/tests
 server/tests/golden
 tui/target
 .env
+
+# per-machine state: scheduled prompts, voice settings
+.strata-*.json
+.strata-*.json.tmp

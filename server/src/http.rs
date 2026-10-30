@@ -525,6 +525,12 @@ fn get_(c: &mut Ctx) {
         }
         return;
     }
+    if path == "/schedules" {
+        if c.authorized() {
+            c.json(200, crate::schedules::list());
+        }
+        return;
+    }
     if path == "/voice" {
         if c.authorized() {
             c.json(200, crate::voice::status_for(c.query_param("page").is_some_and(|v| v == "1")));
@@ -731,6 +737,9 @@ fn delete(c: &mut Ctx) {
         let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy().into_owned();
         return mcp_delete(c, &name);
     }
+    if let Some(id) = path.strip_prefix("/schedules/") {
+        return if crate::schedules::delete(id) { c.json(200, crate::schedules::list()) } else { c.json(404, json!({"error": {"message": "no such schedule"}})) };
+    }
     if path.starts_with("/v1/videos/") && path.matches('/').count() == 3 {
         if let Some(v) = c.svc().video.clone() {
             let jid = path.rsplit('/').next().unwrap_or("").to_string();
@@ -761,6 +770,7 @@ fn post(c: &mut Ctx) {
         "/config" => return config_post(c),
         "/mcp/servers" => return mcp_put(c),
         "/mcp/reminders" => return reminders_post(c),
+        "/schedules" => return schedules_post(c),
         "/voice" => return voice_post(c),
         _ => {}
     }
@@ -1612,6 +1622,27 @@ fn voice_post(c: &mut Ctx) {
     let key = c.svc().set.api_key.first().cloned();
     match crate::voice::set(on, port, key.as_deref()) {
         Ok(v) => c.json(200, v),
+        Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
+    }
+}
+
+/// POST /schedules: a new scheduled prompt or a change to one; POST /schedules {"run": id}: run it now (in the
+/// background: the page watches GET /schedules).
+fn schedules_post(c: &mut Ctx) {
+    if !c.own_page("scheduled prompts can be changed") {
+        return;
+    }
+    let req: Value = c.body().ok().and_then(|b| serde_json::from_slice(if b.is_empty() { b"{}" } else { &b }).ok()).unwrap_or(Value::Null);
+    if let Some(id) = get(&req, "run").as_str() {
+        let (id, port) = (id.to_string(), c.header("host").and_then(|h| h.rsplit_once(':').and_then(|(_, p)| p.parse().ok())).unwrap_or(8090));
+        let key = c.svc().set.api_key.first().cloned();
+        std::thread::spawn(move || {
+            let _ = crate::schedules::run(&id, port, key.as_deref());
+        });
+        return c.json(200, crate::schedules::list());
+    }
+    match crate::schedules::put(&req) {
+        Ok(_) => c.json(200, crate::schedules::list()),
         Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
     }
 }

@@ -1,7 +1,7 @@
 //! The model's browser: Strata.app serves browser tools as an MCP server (Streamable HTTP, plain JSON replies) on
 //! 127.0.0.1 with a key made at each start, and hands both to the server it starts (STRATA_BROWSER_MCP_URL / _KEY:
 //! the server adds "browser", read-only, never saved).  The tools drive the browser pane people see (the bar's Web
-//! button): the model's browsing happens in front of them, Osaurus's way, with their say: typing waits for Allow in
+//! button): the model's browsing happens in front of them, with their say: typing waits for Allow in
 //! the browser's strip, password fields are refused, and Stop there ends the model's browsing until they let it again.
 //!
 //! Each call is a Job for the app's event loop (it owns the web view); the loop answers on the job's channel.
@@ -73,10 +73,18 @@ pub fn read_js(part: i64) -> String {
     if (e.tagName === 'A' && e.href) hrefs.push(e.href);
     items.push(`[${{items.length + 1}}] ${{kind}} "${{name}}"` + (e.tagName === 'A' && e.href ? ' -> ' + e.href.replace(/^https?:\/\//, '').slice(0, 80) : ''));
   }}
-  // every link on the page (for browser_open's check: an address must come from a page read), and today's date
-  document.querySelectorAll('a[href]').forEach((a) => {{ if (hrefs.length < 400 && a.href.startsWith('http')) hrefs.push(a.href); }});
+  // every link on the page, and the sites the text names ("www.bbc.com › weather": how Google's plain results show
+  // them), for browser_open's check: its site must be one a page read showed.  Google's links are redirects
+  // (/url?q=<the address>, or an opaque token): the address, when there is one, too.
+  document.querySelectorAll('a[href]').forEach((a) => {{
+    if (hrefs.length >= 400 || !a.href.startsWith('http')) return;
+    hrefs.push(a.href);
+    try {{ const u = new URL(a.href), q = u.searchParams.get('q') || u.searchParams.get('url');
+      if (u.pathname === '/url' && q && /^https?:/.test(q)) hrefs.push(q); }} catch (e) {{}}
+  }});
+  const sites = [...new Set((text.match(/\b(?:[a-z0-9-]+\.)+(?:com|org|net|gov|edu|int|info|io|co|ai|app|dev|news|tv|me|us|uk|ca|au|de|fr|es|it|nl|eu|jp|ru|ch|be|at|se|no|dk|fi|pl|pt|ie|in|br|mx|nz)\b/gi) || []).map((h) => h.toLowerCase()))].slice(0, 200);
   const d = new Date(), today = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-  return JSON.stringify({{title: document.title, url: location.href, text: text.slice((p - 1) * PART, p * PART), part: p, parts, elements: items, hrefs, today}});
+  return JSON.stringify({{title: document.title, url: location.href, text: text.slice((p - 1) * PART, p * PART), part: p, parts, elements: items, hrefs, sites, today}});
 }})({part}, {PART})"#)
 }
 
@@ -239,5 +247,173 @@ mod tests {
         assert!(page_text(&v).contains("[part 1 of 3: browser_read with part 2 for more]"));
         assert!(read_js(2).ends_with("})(2, 3500)"));
         assert!(type_js(3, "a\"b", true).contains(r#""a\"b""#));
+    }
+}
+
+/// The page scripts in a real browser: headless Chrome (the same JavaScript engine family the web view runs is not
+/// needed: these scripts use only DOM APIs both have), driven over the DevTools protocol.  Skipped when there is no
+/// Chrome (CHROME=<path> to name one).
+#[cfg(test)]
+mod in_a_browser {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+
+    struct Browser {
+        child: Child,
+        ws: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+        id: u64,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Browser {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Browser {
+        fn start() -> Option<Browser> {
+            let exe = std::env::var("CHROME").unwrap_or_else(|_| "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
+            if !std::path::Path::new(&exe).exists() {
+                eprintln!("no Chrome at {exe}: the page scripts' browser tests are skipped");
+                return None;
+            }
+            let dir = std::env::temp_dir().join(format!("strata-js-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::create_dir_all(&dir).ok()?;
+            let child = Command::new(&exe).args(["--headless=new", "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check"])
+                .arg(format!("--user-data-dir={}", dir.display())).arg("about:blank").stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()?;
+            // Chrome says its port in DevToolsActivePort
+            let mut port = None;
+            for _ in 0..100 {
+                if let Some(p) = std::fs::read_to_string(dir.join("DevToolsActivePort")).ok().and_then(|t| t.lines().next()?.parse::<u16>().ok()) {
+                    port = Some(p);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let port = port?;
+            let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+            write!(s, "PUT /json/new?about:blank HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").ok()?;
+            let mut out = String::new();
+            s.read_to_string(&mut out).ok()?;
+            let v: Value = serde_json::from_str(out.split_once("\r\n\r\n")?.1).ok()?;
+            let (ws, _) = tungstenite::connect(v["webSocketDebuggerUrl"].as_str()?).ok()?;
+            Some(Browser { child, ws, id: 0, dir })
+        }
+
+        fn cdp(&mut self, method: &str, params: Value) -> Value {
+            self.id += 1;
+            self.ws.send(tungstenite::Message::Text(json!({"id": self.id, "method": method, "params": params}).to_string().into())).unwrap();
+            loop {
+                if let Ok(tungstenite::Message::Text(t)) = self.ws.read() {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if v["id"] == self.id {
+                        return v["result"].clone();
+                    }
+                }
+            }
+        }
+
+        /// A page from this HTML (a data: URL), loaded.
+        fn page(&mut self, html: &str) {
+            let url = format!("data:text/html;charset=utf-8,{}", html.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>());
+            self.cdp("Page.navigate", json!({"url": url}));
+            for _ in 0..50 {
+                if self.eval("document.readyState") == "complete" {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn eval(&mut self, js: &str) -> Value {
+            self.cdp("Runtime.evaluate", json!({"expression": js, "returnByValue": true}))["result"]["value"].clone()
+        }
+
+        /// A page script's JSON string, parsed (as the app's js_value does).
+        fn json(&mut self, js: &str) -> Value {
+            serde_json::from_str(self.eval(js).as_str().unwrap_or("null")).unwrap_or(Value::Null)
+        }
+    }
+
+    const RESULTS: &str = r#"<html><head><title>paris weather - Google Search</title></head><body>
+<div><a href="/search?q=paris+weather&tbm=nws">News</a> <a href="/search?q=paris+weather&tbm=isch">Images</a></div>
+<div id="main">
+<div>Paris, France / Weather 51°F Clear</div>
+<div><a href="/url?q=CAESXgHrOzAVqG3cU4ZYSa1NAsS98&sa=U">Paris - BBC Weather</a><div>www.bbc.com › weather</div><div>Today, light rain.</div></div>
+<div><a href="/url?q=https://www.theweathernetwork.com/en/city/fr/paris&sa=U">Paris 7 Days Weather</a><div>www.theweathernetwork.com › city</div></div>
+<input name="q" value="paris weather">
+</div></body></html>"#;
+
+    const ARTICLE: &str = r#"<html><head><title>Rayleigh scattering</title></head><body>
+<header><a href="/">Home</a><a href="/login">Log in</a></header><nav><a href="/menu">Menu item</a> navigation words</nav>
+<main><h1>Rayleigh scattering</h1><p>The sky is blue because short wavelengths scatter more.</p>
+<p>PARTSTART %LONG% PARTEND</p><a href="https://en.wikipedia.org/wiki/Light">Light</a><button>Show more</button></main>
+<aside>Sidebar words</aside><footer>Footer words <a href="/privacy">Privacy</a></footer></body></html>"#;
+
+    const FORM: &str = r#"<html><body><main><form id="f" onsubmit="window.sent = (window.sent || 0) + 1; return false;">
+<label for="u">Email</label><input id="u" name="email"><input type="password" name="pw" aria-label="Password">
+<textarea name="note" placeholder="Note"></textarea><button type="button" onclick="window.clicked = 'yes'">Go</button>
+</form></main><script>document.getElementById('u').addEventListener('input', () => window.inputs = (window.inputs || 0) + 1)</script></body></html>"#;
+
+    #[test]
+    fn page_scripts_read_click_and_type_in_a_browser() {
+        let Some(mut b) = Browser::start() else { return };
+
+        // Google's plain results: redirect links unwrapped when they hold the address, the sites the text names
+        b.page(RESULTS);
+        let v = b.json(&read_js(1));
+        let hrefs: Vec<String> = v["hrefs"].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect();
+        assert!(hrefs.iter().any(|h| h == "https://www.theweathernetwork.com/en/city/fr/paris"), "{hrefs:?}");
+        let sites: Vec<&str> = v["sites"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(sites.contains(&"www.bbc.com") && sites.contains(&"www.theweathernetwork.com"), "{sites:?}");
+        assert!(v["text"].as_str().unwrap().contains("51°F Clear"));
+        assert!(v["elements"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("field text \"paris weather\"")));
+        assert!(v["today"].as_str().unwrap().len() == 10);
+        assert!(page_text(&v).contains("Elements:"));
+
+        // an article: its main part only (no header, nav, aside, footer), in parts, elements numbered on the page
+        let long = "word ".repeat(1500); // 7,500 characters: 3 parts
+        b.page(&ARTICLE.replace("%LONG%", &long));
+        let v = b.json(&read_js(1));
+        let t = v["text"].as_str().unwrap();
+        assert!(t.starts_with("Rayleigh scattering") && t.contains("short wavelengths"), "{t:.120}");
+        for gone in ["navigation words", "Sidebar words", "Footer words", "Log in"] {
+            assert!(!t.contains(gone), "{gone} in the text");
+        }
+        assert_eq!((v["part"].as_i64(), v["parts"].as_i64()), (Some(1), Some(3)));
+        let names: Vec<&str> = v["elements"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(names, ["[1] link \"Light\" -> en.wikipedia.org/wiki/Light", "[2] button \"Show more\""]);
+        assert_eq!(b.eval("document.querySelectorAll('[data-strata-id]').length"), json!(2));
+        let v3 = b.json(&read_js(3));
+        assert!(v3["text"].as_str().unwrap().contains("PARTEND") && v3["part"] == 3);
+        assert!(b.json(&read_js(9))["part"] == 3, "a part past the end reads the last");
+        let c = b.json(&click_js(2));
+        assert_eq!(c["clicked"], "Show more");
+        assert!(b.json(&click_js(7))["error"].as_str().unwrap().contains("no element [7]"));
+
+        // a form: what a field is (for the Allow), a password refused, typing fires input, submit sends the form
+        b.page(FORM);
+        b.json(&read_js(1));
+        let field = |b: &mut Browser, name: &str| -> i64 {
+            b.json(&read_js(1))["elements"].as_array().unwrap().iter().filter_map(Value::as_str)
+                .find(|e| e.contains(name)).and_then(|e| e[1..e.find(']').unwrap()].parse().ok()).unwrap()
+        };
+        let email = field(&mut b, "field text");
+        let pw = field(&mut b, "field password");
+        let d = b.json(&describe_js(email));
+        assert_eq!((d["password"].clone(), d["field"].clone()), (json!(false), json!("Email")));
+        assert_eq!(b.json(&describe_js(pw))["password"], true);
+        assert!(b.json(&type_js(pw, "secret", false))["error"].as_str().unwrap().contains("password"));
+        assert_eq!(b.eval("document.querySelector('[name=pw]').value"), json!(""));
+        assert_eq!(b.json(&type_js(email, "a\"b@example.com", true))["typed"], true);
+        assert_eq!(b.eval("document.getElementById('u').value"), json!("a\"b@example.com"));
+        assert_eq!(b.eval("window.inputs"), json!(1));
+        assert_eq!(b.eval("window.sent"), json!(1));
+        let go = field(&mut b, "button \"Go\"");
+        b.json(&click_js(go));
+        assert_eq!(b.eval("window.clicked"), json!("yes"));
     }
 }

@@ -910,14 +910,32 @@ fn link_key(u: &str) -> String {
     u.split('#').next().unwrap_or(u).trim_end_matches('/').to_lowercase()
 }
 
+/// The site of an address (its host without "www."): what browser_open's check compares.
+fn site_of(u: &str) -> String {
+    link_key(u).split('/').next().unwrap_or("").split(':').next().unwrap_or("").to_string()
+}
+
+/// After a search, an address opens when its site was among the links or the site names of the pages the model read
+/// (a page on bbc.com once bbc.com showed up; Google hides most result addresses behind redirects, so the exact page
+/// cannot be required: the model knew bbc.com/weather/2988507, Paris's, and was refused).
 fn link_seen(seen: &std::collections::HashSet<String>, url: &str) -> bool {
-    seen.contains(&link_key(url))
+    if seen.contains(&link_key(url)) {
+        return true;
+    }
+    // the site, or a site it belongs to (weather.bbc.com once bbc.com showed up), down to two labels
+    let site = site_of(url);
+    let labels: Vec<&str> = site.split('.').collect();
+    (0..labels.len().saturating_sub(1)).any(|i| seen.contains(&format!("site:{}", labels[i..].join("."))))
 }
 
 fn remember_links(seen: &Mutex<std::collections::HashSet<String>>, v: &Value) {
     let mut s = seen.lock().unwrap();
     for h in v["hrefs"].as_array().into_iter().flatten().filter_map(Value::as_str) {
         s.insert(link_key(h));
+        s.insert(format!("site:{}", site_of(h)));
+    }
+    for h in v["sites"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        s.insert(format!("site:{}", site_of(h)));
     }
 }
 
@@ -1479,7 +1497,8 @@ fn main() {
                     "browser_open" => {
                         let url = web_url(job.args["url"].as_str().unwrap_or(""));
                         if searched.get().is_some_and(|t| t.elapsed() < Duration::from_secs(600)) && !link_seen(&seen_links.lock().unwrap(), &url) {
-                            let _ = job.reply.send(Err(format!("not opened: {url} was in none of the results or pages you read (guessed addresses are usually 404s). Use browser_click with a result's number, or browser_search again.")));
+                            // said as a result, not an error: the browser held a guess back on purpose (the chat showed red errors)
+                            let _ = job.reply.send(Ok(format!("not opened: {} is a site none of the results or pages you read showed (guessed addresses are usually 404s). Use browser_click with a result's number, or browser_search again.", site_of(&url))));
                         } else {
                             let _ = web.load_url(&url);
                             wait_load(job.reply, 20);
@@ -1701,13 +1720,33 @@ mod tests {
     }
 
     #[test]
+    fn addresses_compare_without_their_dressing() {
+        for (a, b) in [("https://www.example.com/a/", "http://example.com/a"), ("HTTPS://Example.com/A#top", "example.com/a"),
+                       ("https://example.com/a?x=1", "example.com/a?x=1")] {
+            assert_eq!(link_key(a), link_key(b), "{a} / {b}");
+        }
+        assert_ne!(link_key("https://example.com/a?x=1"), link_key("https://example.com/a?x=2")); // a query is the page
+        assert_eq!(site_of("example.com"), "example.com");
+        assert_eq!(site_of("https://www.sub.example.co.uk/p?q#h"), "sub.example.co.uk");
+        assert_eq!(site_of(""), "");
+    }
+
+    #[test]
     fn after_a_search_only_seen_addresses_open() {
         let seen: Mutex<std::collections::HashSet<String>> = Default::default();
-        remember_links(&seen, &json!({"hrefs": ["https://www.bbc.com/weather/2988507", "https://en.wikipedia.org/wiki/Paris#Climate"]}));
+        // what Google's plain results page gives: redirect links, and the sites in the text
+        remember_links(&seen, &json!({"hrefs": ["https://www.google.com/url?q=CAESXgHrOzAV", "https://en.wikipedia.org/wiki/Paris#Climate"],
+                                      "sites": ["www.bbc.com", "theweathernetwork.com"]}));
         let s = seen.lock().unwrap();
-        assert!(link_seen(&s, "http://bbc.com/weather/2988507/"));          // scheme, www., a last slash: the same
+        assert!(link_seen(&s, "https://www.bbc.com/weather/2988507"));     // its site showed: opened (was refused)
+        assert!(link_seen(&s, "http://theweathernetwork.com/en/city/fr/paris"));
         assert!(link_seen(&s, "https://en.wikipedia.org/wiki/Paris"));     // an anchor: the same page
-        assert!(!link_seen(&s, "https://www.bbc.com/weather/today"));      // a guess
+        assert!(!link_seen(&s, "https://www.weatherbug.com/weather-forecast/paris")); // a site no page showed
+        assert!(!link_seen(&s, "https://www.espn.com/racing/results"));
+        assert_eq!(site_of("https://www.BBC.com:443/x"), "bbc.com");
+        assert!(link_seen(&s, "https://weather.bbc.com/paris"));           // a part of a site that showed
+        assert!(!link_seen(&s, "https://bbc.co.uk/weather"));              // another site, however alike
+        assert!(!link_seen(&s, "https://com/x"));                          // never a bare top-level domain
     }
 
     #[test]
