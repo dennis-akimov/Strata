@@ -1,5 +1,6 @@
 pub mod api;
 pub mod bias;
+pub mod dotenv;
 pub mod engine;
 pub mod errors;
 pub mod firewall;

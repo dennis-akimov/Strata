@@ -57,6 +57,21 @@ fn save(key: &str, v: Value) -> Result<(), String> {
     std::fs::write(phrase_path(), all.to_string()).map_err(|e| e.to_string())
 }
 
+/// Answers read aloud (on unless turned off): off, questions still go to the chat, and it stays quiet.
+pub fn speaks() -> bool {
+    saved()["speak"] != json!(false)
+}
+
+pub fn set_speak(on: bool) -> Result<(), String> {
+    save("speak", json!(on))?;
+    let mut s = STATE.lock().unwrap();
+    tell(&mut s, json!({"speak": on}));
+    if !on {
+        tell(&mut s, json!({"hush": true}));
+    }
+    Ok(())
+}
+
 pub fn phrase() -> String {
     saved()["phrase"].as_str().map(String::from).filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "hey strata".into())
 }
@@ -108,7 +123,7 @@ pub fn status() -> Value {
     if !on {
         s.child = None;
     }
-    json!({"available": cfg!(target_os = "macos") && exe().is_file(), "on": on, "phrase": phrase(), "heard": s.heard, "events": s.events})
+    json!({"available": cfg!(target_os = "macos") && exe().is_file(), "on": on, "phrase": phrase(), "speak": speaks(), "heard": s.heard, "events": s.events})
 }
 
 /// POST /voice {"on": true|false}: start or stop listening; the helper asks this server (127.0.0.1:`port`).
@@ -125,7 +140,11 @@ pub fn set(on: bool, port: u16, key: Option<&str>) -> Result<Value, String> {
             return Err("engine-metal/strata-voice is missing: make build compiles it on macOS 26 or later".into());
         }
         let mut cmd = Command::new(exe());
-        cmd.args(["--port", &port.to_string(), "--phrase", &phrase(), "--stdin-exit", "--verbose"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.args(["--port", &port.to_string(), "--phrase", &phrase(), "--stdin-exit", "--verbose"]);
+        if !speaks() {
+            cmd.arg("--no-speak");
+        }
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         if let Some(k) = key {
             cmd.env("STRATA_API_KEY", k); // not on the command line, where ps shows it
         }
@@ -191,7 +210,7 @@ pub fn speak(text: &str, hush: bool) -> Value {
     let mut s = STATE.lock().unwrap();
     if hush {
         tell(&mut s, json!({"hush": true}));
-    } else {
+    } else if speaks() {
         tell(&mut s, json!({"say": text}));
         push(&mut s, json!({"event": "answer", "text": text, "by": "page"}));
     }

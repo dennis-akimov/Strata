@@ -380,7 +380,13 @@ fn main() {
     } else {
         Arc::new(ByteTokenizer)
     };
-    let hub = match mcp::hub_from_config(&cfgv, a.mcp_config.as_deref()) {
+    // the Strata folder's .env: one more API key and MCP servers, on top of the config (crate::dotenv)
+    let dotenv = strata_server::dotenv::load(&root());
+    let env_mcp = strata_server::dotenv::mcp_servers(&dotenv);
+    if !env_mcp.is_empty() {
+        say(&format!("MCP servers from .env: {}", env_mcp.keys().cloned().collect::<Vec<_>>().join(", ")));
+    }
+    let hub = match mcp::hub_from_config(&cfgv, a.mcp_config.as_deref(), &env_mcp) {
         Ok(Some(h)) => h,
         Ok(None) => mcp::McpHub::new(Default::default(), mcp::settings_from(&cfgv).unwrap_or_else(|e| exit_msg(&e)), &[]),
         Err(e) => exit_msg(&e),
@@ -502,7 +508,16 @@ fn main() {
     }
     let key_src = a.api_key.clone().filter(|k| !k.is_empty()).or(env_key).map(Value::from).unwrap_or_else(|| get(&cfgv, "api_key").clone());
     match net::api_key_of(&key_src) {
-        Ok(k) => set.api_key = net::key_list(&k),
+        Ok(k) => {
+            set.api_key = net::key_list(&k);
+            // .env's API_KEY: accepted too, next to the config's / the command line's (never in their place)
+            if let Some(ek) = strata_server::dotenv::get(&dotenv, "API_KEY").map(|k| py::strip(k).to_string()).filter(|k| !k.is_empty()) {
+                if !set.api_key.contains(&ek) {
+                    set.api_key.push(ek);
+                    say("API key: .env's API_KEY is accepted too");
+                }
+            }
+        }
         Err(e) => {
             eprintln!("[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / \"api_key\" out");
             std::process::exit(2);
@@ -633,7 +648,11 @@ fn main() {
     let gguf = args[..args.len().saturating_sub(1)].iter().position(|x| x == "--gguf").map(|i| Path::new(&args[i + 1]).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
     println!("       model: {}{}", svc.model, if gguf.is_empty() { String::new() } else { format!("  ({gguf})") });
     if !svc.set.api_key.is_empty() {
-        println!("       API key: {}", svc.set.api_key.join(", "));
+        // .env's key is not printed (the log is no place for it): only that it is accepted
+        let from_env = strata_server::dotenv::get(&dotenv, "API_KEY").map(|k| py::strip(k).to_string());
+        let shown: Vec<&str> = svc.set.api_key.iter().map(String::as_str).filter(|k| Some(*k) != from_env.as_deref()).collect();
+        let env_note = if from_env.as_deref().is_some_and(|k| svc.set.api_key.iter().any(|x| x == k)) { ".env's API_KEY" } else { "" };
+        println!("       API key: {}", shown.into_iter().chain((!env_note.is_empty()).then_some(env_note)).collect::<Vec<_>>().join(", "));
     }
     println!("       open http://{here}:{}/ in a browser to chat; close this window to stop the model", a.port);
     if !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {

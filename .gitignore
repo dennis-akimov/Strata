@@ -72,3 +72,4 @@ server/tests
 /Strata.app
 server/tests/golden
 tui/target
+.env

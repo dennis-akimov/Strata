@@ -1581,6 +1581,12 @@ fn voice_post(c: &mut Ctx) {
     if let Some(t) = get(&req, "say").as_str() {
         return c.json(200, crate::voice::speak(t, false));
     }
+    if let Some(on) = get(&req, "speak").as_bool() {
+        if let Err(e) = crate::voice::set_speak(on) {
+            return c.json(500, json!({"error": {"type": "server_error", "message": e}}));
+        }
+        return c.json(200, crate::voice::status());
+    }
     if get(&req, "hush") == &json!(true) {
         return c.json(200, crate::voice::speak("", true));
     }
@@ -1616,7 +1622,7 @@ fn mcp_put(c: &mut Ctx) {
     let old = get(&req, "name").as_str().and_then(|n| hub.servers.lock().unwrap().get(n).cloned());
     if let Some(o) = &old {
         if !o.editable {
-            return c.json(409, json!({"error": {"type": "invalid_request_error", "message": format!("{} comes from the config file or --mcp-config, not from this page: change it there", py::py_repr(&json!(o.name)))}}));
+            return c.json(409, json!({"error": {"type": "invalid_request_error", "message": format!("{} comes from the config file, --mcp-config or .env, not from this page: change it there", py::py_repr(&json!(o.name)))}}));
         }
     }
     let (name, entry) = match crate::mcp::page_entry(&req, old.as_ref().map(|o| &o.cfg)) {
@@ -1643,7 +1649,7 @@ fn mcp_delete(c: &mut Ctx, name: &str) {
     let s = svc.mcp.as_ref().and_then(|h| h.servers.lock().unwrap().get(name).cloned());
     match s {
         None => return c.json(404, json!({"error": {"type": "invalid_request_error", "message": format!("no MCP server {}", py::py_repr(&json!(name)))}})),
-        Some(s) if !s.editable => return c.json(409, json!({"error": {"type": "invalid_request_error", "message": format!("{} comes from the config file or --mcp-config, not from this page", py::py_repr(&json!(name)))}})),
+        Some(s) if !s.editable => return c.json(409, json!({"error": {"type": "invalid_request_error", "message": format!("{} comes from the config file, --mcp-config or .env, not from this page", py::py_repr(&json!(name)))}})),
         _ => {}
     }
     let saved = match mcp_save(&svc, name, None) {

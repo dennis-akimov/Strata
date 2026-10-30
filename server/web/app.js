@@ -1853,6 +1853,7 @@ async function loadVoice() {
   $("voice-on-label").textContent = quoted;
   $("voice-btn").title = `Voice: ${quoted}`;
   if (document.activeElement !== $("voice-phrase")) $("voice-phrase").value = ph;
+  $("voice-speak").checked = v.speak !== false;
   const ev = v.events || [], last = ev[ev.length - 1] || {};
   const said = {starting: "Starting\u2026", listening: `Listening for ${quoted}.`, wake: `Heard ${quoted}: go on\u2026`,
                 command: "Asking the model\u2026", answer: `Listening for ${quoted}.`, off: "Off.",
@@ -1877,13 +1878,18 @@ async function voicePost(body) {
   loadVoice();
 }
 $("voice-on").onchange = (e) => voicePost({on: e.target.checked});
+$("voice-speak").onchange = (e) => voicePost({speak: e.target.checked});
 $("voice-phrase-form").onsubmit = (e) => { e.preventDefault(); voicePost({phrase: $("voice-phrase").value}); };
 $("voice-allow").onclick = () => { $("voice-state").textContent = "macOS asks now (its window may be behind this one)\u2026"; voicePost({permissions: true}); };
 $("voice-pop").addEventListener("toggle", (e) => {
   if (e.newState !== "open") return;
-  const b = $("voice-btn").getBoundingClientRect(), p = $("voice-pop");      // above the button, kept on screen
+  // above the button, kept on screen: its bottom is anchored, so it grows upward as its contents load (a top
+  // computed at opening put the later rows below the window); taller than the window, it scrolls
+  const b = $("voice-btn").getBoundingClientRect(), p = $("voice-pop");
   p.style.left = `${Math.max(8, Math.min(innerWidth - p.offsetWidth - 8, b.left))}px`;
-  p.style.top = `${Math.max(8, b.top - p.offsetHeight - 10)}px`;
+  p.style.top = "auto";
+  p.style.bottom = `${Math.max(8, innerHeight - b.top + 10)}px`;
+  p.style.maxHeight = `${Math.max(160, b.top - 18)}px`;
   loadVoice();
 });
 loadVoice();

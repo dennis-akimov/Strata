@@ -931,7 +931,8 @@ pub fn page_entry(req: &Value, old: Option<&Value>) -> Result<(String, Value), S
 }
 
 /// The run config's `"mcp_servers"` (or `"mcpServers"`) plus the --mcp-config file; None when there are none.
-pub fn hub_from_config(cfg: &Value, mcp_config_path: Option<&str>) -> Result<Option<McpHub>, String> {
+/// `extra`: servers from the Strata folder's .env (crate::dotenv): a name the config or --mcp-config has is theirs.
+pub fn hub_from_config(cfg: &Value, mcp_config_path: Option<&str>, extra: &Map<String, Value>) -> Result<Option<McpHub>, String> {
     let mut servers = servers_from(get(cfg, "mcp_servers"), "config mcp_servers")?;
     servers.extend(servers_from(get(cfg, "mcpServers"), "config mcpServers")?);
     if let Some(p) = mcp_config_path {
@@ -940,6 +941,14 @@ pub fn hub_from_config(cfg: &Value, mcp_config_path: Option<&str>) -> Result<Opt
         let block = data.get("mcpServers").or_else(|| data.get("mcp_servers")).cloned();
         let Some(block) = block else { return Err(format!("[strata] --mcp-config {p}: expected {{\"mcpServers\": {{...}}}}")) };
         servers.extend(servers_from(&block, &format!("--mcp-config {p}"))?);
+    }
+    let env = servers_from(&Value::Object(extra.clone()), ".env")?;
+    for (name, entry) in env {
+        if servers.contains_key(&name) {
+            say(&format!("MCP server {name}: the config's is used, not .env's MCP_{}_URL", name.to_uppercase()));
+        } else {
+            servers.insert(name, entry);
+        }
     }
     if servers.is_empty() {
         return Ok(None);

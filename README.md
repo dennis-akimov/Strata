@@ -202,6 +202,12 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   [lightx2v's Lightning LoRAs](https://huggingface.co/lightx2v/Wan2.2-Lightning) (4 steps instead of 18, one pass a step). A 2 s 832x480 video takes about
   7 minutes (49 without the LoRAs) and 30 GB of memory at its peak. Install: `make pull MODEL=WAN2.2` (29 GB, the
   LoRAs included), then [steps](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b).
+- **`.env` (optional, a convenience):** `cp .env.example .env; chmod 600 .env`. `API_KEY=` is one more key the
+  server accepts for `/v1` and the chat page, next to the run config's `"api_key"`, `--api-key` and
+  `STRATA_API_KEY` (none of them is replaced; Strata.app and the TUI send it when their config has none; it is never
+  printed). `MCP_<NAME>_URL=` and `MCP_<NAME>_API_KEY=` add the MCP server `<name>` (`Authorization: Bearer`, or
+  `MCP_<NAME>_HEADER=X-API-Key`); one of the same name in the config, `--mcp-config` or added on the page wins, and
+  `.env`'s are read-only on the page and never written to the config. Read when the server starts.
 - **Voice ("Hey Strata", macOS 26 or later):** the microphone button in the chat's bar. Say the wake phrase and your
   question: with the chat page open, the question goes into the chat as yours and the answer streams there like a
   typed one (the chat keeps both, with its history and settings), then is read aloud in macOS's voice; with no page

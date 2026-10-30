@@ -112,6 +112,9 @@ actor Voice {
     var directive: String?  // strata-server's word on a question: "page" (the open chat sends it) or "self"
 
     func direct(_ d: String) { directive = d }
+    /// answers read aloud (--no-speak, or {"speak": false} from strata-server: the chat shows them, quietly)
+    var speakOn = !CommandLine.arguments.contains("--no-speak")
+    func setSpeak(_ on: Bool) { speakOn = on }
 
     init(port: String, key: String, phrase: String, voice: String) {
         self.port = port; self.key = key; self.phrase = words(phrase); self.voice = voice
@@ -211,6 +214,7 @@ actor Voice {
 
     func say(_ text: String) {
         speaking?.terminate()
+        guard speakOn else { speaking = nil; return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
         p.arguments = (voice.isEmpty ? [] : ["-v", voice]) + [text]
@@ -282,6 +286,7 @@ struct StrataVoice {
                         if let d = v["ask"] as? String { await voice.direct(d) }
                         if let t = v["say"] as? String, !t.isEmpty { await voice.say(plain(t)) }
                         if v["hush"] as? Bool == true { await voice.hush() }
+                        if let on = v["speak"] as? Bool { await voice.setSpeak(on) }
                     }
                 }
                 exit(0)

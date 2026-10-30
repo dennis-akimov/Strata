@@ -589,11 +589,12 @@ struct State {
 impl State {
     fn api_key(&self) -> String {
         let cfg = self.config.as_deref().map(read_config).unwrap_or(json!({}));
-        match &cfg["api_key"] {
+        let k = match &cfg["api_key"] {
             Value::String(s) => s.split(',').next().unwrap_or("").trim().to_string(),
             Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
             _ => String::new(),
-        }
+        };
+        if k.is_empty() { env_api_key(&cfg) } else { k }
     }
 
     fn base(&self) -> String {
@@ -842,6 +843,18 @@ fn phase_color(phase: &str) -> (u8, u8, u8) {
         "unloaded" => (191, 90, 242),
         _ => (142, 142, 147),
     }
+}
+
+/// API_KEY from the Strata folder's .env (the config's "cwd"): the server accepts it too, so this one sends it when
+/// the config has none (server/src/dotenv.rs reads the same file; quotes and an inline " #" comment are dropped).
+fn env_api_key(cfg: &Value) -> String {
+    let Some(dir) = cfg["cwd"].as_str() else { return String::new() };
+    let text = std::fs::read_to_string(Path::new(dir).join(".env")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("export ").unwrap_or(l.trim()).strip_prefix("API_KEY="))
+        .last()
+        .map(|v| v.split(" #").next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .unwrap_or_default()
 }
 
 fn js_call(wv: &WebView, f: &str, v: &Value) {
