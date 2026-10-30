@@ -422,11 +422,16 @@ fn system_state() -> Value {
     let siri = Command::new("/usr/bin/defaults").args(["read", "com.apple.assistant.support", "Assistant Enabled"]).output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1").unwrap_or(false);
     let wired = Command::new("/usr/sbin/sysctl").args(["-n", "iogpu.wired_limit_mb"]).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
-    let daemon_mb = std::fs::read_to_string(GPU_DAEMON).ok().and_then(|t| t.split("iogpu.wired_limit_mb=").nth(1).and_then(|r| r.split('<').next()?.trim().parse::<u64>().ok()));
+    let daemon = std::fs::read_to_string(GPU_DAEMON).ok();
+    let daemon_mb = daemon.as_ref().and_then(|t| t.split("iogpu.wired_limit_mb=").nth(1).and_then(|r| r.split('<').next()?.trim().parse::<u64>().ok()));
+    // a LaunchDaemon from before the kernel's cap was set with it: turned on again, it is rewritten (sound needs it)
+    let daemon_old = daemon.as_ref().is_some_and(|t| !t.contains("vm.global_user_wire_limit"));
+    let wire_cap = Command::new("/usr/sbin/sysctl").args(["-n", "vm.global_user_wire_limit"]).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
     let (_, _, suggest) = gpu_limit(f64::MAX);
     json!({"keep_ai_off": settings["keep_ai_off"] == true, "ai_running": ai, "ai_bytes": ai_b, "siri": siri,
            "keep_still_wallpaper": settings["keep_still_wallpaper"] == true, "aerial_running": aer.len(), "aerial_bytes": aer_b,
-           "gpu_daemon_mb": daemon_mb, "wired_mb": wired, "suggest_mb": suggest, "power": power()})
+           "gpu_daemon_mb": if daemon_old { None } else { daemon_mb }, "gpu_daemon_old_mb": if daemon_old { daemon_mb } else { None },
+           "wire_cap": wire_cap, "wired_mb": wired, "suggest_mb": suggest, "power": power()})
 }
 
 fn still_wallpaper() {
@@ -438,6 +443,24 @@ fn still_wallpaper() {
 
 /// Apply a toggle.  Apple Intelligence's own switch is the user's (System Settings opens at it); Siri's preference
 /// and the on-device model's processes this app handles.  The GPU limit: a LaunchDaemon that sets it at every boot.
+/// The kernel's cap on memory programs may pin (vm.global_user_wire_limit) for a GPU limit of `mb`: the GPU's share
+/// counts against it, and macOS's default (the memory less ~4 GB) is below a raised GPU limit on small Macs: a 16 GB
+/// M1 at 13,312 MB had 13.9 GB pinned against a 13.06 GB cap, and coreaudiod could not pin 80 KB for the speakers
+/// (mlock failed: no sound at all while the model was loaded).  The GPU's limit + 1.5 GB, at most the memory less 2 GiB.
+fn wire_limit_for(mb: u64, memsize: u64) -> u64 {
+    (mb * 1048576 + 1_500_000_000).min(memsize.saturating_sub(2 << 30))
+}
+
+/// The two settings for a GPU limit of `mb`, for one `sysctl` call: the GPU's, and the kernel's cap above it.
+fn wire_settings(mb: u64) -> String {
+    let memsize = Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output().ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
+    let default = memsize.saturating_sub(Command::new("/usr/sbin/sysctl").args(["-n", "vm.global_no_user_wire_amount"]).output().ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0));
+    let wire = wire_limit_for(mb, memsize).max(default);
+    format!("iogpu.wired_limit_mb={mb} vm.global_user_wire_limit={wire}")
+}
+
 fn system_toggle(what: &str, on: bool, mb: u64) -> Result<(), String> {
     let mut set = load_settings();
     match what {
@@ -481,12 +504,15 @@ fn system_toggle(what: &str, on: bool, mb: u64) -> Result<(), String> {
                 let plist = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\"><dict><key>Label</key><string>{GPU_LABEL}</string><key>ProgramArguments</key><array><string>/usr/sbin/sysctl</string>\
-<string>iogpu.wired_limit_mb={mb}</string></array><key>RunAtLoad</key><true/></dict></plist>\n");
+{}</array><key>RunAtLoad</key><true/></dict></plist>\n",
+                    wire_settings(mb).split(' ').map(|a| format!("<string>{a}</string>")).collect::<String>());
                 let tmp = std::env::temp_dir().join("us.tottle.strata.gpu-limit.plist");
                 std::fs::write(&tmp, plist).map_err(|e| e.to_string())?;
                 format!("launchctl bootout system/{GPU_LABEL} 2>/dev/null; install -m 644 -o root -g wheel '{}' {GPU_DAEMON} && launchctl bootstrap system {GPU_DAEMON}", tmp.display())
             } else {
-                format!("launchctl bootout system/{GPU_LABEL} 2>/dev/null; rm -f {GPU_DAEMON}; sysctl iogpu.wired_limit_mb=0")
+                // macOS's defaults: the GPU's own, and the kernel's cap of the memory less its reserve
+                format!("launchctl bootout system/{GPU_LABEL} 2>/dev/null; rm -f {GPU_DAEMON}; sysctl iogpu.wired_limit_mb=0 \
+                         vm.global_user_wire_limit=$(( $(sysctl -n hw.memsize) - $(sysctl -n vm.global_no_user_wire_amount) ))")
             };
             if !admin(&shell) {
                 return Err("not changed (the password dialog was cancelled)".into());
@@ -999,7 +1025,7 @@ fn main() {
                 "memory" => check_memory(&st, &proxy, None),
                 "raise_limit" | "power_high" | "low_power_off" => {
                     let shell = match cmd {
-                        "raise_limit" => format!("sysctl iogpu.wired_limit_mb={}", v["mb"].as_u64().unwrap_or(0)),
+                        "raise_limit" => format!("sysctl {}", wire_settings(v["mb"].as_u64().unwrap_or(0))),
                         "power_high" => "pmset -a powermode 2".to_string(),
                         _ => "pmset -a lowpowermode 0".to_string(),
                     };
@@ -1330,6 +1356,15 @@ mod tests {
         assert_eq!(fit_fix(&opts(json!([{"ctx": 4096, "gpu_fits": true, "gpu_batch": 512}]))), Some((4096, Some(512))));
         assert_eq!(fit_fix(&opts(json!([{"ctx": 8192, "gpu_fits": true, "gpu_batch": 256}]))), Some((8192, Some(256))));
         assert_eq!(fit_fix(&opts(json!([{"ctx": 4096, "gpu_fits": false}]))), None);
+    }
+
+    #[test]
+    fn the_wire_cap_follows_the_gpu_limit() {
+        let gb16 = 17_179_869_184;
+        // the 16 GB M1 at 13,312 MB: 15.03 GB (2 GiB stay unpinned), above macOS's 13.06 GB
+        assert_eq!(wire_limit_for(13312, gb16), gb16 - (2 << 30));
+        // a 64 GB Mac at 48 GB: the GPU's 48 GiB + 1.5 GB
+        assert_eq!(wire_limit_for(49152, 68_719_476_736), 49152 * 1048576 + 1_500_000_000);
     }
 
     #[test]

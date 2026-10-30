@@ -166,7 +166,7 @@ document.addEventListener('click',e=>{const b=e.target.closest('button[data-tip]
 // the System card: macOS's own memory users, kept off by toggles (the app re-applies them while it runs)
 const mb=b=>b>=1e9?(b/1e9).toFixed(1)+' GB':Math.round(b/1e6)+' MB';
 function system(v){
-  const gpuOn=v.gpu_daemon_mb!=null,target=v.gpu_daemon_mb||v.suggest_mb;
+  const gpuOn=v.gpu_daemon_mb!=null,target=v.gpu_daemon_mb||v.gpu_daemon_old_mb||v.suggest_mb;
   const row=(id,on,title,status,note)=>`<label class="sw"><input type="checkbox" data-sys="${id}"${on?' checked':''}><span><b>${title}</b>
     <span class="mute">${status}</span><br><span class="mute">${note}</span></span></label>`;
   const html=`<h3>Free memory for the model</h3>`+
@@ -182,8 +182,9 @@ function system(v){
       :row('power',!pw.low,'Full speed on battery and power adapter (Low Power Mode off)',pw.low?'Low Power Mode is on: it slows the GPU':'Low Power Mode is off',
         `This Mac has no High Power Mode; off is its fastest. <code>sudo pmset -a lowpowermode 0</code>${pw.battery?' · on battery now: plug in for full speed':''}`);})()+
     (target?row('gpu',gpuOn,`GPU memory limit ${(target/1024).toFixed(1)} GB at every startup`,
-      `the GPU may hold ${v.wired_mb?(v.wired_mb/1024).toFixed(1)+' GB now':"macOS's default now (about two thirds of the memory)"}`,
-      `<code>sudo sysctl iogpu.wired_limit_mb=${target}</code> at every boot (a LaunchDaemon); off puts macOS's default back. macOS asks for your password.`):'')+
+      `the GPU may hold ${v.wired_mb?(v.wired_mb/1024).toFixed(1)+' GB now':"macOS's default now (about two thirds of the memory)"}; macOS may pin ${v.wire_cap?(v.wire_cap/1e9).toFixed(1)+' GB':'?'} in all`+
+        (v.gpu_daemon_old_mb?' — <b>turn on to update it</b>: the one set up before also needs the cap below, or sound stops while a big model is loaded':''),
+      `<code>sudo sysctl iogpu.wired_limit_mb=${target}</code>, and macOS's cap on pinned memory above it (<code>vm.global_user_wire_limit</code>: the GPU's + 1.5 GB, 2 GB of memory left unpinned; sound needs a little pinned), at every boot (a LaunchDaemon); off puts macOS's defaults back. macOS asks for your password.`):'')+
     `<div class="mute" style="margin-top:6px">WindowServer (the display) and the rest of macOS stay: they are macOS itself.</div>`;
   for(const el of document.querySelectorAll('.syscard'))el.innerHTML=html;
   for(const t of document.querySelectorAll('[data-sys]'))t.onchange=()=>{t.disabled=true;

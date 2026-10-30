@@ -105,7 +105,8 @@ actor Voice {
     let port: String, key: String, phrase: [String], voice: String
     var history: [[String: String]] = []
     var capturing = false, command = "", lastHeard = Date(), started = Date(), speaking: Process?
-    var baseline = 0   // words of the current utterance before the wake phrase's end
+    var baseline = 0   // 0: still in the utterance with the wake phrase; -1: the question goes on in later ones
+    var said = ""      // the question's finished utterances (after the wake phrase's)
     var open = false   // the recognizer's current utterance has not had its final result yet
     var consumed = false  // that utterance's question was sent: the rest of it (its final result) is no new wake
     var directive: String?  // strata-server's word on a question: "page" (the open chat sends it) or "self"
@@ -118,6 +119,8 @@ actor Voice {
 
     /// A recognizer result: the current utterance's text so far (`final`: the utterance ended).
     func heard(_ text: String, final: Bool) {
+        // a piece with no word in it (the recognizer sends a lone "?" after an utterance ends) changes nothing
+        guard text.contains(where: { $0.isLetter || $0.isNumber }) else { return }
         open = !final
         if consumed {
             if final { consumed = false }
@@ -131,18 +134,18 @@ actor Voice {
             NSSound(named: "Tink")?.play()
             emit(["event": "wake"])
             command = ws[end...].joined(separator: " ")
-            baseline = 0
-            if final { baseline = -1 }                     // the rest comes in the next utterances
+            said = final ? command : ""
+            baseline = final ? -1 : 0                      // a final one: the rest comes in the next utterances
             return
         }
         lastHeard = Date()
         // the utterance with the wake phrase: what follows it; later utterances: all of it
-        let part = baseline < 0 ? text : (wakeEnd(ws, phrase).map { ws[$0...].joined(separator: " ") } ?? text)
-        if baseline < 0 {
-            command = (command + " " + part).trimmingCharacters(in: .whitespaces)
-        } else {
-            command = part
-            if final { baseline = -1 }
+        // the utterance in progress replaces itself (each result is all of it so far); a final one is kept
+        let part = baseline < 0 ? ws.joined(separator: " ") : (wakeEnd(ws, phrase).map { ws[$0...].joined(separator: " ") } ?? ws.joined(separator: " "))
+        command = baseline < 0 ? (said + " " + part).trimmingCharacters(in: .whitespaces) : part
+        if final {
+            said = command
+            baseline = -1
         }
     }
 
@@ -150,8 +153,11 @@ actor Voice {
     func tick() async {
         guard capturing else { return }
         let quiet = Date().timeIntervalSince(lastHeard), total = Date().timeIntervalSince(started)
-        let q = command.trimmingCharacters(in: .whitespaces)
-        if (q.isEmpty && quiet < 6) || (!q.isEmpty && quiet < 1.4 && total < 30) { return }
+        let q = command.contains(where: { $0.isLetter || $0.isNumber }) ? command.trimmingCharacters(in: .whitespaces) : ""
+        // the end of the question: the recognizer finished its utterance (and 0.6 s brought no next one), or 2.5 s of
+        // nothing at all (a 1.4 s silence alone cut "what is the capital of Portugal" before its last word came)
+        let ended = (!open && quiet >= 0.6) || quiet >= 2.5
+        if (q.isEmpty && quiet < 6) || (!q.isEmpty && !ended && total < 30) { return }
         capturing = false
         guard !q.isEmpty else { emit(["event": "wake-timeout"]); return }
         NSSound(named: "Pop")?.play()
