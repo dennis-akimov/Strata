@@ -23,7 +23,7 @@ pub fn tools() -> Value {
     json!([
         {"name": "browser_search", "description": "Search Google in the browser beside the chat: its results page, compactly (answers Google shows, the results' titles and snippets, their links numbered for browser_click). Only for what needs the web (news, weather, prices, a site, facts you are unsure of), never for what you already know.",
          "inputSchema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}},
-        {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address or a site like example.com. Then browser_read it.",
+        {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address the user gave or one from a page you read. Never guess an address (guessed ones are often 404s): browser_search, then browser_click a result. Then browser_read it.",
          "inputSchema": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}},
         {"name": "browser_read", "description": "The page in the browser now, compactly: its main text (in parts of 3,500 characters: part 2, 3... for more) and up to 40 links, buttons and fields numbered [n] for browser_click / browser_type.",
          "inputSchema": {"type": "object", "properties": {"part": {"type": "integer", "description": "which part of the text (default 1)"}}}},

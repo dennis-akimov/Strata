@@ -89,6 +89,9 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
     let max_rounds = hub.settings["max_rounds"].as_i64().unwrap_or(8);
     let (mut total, mut rounds) = (0i64, 0i64);
     let mut messages = m.messages;
+    // the round after the limit: no tools, so the model answers from what it has (a reply is never left empty)
+    let mut tools = tools;
+    let mut last = false;
     let mut done: Map<String, Value>;
     loop {
         let (mut text, mut reasoning, mut calls, mut own_calls) = (String::new(), String::new(), vec![], 0);
@@ -121,9 +124,26 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
         done = round_done.unwrap_or_default();
         total += done.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0);
         let mut run_them = !calls.is_empty() && own_calls == 0 && done.get("finish").and_then(Value::as_str) == Some("stop") && !cancel.is_set();
-        if run_them && rounds >= max_rounds {
+        if run_them && rounds >= max_rounds && !last && !cancel.is_set() {
+            // the limit: these calls are not run; one more round, without tools, to answer from what it gathered
             emit(Item::Mcp(json!({"event": "limit", "max_rounds": max_rounds})))?;
-            run_them = false;
+            for c in &calls {
+                emit(Item::Mcp(json!({"event": "result", "id": c.id, "ok": false, "skipped": true, "text": "not run", "chars": 0, "truncated": false, "ms": 0})))?;
+            }
+            let mut assistant = json!({"role": "assistant", "content": crate::py::strip(&text)}).as_object().cloned().unwrap();
+            assistant.insert("tool_calls".into(), Value::Array(calls.iter().map(|c| json!({"function": {"name": c.name, "arguments": Value::Object(c.arguments.clone())}})).collect()));
+            messages.push(Value::Object(assistant));
+            messages.extend(calls.iter().map(|_| json!({"role": "tool", "content": "not run: the limit of tool calls for one answer is reached. Answer the user now from what you have found (say what is missing)."})));
+            last = true;
+            tools = None;
+            let (i2, t2, m2) = svc.prepare(&messages, None, &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
+            ids = i2;
+            thinking = t2;
+            max_new = m2;
+            continue;
+        }
+        if run_them && last {
+            run_them = false;                             // no tools in the last round: any call there is not run
         }
         if !run_them {
             for c in &calls {

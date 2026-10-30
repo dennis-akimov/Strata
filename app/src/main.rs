@@ -1411,7 +1411,7 @@ fn main() {
                         if blocked {
                             let _ = w.send(Err("Google asks to prove this is a person (the browser shows it): the user can do that, then search again".into()));
                         } else {
-                            eval_reply(&web, &browser_mcp::read_js(1), w, |v| Ok(browser_mcp::page_text(&v)));
+                            eval_reply(&web, &browser_mcp::read_js(1), w, |v| Ok(format!("{}\n\n[Google's own answer, when it shows one, is at the top: answer from these results when they hold the answer. To read a result, browser_click its number; do not guess addresses.]", browser_mcp::page_text(&v))));
                         }
                     }
                 }
