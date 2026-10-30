@@ -382,9 +382,13 @@ fn main() {
     };
     // the Strata folder's .env: one more API key and MCP servers, on top of the config (crate::dotenv)
     let dotenv = strata_server::dotenv::load(&root());
-    let env_mcp = strata_server::dotenv::mcp_servers(&dotenv);
+    let mut env_mcp = strata_server::dotenv::mcp_servers(&dotenv);
+    // Strata.app's browser for the model (app/src/browser_mcp.rs): its endpoint and key, made at each app start
+    if let (Ok(u), Ok(k)) = (std::env::var("STRATA_BROWSER_MCP_URL"), std::env::var("STRATA_BROWSER_MCP_KEY")) {
+        env_mcp.insert("browser".into(), json!({"url": u, "headers": {"Authorization": format!("Bearer {k}")}}));
+    }
     if !env_mcp.is_empty() {
-        say(&format!("MCP servers from .env: {}", env_mcp.keys().cloned().collect::<Vec<_>>().join(", ")));
+        say(&format!("MCP servers from .env or Strata.app (its browser): {}", env_mcp.keys().cloned().collect::<Vec<_>>().join(", ")));
     }
     let hub = match mcp::hub_from_config(&cfgv, a.mcp_config.as_deref(), &env_mcp) {
         Ok(Some(h)) => h,

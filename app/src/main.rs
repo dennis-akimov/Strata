@@ -19,6 +19,8 @@ use tray_icon::menu::{accelerator::{Accelerator, Code, Modifiers}, Menu, MenuEve
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use wry::{WebView, WebViewBuilder};
 
+mod browser_mcp;
+
 const PANEL: &str = include_str!("panel.html");
 const LOG_KEEP: usize = 2000;
 const BAR: f64 = 44.0;
@@ -39,6 +41,9 @@ enum Ev {
     /// the browser pane: its page's address (each load), and a page's text for the chat ("Send page to chat")
     Web(String),
     WebText(String),
+    /// a browser tool's call from the model (browser_mcp), and an element described for browser_type's Allow
+    Tool(browser_mcp::Job),
+    Described(browser_mcp::Job, String),
     Quit,
 }
 
@@ -616,6 +621,8 @@ struct State {
     stopping_since: Option<Instant>,
     log: VecDeque<String>,
     last: Value,
+    /// the model's browser (browser_mcp): its endpoint's port and key, for the server this app starts
+    browser: Option<(u16, String)>,
 }
 
 impl State {
@@ -684,6 +691,10 @@ fn start(st: &Shared, proxy: &EventLoopProxy<Ev>) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some((bport, bkey)) = &s.browser {
+        // the server adds the model's browser tools (MCP server "browser", read-only, not saved)
+        cmd.env("STRATA_BROWSER_MCP_URL", format!("http://127.0.0.1:{bport}/mcp")).env("STRATA_BROWSER_MCP_KEY", bkey);
+    }
     // the app blocks SIGTERM/SIGINT for its waiter thread and a spawned child keeps that mask: unblock them, or the
     // server never hears its SIGTERM (stop = 120 s, then SIGKILL)
     unsafe {
@@ -889,6 +900,26 @@ fn env_api_key(cfg: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// A script's value from evaluate_script_with_callback: JSON-encoded (a string holding the JSON the script built).
+fn js_value(r: &str) -> Value {
+    serde_json::from_str::<String>(r).ok().and_then(|s| serde_json::from_str(&s).ok()).or_else(|| serde_json::from_str(r).ok()).unwrap_or(Value::Null)
+}
+
+/// Run `js` in the browser pane and answer the model's call with `f` of its value (the page's {error} as an error).
+fn eval_reply(web: &WebView, js: &str, reply: std::sync::mpsc::Sender<Result<String, String>>, f: impl Fn(Value) -> Result<String, String> + Send + 'static) {
+    let _ = web.evaluate_script_with_callback(js, move |r| {
+        let v = js_value(&r);
+        let out = if let Some(e) = v["error"].as_str() {
+            Err(e.to_string())
+        } else if v.is_null() {
+            Err("the page did not answer (still loading?): try again in a moment".into())
+        } else {
+            f(v)
+        };
+        let _ = reply.send(out);
+    });
+}
+
 fn js_call(wv: &WebView, f: &str, v: &Value) {
     let _ = wv.evaluate_script(&format!("{f}({v})"));
 }
@@ -955,7 +986,7 @@ fn main() {
     let config = settings["config"].as_str().map(PathBuf::from).filter(|p| p.is_file()).or_else(|| configs(&root).into_iter().next());
     let config = config.filter(|c| runnable(&read_config(c))).or_else(|| configs(&root).into_iter().next());
     let port = config.as_deref().map(config_port).unwrap_or(8090);
-    let st: Shared = Arc::new(Mutex::new(State { root, config, port, child: None, phase: "stopped", stopping_since: None, log: VecDeque::new(), last: json!({}) }));
+    let st: Shared = Arc::new(Mutex::new(State { root, config, port, child: None, phase: "stopped", stopping_since: None, log: VecDeque::new(), last: json!({}), browser: None }));
 
     // SIGTERM / Ctrl+C on the app = Quit (the server is stopped its own way, not orphaned); blocked before any thread
     // starts so only the waiter gets them (a spawned server starts with an empty mask)
@@ -977,6 +1008,23 @@ fn main() {
             let _ = p.send_event(Ev::Quit);
         }
     });
+    // the model's browser: its MCP endpoint (after the signals are blocked: its threads must not take them)
+    let web_stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut b = [0u8; 16];
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+        let key: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        let p = Mutex::new(proxy.clone());
+        match browser_mcp::serve(key.clone(), web_stopped.clone(), move |job| {
+            let _ = p.lock().unwrap().send_event(Ev::Tool(job));
+        }) {
+            Ok(bport) => st.lock().unwrap().browser = Some((bport, key)),
+            Err(e) => eprintln!("strata-app: the model's browser did not start: {e}"),
+        }
+    }
+    let load_waiters: std::cell::RefCell<Vec<std::sync::mpsc::Sender<Result<String, String>>>> = Default::default();
+    let approvals: std::cell::RefCell<HashMap<u64, browser_mcp::Job>> = Default::default();
+    let next_ask = std::cell::Cell::new(0u64);
     {
         let p = proxy.clone();
         MenuEvent::set_event_handler(Some(move |e| {
@@ -1015,10 +1063,20 @@ fn main() {
     };
     let page = {
         let p = proxy.clone();
+        let pi = proxy.clone();
         WebViewBuilder::new()
             .with_initialization_script(KEY_SCRIPT)
             .with_bounds(rect(0.0, BAR, 1280.0, 900.0 - BAR))
             .with_visible(false)
+            // the chat's globe button: the page may open and close the browser pane, and nothing else (it shows the
+            // server's content: no other app command is taken from it)
+            .with_ipc_handler(move |req| {
+                if let Ok(v) = serde_json::from_str::<Value>(req.body()) {
+                    if v["cmd"] == "web" {
+                        let _ = pi.send_event(Ev::Ipc(json!({"cmd": "web"})));
+                    }
+                }
+            })
             .with_on_page_load_handler(move |e, url| {
                 let event = match e {
                     wry::PageLoadEvent::Started => "started",
@@ -1268,6 +1326,7 @@ fn main() {
                     }
                     layout(full.get());
                     js_call(&control_view, "webOpen", &json!(web_open.get()));
+                    js_call(&page, "strataWeb", &json!(web_open.get()));
                 }
                 "web_go" => {
                     let _ = web.load_url(&web_url(v["url"].as_str().unwrap_or("")));
@@ -1275,6 +1334,27 @@ fn main() {
                 "web_back" => { let _ = web.evaluate_script("history.back()"); }
                 "web_fwd" => { let _ = web.evaluate_script("history.forward()"); }
                 "web_reload" => { let _ = web.evaluate_script("location.reload()"); }
+                "web_allow" => {
+                    // the person's answer to browser_type's question
+                    if let Some(job) = approvals.borrow_mut().remove(&v["id"].as_u64().unwrap_or(0)) {
+                        if v["yes"] == true {
+                            let js = browser_mcp::type_js(job.args["element"].as_i64().unwrap_or(0), job.args["text"].as_str().unwrap_or(""), job.args["submit"] == true);
+                            eval_reply(&web, &js, job.reply, |_| Ok("typed: browser_read the page now".into()));
+                        } else {
+                            let _ = job.reply.send(Err("the user said no to typing that: ask them in the chat".into()));
+                        }
+                    }
+                }
+                "web_stop" => {
+                    let on = v["on"] == true;
+                    web_stopped.store(on, std::sync::atomic::Ordering::SeqCst);
+                    if on {
+                        for (_, job) in approvals.borrow_mut().drain() {
+                            let _ = job.reply.send(Err("the user stopped the model's browsing".into()));
+                        }
+                    }
+                    js_call(&web_bar, "stopped", &json!(on));
+                }
                 "web_send" => {
                     let p = proxy.clone();
                     let _ = web.evaluate_script_with_callback(WEB_READ, move |r| {
@@ -1320,11 +1400,77 @@ fn main() {
                 let cmd = v["cmd"].as_str().unwrap_or("").to_string();
                 act(&cmd, &v);
             }
-            Event::UserEvent(Ev::Web(url)) => js_call(&web_bar, "setUrl", &json!(url)),
+            Event::UserEvent(Ev::Web(url)) => {
+                js_call(&web_bar, "setUrl", &json!(url));
+                for w in load_waiters.borrow_mut().drain(..) {
+                    let _ = w.send(Ok(format!("opened {url}: browser_read it")));
+                }
+            }
+            Event::UserEvent(Ev::Tool(job)) => {
+                // the model's browser tools work in the pane people see: it opens for them
+                if !web_open.get() {
+                    web_open.set(true);
+                    layout(full.get());
+                    js_call(&control_view, "webOpen", &json!(true));
+                    js_call(&page, "strataWeb", &json!(true));
+                }
+                js_call(&web_bar, "busy", &json!(job.tool));
+                let n = job.args["element"].as_i64().unwrap_or(0);
+                // a load that never finishes still answers (the model reads what is there)
+                let wait_load = |reply: std::sync::mpsc::Sender<Result<String, String>>, secs: u64| {
+                    let late = reply.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(secs));
+                        let _ = late.send(Ok(format!("still loading after {secs} s: browser_read it in a moment")));
+                    });
+                    load_waiters.borrow_mut().push(reply);
+                };
+                match job.tool.as_str() {
+                    "browser_open" => {
+                        let _ = web.load_url(&web_url(job.args["url"].as_str().unwrap_or("")));
+                        wait_load(job.reply, 20);
+                    }
+                    "browser_back" => {
+                        let _ = web.evaluate_script("history.back()");
+                        wait_load(job.reply, 8);
+                    }
+                    "browser_read" => eval_reply(&web, browser_mcp::READ_JS, job.reply, |v| Ok(browser_mcp::page_text(&v))),
+                    "browser_click" => eval_reply(&web, &browser_mcp::click_js(n), job.reply,
+                                                  |v| Ok(format!("clicked \"{}\": browser_read the page now", v["clicked"].as_str().unwrap_or("")))),
+                    "browser_scroll" => {
+                        let js = format!("window.scrollBy(0, {}innerHeight * 0.8); JSON.stringify({{y: Math.round(scrollY), height: document.documentElement.scrollHeight}})",
+                                         if job.args["direction"] == "up" { "-" } else { "" });
+                        eval_reply(&web, &js, job.reply, |v| Ok(format!("at {} of {} px: browser_read to see it", v["y"], v["height"])));
+                    }
+                    "browser_type" => {
+                        let (p, slot) = (proxy.clone(), Mutex::new(Some(job)));
+                        let _ = web.evaluate_script_with_callback(&browser_mcp::describe_js(n), move |r| {
+                            if let Some(j) = slot.lock().unwrap().take() {
+                                let _ = p.send_event(Ev::Described(j, r));
+                            }
+                        });
+                    }
+                    other => {
+                        let _ = job.reply.send(Err(format!("no browser tool {other}")));
+                    }
+                }
+            }
+            Event::UserEvent(Ev::Described(job, r)) => {
+                let v = js_value(&r);
+                if let Some(e) = v["error"].as_str() {
+                    let _ = job.reply.send(Err(e.to_string()));
+                } else if v["password"] == true {
+                    let _ = job.reply.send(Err("a password field: the model never types there; the user signs in themselves".into()));
+                } else {
+                    // asked in the browser's strip; the answer comes back as "web_allow"
+                    next_ask.set(next_ask.get() + 1);
+                    js_call(&web_bar, "ask", &json!({"id": next_ask.get(), "text": job.args["text"], "field": v["field"], "host": v["host"], "submit": job.args["submit"] == true}));
+                    approvals.borrow_mut().insert(next_ask.get(), job);
+                }
+            }
             Event::UserEvent(Ev::WebText(r)) => {
                 // the script's value comes JSON-encoded (a string holding the JSON it built)
-                let v: Value = serde_json::from_str::<String>(&r).ok().and_then(|s| serde_json::from_str(&s).ok())
-                    .or_else(|| serde_json::from_str(&r).ok()).unwrap_or(Value::Null);
+                let v = js_value(&r);
                 if v.is_object() {
                     let title = v["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("web page");
                     let text = format!("{}\n{}\n\n{}{}", title, v["url"].as_str().unwrap_or(""), v["text"].as_str().unwrap_or(""),

@@ -211,14 +211,23 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   browser on the right (back, forward, reload; the address field takes an address, a site like `news.ycombinator.com`,
   or words to search with DuckDuckGo). **Send page to chat** puts the page you read (its title, address and text, up
   to 20,000 characters) into the message box as an attached file, to ask about it. A full WebKit view: sign-ins
-  stay like in Safari. The model does not drive it.
+  stay like in Safari. The chat's globe button opens and closes it too.
+- **The model browses (Strata.app):** with the chat's MCP switch on, the model has `browser_open`, `browser_read` (the
+  page's text and its links, buttons and fields numbered `[n]`), `browser_click`, `browser_type`, `browser_scroll` and
+  `browser_back`, in that same pane, in front of you: "find the opening hours on example.org". Typing waits for your
+  **Allow** in the browser's strip (it says what goes into which field on which site), a password field is refused
+  (you sign in yourself), and **Stop model** there refuses its browser tools until you let it again. Strata.app serves
+  these tools (app/src/browser_mcp.rs: MCP on 127.0.0.1 with a key made at each start) and hands them to the server it
+  starts as the MCP server `browser` (not saved; only there while the app runs). Tried on the M1 with LFM2.5-24B:
+  opened example.com, read it, clicked "Learn more", read IANA's page.
 - **`.env` (optional, a convenience):** `cp .env.example .env; chmod 600 .env`. `API_KEY=` is one more key the
   server accepts for `/v1` and the chat page, next to the run config's `"api_key"`, `--api-key` and
   `STRATA_API_KEY` (none of them is replaced; Strata.app and the TUI send it when their config has none; it is never
   printed). `MCP_<NAME>_URL=` and `MCP_<NAME>_API_KEY=` add the MCP server `<name>` (`Authorization: Bearer`, or
   `MCP_<NAME>_HEADER=X-API-Key`); one of the same name in the config, `--mcp-config` or added on the page wins, and
   `.env`'s are read-only on the page and never written to the config. Read when the server starts.
-- **Voice ("Hey Strata", macOS 26 or later):** the microphone button in the chat's bar. Say the wake phrase and your
+- **Voice ("Hey Strata", macOS 26 or later):** the microphone button in the chat's bar turns it on and off (lit while
+  on); the small arrow next to it opens its settings. Say the wake phrase and your
   question: with the chat page open, the question goes into the chat as yours and the answer streams there like a
   typed one (the chat keeps both, with its history and settings), then is read aloud in macOS's voice; with no page
   open, the helper asks the model itself and reads the answer. Voice stays on across restarts. Apple's on-device dictation

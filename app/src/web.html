@@ -4,19 +4,36 @@
 html,body{margin:0;height:100%;background:var(--card);color:var(--fg);font:13px -apple-system,system-ui,sans-serif;overflow:hidden}
 #w{display:flex;gap:5px;align-items:center;padding:4px 8px;height:36px;box-sizing:border-box;border-bottom:1px solid var(--line)}
 button{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 8px;font:inherit;cursor:pointer;flex:none}
+#busy{font-size:11.5px;color:#0a84ff;flex:none;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#stop.on{background:#ff453a;color:#fff;border-color:#ff453a}
+#ask{display:none;gap:6px;align-items:center;padding:4px 8px;height:36px;box-sizing:border-box;border-bottom:1px solid var(--line);background:#fff7d6;color:#1d1d1f}
+#ask span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#ask .yes{background:#34c759;color:#fff;border-color:#34c759}
 #u{flex:1;min-width:60px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font:inherit}
 </style></head><body><form id="w" autocomplete="off">
 <button type="button" id="back" title="Back">‹</button><button type="button" id="fwd" title="Forward">›</button>
 <button type="button" id="reload" title="Reload">↻</button>
 <input id="u" placeholder="Search or type an address" spellcheck="false">
 <button type="button" id="sendp" title="This page's text into the chat's message box, as an attached file">Send page to chat</button>
+<span id="busy"></span>
+<button type="button" id="stop" title="Stop the model's browsing (its browser tools are refused until you let it again)">Stop model</button>
 <button type="button" id="close" title="Close the browser">✕</button></form>
+<div id="ask"><span id="asktext"></span><button type="button" class="yes" id="allow">Allow</button><button type="button" id="deny">Deny</button></div>
 <script>
 const $=id=>document.getElementById(id),send=(cmd,o={})=>window.ipc.postMessage(JSON.stringify({cmd,...o}));
 $("w").onsubmit=e=>{e.preventDefault();send("web_go",{url:$("u").value});$("u").blur();};
 $("back").onclick=()=>send("web_back");$("fwd").onclick=()=>send("web_fwd");$("reload").onclick=()=>send("web_reload");
 $("sendp").onclick=()=>{send("web_send");$("sendp").textContent="Sent";setTimeout(()=>$("sendp").textContent="Send page to chat",1500);};
 $("close").onclick=()=>send("web");
+// the model's browsing: what it does now (cleared a few seconds after), Stop, and its typing's Allow / Deny
+let busyT=0,askId=0;
+function busy(tool){$("busy").textContent="model: "+tool.replace("browser_","");clearTimeout(busyT);busyT=setTimeout(()=>$("busy").textContent="",6000);}
+let isStopped=false;
+$("stop").onclick=()=>send("web_stop",{on:!isStopped});
+function stopped(on){isStopped=on;$("stop").classList.toggle("on",on);$("stop").textContent=on?"Let the model browse":"Stop model";}
+function ask(o){askId=o.id;$("asktext").textContent=`The model wants to type “${o.text}” into “${o.field}” on ${o.host}${o.submit?" and send it":""}.`;
+  $("w").style.display="none";$("ask").style.display="flex";}
+function answer(yes){send("web_allow",{id:askId,yes});$("ask").style.display="none";$("w").style.display="flex";}
+$("allow").onclick=()=>answer(true);$("deny").onclick=()=>answer(false);
 // the app says where the page is (each load)
 function setUrl(u){if(document.activeElement!==$("u"))$("u").value=u==="about:blank"?"":u;}
 </script></body></html>

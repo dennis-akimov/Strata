@@ -1849,12 +1849,12 @@ async function loadVoice() {
   for (const e of evs) if (e.n > voiceSeen && e.event === "command" && e.by === "page" && e.text) voiceQueue.push(e.text);
   voiceSeen = Math.max(voiceSeen, top);
   voiceRun();
-  $("voice-btn").hidden = !v.available;
+  $("voice-btn").hidden = $("voice-more").hidden = !v.available;
   $("voice-btn").setAttribute("aria-pressed", v.on ? "true" : "false");
   $("voice-on").checked = !!v.on;
   const ph = v.phrase || "hey strata", quoted = `\u201c${ph.replace(/\b\w/g, (c) => c.toUpperCase())}\u201d`;
   $("voice-on-label").textContent = quoted;
-  $("voice-btn").title = `Voice: ${quoted}`;
+  $("voice-btn").title = v.on ? `Voice on: say ${quoted} and your question (click: off)` : `Voice off (click: on, then say ${quoted})`;
   if (document.activeElement !== $("voice-phrase")) $("voice-phrase").value = ph;
   $("voice-speak").checked = v.speak !== false;
   const ev = v.events || [], last = ev[ev.length - 1] || {};
@@ -1876,11 +1876,25 @@ async function voicePost(body) {
   try {
     const r = await fetch("voice", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
     const j = await r.json();
-    if (!r.ok) $("voice-state").textContent = (j.error && j.error.message) || `HTTP ${r.status}`;
+    if (!r.ok) {
+      $("voice-state").textContent = (j.error && j.error.message) || `HTTP ${r.status}`;
+      toast("error", "Voice", $("voice-state").textContent, 6000);
+    } else if (body.on === true) {
+      // turned on: a start that fails (the microphone, its permission) is said, not left in the closed panel
+      setTimeout(async () => {
+        try {
+          const v = await (await fetch("voice", {headers: headers(), cache: "no-store"})).json();
+          const last = (v.events || []).slice(-1)[0] || {};
+          if (!v.on && last.event === "error") toast("error", "Voice did not start", last.text + " (the arrow next to the microphone: Allow microphone)", 9000);
+        } catch (e) { /* the next poll says it */ }
+      }, 6000);
+    }
   } catch (e) { $("voice-state").textContent = String(e); }
   loadVoice();
 }
 $("voice-on").onchange = (e) => voicePost({on: e.target.checked});
+// the microphone itself: voice on / off (its settings behind the arrow next to it)
+$("voice-btn").onclick = () => voicePost({on: $("voice-btn").getAttribute("aria-pressed") !== "true"});
 $("voice-speak").onchange = (e) => voicePost({speak: e.target.checked});
 $("voice-phrase-form").onsubmit = (e) => { e.preventDefault(); voicePost({phrase: $("voice-phrase").value}); };
 $("voice-allow").onclick = () => { $("voice-state").textContent = "macOS asks now (its window may be behind this one)\u2026"; voicePost({permissions: true}); };
@@ -1888,7 +1902,7 @@ $("voice-pop").addEventListener("toggle", (e) => {
   if (e.newState !== "open") return;
   // above the button, kept on screen: its bottom is anchored, so it grows upward as its contents load (a top
   // computed at opening put the later rows below the window); taller than the window, it scrolls
-  const b = $("voice-btn").getBoundingClientRect(), p = $("voice-pop");
+  const b = $("voice-more").getBoundingClientRect(), p = $("voice-pop");
   p.style.left = `${Math.max(8, Math.min(innerWidth - p.offsetWidth - 8, b.left))}px`;
   p.style.top = "auto";
   p.style.bottom = `${Math.max(8, innerHeight - b.top + 10)}px`;
@@ -1913,3 +1927,11 @@ $("s-rem").onclick = async () => {
   try { await mcpSend("POST", "mcp/reminders", {on}); }
   catch (e) { toast("error", "Reminders", e.message, 6000); $("s-rem").setAttribute("aria-checked", on ? "false" : "true"); }
 };
+
+// Strata.app's browser pane: the globe opens and closes it (only inside the app, which takes the message); the app
+// says when it changes (also when the model's browsing opens it)
+if (window.ipc && window.ipc.postMessage) {
+  $("web-btn").hidden = false;
+  $("web-btn").onclick = () => window.ipc.postMessage(JSON.stringify({cmd: "web"}));
+}
+window.strataWeb = (open) => $("web-btn").setAttribute("aria-pressed", open ? "true" : "false");
