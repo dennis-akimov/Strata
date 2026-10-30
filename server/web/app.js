@@ -508,6 +508,9 @@ const MCP_STATE = {ready: ["st-badge--generating", "Connected"], starting: ["st-
                    failed: ["st-badge--error", "Failed"], stopped: ["st-badge--queued", "Stopped"], idle: ["", "Waiting"]};
 function renderMcp() {
   const servers = mcpInfo.servers || [];
+  const rem = mcpInfo.reminders || {};
+  $("rem-row").hidden = !rem.available;
+  $("s-rem").setAttribute("aria-checked", rem.on ? "true" : "false");
   $("mcp-card").hidden = !servers.length;
   $("mcp-row").hidden = !servers.length;
   $("mcp-conns").hidden = !mcpLoaded;                // connections can be added here even when there are none yet
@@ -1893,3 +1896,20 @@ $("voice-pop").addEventListener("toggle", (e) => {
   loadVoice();
 });
 loadVoice();
+
+// Strata.app's browser pane, "Send page to chat": the page's text into the message box, as an attached file
+window.strataAttach = ([name, text]) => {
+  showTab("chat");
+  attachments.push({kind: "file", name: name || "web page.txt", text: String(text || "")});
+  renderAttachments();
+  $("input").focus();
+};
+
+// macOS Reminders: the settings' switch (POST mcp/reminders); the model then has reminders_* tools (and the chat's
+// MCP switch must be on, as for every MCP server)
+$("s-rem").onclick = async () => {
+  const on = $("s-rem").getAttribute("aria-checked") !== "true";
+  $("s-rem").setAttribute("aria-checked", on ? "true" : "false");
+  try { await mcpSend("POST", "mcp/reminders", {on}); }
+  catch (e) { toast("error", "Reminders", e.message, 6000); $("s-rem").setAttribute("aria-checked", on ? "false" : "true"); }
+};

@@ -52,6 +52,7 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   <span class="mute sep">|</span><button id="load">Load model</button><button id="unload">Unload</button>
   <span id="rate" class="mute"></span><span style="flex:1"></span>
   <span class="mute" id="url"></span>
+  <button id="webbtn" title="a browser beside the chat (Send page to chat puts the page you read into the message box)">Web</button>
   <button id="sysbtn" title="what macOS runs that the model would rather have the memory of">System</button>
   <button id="logbtn" title="the server's output">Log</button>
   <span id="more"><button id="morebtn">More ▾</button><div id="menu">
@@ -74,6 +75,9 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
 </div>
 <script>
 const $=id=>document.getElementById(id), send=(cmd,o={})=>window.ipc.postMessage(JSON.stringify({cmd,...o}));
+// the browser pane beside the chat: the Web button opens and closes it (pressed while it shows)
+function webOpen(on){$('webbtn').classList.toggle('main',on);}
+setTimeout(()=>{$('webbtn').onclick=()=>send('web');},0);
 const COLORS={ready:'#34c759',busy:'#0a84ff',starting:'#ff9f0a',stopping:'#ff9f0a',unloaded:'#bf5af2',stopped:'#8e8e93'};
 let base='',up=false;
 const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

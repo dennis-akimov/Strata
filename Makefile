@@ -196,6 +196,9 @@ ifeq ($(shell uname -s),Darwin)
 	@# "Hey Strata" (the chat's Voice button): Apple's on-device dictation; its Info.plist inside, for the microphone's prompt
 	@rm -f engine-metal/strata-voice; swiftc -O -parse-as-library metal/voice/strata_voice.swift -o engine-metal/strata-voice \
 	  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker metal/voice/Info.plist 2>/dev/null || echo "strata-voice not built: voice needs macOS 26 or later"
+	@# macOS Reminders for the model (the chat's settings switch): an MCP server over EventKit
+	@rm -f engine-metal/strata-reminders; swiftc -O -parse-as-library metal/reminders/strata_reminders.swift -o engine-metal/strata-reminders \
+	  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker metal/reminders/Info.plist 2>/dev/null || echo "strata-reminders not built (macOS 14 or later)"
 else ifeq ($(APPLE_LINUX),1)
 	@# Linux on Apple Silicon: llama.cpp's Vulkan backend (metal/CMakeLists.txt picks it off macOS)
 	$(CMAKE) -S . -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON

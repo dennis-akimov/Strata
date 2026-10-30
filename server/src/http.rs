@@ -564,7 +564,10 @@ fn get_(c: &mut Ctx) {
     }
     if path == "/mcp" {
         if c.authorized() {
-            let s = svc.mcp.as_ref().map(|m| m.status()).unwrap_or(json!({"servers": [], "tools": 0}));
+            let mut s = svc.mcp.as_ref().map(|m| m.status()).unwrap_or(json!({"servers": [], "tools": 0}));
+            // macOS Reminders (engine-metal/strata-reminders): the page's switch for it
+            let on = s["servers"].as_array().is_some_and(|a| a.iter().any(|x| x["name"] == "reminders"));
+            s["reminders"] = json!({"available": cfg!(target_os = "macos") && reminders_exe().is_file(), "on": on});
             c.json(200, s);
         }
         return;
@@ -757,6 +760,7 @@ fn post(c: &mut Ctx) {
         "/settings" => return settings(c),
         "/config" => return config_post(c),
         "/mcp/servers" => return mcp_put(c),
+        "/mcp/reminders" => return reminders_post(c),
         "/voice" => return voice_post(c),
         _ => {}
     }
@@ -1610,6 +1614,37 @@ fn voice_post(c: &mut Ctx) {
         Ok(v) => c.json(200, v),
         Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
     }
+}
+
+fn reminders_exe() -> std::path::PathBuf {
+    crate::root().join("engine-metal/strata-reminders")
+}
+
+/// POST /mcp/reminders {"on": bool}: macOS Reminders as the MCP server "reminders" (metal/reminders), saved in the
+/// run config like the page's other servers; off takes it out of both.  macOS asks for Reminders access at its first
+/// call (for Strata.app).
+fn reminders_post(c: &mut Ctx) {
+    if !c.own_page("Reminders can be turned on") {
+        return;
+    }
+    let svc = c.svc().clone();
+    let Some(hub) = svc.mcp.clone() else { return c.json(404, json!({"error": {"message": "not found"}})) };
+    let req: Value = c.body().ok().and_then(|b| serde_json::from_slice(if b.is_empty() { b"{}" } else { &b }).ok()).unwrap_or(Value::Null);
+    let on = get(&req, "on") == &json!(true);
+    if on && !reminders_exe().is_file() {
+        return c.json(400, json!({"error": {"type": "invalid_request_error", "message": "engine-metal/strata-reminders is missing: make build compiles it (macOS)"}}));
+    }
+    let entry = json!({"command": reminders_exe().to_string_lossy()});
+    if let Err(e) = mcp_save(&svc, "reminders", if on { Some(&entry) } else { None }) {
+        return c.json(500, json!({"error": {"type": "server_error", "message": format!("the run config cannot be written: {e}")}}));
+    }
+    if on {
+        hub.put("reminders", entry);
+    } else {
+        hub.remove("reminders");
+    }
+    say(&format!("the chat page turned macOS Reminders {}", if on { "on" } else { "off" }));
+    c.json(200, hub.status())
 }
 
 fn mcp_put(c: &mut Ctx) {

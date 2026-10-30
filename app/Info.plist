@@ -12,6 +12,8 @@
 	<key>LSMinimumSystemVersion</key><string>13.0</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSMicrophoneUsageDescription</key><string>Strata listens for "Hey Strata" and your question, on this Mac (the chat's Voice button).</string>
+	<key>NSRemindersFullAccessUsageDescription</key><string>Strata's model reads, adds and completes your reminders when you ask it to in the chat (the chat's settings: macOS Reminders).</string>
+	<key>NSRemindersUsageDescription</key><string>Strata's model reads, adds and completes your reminders when you ask it to in the chat (the chat's settings: macOS Reminders).</string>
 	<key>NSSpeechRecognitionUsageDescription</key><string>Strata turns what you say after "Hey Strata" into text with Apple's on-device speech recognition.</string>
 	<key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/><key>NSAllowsArbitraryLoadsInWebContent</key><true/></dict>
 </dict>

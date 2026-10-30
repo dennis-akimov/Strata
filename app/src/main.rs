@@ -36,8 +36,40 @@ enum Ev {
     Log(String),
     Ipc(Value),
     Menu(MenuEvent),
+    /// the browser pane: its page's address (each load), and a page's text for the chat ("Send page to chat")
+    Web(String),
+    WebText(String),
     Quit,
 }
+
+/// The browser pane's address field: an address as typed, a bare host (has a dot, no space) over https, anything else
+/// a DuckDuckGo search.
+fn web_url(input: &str) -> String {
+    let t = input.trim();
+    if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("about:") {
+        return t.to_string();
+    }
+    if !t.is_empty() && !t.contains(char::is_whitespace) && t.contains('.') {
+        return format!("https://{t}");
+    }
+    let q: String = form_urlencoded_q(t);
+    format!("https://duckduckgo.com/?q={q}")
+}
+
+fn form_urlencoded_q(s: &str) -> String {
+    s.bytes().map(|b| match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+        b' ' => "+".into(),
+        _ => format!("%{b:02X}"),
+    }).collect()
+}
+
+/// What "Send page to chat" reads from the browser pane: the title, the address and the text people see (20,000
+/// characters at most: a long page is cut, and said to be).
+const WEB_READ: &str = "JSON.stringify({title: document.title, url: location.href, text: (document.body ? document.body.innerText : '').slice(0, 20000), cut: (document.body ? document.body.innerText.length : 0) > 20000})";
+
+const WEB_HTML: &str = include_str!("web.html");
+const WEB_BAR: f64 = 36.0;
 
 /// Strata's folder: $STRATA_ROOT, else the folder this app was built in.
 fn root() -> PathBuf {
@@ -998,6 +1030,36 @@ fn main() {
             .build_as_child(&control_win)
             .expect("webview")
     };
+    // the browser pane (the bar's Web button): a strip of controls, and a web view, right of the page; hidden until opened
+    let web_open = std::cell::Cell::new(false);
+    let web_bar = {
+        let p = proxy.clone();
+        WebViewBuilder::new()
+            .with_html(WEB_HTML)
+            .with_bounds(rect(640.0, BAR, 640.0, WEB_BAR))
+            .with_visible(false)
+            .with_ipc_handler(move |req| {
+                if let Ok(v) = serde_json::from_str::<Value>(req.body()) {
+                    let _ = p.send_event(Ev::Ipc(v));
+                }
+            })
+            .build_as_child(&control_win)
+            .expect("webview")
+    };
+    let web = {
+        let p = proxy.clone();
+        WebViewBuilder::new()
+            .with_url("about:blank")
+            .with_bounds(rect(640.0, BAR + WEB_BAR, 640.0, 900.0 - BAR - WEB_BAR))
+            .with_visible(false)
+            .with_on_page_load_handler(move |e, url| {
+                if matches!(e, wry::PageLoadEvent::Finished) {
+                    let _ = p.send_event(Ev::Web(url));
+                }
+            })
+            .build_as_child(&control_win)
+            .expect("webview")
+    };
     // the page's loads: a load that never finishes (10 s) or finishes empty is said, with Open in browser and Retry
     let (navs, loaded) = (Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
@@ -1025,8 +1087,15 @@ fn main() {
         let layout = |full: bool| {
             let sz = control_win.inner_size().to_logical::<f64>(control_win.scale_factor());
             let _ = control_view.set_bounds(rect(0.0, 0.0, sz.width, if full { sz.height } else { BAR }));
-            let _ = page.set_bounds(rect(0.0, BAR, sz.width, (sz.height - BAR).max(0.0)));
+            // the browser open: the page on the left half, the browser (its strip, then the web view) on the right
+            let split = web_open.get() && !full;
+            let left = if split { (sz.width / 2.0).round() } else { sz.width };
+            let _ = page.set_bounds(rect(0.0, BAR, left, (sz.height - BAR).max(0.0)));
             let _ = page.set_visible(!full);
+            let _ = web_bar.set_bounds(rect(left, BAR, sz.width - left, WEB_BAR));
+            let _ = web.set_bounds(rect(left, BAR + WEB_BAR, sz.width - left, (sz.height - BAR - WEB_BAR).max(0.0)));
+            let _ = web_bar.set_visible(split);
+            let _ = web.set_visible(split);
         };
         let act = |cmd: &str, v: &Value| {
             let note = |msg: &str| js_call(&control_view, "note", &json!(msg));
@@ -1192,6 +1261,26 @@ fn main() {
                     let _ = page.evaluate_script("location.hash = '#chat'");
                 }
                 "browser" => open(&[&format!("{}/", st.lock().unwrap().base())]),
+                "web" => {
+                    web_open.set(!web_open.get());
+                    if web_open.get() && web.url().map(|u| u == "about:blank").unwrap_or(true) {
+                        let _ = web.load_url("https://duckduckgo.com/");
+                    }
+                    layout(full.get());
+                    js_call(&control_view, "webOpen", &json!(web_open.get()));
+                }
+                "web_go" => {
+                    let _ = web.load_url(&web_url(v["url"].as_str().unwrap_or("")));
+                }
+                "web_back" => { let _ = web.evaluate_script("history.back()"); }
+                "web_fwd" => { let _ = web.evaluate_script("history.forward()"); }
+                "web_reload" => { let _ = web.evaluate_script("location.reload()"); }
+                "web_send" => {
+                    let p = proxy.clone();
+                    let _ = web.evaluate_script_with_callback(WEB_READ, move |r| {
+                        let _ = p.send_event(Ev::WebText(r));
+                    });
+                }
                 "edit_config" => {
                     if let Some(c) = st.lock().unwrap().config.clone() {
                         open(&["-t", &c.to_string_lossy()]);
@@ -1230,6 +1319,19 @@ fn main() {
             Event::UserEvent(Ev::Ipc(v)) => {
                 let cmd = v["cmd"].as_str().unwrap_or("").to_string();
                 act(&cmd, &v);
+            }
+            Event::UserEvent(Ev::Web(url)) => js_call(&web_bar, "setUrl", &json!(url)),
+            Event::UserEvent(Ev::WebText(r)) => {
+                // the script's value comes JSON-encoded (a string holding the JSON it built)
+                let v: Value = serde_json::from_str::<String>(&r).ok().and_then(|s| serde_json::from_str(&s).ok())
+                    .or_else(|| serde_json::from_str(&r).ok()).unwrap_or(Value::Null);
+                if v.is_object() {
+                    let title = v["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("web page");
+                    let text = format!("{}\n{}\n\n{}{}", title, v["url"].as_str().unwrap_or(""), v["text"].as_str().unwrap_or(""),
+                                       if v["cut"] == true { "\n\n[the page goes on: cut at 20,000 characters]" } else { "" });
+                    let name: String = title.chars().filter(|c| !"/\\:".contains(*c)).take(60).collect();
+                    js_call(&page, "strataAttach", &json!([format!("{name}.txt"), text]));
+                }
             }
             Event::UserEvent(Ev::Log(line)) => {
                 st.lock().unwrap().push_log(line.clone());
@@ -1378,6 +1480,14 @@ mod tests {
         assert_eq!(wire_limit_for(13312, gb16), gb16 - (2 << 30));
         // a 64 GB Mac at 48 GB: the GPU's 48 GiB + 1.5 GB
         assert_eq!(wire_limit_for(49152, 68_719_476_736), 49152 * 1048576 + 1_500_000_000);
+    }
+
+    #[test]
+    fn the_address_field_takes_addresses_hosts_and_searches() {
+        assert_eq!(web_url("https://example.com/a?b=1"), "https://example.com/a?b=1");
+        assert_eq!(web_url("  news.ycombinator.com "), "https://news.ycombinator.com");
+        assert_eq!(web_url("rust tokio select"), "https://duckduckgo.com/?q=rust+tokio+select");
+        assert_eq!(web_url("C++ & Rust?"), "https://duckduckgo.com/?q=C%2B%2B+%26+Rust%3F");
     }
 
     #[test]

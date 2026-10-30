@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key><string>us.tottle.strata.reminders</string>
+	<key>CFBundleName</key><string>strata-reminders</string>
+	<key>NSRemindersFullAccessUsageDescription</key><string>Strata's model reads, adds and completes your reminders when you ask it to in the chat.</string>
+	<key>NSRemindersUsageDescription</key><string>Strata's model reads, adds and completes your reminders when you ask it to in the chat.</string>
+</dict>
+</plist>
