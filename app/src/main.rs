@@ -30,6 +30,7 @@ enum Ev {
     Status(Value),
     Memory(Value),
     Apps(Value),
+    System(Value),
     Alert(Value),
     Page(Value),
     Log(String),
@@ -357,6 +358,127 @@ fn power() -> Value {
     let field = |k: &str| g.lines().find_map(|l| { let mut f = l.split_whitespace(); (f.next() == Some(k)).then(|| f.next().and_then(|v| v.parse::<u8>().ok())).flatten() });
     json!({"low": field("lowpowermode") == Some(1) || field("powermode") == Some(1), "high_capable": field("powermode").is_some(),
            "high": field("powermode") == Some(2), "battery": batt.contains("'Battery Power'")})
+}
+
+// ------------------------------------------------------------------ the Mac's own memory users, kept off on request
+//
+// Three toggles in the stopped screen's System card (settings app.json: keep_ai_off, keep_still_wallpaper; the GPU
+// limit lives in a LaunchDaemon, not in the app): what macOS runs that a model would rather have the memory of.
+
+const AI_PROCS: [&str; 2] = ["TGOnDeviceInferenceProviderService", "Siri AI"];
+const AERIAL_PROC: &str = "WallpaperAerialsExtension";
+const STILL_WALLPAPER: &str = "/System/Library/Desktop Pictures/Solid Colors/Black.png";
+const GPU_DAEMON: &str = "/Library/LaunchDaemons/us.tottle.strata.gpu-limit.plist";
+const GPU_LABEL: &str = "us.tottle.strata.gpu-limit";
+
+/// (pids, resident bytes) of this user's processes with exactly this name.
+fn procs(name: &str) -> (Vec<i32>, u64) {
+    let out = Command::new("/bin/ps").args(["-axo", "pid=,uid=,rss=,comm="]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let me = unsafe { libc::getuid() }.to_string();
+    let (mut pids, mut bytes) = (vec![], 0u64);
+    for l in out.lines() {
+        let mut f = l.split_whitespace();
+        let (Some(pid), Some(uid), Some(rss)) = (f.next(), f.next(), f.next()) else { continue };
+        let comm = f.collect::<Vec<_>>().join(" ");
+        if uid == me && Path::new(&comm).file_name().is_some_and(|n| n == name) {
+            pids.push(pid.parse().unwrap_or(0));
+            bytes += rss.parse::<u64>().unwrap_or(0) * 1024;
+        }
+    }
+    (pids, bytes)
+}
+
+fn end(name: &str) {
+    for pid in procs(name).0.into_iter().filter(|p| *p > 0) {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+}
+
+/// What the System card shows: each toggle's state and the memory its processes hold now.
+fn system_state() -> Value {
+    let settings = load_settings();
+    let (ai, ai_b) = AI_PROCS.iter().map(|n| procs(n)).fold((0usize, 0u64), |(c, b), (p, x)| (c + p.len(), b + x));
+    let (aer, aer_b) = procs(AERIAL_PROC);
+    let siri = Command::new("/usr/bin/defaults").args(["read", "com.apple.assistant.support", "Assistant Enabled"]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1").unwrap_or(false);
+    let wired = Command::new("/usr/sbin/sysctl").args(["-n", "iogpu.wired_limit_mb"]).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
+    let daemon_mb = std::fs::read_to_string(GPU_DAEMON).ok().and_then(|t| t.split("iogpu.wired_limit_mb=").nth(1).and_then(|r| r.split('<').next()?.trim().parse::<u64>().ok()));
+    let (_, _, suggest) = gpu_limit(f64::MAX);
+    json!({"keep_ai_off": settings["keep_ai_off"] == true, "ai_running": ai, "ai_bytes": ai_b, "siri": siri,
+           "keep_still_wallpaper": settings["keep_still_wallpaper"] == true, "aerial_running": aer.len(), "aerial_bytes": aer_b,
+           "gpu_daemon_mb": daemon_mb, "wired_mb": wired, "suggest_mb": suggest})
+}
+
+fn still_wallpaper() {
+    let script = format!("tell application \"System Events\" to tell every desktop to set picture to POSIX file \"{STILL_WALLPAPER}\"");
+    let _ = Command::new("/usr/bin/osascript").args(["-e", &script]).status();
+    std::thread::sleep(Duration::from_secs(2));
+    end(AERIAL_PROC);
+}
+
+/// Apply a toggle.  Apple Intelligence's own switch is the user's (System Settings opens at it); Siri's preference
+/// and the on-device model's processes this app handles.  The GPU limit: a LaunchDaemon that sets it at every boot.
+fn system_toggle(what: &str, on: bool, mb: u64) -> Result<(), String> {
+    let mut set = load_settings();
+    match what {
+        "ai" => {
+            set["keep_ai_off"] = json!(on);
+            save_settings(&set);
+            if on {
+                let _ = Command::new("/usr/bin/defaults").args(["write", "com.apple.assistant.support", "Assistant Enabled", "-bool", "false"]).status();
+                for n in AI_PROCS {
+                    end(n);
+                }
+                let _ = Command::new("/usr/bin/open").arg("x-apple.systempreferences:com.apple.Siri-Settings.extension").status();
+            } else {
+                let _ = Command::new("/usr/bin/defaults").args(["write", "com.apple.assistant.support", "Assistant Enabled", "-bool", "true"]).status();
+            }
+        }
+        "wallpaper" => {
+            set["keep_still_wallpaper"] = json!(on);
+            save_settings(&set);
+            if on {
+                still_wallpaper();
+            } else {
+                let _ = Command::new("/usr/bin/open").arg("x-apple.systempreferences:com.apple.Wallpaper-Settings.extension").status();
+            }
+        }
+        "gpu" => {
+            let shell = if on {
+                let plist = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\"><dict><key>Label</key><string>{GPU_LABEL}</string><key>ProgramArguments</key><array><string>/usr/sbin/sysctl</string>\
+<string>iogpu.wired_limit_mb={mb}</string></array><key>RunAtLoad</key><true/></dict></plist>\n");
+                let tmp = std::env::temp_dir().join("us.tottle.strata.gpu-limit.plist");
+                std::fs::write(&tmp, plist).map_err(|e| e.to_string())?;
+                format!("launchctl bootout system/{GPU_LABEL} 2>/dev/null; install -m 644 -o root -g wheel '{}' {GPU_DAEMON} && launchctl bootstrap system {GPU_DAEMON}", tmp.display())
+            } else {
+                format!("launchctl bootout system/{GPU_LABEL} 2>/dev/null; rm -f {GPU_DAEMON}; sysctl iogpu.wired_limit_mb=0")
+            };
+            if !admin(&shell) {
+                return Err("not changed (the password dialog was cancelled)".into());
+            }
+        }
+        _ => return Err(format!("unknown toggle {what}")),
+    }
+    Ok(())
+}
+
+/// While the app runs: what the toggles keep off stays off (macOS starts the on-device model again on demand, and an
+/// update can bring the aerial wallpaper back).  Every 30 s; quiet when nothing is on.
+fn keep_off() {
+    loop {
+        let set = load_settings();
+        if set["keep_ai_off"] == true {
+            for n in AI_PROCS {
+                end(n);
+            }
+        }
+        if set["keep_still_wallpaper"] == true && !procs(AERIAL_PROC).0.is_empty() {
+            still_wallpaper();
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    }
 }
 
 /// A system setting through macOS's own administrator dialog (osascript "with administrator privileges").
@@ -804,6 +926,7 @@ fn main() {
         let (st, p) = (st.clone(), proxy.clone());
         move || poll(st, p)
     });
+    std::thread::spawn(keep_off); // what the System card's toggles keep off
     if settings["autostart"].as_bool().unwrap_or(false) {
         let _ = start(&st, &proxy);
     }
@@ -840,6 +963,23 @@ fn main() {
                                 let _ = p.send_event(Ev::Log(format!("── {e} ──")));
                             }
                         }
+                        check_memory(&st2, &p, None);
+                    });
+                }
+                "system" => {
+                    let p = proxy.clone();
+                    std::thread::spawn(move || {
+                        let _ = p.send_event(Ev::System(system_state()));
+                    });
+                }
+                "system_toggle" => {
+                    let (p, st2) = (proxy.clone(), st.clone());
+                    let (what, on, mb) = (v["what"].as_str().unwrap_or("").to_string(), v["on"] == true, v["mb"].as_u64().unwrap_or(0));
+                    std::thread::spawn(move || {
+                        let r = system_toggle(&what, on, mb);
+                        let _ = p.send_event(Ev::Log(format!("── {what} {}: {} ──", if on { "on" } else { "off" }, r.clone().err().unwrap_or("done".into()))));
+                        std::thread::sleep(Duration::from_secs(2));
+                        let _ = p.send_event(Ev::System(system_state()));
                         check_memory(&st2, &p, None);
                     });
                 }
@@ -999,6 +1139,7 @@ fn main() {
             }
             Event::UserEvent(Ev::Memory(m)) => js_call(&control_view, "memory", &m),
             Event::UserEvent(Ev::Apps(a)) => js_call(&control_view, "apps", &a),
+            Event::UserEvent(Ev::System(v)) => js_call(&control_view, "system", &v),
             Event::UserEvent(Ev::Page(e)) => {
                 if e["event"] == "finished" {
                     loaded.store(navs.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
@@ -1102,5 +1243,14 @@ mod tests {
         }
         assert!(apps.iter().all(|a| !a["bundle"].as_str().unwrap().starts_with("/System/") && a["name"] != "Strata"));
         eprintln!("{}", apps.iter().map(|a| format!("{} {:.1} GB", a["name"].as_str().unwrap(), a["bytes"].as_f64().unwrap() / 1e9)).collect::<Vec<_>>().join(", "));
+    }
+
+    #[test]
+    fn reads_the_system_state() {
+        let v = system_state();
+        for k in ["keep_ai_off", "ai_running", "siri", "keep_still_wallpaper", "aerial_running", "wired_mb", "suggest_mb"] {
+            assert!(v.get(k).is_some(), "{k} missing: {v}");
+        }
+        eprintln!("{v}");
     }
 }

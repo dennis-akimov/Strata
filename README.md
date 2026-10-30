@@ -8,7 +8,9 @@ Apple Silicon · tested on an M5 Max with 128 GB · free and open source</p>
 > **This is an independently maintained fork of [Strata](https://github.com/Niko1221/Strata) for Apple Silicon Macs
 > only**, maintained by [dennis-akimov](https://github.com/dennis-akimov). It adds a Metal engine and the Mac setup.
 > The original's Windows and Linux engines (NVIDIA CUDA, AMD HIP, Intel SYCL) are still in this repository as they were
-> at the fork point, but they are not built, tested or updated here.
+> at the fork point, but they are not built, tested or updated here. **Linux on an Apple Silicon Mac** (Asahi Linux, or
+> Debian with Asahi's kernel) is supported: the same engine on the Mac's GPU through Vulkan, and `strata-tui`, the app
+> in a terminal ([below](#linux-on-an-apple-silicon-mac)).
 > **For a Windows or Linux PC, use the original: [github.com/Niko1221/Strata](https://github.com/Niko1221/Strata).**
 
 Strata runs large AI models on your own computer: they chat, write code, read pictures and work with your apps and
@@ -37,6 +39,23 @@ Measured on one MacBook Pro with an M5 Max (40-core GPU, 128 GB), macOS 26.4, in
 † Measured 2026-10-12 on 600-word (800-token) answers, with the GPU throttled to 1.2-1.5 GHz after earlier runs, so a floor.
 
 ‡ Measured 2026-10-13 on 300-token answers, against 91-99 tokens/s without the draft in the same runs: the draft helps math, not chat.
+
+On a 16 GB Mac: a 13-inch MacBook Pro with the M1 (2020), 2026-10-29/30, short answers, on macOS and on Linux on the
+same Mac:
+
+| Model | macOS 27 (Metal) | Linux, Debian + Asahi kernel 7.1.13 (Vulkan, Mesa 26.1) | Model file |
+| --- | ---: | ---: | ---: |
+| **GPT-OSS 20B** (MXFP4) | 18.6-19.9 tokens/s at an 8K context § | 12.1-12.2 tokens/s at a 32K context ¶ | 12 GB |
+| **Qwen3.6-35B-A3B 2-bit** (Unsloth UD-IQ2_M) | not measured | 2.4 tokens/s at a 32K context ¶ | 11.5 GB |
+
+§ Only after raising macOS's GPU memory limit (`sudo sysctl iogpu.wired_limit_mb=13312`, until the next restart): by
+default macOS lets the GPU of a Mac up to 36 GB hold about two thirds of the memory, too little for the model's 11 GB of
+weights. `make setup` and Strata.app offer it.
+
+¶ Linux's Apple GPU driver (Honeykrisp) gives the GPU half the memory by default (7.65 GB here); setup writes
+`"HK_SYSMEM"` into the run config to give it 13 GB.
+
+On a 16 GB Mac GPT-OSS 20B is the one to use: the 2-bit Qwen fits but answers 5x slower, and 2 bits cost quality.
 
 Pictures and videos on the same Mac (2026-10-11/12):
 
@@ -82,6 +101,23 @@ nothing. Without the app: `make run PORT=8090` and http://127.0.0.1:8090. Loadin
 while Strata runs; press Ctrl+C to stop it, or use `make start` / `make stop` to run it in the background. Every
 option, the limits and the warnings: **[docs/MACOS.md](docs/MACOS.md)**.
 
+### Linux on an Apple Silicon Mac
+
+On Asahi Linux, or Debian / Ubuntu with Asahi's kernel (M1 and M2; tried on an M1 with Debian forky):
+
+```sh
+git clone https://github.com/dennis-akimov/Strata.git
+cd Strata
+python3 bootstrap.py --onboard    # the first time, before make is installed; later: make setup
+make tui                          # Strata.app in the terminal: Ctrl+S starts the model, type, Enter
+```
+
+Setup installs the system packages with sudo (the compiler, make, cmake, the Vulkan build parts, Mesa's Apple GPU
+driver, aria2), adds you to the GPU's groups (`render`, `video`; from your next login), installs Rust, builds the
+engine with Vulkan, the server and `strata-tui`, downloads the model, writes its run config and checks that it answers.
+`python3 bootstrap.py --detect` shows what it found (the chip, and whether the GPU's driver is there). Details:
+[docs/MACOS.md](docs/MACOS.md#linux-on-an-apple-silicon-mac-asahi).
+
 **Updating:** `git pull`, then `make run` (setup rebuilds the engine when the sources changed; the model stays).
 **Where things are:** models in `Strata-data/` next to the `Strata` folder, settings in `strata-<model>.json`, chats
 in your browser.
@@ -97,6 +133,7 @@ in your browser.
 | GPT-OSS 120B + DFlash draft | 1.6 GB more | about 72 GB (estimate) | Faster on math and step-by-step answers (about +35%), slower on chat (about -20%). `make pull MODEL=GPT-OSS-120B-DFLASH`, then [steps](docs/MACOS.md#gpt-oss-120b-with-a-dflash-draft) |
 | GPT-OSS 20B | 12 GB | 19 GB (measured) | The fastest here (about 3.6B parameters active per token), less capable than the 120B. `make pull MODEL=GPT-OSS-20B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
 | Qwen3.6-35B-A3B | 22 GB | 29 GB (measured) | About 3B parameters active per token, but no faster than GPT-OSS 120B here. `make pull MODEL=QWEN3.6-35B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
+| Qwen3.6-35B-A3B 2-bit (UD-IQ2_M) | 11.5 GB | about 13 GB at 32K (measured) | The same model squeezed to 2 bits to fit a 16 GB Mac; 2.4 tokens/s there on Linux, 5x slower than GPT-OSS 20B, and below the 4-bit in quality. `make pull MODEL=QWEN3.6-35B-IQ2` (it writes its run config) |
 | GLM-5.3-Flash (Maya-S24) | 95 GB | 89 GB at 32K (measured) | The largest here (320B parameters, about 18B active per token), and the slowest. Chat, thinking and tool calls work. Install: `make pull MODEL=GLM-5.3`, then [steps](docs/MACOS.md#glm-53-flash) |
 | HunyuanImage-3.0 (pictures) | 169 GB, streamed (54 GB kept) | 54 GB mapped + 0.3 GB | 80B; about 90 s a picture. Its license excludes the EU, the UK and South Korea. `make pull MODEL=HUNYUAN` (about 2 hours) |
 | Nucleus-Image (pictures) | about 50 GB (21 GB kept) | 12 GB mapped + 2 GB | 17B, Apache-2.0; about 45 s a picture. `make pull MODEL=NUCLEUS` |
@@ -130,6 +167,9 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   [lightx2v's Lightning LoRAs](https://huggingface.co/lightx2v/Wan2.2-Lightning) (4 steps instead of 18, one pass a step). A 2 s 832x480 video takes about
   7 minutes (49 without the LoRAs) and 30 GB of memory at its peak. Install: `make pull MODEL=WAN2.2` (29 GB, the
   LoRAs included), then [steps](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b).
+- **In the terminal:** `make tui` is Strata.app for a terminal (Linux on an Apple Silicon Mac, or over SSH): a bar with
+  the state and the memory, **Chat** (the thinking dimmed), **Monitor**, **Memory** (the context to pick, the programs
+  using the most memory) and **Log**. Ctrl+S starts or stops the model, Ctrl+Q quits and stops it.
 - **One request at a time** by default; others wait. A follow-up in the same conversation reads only what is new, so
   it starts quickly; a long new prompt takes a while to read before the answer starts.
 - **From another device on your network:** in `strata-<model>.json` set `"host": "0.0.0.0"` and an `"api_key"`,
@@ -147,6 +187,11 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   `run-<model>.sh` offers to stop it; otherwise use another port (`make run PORT=8090`). Two models at once need the
   memory for both.
 - **The model does not fit.** Close large apps, choose a smaller model or a smaller context (`make run CONTEXT=32768`).
+  Strata.app's memory card and `make tui`'s Memory view show what it needs, what the GPU may hold and what is free.
+- **It runs out of GPU memory on a 16-32 GB Mac although memory is free.** macOS: the GPU's limit is about two
+  thirds of the memory by default; `sudo sysctl iogpu.wired_limit_mb=<the memory in MB less 3072>` raises it until the
+  next restart (Strata.app's **Raise it** button does it). Linux: the run config's `"env": {"HK_SYSMEM": "<bytes>"}`
+  sets the GPU's share (setup writes it).
 
 More: [docs/MACOS.md](docs/MACOS.md#limits-and-warnings). Problems with this Mac fork:
 [issues](https://github.com/dennis-akimov/Strata/issues). A security problem: report it privately, see

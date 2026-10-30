@@ -32,6 +32,11 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
 #notready{font-size:12px;max-width:620px;text-align:left}#notready div{margin:2px 0}
 .tips{margin-top:8px;display:flex;flex-direction:column;gap:6px}.tips div{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .tips code{font:11px ui-monospace,Menlo,monospace;background:var(--bg);padding:1px 5px;border-radius:4px;user-select:all}
+#sys{flex:1;display:flex;align-items:center;justify-content:center;padding:16px;overflow:auto}
+.sw{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line)}.sw:first-of-type{border-top:0}
+.sw input{appearance:none;width:34px;height:20px;border-radius:10px;background:var(--line);position:relative;flex:none;cursor:pointer;margin-top:1px}
+.sw input:checked{background:#34c759}.sw input::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:left .15s}
+.sw input:checked::after{left:16px}.sw b{display:block}.sw .mute{font-size:11.5px}
 .applist table{width:100%;border-collapse:collapse;margin-top:6px}.applist td{padding:4px 2px;border-top:1px solid var(--line)}
 .applist td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.applist td.b{text-align:right;white-space:nowrap}
 .applist button{padding:2px 8px}.applist button.force{border-color:#ff453a;color:#ff453a}
@@ -47,6 +52,7 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   <span class="mute sep">|</span><button id="load">Load model</button><button id="unload">Unload</button>
   <span id="rate" class="mute"></span><span style="flex:1"></span>
   <span class="mute" id="url"></span>
+  <button id="sysbtn" title="what macOS runs that the model would rather have the memory of">System</button>
   <button id="logbtn" title="the server's output">Log</button>
   <span id="more"><button id="morebtn">More ▾</button><div id="menu">
     <button id="browser">Open in browser</button><button id="edit_config">Edit config</button>
@@ -56,10 +62,12 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   </div></span>
 </div>
 <div id="main">
+  <div id="sys" hidden><div class="card syscard"></div></div>
   <div id="alert" hidden><div class="card"><h3 id="alerttitle"></h3><div id="alerttext"></div><div class="applist"></div><div class="acts" id="alertacts"></div></div></div>
   <div id="idle"><h2 id="idletitle">The server is stopped</h2><div class="mute" id="where"></div><div id="note"></div>
     <div class="card" id="memcard" hidden></div>
     <div class="card applist" id="appscard" hidden></div>
+    <div class="card syscard"></div>
     <button class="main" id="start2">Start the server</button><a href="#" id="showlog" class="mute">show the server's log</a>
     <div id="notready" class="mute"></div></div>
   <pre id="log"></pre>
@@ -93,11 +101,11 @@ function status(s){
   const serving=['ready','busy','unloaded'].includes(ph);
   if(serving&&!up){up=true;send('page',{tab:'monitor'});}   // the server's own page: Chat, Monitor, About
   if(!running&&up)up=false;
-  $('idle').hidden=up||!$('alert').hidden;document.body.classList.toggle('down',!up);layout();
+  $('idle').hidden=up||!$('alert').hidden||!$('sys').hidden;document.body.classList.toggle('down',!up);layout();
   $('idletitle').textContent={starting:'Starting… loading the model',stopping:'Stopping… the engine frees its memory'}[ph]||'The server is stopped';
   if(ph!=='stopped')$('note').textContent='';
 }
-let full=null;function layout(){const f=!up||$('log').classList.contains('open')||!$('alert').hidden;if(f!==full){full=f;send('layout',{full:f});}}
+let full=null;function layout(){const f=!up||$('log').classList.contains('open')||!$('alert').hidden||!$('sys').hidden;if(f!==full){full=f;send('layout',{full:f});}}
 // the memory check of the selected config (the engine's --plan, and the memory free now)
 function memory(m){
   mem=m;const chip=$('mem');
@@ -153,6 +161,28 @@ function tips(m){
 }
 document.addEventListener('click',e=>{const b=e.target.closest('button[data-tip]');if(!b)return;
   b.disabled=true;b.textContent='Asking macOS…';send(b.dataset.tip,b.dataset.mb?{mb:+b.dataset.mb}:{});});
+// the System card: macOS's own memory users, kept off by toggles (the app re-applies them while it runs)
+const mb=b=>b>=1e9?(b/1e9).toFixed(1)+' GB':Math.round(b/1e6)+' MB';
+function system(v){
+  const gpuOn=v.gpu_daemon_mb!=null,target=v.gpu_daemon_mb||v.suggest_mb;
+  const row=(id,on,title,status,note)=>`<label class="sw"><input type="checkbox" data-sys="${id}"${on?' checked':''}><span><b>${title}</b>
+    <span class="mute">${status}</span><br><span class="mute">${note}</span></span></label>`;
+  const html=`<h3>Free memory for the model</h3>`+
+    row('ai',v.keep_ai_off,'Keep Apple Intelligence &amp; Siri off',
+      v.ai_running?`its on-device model runs now: ${v.ai_running} processes, ${mb(v.ai_bytes)}`:'its on-device model is not running',
+      `Siri ${v.siri?'on':'off'}. Apple Intelligence's own switch is yours: System Settings opens at it. While Strata runs, it ends the model's processes when macOS starts them.`)+
+    row('wallpaper',v.keep_still_wallpaper,'Keep the moving wallpaper off',
+      v.aerial_running?`the moving (aerial) wallpaper runs now: ${v.aerial_running} process, ${mb(v.aerial_bytes)}`:'the moving wallpaper is not running',
+      `Wallpaper ${v.aerial_running?'moving':'still'}. A still colour takes its place; while Strata runs, it ends the aerial again if one returns.`)+
+    (target?row('gpu',gpuOn,`GPU memory limit ${(target/1024).toFixed(1)} GB at every startup`,
+      `the GPU may hold ${v.wired_mb?(v.wired_mb/1024).toFixed(1)+' GB now':"macOS's default now (about two thirds of the memory)"}`,
+      `<code>sudo sysctl iogpu.wired_limit_mb=${target}</code> at every boot (a LaunchDaemon); off puts macOS's default back. macOS asks for your password.`):'')+
+    `<div class="mute" style="margin-top:6px">WindowServer (the display) and the rest of macOS stay: they are macOS itself.</div>`;
+  for(const el of document.querySelectorAll('.syscard'))el.innerHTML=html;
+  for(const t of document.querySelectorAll('[data-sys]'))t.onchange=()=>{t.disabled=true;
+    send('system_toggle',{what:t.dataset.sys,on:t.checked,mb:target||0});};
+}
+$('sysbtn').onclick=()=>{const open=$('sys').hidden;$('sys').hidden=!open;$('sysbtn').classList.toggle('on',open);$('idle').hidden=up||open;if(open)send('system');layout();};
 function setCtx(o,start){if(!o)return;send('set_context',{ctx:o.ctx,batch512:!!o.batch512,start:!!start});$('mem').textContent='memory …';closeAlert();}
 // a chat failed for memory, or the engine ended while loading: what to do, one click each
 function trouble(a){
@@ -191,7 +221,7 @@ function pageTrouble(url,why){
     else if(a==='log'){closeAlert();if(!$('log').classList.contains('open'))$('logbtn').click();}else closeAlert();};
   $('alert').hidden=false;$('idle').hidden=true;layout();
 }
-function closeAlert(){$('alert').dataset.kind='';$('alert').hidden=true;$('idle').hidden=up;layout();}
+function closeAlert(){$('alert').dataset.kind='';$('alert').hidden=true;$('idle').hidden=up||!$('sys').hidden;layout();}
 function log(line){const l=$('log'),end=l.scrollTop+l.clientHeight>=l.scrollHeight-20;l.append(line+'\n');
   while(l.childNodes.length>2000)l.firstChild.remove();if(end)l.scrollTop=l.scrollHeight;}
 function note(m){$('note').textContent=m;if(up&&!$('log').classList.contains('open'))$('logbtn').click();log('── '+m+' ──');}
@@ -204,5 +234,5 @@ $('morebtn').onclick=e=>{e.stopPropagation();$('menu').classList.toggle('open');
 document.onclick=()=>$('menu').classList.remove('open');$('menu').onclick=e=>e.stopPropagation();
 for(const id of ['start','stop','restart','load','unload','browser','edit_config','reveal','engine_log','copy_key'])
   $(id).onclick=()=>{$('menu').classList.remove('open');send(id);};
-send('init');
+send('init');send('system');
 </script></body></html>
