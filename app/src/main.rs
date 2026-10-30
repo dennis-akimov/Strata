@@ -960,6 +960,25 @@ fn eval_reply(web: &WebView, js: &str, reply: std::sync::mpsc::Sender<Result<Str
     });
 }
 
+/// Run an action's `js` (a click, a scroll, a submit), then answer with the page as it is `ms` later: an answer the model
+/// would otherwise spend a second call on (8 calls bought 4 page views: click then read, scroll then read).  A page the
+/// action loads answers sooner, when it is a load waiter too (the first answer is the one the call takes).
+fn act_then_read(web: &WebView, js: &str, reply: std::sync::mpsc::Sender<Result<String, String>>, proxy: &tao::event_loop::EventLoopProxy<Ev>, ms: u64) {
+    let p = Mutex::new(proxy.clone());
+    let _ = web.evaluate_script_with_callback(js, move |r| {
+        let v = js_value(&r);
+        if let Some(e) = v["error"].as_str() {
+            let _ = reply.send(Err(e.to_string()));
+            return;
+        }
+        let (reply, p) = (reply.clone(), p.lock().unwrap().clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            let _ = p.send_event(Ev::PageRead(reply, false));
+        });
+    });
+}
+
 fn js_call(wv: &WebView, f: &str, v: &Value) {
     let _ = wv.evaluate_script(&format!("{f}({v})"));
 }
@@ -1401,7 +1420,12 @@ fn main() {
                     if let Some(job) = approvals.borrow_mut().remove(&v["id"].as_u64().unwrap_or(0)) {
                         if v["yes"] == true {
                             let js = browser_mcp::type_js(job.args["element"].as_i64().unwrap_or(0), job.args["text"].as_str().unwrap_or(""), job.args["submit"] == true);
-                            eval_reply(&web, &js, job.reply, |_| Ok("typed: browser_read the page now".into()));
+                            if job.args["submit"] == true {
+                                load_waiters.borrow_mut().push(job.reply.clone());
+                                act_then_read(&web, &js, job.reply, &proxy, 2500);
+                            } else {
+                                eval_reply(&web, &js, job.reply, |_| Ok("typed (not sent): browser_click the form's button, or browser_type again with submit".into()));
+                            }
                         } else {
                             let _ = job.reply.send(Err("the user said no to typing that: ask them in the chat".into()));
                         }
@@ -1550,12 +1574,15 @@ fn main() {
                         });
                         search_waiters.borrow_mut().push(job.reply);
                     }
-                    "browser_click" => eval_reply(&web, &browser_mcp::click_js(n), job.reply,
-                                                  |v| Ok(format!("clicked \"{}\": browser_read the page now", v["clicked"].as_str().unwrap_or("")))),
+                    "browser_click" => {
+                        // a link loads a page (read when it has); a button that changes this page: read 2 s on
+                        load_waiters.borrow_mut().push(job.reply.clone());
+                        act_then_read(&web, &browser_mcp::click_js(n), job.reply, &proxy, 2000);
+                    }
                     "browser_scroll" => {
                         let js = format!("window.scrollBy(0, {}innerHeight * 0.8); JSON.stringify({{y: Math.round(scrollY), height: document.documentElement.scrollHeight}})",
                                          if job.args["direction"] == "up" { "-" } else { "" });
-                        eval_reply(&web, &js, job.reply, |v| Ok(format!("at {} of {} px: browser_read to see it", v["y"], v["height"])));
+                        act_then_read(&web, &js, job.reply, &proxy, 800);
                     }
                     "browser_type" => {
                         let (p, slot) = (proxy.clone(), Mutex::new(Some(job)));

@@ -77,13 +77,33 @@ pub fn page_source(text: &str) -> Option<(String, String)> {
     Some((if title.is_empty() { url.clone() } else { title }, url))
 }
 
-/// The Sources list under an answer: the pages it did not link itself (search pages only when nothing else was read),
-/// at most 6; None when there is nothing to add.
-pub fn sources_text(sources: &[(String, String)], answer: &str) -> Option<String> {
-    let pages: Vec<&(String, String)> = sources.iter().filter(|(_, u)| !(u.contains("google.") && u.contains("/search"))).collect();
-    let list: Vec<&(String, String)> = if pages.is_empty() { sources.iter().collect() } else { pages };
-    let lines: Vec<String> = list.iter().filter(|(_, u)| !answer.contains(u.as_str())).take(6)
-        .map(|(t, u)| format!("- [{}]({u})", t.replace(['[', ']'], ""))).collect();
+/// A page the browser gave the model: (title, address, the text it read).
+pub type Source = (String, String, String);
+
+fn trigrams(text: &str) -> HashSet<String> {
+    let w: Vec<String> = text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+    w.windows(3).map(|t| t.join(" ")).collect()
+}
+
+/// Whether the answer says what the page says: 3 of its word triples are on the page, the question's own left out
+/// ("events in san diego" is on every page the search found).  A soft 404 ("Page not found" served with 200, RFC 9110
+/// 15.5.5 has no say there), a bot check or an error page shares none, so it is not cited.
+// ponytail: word-triple overlap, not entailment; a model judging each page if wrong citations still get through
+pub fn supports(page: &str, answer: &str, question: &str) -> bool {
+    let q = trigrams(question);
+    let page = trigrams(page);
+    trigrams(answer).iter().filter(|t| !q.contains(*t) && page.contains(*t)).count() >= 3
+}
+
+/// The Sources list under an answer: the pages it used (what it says is on them) and did not link itself, search pages
+/// only when no other page was used, at most 6; None when there is nothing to add.
+pub fn sources_text(sources: &[Source], answer: &str, question: &str) -> Option<String> {
+    let used: Vec<&Source> = sources.iter().filter(|(_, _, text)| supports(text, answer, question)).collect();
+    let search = |u: &str| u.contains("google.") && u.contains("/search");
+    let pages: Vec<&Source> = used.iter().copied().filter(|(_, u, _)| !search(u)).collect();
+    let list = if pages.is_empty() { used } else { pages };
+    let lines: Vec<String> = list.iter().filter(|(_, u, _)| !answer.contains(u.as_str())).take(6)
+        .map(|(t, u, _)| format!("- [{}]({u})", t.replace(['[', ']'], ""))).collect();
     (!lines.is_empty()).then(|| format!("\n\n**Sources**\n{}", lines.join("\n")))
 }
 
@@ -122,7 +142,8 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
     let mut last = false;
     // the pages the browser read or searched in this answer: listed under it (an answer from the web always says
     // where from, even when a small model forgets to)
-    let mut sources: Vec<(String, String)> = vec![];
+    let mut sources: Vec<Source> = vec![];
+    let question = messages.iter().rev().find(|m| m["role"] == "user").map(|m| crate::py::py_str(&m["content"])).unwrap_or_default();
     let mut answer_text = String::new();
     let mut done: Map<String, Value>;
     loop {
@@ -184,8 +205,14 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
                     emit(Item::Mcp(json!({"event": "result", "id": c.id, "ok": false, "skipped": true, "text": "not run", "chars": 0, "truncated": false, "ms": 0})))?;
                 }
                 tools = None;
-                let (i2, t2, m2) = svc.prepare(&messages, None, &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
-                (ids, thinking, max_new) = (i2, t2, m2);
+                let (mut i2, t2, m2) = svc.prepare(&messages, None, &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
+                // its thinking closed for it: a template that always opens one (LFM's) let it think "let me try another
+                // page" to the end, with no answer; after </think> what comes is the answer
+                let close = t2 && !svc.harmony;
+                if close {
+                    i2.extend(svc.tok.encode(&format!("{}\n\n", crate::parser::THINK_END), true));
+                }
+                (ids, thinking, max_new) = (i2, t2 && !close, m2);
                 continue;
             }
         }
@@ -220,9 +247,10 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             say(&format!("tool {}: {}, {} characters in {:.1} s{}", c.name, if truthy(&r["ok"]) { "ok" } else { "error" }, crate::mcp::thousands(num("chars") as i64), num("ms") / 1000.0, if truthy(&r["truncated"]) { " (truncated for the model)" } else { "" }));
             results.push(r["text"].as_str().unwrap_or("").to_string());
             if server == json!("browser") && truthy(&r["ok"]) && matches!(tool.as_str(), "browser_read" | "browser_search" | "browser_open" | "browser_back") {
-                if let Some(s) = page_source(r["text"].as_str().unwrap_or("")) {
-                    if !sources.iter().any(|x| x.1 == s.1) {
-                        sources.push(s);
+                let text = r["text"].as_str().unwrap_or("");
+                if let Some((title, url)) = page_source(text) {
+                    if !sources.iter().any(|x| x.1 == url) {
+                        sources.push((title, url, text.to_string()));
                     }
                 }
             }
@@ -242,6 +270,13 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
         }
         assistant.insert("tool_calls".into(), Value::Array(calls.iter().map(|c| json!({"function": {"name": c.name, "arguments": Value::Object(c.arguments.clone())}})).collect()));
         messages.push(Value::Object(assistant));
+        // the budget on the last result (a model that can see what is left spends it better: Google's "Budget-Aware
+        // Tool Use", arXiv 2511.17006); without it, a small model opened page after page into the limit
+        let left = max_rounds - rounds;
+        if let Some(r) = results.last_mut() {
+            r.push_str(&format!("\n\n[tool calls left for this answer: {left} of {max_rounds}{}]",
+                                if left <= 2 { ". Answer from what you have unless one more page is essential" } else { "" }));
+        }
         messages.extend(results.into_iter().map(|r| json!({"role": "tool", "content": r})));
         let (i2, t2, m2) = loop {
             match svc.prepare(&messages, tools.as_deref(), &m.kw, Some(m.max_req), None, None) {
@@ -260,7 +295,11 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
         thinking = t2;
         max_new = m2;
     }
-    if let Some(list) = sources_text(&sources, &answer_text) {
+    if crate::py::strip(&answer_text).is_empty() && !sources.is_empty() && !cancel.is_set() {
+        // still no answer: said, with what was read, instead of an empty reply
+        let read: Vec<String> = sources.iter().take(6).map(|(t, u, _)| format!("- [{}]({u})", t.replace(['[', ']'], ""))).collect();
+        emit(Item::Event(crate::parser::Event::text(Kind::Content, format!("I ran out of steps before I could answer. The pages I read:\n{}\n\nAsk again, more narrowly, and I will answer from them.", read.join("\n")))))?;
+    } else if let Some(list) = sources_text(&sources, &answer_text, &question) {
         emit(Item::Event(crate::parser::Event::text(Kind::Content, list)))?;
     }
     done.insert("completion_tokens".into(), json!(total));
@@ -598,14 +637,41 @@ mod sources_tests {
         let opened = "[Today is 2026-10-30. Answer only from what this page says, and link it as [title](address).]\n\nEvents | Reader\nhttps://r.test/events\n\nJazz";
         assert_eq!(page_source(opened), Some(("Events | Reader".into(), "https://r.test/events".into())));
         assert_eq!(page_source("[Today is x.]\n\nJust a moment\nhttps://cf.test/\n\n(no text on this page: a bot check)\n\nElements:\n(none)"), None);
-        let both = vec![page_source(search).unwrap(), page_source(read).unwrap()];
-        // a page was read: the search page is not listed
-        assert_eq!(sources_text(&both, "It is sunny."), Some("\n\n**Sources**\n- [Paris - BBC Weather](https://www.bbc.com/weather/2988507)".into()));
+        let src = |t: &str| { let (a, b) = page_source(t).unwrap(); (a, b, t.to_string()) };
+        let read = "Paris - BBC Weather\nhttps://www.bbc.com/weather/2988507\n\nToday: sunny intervals and a gentle breeze, 18C\n\nElements:\n(none)";
+        let search = "[Read this first. Today is 2026-10-30: ...]\n\nparis weather - Google Search\nhttps://www.google.com/search?q=paris+weather\n\nParis today: sunny intervals and a gentle breeze";
+        let both = vec![src(search), src(read)];
+        let q = "paris weather";
+        let answer = "In Paris it is 18C with sunny intervals and a gentle breeze.";
+        // a page was used: the search page is not listed
+        assert_eq!(sources_text(&both, answer, q), Some("\n\n**Sources**\n- [Paris - BBC Weather](https://www.bbc.com/weather/2988507)".into()));
         // the answer linked it already: nothing added
-        assert_eq!(sources_text(&both, "Sunny ([BBC](https://www.bbc.com/weather/2988507))."), None);
+        assert_eq!(sources_text(&both, &format!("{answer} ([BBC](https://www.bbc.com/weather/2988507))"), q), None);
         // only a search: its results page is the source
-        assert_eq!(sources_text(&both[..1], "Sunny."), Some("\n\n**Sources**\n- [paris weather](https://www.google.com/search?q=paris+weather)".into()));
-        assert_eq!(sources_text(&[], "x"), None);
+        assert_eq!(sources_text(&both[..1], answer, q), Some("\n\n**Sources**\n- [paris weather](https://www.google.com/search?q=paris+weather)".into()));
+        // an answer that says nothing the pages say (from memory) cites none of them
+        assert_eq!(sources_text(&both, "It rains a lot in autumn there.", q), None);
+        assert_eq!(sources_text(&[], "x", ""), None);
+    }
+
+    #[test]
+    fn error_pages_bot_checks_and_soft_404s_are_not_cited() {
+        // the three pages a family-events answer listed (2026-10-30 chat): fetched, but none of the answer came from them
+        let q = "find more family events in san diego today";
+        let answer = "1. **Halloween Spooktacular** at the Fairmont Grand Del Mar, 5:00pm to 10:00pm: trick-or-treat stations, a live DJ and a photo station for families in San Diego today.";
+        let page = |title: &str, url: &str, body: &str| (title.to_string(), url.to_string(), format!("[Today is 2026-10-30.]\n\n{title}\n{url}\n\n{body}"));
+        let bad = vec![
+            page("0 - Failed to parse time string (2026-5252-01 00:00:00) at position 6 (2): Unexpected character", "https://www.sandiegofamily.com/x", "0 - Failed to parse time string (2026-5252-01 00:00:00) at position 6 (2): Unexpected character"),
+            page("Page not found | Coronado Public Library", "https://coronado.librarycalendar.com/events/2026/10", "Page not found. The page you requested could not be found. Search the library catalog. Family events in San Diego today"),
+            page("Just a moment...", "https://sandiegomoms.com/calendar", "Performing security verification. This website uses a security service to protect against malicious bots."),
+        ];
+        let good = page("Halloween Spooktacular | San Diego", "https://www.sandiego.org/e/1", "Halloween Spooktacular. Fairmont Grand Del Mar. 5:00pm to 10:00pm. Trick-or-treat stations, a live DJ and a photo station.");
+        let mut all = bad.clone();
+        all.push(good);
+        assert_eq!(sources_text(&bad, answer, q), None);
+        assert_eq!(sources_text(&all, answer, q), Some("\n\n**Sources**\n- [Halloween Spooktacular | San Diego](https://www.sandiego.org/e/1)".into()));
+        // the question's words on a page are not support ("family events in san diego today" is on the 404 page)
+        assert!(!supports(&bad[1].2, "Family events in San Diego today: none found.", q));
     }
 }
 
@@ -665,7 +731,7 @@ mod loop_tests {
 
     /// Page n, as the browser's tools answer.
     fn page(n: usize) -> String {
-        format!("[Today is 2026-10-30.]\n\nPage {n}\nhttps://p.test/{n}\n\nJazz at {n}")
+        format!("[Today is 2026-10-30.]\n\nPage {n}\nhttps://p.test/{n}\n\nThe Soto Six jazz quartet plays venue {n} at 8 PM")
     }
 
     fn run_on(server: &str, tool: &'static str, reply: fn(usize) -> String, scripts: &[&str]) -> (Vec<Value>, String, Vec<Vec<u32>>) {
@@ -719,7 +785,10 @@ mod loop_tests {
 
     #[test]
     fn a_call_again_instead_of_an_answer_gets_a_round_without_tools() {
-        let (mcp, text, prompts) = run(&[CALL, CALL, CALL, CALL, "</think>\n\nFrom page 1 and 2."]);
+        use crate::tokenizer::Tokenize;
+        // the last turn has no </think>: the loop closed the thinking for it, so its text is the answer
+        let (mcp, text, prompts) = run(&[CALL, CALL, CALL, CALL, "From page 1 and 2."]);
+        assert!(ByteTokenizer.decode(&prompts[4]).ends_with("</think>\n\n"), "the thinking is closed in the last prompt");
         assert_eq!(not_run(&mcp), 2, "the limit's call and the final round's call");
         assert!(text.contains("From page 1 and 2."), "a reply is never empty: {text:?}");
         assert_eq!(prompts.len(), 5);
@@ -728,7 +797,7 @@ mod loop_tests {
 
     #[test]
     fn pages_the_browser_opened_are_listed_under_the_answer() {
-        let (_, text, _) = run_on("browser", "browser_open", page, &[OPEN, OPEN, "</think>\n\nJazz tonight."]);
+        let (_, text, _) = run_on("browser", "browser_open", page, &[OPEN, OPEN, "</think>\n\nThe Soto Six jazz quartet plays tonight."]);
         assert!(text.ends_with("**Sources**\n- [Page 1](https://p.test/1)\n- [Page 2](https://p.test/2)"), "{text:?}");
     }
 
@@ -737,13 +806,13 @@ mod loop_tests {
     #[test]
     fn a_page_gone_back_to_is_a_source_too() {
         let back = "</think>\n\n<tool_call>\n<function=browser__browser_back>\n</function>\n</tool_call>";
-        let (_, text, _) = run_on("browser", "browser_back", page, &[back, "</think>\n\nJazz."]);
+        let (_, text, _) = run_on("browser", "browser_back", page, &[back, "</think>\n\nThe Soto Six jazz quartet plays tonight."]);
         assert!(text.ends_with("**Sources**\n- [Page 1](https://p.test/1)"), "{text:?}");
     }
 
     #[test]
     fn the_same_page_twice_is_listed_once() {
-        let (_, text, _) = run_on("browser", "browser_open", |_| page(7), &[OPEN, OPEN, "</think>\n\nJazz."]);
+        let (_, text, _) = run_on("browser", "browser_open", |_| page(7), &[OPEN, OPEN, "</think>\n\nThe Soto Six jazz quartet plays tonight."]);
         assert_eq!(text.matches("https://p.test/7").count(), 1, "{text:?}");
     }
 
@@ -765,7 +834,28 @@ mod loop_tests {
     fn other_servers_results_are_not_sources() {
         // a tool of another server that answers like a page: only the browser's pages are cited
         let call = "</think>\n\n<tool_call>\n<function=web__browser_open>\n</function>\n</tool_call>";
-        let (_, text, _) = run_on("web", "browser_open", page, &[call, "</think>\n\nJazz."]);
+        let (_, text, _) = run_on("web", "browser_open", page, &[call, "</think>\n\nThe Soto Six jazz quartet plays tonight."]);
         assert!(!text.contains("Sources"), "{text:?}");
+    }
+
+    #[test]
+    fn the_model_sees_its_tool_budget() {
+        use crate::tokenizer::Tokenize;
+        let (_, _, prompts) = run(&[CALL, CALL, "</think>\n\nDone."]);
+        let seen = |i: usize| ByteTokenizer.decode(&prompts[i]);
+        assert!(seen(1).contains("[tool calls left for this answer: 1 of 2. Answer from what you have unless one more page is essential]"), "{}", seen(1));
+        assert!(seen(2).contains("[tool calls left for this answer: 0 of 2."));
+        assert!(!seen(0).contains("tool calls left"));
+    }
+
+    #[test]
+    fn no_answer_at_all_says_so_with_the_pages_read() {
+        let open = "</think>\n\n<tool_call>\n<function=browser__browser_open>\n<parameter=url>\nhttps://p.test/1\n</parameter>\n</function>\n</tool_call>";
+        // calls to the end, and an empty last turn
+        let (_, text, _) = run_on("browser", "browser_open", page, &[open, open, open, open, ""]);
+        assert!(text.starts_with("I ran out of steps before I could answer. The pages I read:\n- [Page 1](https://p.test/1)\n- [Page 2](https://p.test/2)"), "{text:?}");
+        // nothing read: no note (the reply is the model's, as it is)
+        let (_, text, _) = run(&[CALL, CALL, CALL, CALL, ""]);
+        assert!(!text.contains("ran out of steps"), "{text:?}");
     }
 }

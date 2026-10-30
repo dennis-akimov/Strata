@@ -27,13 +27,13 @@ pub fn tools() -> Value {
          "inputSchema": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}},
         {"name": "browser_read", "description": "The page in the browser now (when you answer from it, link it: [its title](its address)), compactly: its main text (in parts of 3,500 characters: part 2, 3... for more) and up to 40 links, buttons and fields numbered [n] for browser_click / browser_type.",
          "inputSchema": {"type": "object", "properties": {"part": {"type": "integer", "description": "which part of the text (default 1)"}}}},
-        {"name": "browser_click", "description": "Click element [n] of the last browser_read (a link, a button). Then browser_read again: the page may have changed.",
+        {"name": "browser_click", "description": "Click element [n] of the last page you read (a link, a button). It answers with the page after the click.",
          "inputSchema": {"type": "object", "required": ["element"], "properties": {"element": {"type": "integer"}}}},
-        {"name": "browser_type", "description": "Type text into field [n] of the last browser_read (the user is asked to allow it; never a password). submit: press Enter / send its form.",
+        {"name": "browser_type", "description": "Type text into field [n] of the last browser_read (the user is asked to allow it; never a password). submit: press Enter / send its form (it then answers with the page that follows).",
          "inputSchema": {"type": "object", "required": ["element", "text"], "properties": {"element": {"type": "integer"}, "text": {"type": "string"}, "submit": {"type": "boolean"}}}},
-        {"name": "browser_scroll", "description": "Scroll the page down (or up) by about a screen.",
+        {"name": "browser_scroll", "description": "Scroll the page down (or up) by about a screen, for content it loads as you scroll; it answers with the page then (for a long page's text, browser_read its next part instead).",
          "inputSchema": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["down", "up"]}}}},
-        {"name": "browser_back", "description": "Go back to the previous page.",
+        {"name": "browser_back", "description": "Go back to the previous page. It answers with that page's text.",
          "inputSchema": {"type": "object", "properties": {}}}
     ])
 }
@@ -481,6 +481,17 @@ mod in_a_browser {
         b.page(&format!("<html><body><header>Site menu</header><main></main><div><h1>Calendar</h1><p>{}</p></div></body></html>", "Concert tonight. ".repeat(30)));
         let t = b.json(&read_js(1))["text"].as_str().unwrap().to_string();
         assert!(t.starts_with("Calendar") && !t.contains("Site menu"), "{t:.120}");
+
+        // what browser_open answers with, from a real page: the note, then title and address on their own lines (the
+        // server's Sources list reads those two lines); a page with no text says so in the line the server skips
+        b.page("<html><head><title>Jazz tonight</title></head><body><main><p>Quartet at 8 PM.</p></main></body></html>");
+        let t = loaded_text(&b.json(&read_js(1)), false);
+        let (note, body) = t.split_once("\n\n").unwrap();
+        assert!(note.starts_with("[Today is 20") && note.ends_with("link it as [title](address).]"), "{note}");
+        let lines: Vec<&str> = body.lines().take(4).collect();
+        assert_eq!((lines[0], lines[1].starts_with("data:") || lines[1].starts_with("http") || lines[1].starts_with("about:"), lines[3]), ("Jazz tonight", true, "Quartet at 8 PM."), "{body}");
+        b.page("<html><head><title>Just a moment</title></head><body></body></html>");
+        assert!(loaded_text(&b.json(&read_js(1)), false).contains("\n(no text on this page"));
 
         // a form: what a field is (for the Allow), a password refused, typing fires input, submit sends the form
         b.page(FORM);
