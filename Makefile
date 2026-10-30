@@ -108,11 +108,11 @@ endif
 
 # setup's own download (Hugging Face, resumable; HF_ENDPOINT for a mirror, SETUP_ARGS="--data-dir DIR" for elsewhere);
 # the models setup does not install (GLM-5.3, GPT-OSS-120B, GPT-OSS-120B-HERETIC, GPT-OSS-120B-DFLASH, GPT-OSS-20B, QWEN3.6-35B, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.py
-PULL_EXTRA  := GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b gpt-oss-120b-heretic gpt-oss-120b-dflash gpt-oss-20b qwen3.6-35b nucleus hunyuan wan2.2
+PULL_EXTRA  := GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B QWEN3.6-35B-IQ2 NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b gpt-oss-120b-heretic gpt-oss-120b-dflash gpt-oss-20b qwen3.6-35b qwen3.6-35b-iq2 nucleus hunyuan wan2.2
 DATA_DIR    ?= ../Strata-data
 pull:
 	$(if $(filter $(MODEL),$(PULL_EXTRA)),$(PY) tools/pull_model.py $(MODEL) $(DATA_DIR),python3 bootstrap.py --setup --no-start $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS))
-ifeq ($(shell uname -s),Darwin)
+ifneq ($(filter Darwin,$(shell uname -s))$(APPLE_LINUX),)
 	@# a chat model pulled by hand gets its run config too (the context the engine measures to fit this Mac)
 	@if [ -n "$(filter $(MODEL),$(PULL_EXTRA))" ] && [ -x engine-metal/strata-metal ]; then \
 	  .venv/bin/python metal/onboard_mac.py --config-only $(MODEL) --data-dir $(DATA_DIR); \

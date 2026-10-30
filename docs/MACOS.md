@@ -275,6 +275,11 @@ Then a run config as for [GPT-OSS 120B](#gpt-oss-120b) with that file and pack, 
 | GPU clock during those runs (throttled, so a floor) | 1.2-1.3 GHz | 1.2-1.5 GHz |
 | Memory at 131,072 tokens of context (model, cache and work buffers) | 19 GB | 29 GB |
 
+**On a 16 GB Mac:** the MXFP4 file (21.7 GB) does not fit; `make pull MODEL=QWEN3.6-35B-IQ2` takes Unsloth's 2-bit
+UD-IQ2_M of the same model (11.5 GB, same pinned revision, SHA-256 checked, the same tokenizer pack) and writes its run
+config `strata-qwen3.6-35b-a3b-iq2.json` with the context that fits. 2-bit costs quality: compare it with GPT-OSS 20B,
+which was trained for its 4-bit format.
+
 Qwen3.6 has fewer active parameters than GPT-OSS 120B but is no faster: 30 of its 40 layers are linear attention (Gated
 DeltaNet), whose small steps for each token take time that fewer parameters do not save. This file has no MTP head.
 

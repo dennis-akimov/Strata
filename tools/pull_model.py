@@ -10,6 +10,8 @@ Hugging Face revision; a stopped download continues when you run the same line a
                  (strata-metal --dflash; it needs metal/patches/core/0002)
   GPT-OSS-20B    gpt-oss-20b MXFP4 (12.1 GB, sha-256 checked) and its tokenizer pack
   QWEN3.6-35B    Qwen3.6-35B-A3B MXFP4_MOE (21.7 GB, sha-256 checked) and its tokenizer pack
+  QWEN3.6-35B-IQ2  the same model in Unsloth's 2-bit UD-IQ2_M (11.5 GB, sha-256 checked): fits a 16 GB Mac, below the
+                 4-bit in quality; the same tokenizer pack
   NUCLEUS        Nucleus-Image: ~50 GB downloaded, converted to 3 GGUFs (~21 GB), the downloads deleted
   HUNYUAN        HunyuanImage-3.0-Instruct-Distil: 169 GB streamed shard by shard into one 54 GB GGUF
   WAN2.2         Wan 2.2 T2V A14B for videos: both experts (Q4_K_M), UMT5 (Q8_0), the VAE, the Lightning LoRAs (29 GB),
@@ -37,7 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 PY = ROOT / ".venv" / "bin" / "python"
 MTP_PY = ROOT / ".venv-mtp" / "bin" / "python"
-NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B",
+NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "QWEN3.6-35B-IQ2",
          "NUCLEUS", "HUNYUAN", "WAN2.2")
 
 
@@ -210,6 +212,10 @@ def pull(name: str, data: Path) -> None:
     elif name == "QWEN3.6-35B":
         g = get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
                 "2fdd20997c4d88ee25f70f500c61f8b999378d92ab055f9d450fc70d617158d3")
+        tokenizer(g, data / "packs" / "qwen3.6-35b-a3b")
+    elif name == "QWEN3.6-35B-IQ2":
+        g = get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-IQ2_M.gguf",
+                "2be7ef1ed7e1af8b10d3829102cf9a6c2bd5ddb64d675b4ece23a60799403d43")
         tokenizer(g, data / "packs" / "qwen3.6-35b-a3b")
     elif name == "NUCLEUS":
         d = m / "Nucleus-Image"
