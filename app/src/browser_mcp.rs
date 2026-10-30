@@ -25,7 +25,7 @@ pub fn tools() -> Value {
          "inputSchema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}},
         {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address the user gave, or one from a page you read. After a browser_search only addresses from the results or pages you read are opened (guessed ones were 404s): use browser_click on a result's number. Then browser_read it.",
          "inputSchema": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}},
-        {"name": "browser_read", "description": "The page in the browser now, compactly: its main text (in parts of 3,500 characters: part 2, 3... for more) and up to 40 links, buttons and fields numbered [n] for browser_click / browser_type.",
+        {"name": "browser_read", "description": "The page in the browser now (when you answer from it, link it: [its title](its address)), compactly: its main text (in parts of 3,500 characters: part 2, 3... for more) and up to 40 links, buttons and fields numbered [n] for browser_click / browser_type.",
          "inputSchema": {"type": "object", "properties": {"part": {"type": "integer", "description": "which part of the text (default 1)"}}}},
         {"name": "browser_click", "description": "Click element [n] of the last browser_read (a link, a button). Then browser_read again: the page may have changed.",
          "inputSchema": {"type": "object", "required": ["element"], "properties": {"element": {"type": "integer"}}}},
@@ -296,10 +296,28 @@ mod in_a_browser {
             let port = port?;
             let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
             write!(s, "PUT /json/new?about:blank HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").ok()?;
-            let mut out = String::new();
-            s.read_to_string(&mut out).ok()?;
-            let v: Value = serde_json::from_str(out.split_once("\r\n\r\n")?.1).ok()?;
+            // Chrome keeps the connection open: read its headers, then Content-Length bytes (a timeout, not a hang)
+            s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+            let mut r = BufReader::new(s);
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).ok()? == 0 || h.trim().is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = h.split_once(':') {
+                    if k.eq_ignore_ascii_case("content-length") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).ok()?;
+            let v: Value = serde_json::from_slice(&body).ok()?;
             let (ws, _) = tungstenite::connect(v["webSocketDebuggerUrl"].as_str()?).ok()?;
+            if let tungstenite::stream::MaybeTlsStream::Plain(t) = ws.get_ref() {
+                let _ = t.set_read_timeout(Some(Duration::from_secs(20))); // a hang fails the test, not the run
+            }
             Some(Browser { child, ws, id: 0, dir })
         }
 
@@ -307,11 +325,15 @@ mod in_a_browser {
             self.id += 1;
             self.ws.send(tungstenite::Message::Text(json!({"id": self.id, "method": method, "params": params}).to_string().into())).unwrap();
             loop {
-                if let Ok(tungstenite::Message::Text(t)) = self.ws.read() {
-                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
-                    if v["id"] == self.id {
-                        return v["result"].clone();
+                match self.ws.read() {
+                    Ok(tungstenite::Message::Text(t)) => {
+                        let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                        if v["id"] == self.id {
+                            return v["result"].clone();
+                        }
                     }
+                    Ok(_) => {}
+                    Err(e) => panic!("{method}: no answer from Chrome ({e})"),
                 }
             }
         }
@@ -339,11 +361,11 @@ mod in_a_browser {
     }
 
     const RESULTS: &str = r#"<html><head><title>paris weather - Google Search</title></head><body>
-<div><a href="/search?q=paris+weather&tbm=nws">News</a> <a href="/search?q=paris+weather&tbm=isch">Images</a></div>
+<div><a href="https://www.google.com/search?q=paris+weather&tbm=nws">News</a> <a href="https://www.google.com/search?q=paris+weather&tbm=isch">Images</a></div>
 <div id="main">
 <div>Paris, France / Weather 51°F Clear</div>
-<div><a href="/url?q=CAESXgHrOzAVqG3cU4ZYSa1NAsS98&sa=U">Paris - BBC Weather</a><div>www.bbc.com › weather</div><div>Today, light rain.</div></div>
-<div><a href="/url?q=https://www.theweathernetwork.com/en/city/fr/paris&sa=U">Paris 7 Days Weather</a><div>www.theweathernetwork.com › city</div></div>
+<div><a href="https://www.google.com/url?q=CAESXgHrOzAVqG3cU4ZYSa1NAsS98&sa=U">Paris - BBC Weather</a><div>www.bbc.com › weather</div><div>Today, light rain.</div></div>
+<div><a href="https://www.google.com/url?q=https://www.theweathernetwork.com/en/city/fr/paris&sa=U">Paris 7 Days Weather</a><div>www.theweathernetwork.com › city</div></div>
 <input name="q" value="paris weather">
 </div></body></html>"#;
 

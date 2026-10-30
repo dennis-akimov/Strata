@@ -749,7 +749,9 @@ function inline(s) {
   s = esc(s)
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1<em>$2</em>")
-    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    // a bare address is a link too (not one inside a link already made: after href=" or as its text)
+    .replace(/(^|[\s(])(https?:\/\/[^\s<"]*[^\s<".,;:!?)'])/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
 function codeBlock(lang, code) {
@@ -2041,3 +2043,13 @@ $("sched-list").onclick = async (e) => {
 };
 $("scrim").addEventListener("click", () => { if ($("sched").dataset.open === "true") openSched(false); });
 loadSched();
+
+// Strata.app: a link in the chat opens in the browser pane beside it (its web view opens no new windows, and the
+// chat must not navigate away); elsewhere target=_blank opens a tab as usual
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest("a[href]");
+  if (!a || !window.ipc || !window.ipc.postMessage || !/^https?:/.test(a.href) || a.closest(".st-drawer")) return;
+  if (new URL(a.href).origin === location.origin) return;     // the server's own pages stay as they are
+  e.preventDefault();
+  window.ipc.postMessage(JSON.stringify({cmd: "web_open", url: a.href}));
+});

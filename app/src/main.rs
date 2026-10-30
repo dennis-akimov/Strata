@@ -1119,6 +1119,12 @@ fn main() {
                     if v["cmd"] == "web" {
                         let _ = pi.send_event(Ev::Ipc(json!({"cmd": "web"})));
                     }
+                    // a link clicked in the chat: http(s) only, into the browser pane
+                    if v["cmd"] == "web_open" {
+                        if let Some(u) = v["url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+                            let _ = pi.send_event(Ev::Ipc(json!({"cmd": "web_open", "url": u})));
+                        }
+                    }
                 }
             })
             .with_on_page_load_handler(move |e, url| {
@@ -1372,6 +1378,15 @@ fn main() {
                     js_call(&control_view, "webOpen", &json!(web_open.get()));
                     js_call(&page, "strataWeb", &json!(web_open.get()));
                 }
+                "web_open" => {
+                    if !web_open.get() {
+                        web_open.set(true);
+                        layout(full.get());
+                        js_call(&control_view, "webOpen", &json!(true));
+                        js_call(&page, "strataWeb", &json!(true));
+                    }
+                    let _ = web.load_url(v["url"].as_str().unwrap_or("about:blank"));
+                }
                 "web_go" => {
                     let _ = web.load_url(&web_url(v["url"].as_str().unwrap_or("")));
                 }
@@ -1470,7 +1485,7 @@ fn main() {
                 let seen = seen_links.clone();
                 eval_reply(&web, &browser_mcp::read_js(1), w, move |v| {
                     remember_links(&seen, &v);
-                    Ok(format!("[Read this first. Today is {}: prefer the newest results, and put the year in a query when it matters. Answer the user from these results when they hold the answer (Google's own answer is at the top). Only if they do not: browser_click a result's number.]\n\n{}",
+                    Ok(format!("[Read this first. Today is {}: prefer the newest results, and put the year in a query when it matters. Answer the user from these results when they hold the answer (Google's own answer is at the top), and link each source you use as [title](address). Only if they do not: browser_click a result's number.]\n\n{}",
                                v["today"].as_str().unwrap_or("?"), browser_mcp::page_text(&v)))
                 });
             }

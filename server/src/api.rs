@@ -59,6 +59,30 @@ impl Run<'_> {
     }
 }
 
+/// A browser result's page (browser_mcp's page_text: its title on the first line, its address on the second; a search
+/// result starts with a note in [...] first): (title, address); a Google results page as "Google: <query>".
+pub fn page_source(text: &str) -> Option<(String, String)> {
+    let body = if text.starts_with("[Read this first") { text.split_once("\n\n").map(|x| x.1).unwrap_or(text) } else { text };
+    let mut lines = body.lines();
+    let title = lines.next()?.trim().to_string();
+    let url = lines.next()?.trim().to_string();
+    if !url.starts_with("http") {
+        return None;
+    }
+    let title = if url.contains("google.") && url.contains("/search") { title.trim_end_matches(" - Google Search").to_string() } else { title };
+    Some((if title.is_empty() { url.clone() } else { title }, url))
+}
+
+/// The Sources list under an answer: the pages it did not link itself (search pages only when nothing else was read),
+/// at most 6; None when there is nothing to add.
+pub fn sources_text(sources: &[(String, String)], answer: &str) -> Option<String> {
+    let pages: Vec<&(String, String)> = sources.iter().filter(|(_, u)| !(u.contains("google.") && u.contains("/search"))).collect();
+    let list: Vec<&(String, String)> = if pages.is_empty() { sources.iter().collect() } else { pages };
+    let lines: Vec<String> = list.iter().filter(|(_, u)| !answer.contains(u.as_str())).take(6)
+        .map(|(t, u)| format!("- [{}]({u})", t.replace(['[', ']'], ""))).collect();
+    (!lines.is_empty()).then(|| format!("\n\n**Sources**\n{}", lines.join("\n")))
+}
+
 /// The conversation's tool results, shortened one at a time when they no longer fit the context: the oldest still-whole
 /// result becomes a note (its size and first 200 characters); when only the newest is left, it is halved (from 2,000
 /// characters on).  The user's and the model's own messages are never touched.  (index, its characters before) or None.
@@ -92,6 +116,10 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
     // the round after the limit: no tools, so the model answers from what it has (a reply is never left empty)
     let mut tools = tools;
     let mut last = false;
+    // the pages the browser read or searched in this answer: listed under it (an answer from the web always says
+    // where from, even when a small model forgets to)
+    let mut sources: Vec<(String, String)> = vec![];
+    let mut answer_text = String::new();
     let mut done: Map<String, Value>;
     loop {
         let (mut text, mut reasoning, mut calls, mut own_calls) = (String::new(), String::new(), vec![], 0);
@@ -122,6 +150,7 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             other => emit(other),
         })?;
         done = round_done.unwrap_or_default();
+        answer_text.push_str(&text);
         total += done.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0);
         let mut run_them = !calls.is_empty() && own_calls == 0 && done.get("finish").and_then(Value::as_str) == Some("stop") && !cancel.is_set();
         if run_them && rounds >= max_rounds && !last && !cancel.is_set() {
@@ -175,6 +204,13 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             let num = |k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0);
             say(&format!("tool {}: {}, {} characters in {:.1} s{}", c.name, if truthy(&r["ok"]) { "ok" } else { "error" }, crate::mcp::thousands(num("chars") as i64), num("ms") / 1000.0, if truthy(&r["truncated"]) { " (truncated for the model)" } else { "" }));
             results.push(r["text"].as_str().unwrap_or("").to_string());
+            if server == json!("browser") && truthy(&r["ok"]) && matches!(tool.as_str(), "browser_read" | "browser_search") {
+                if let Some(s) = page_source(r["text"].as_str().unwrap_or("")) {
+                    if !sources.iter().any(|x| x.1 == s.1) {
+                        sources.push(s);
+                    }
+                }
+            }
             let mut ev = json!({"event": "result", "id": c.id}).as_object().cloned().unwrap();
             for k in ["ok", "text", "chars", "truncated", "ms"] {
                 ev.insert(k.into(), r[k].clone());
@@ -208,6 +244,9 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
         ids = i2;
         thinking = t2;
         max_new = m2;
+    }
+    if let Some(list) = sources_text(&sources, &answer_text) {
+        emit(Item::Event(crate::parser::Event::text(Kind::Content, list)))?;
     }
     done.insert("completion_tokens".into(), json!(total));
     done.insert("prompt_tokens".into(), json!(ids.len()));
@@ -527,5 +566,27 @@ mod compact_tests {
         let n = m[3]["content"].as_str().unwrap().chars().count();         // halved again on the next overflow
         assert_eq!(compact_one(&mut m), Some((3, n)));
         assert_eq!(compact_one(&mut vec![json!({"role": "user", "content": "hi"})]), None);
+    }
+}
+
+#[cfg(test)]
+mod sources_tests {
+    use super::*;
+
+    #[test]
+    fn an_answer_from_the_web_lists_its_pages() {
+        let read = "Paris - BBC Weather\nhttps://www.bbc.com/weather/2988507\n\nToday: sunny\n\nElements:\n(none)";
+        let search = "[Read this first. Today is 2026-10-30: ...]\n\nparis weather - Google Search\nhttps://www.google.com/search?q=paris+weather\n\nresults";
+        assert_eq!(page_source(read), Some(("Paris - BBC Weather".into(), "https://www.bbc.com/weather/2988507".into())));
+        assert_eq!(page_source(search), Some(("paris weather".into(), "https://www.google.com/search?q=paris+weather".into())));
+        assert_eq!(page_source("opened https://x: browser_read it"), None);
+        let both = vec![page_source(search).unwrap(), page_source(read).unwrap()];
+        // a page was read: the search page is not listed
+        assert_eq!(sources_text(&both, "It is sunny."), Some("\n\n**Sources**\n- [Paris - BBC Weather](https://www.bbc.com/weather/2988507)".into()));
+        // the answer linked it already: nothing added
+        assert_eq!(sources_text(&both, "Sunny ([BBC](https://www.bbc.com/weather/2988507))."), None);
+        // only a search: its results page is the source
+        assert_eq!(sources_text(&both[..1], "Sunny."), Some("\n\n**Sources**\n- [paris weather](https://www.google.com/search?q=paris+weather)".into()));
+        assert_eq!(sources_text(&[], "x"), None);
     }
 }

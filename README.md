@@ -219,7 +219,10 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   it read (guessed ones were 404s); at the tool-round limit (`mcp.max_rounds`, 8) it answers from what it has, and
   when tool results outgrow the context the oldest ones are compacted to a note (auto-compact) instead of failing. On
   the 16 GB M1 with LFM2.5-24B: "Paris weather today" 30 s (one search), "the most recent F1 race" 127 s (right, 2026);
-  a page read went from ~5,300 tokens (~25 s to read) to ~1,500. Google is the start page and the search. Typing waits for your
+  a page read went from ~5,300 tokens (~25 s to read) to ~1,500. Google is the start page and the search. An answer from the web always ends with **Sources** (the pages the browser read, or the search, as links: the
+  server adds the ones the answer did not link), and links in the chat are clickable (in Strata.app they open in the
+  browser pane; a bare address becomes a link). The page scripts are tested in headless Chrome (`cargo test` in
+  app/, skipped without Chrome). Typing waits for your
   **Allow** in the browser's strip (it says what goes into which field on which site), a password field is refused
   (you sign in yourself), and **Stop model** there refuses its browser tools until you let it again. Strata.app serves
   these tools (app/src/browser_mcp.rs: MCP on 127.0.0.1 with a key made at each start) and hands them to the server it
