@@ -16,10 +16,14 @@
 use serde_json::{json, Value};
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, Write};
+#[cfg(target_os = "macos")]
+use std::io::BufRead;
+use std::io::Write;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::sync::{LazyLock, Mutex};
 
 #[derive(Debug, Default, Clone)]
@@ -37,12 +41,38 @@ fn tree() -> Vec<i32> {
     let mut out = vec![std::process::id() as i32];
     let mut i = 0;
     while i < out.len() {
-        let mut kids = vec![0i32; 1024];
-        let n = unsafe { libc::proc_listchildpids(out[i], kids.as_mut_ptr().cast(), (kids.len() * 4) as i32) };
-        out.extend(kids.into_iter().take(n.max(0) as usize).filter(|p| *p > 0));
+        out.extend(children(out[i]));
         i += 1;
     }
     out
+}
+
+#[cfg(target_os = "macos")]
+fn children(pid: i32) -> Vec<i32> {
+    let mut kids = vec![0i32; 1024];
+    let n = unsafe { libc::proc_listchildpids(pid, kids.as_mut_ptr().cast(), (kids.len() * 4) as i32) };
+    kids.into_iter().take(n.max(0) as usize).filter(|p| *p > 0).collect()
+}
+
+/// Linux: every process whose parent (/proc/PID/stat, the field after the command's closing parenthesis) is pid.
+#[cfg(not(target_os = "macos"))]
+fn children(pid: i32) -> Vec<i32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p: i32 = e.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
+            let ppid: i32 = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()?;
+            (ppid == pid).then_some(p)
+        })
+        .collect()
+}
+
+/// lsof: /usr/sbin on macOS, /usr/bin on Linux.
+fn lsof() -> Command {
+    Command::new(if std::path::Path::new("/usr/sbin/lsof").exists() { "/usr/sbin/lsof" } else { "lsof" })
 }
 
 /// lsof -F output: p<pid> c<command>, then per socket f<fd> t<IPv4|IPv6> P<TCP|UDP> n<name> T<ST=STATE> ...
@@ -135,7 +165,7 @@ fn fold(socks: &[Sock]) -> Vec<Value> {
 
 /// GET /connections[?all=1]
 pub fn connections(all: bool) -> Value {
-    let mut cmd = std::process::Command::new("/usr/sbin/lsof");
+    let mut cmd = lsof();
     cmd.args(["-nP", "+c", "0", "-i", "-F", "pcPnT"]);
     if !all {
         cmd.args(["-a", "-p", &tree().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")]);
@@ -343,6 +373,7 @@ pub fn start(cfg: &Value, persist: bool) {
         fw.file = file;
     }
     std::thread::Builder::new().name("firewall-sample".into()).spawn(sample).ok();
+    #[cfg(target_os = "macos")] // the jail and its log are macOS's (sandbox-exec); on Linux the programs run as they are
     std::thread::Builder::new().name("firewall-kernel".into()).spawn(kernel_log).ok();
 }
 
@@ -350,7 +381,7 @@ pub fn start(cfg: &Value, persist: bool) {
 fn sample() {
     let mut before: HashSet<(i32, String, String)> = HashSet::new();
     loop {
-        let out = Command::new("/usr/sbin/lsof").args(["-nP", "+c", "0", "-i", "-F", "pcPnT", "-a", "-p", &tree().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")]).output();
+        let out = lsof().args(["-nP", "+c", "0", "-i", "-F", "pcPnT", "-a", "-p", &tree().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")]).output();
         let socks = out.map(|o| parse(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default();
         let listening: HashSet<(i32, String)> = socks.iter().filter(|s| s.state == "LISTEN").map(|s| (s.pid, split(&s.local).1.to_string())).collect();
         let mut now_set = HashSet::new();
@@ -383,6 +414,7 @@ fn sample() {
 /// The kernel's own record of every network attempt a jailed process made: "Sandbox: curl(21467) deny(1)
 /// network-outbound /private/var/run/mDNSResponder".  It sees what a 2 s sample misses (a lookup, a ping, a refused
 /// connect lasts microseconds).
+#[cfg(target_os = "macos")]
 fn kernel_log() {
     static LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Sandbox: (.+?)\((\d+)\) deny\(\d+\) (network-[a-z-]+)\s*(.*)").unwrap());
     loop {

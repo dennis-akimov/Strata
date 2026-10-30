@@ -72,6 +72,31 @@ run the same command again: it continues where it stopped. Q2_0, IQ3_XXS (`make 
 
 If setup stops, it says what is missing and the command that fixes it.
 
+## Linux on an Apple Silicon Mac (Asahi)
+
+The same engine runs under Linux on an M1 or M2 Mac (Asahi Linux, or Debian / Ubuntu with Asahi's kernel): llama.cpp
+on **Vulkan**, through Mesa's Apple GPU driver (Honeykrisp), instead of Metal. Tried on a 16 GB M1 MacBook Pro with
+Debian forky and kernel 7.1.13-asahi.
+
+```sh
+git clone https://github.com/dennis-akimov/Strata.git && cd Strata
+python3 bootstrap.py --onboard      # the first time, when make is not installed yet; later: make setup
+```
+
+It does what `make setup` does on macOS, with Linux's parts:
+
+| Step | On Linux |
+|---|---|
+| Tools | with sudo: `build-essential make pkg-config cmake ninja-build git curl ca-certificates python3-venv python3-pip aria2 lsof libvulkan-dev glslc spirv-headers glslang-tools mesa-vulkan-drivers vulkan-tools`; you in the groups `render` and `video` (the GPU's device files; they apply from your next login, setup itself uses them at once); Rust (rustup) |
+| GPU check | `vulkaninfo --summary` must list `Apple M1 (G13G B1)` / Honeykrisp. Only `llvmpipe` means the GPU is not reachable: the groups above, or the kernel's `asahi` driver |
+| Engine | `build-metal/metal/strata-metal` built with `GGML_VULKAN` (10-20 minutes the first time: Vulkan's shaders compile too) |
+| Memory | no Metal limit: the model may use the memory less 3 GB (or 15%) for Linux |
+| At the end | no Strata.app (it is macOS's): `make run PORT=8090` and http://127.0.0.1:8090; `make start` / `make stop` in the background |
+
+`make run` and `make start` start the newest `strata-*.json` (`make run CONFIG=strata-x.json` for another). Not on
+Linux: Strata.app, the kernel sandbox of the Firewall tab (sandbox-exec is macOS's: the engine and MCP programs run
+with the network there, and the tab says so) and Apple's GPU counters in the Monitor.
+
 ## Limits and warnings
 
 - **Memory.** A Mac's CPU and GPU share one memory. Metal sets a limit on how much the GPU may use at once

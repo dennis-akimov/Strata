@@ -5,8 +5,14 @@
 set(STRATA_LLAMA_COMMIT "71ad0590f4808b6202f9213d166913858c73b1bc")   # 2026-10-08: few-row MMA mat-mul (#30065), +8% decode with MTP
 set(STRATA_LLAMA_DIR "" CACHE PATH "a llama.cpp checkout at STRATA_LLAMA_COMMIT with metal/patches/core applied (default: fetched)")
 
-set(GGML_METAL ON CACHE BOOL "" FORCE)
-set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # the shaders inside the binary: no Xcode needed to run it
+if(APPLE)
+  set(GGML_METAL ON CACHE BOOL "" FORCE)
+  set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # the shaders inside the binary: no Xcode needed to run it
+else()
+  # Linux on Apple Silicon (Asahi): the GPU through Vulkan (Mesa's Honeykrisp; libvulkan-dev + glslc to build)
+  set(GGML_METAL OFF CACHE BOOL "" FORCE)
+  set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)

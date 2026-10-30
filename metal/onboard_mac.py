@@ -26,6 +26,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -37,6 +38,17 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+LINUX = platform.system() == "Linux"     # Linux on Apple Silicon (Asahi): the same engine on Vulkan, no Strata.app
+sys.path.insert(0, str(ROOT))
+from bootstrap import apple_silicon      # noqa: E402  (stdlib only: what this machine is, read on the fly)
+# what onboarding installs on Linux (Debian / Ubuntu names): the compiler and make, cmake / ninja, llama.cpp's Vulkan
+# backend (headers, glslc, SPIR-V headers), Mesa's Apple GPU driver (Honeykrisp), downloads, the Firewall tab's lsof
+APT = ["build-essential", "make", "pkg-config", "cmake", "ninja-build", "git", "curl", "ca-certificates",
+       "python3-venv", "python3-pip", "aria2", "lsof", "libvulkan-dev", "glslc", "spirv-headers", "glslang-tools",
+       "mesa-vulkan-drivers", "vulkan-tools"]
+def meminfo(key: str) -> float:
+    m = re.search(rf"^{key}:\s+(\d+) kB", Path("/proc/meminfo").read_text(), re.M)
+    return float(m.group(1)) * 1024 if m else 0.0
 ENGINE = ROOT / "engine-metal"
 GB = 1e9
 GIB = 2**30
@@ -129,7 +141,10 @@ def metal_limit() -> float:
 
 
 def free_now() -> float:
-    """Memory free or reclaimable right now (bytes): free + inactive + speculative + purgeable pages."""
+    """Memory free or reclaimable right now (bytes): free + inactive + speculative + purgeable pages (Linux:
+    MemAvailable)."""
+    if LINUX:
+        return meminfo("MemAvailable")
     out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
     page = int(re.search(r"page size of (\d+)", out).group(1)) if "page size" in out else 16384
     pages = {m[0]: int(m[1]) for m in re.findall(r"Pages (free|inactive|speculative|purgeable):\s+(\d+)", out)}
@@ -140,6 +155,14 @@ def memory_apps(n: int = 5) -> list[tuple[str, float]]:
     """The apps using the most memory (an app's processes added up; top's MEM counts compressed memory): the ones to
     quit.  macOS's own and Strata are left out.  [(name, bytes)], largest first."""
     units = {"K": 2**10, "M": 2**20, "G": 2**30}
+    if LINUX:                       # Linux: ps's resident memory, by program
+        progs: dict[str, float] = {}
+        for line in subprocess.run(["ps", "-eo", "uid=,rss=,comm="], capture_output=True, text=True).stdout.splitlines():
+            f = line.split(None, 2)
+            if len(f) == 3 and f[0] == str(os.getuid()) and not f[2].startswith("strata-"):
+                progs[f[2]] = progs.get(f[2], 0) + int(f[1]) * 1024
+        big = sorted(((k, v) for k, v in progs.items() if v >= 300 * 2**20), key=lambda kv: -kv[1])[:n]
+        return [(k + " (background)", v) for k, v in big]
     top = subprocess.run(["top", "-l", "1", "-stats", "pid,mem"], capture_output=True, text=True).stdout
     mem = {}
     for line in top.splitlines():
@@ -179,6 +202,13 @@ def gpu_limit(ram: float) -> tuple[float, int, int]:
 
 
 def power() -> list[str]:
+    if LINUX:
+        online = [p for p in Path("/sys/class/power_supply").glob("*/online") if p.read_text().strip() == "1"]
+        return [] if online or not any(Path("/sys/class/power_supply").glob("*")) else ["on battery: plug in the power adapter for full speed"]
+    return power_mac()
+
+
+def power_mac() -> list[str]:
     """Energy-mode advice (pmset): Low Power slows the GPU; High Power (MacBook Pro with Max, 2024+ Pro, Mac mini Pro,
     Mac Studio 2026: a `powermode` line in pmset) keeps its clock under long answers; a battery holds it back."""
     g = subprocess.run(["pmset", "-g"], capture_output=True, text=True).stdout
@@ -195,6 +225,13 @@ def power() -> list[str]:
 
 
 def mac() -> dict:
+    if LINUX:
+        # no Metal limit: Vulkan's memory is the system's (the unified memory), less what Linux needs
+        ram = meminfo("MemTotal")
+        chip = apple_silicon()["chip"] or "Apple Silicon"
+        usable = ram - max(3 * GB, 0.15 * ram)
+        return {"chip": chip, "ram": ram, "limit": usable, "wired_mb": 0, "suggest_mb": 0, "usable": usable,
+                "macos": "Linux " + platform.release()}
     ram = float(sysctl("hw.memsize") or 0)
     limit, wired, suggest = gpu_limit(ram)
     return {"chip": sysctl("machdep.cpu.brand_string") or "Apple Silicon", "ram": ram, "limit": limit,
@@ -221,8 +258,36 @@ def path_with_cargo() -> dict:
     return env
 
 
+def apt_tools() -> None:
+    """Linux: the system packages (sudo), and the GPU's groups for this user (/dev/dri/renderD128 is group render)."""
+    missing = [p for p in APT if subprocess.run(["dpkg", "-s", p], capture_output=True).returncode != 0]
+    if missing:
+        if not shutil.which("apt-get"):
+            fail("this Linux has no apt-get", "Install these (or your distribution's names for them), then run it again: " + " ".join(APT))
+        note(f"installing {len(missing)} system packages with apt (sudo may ask for your password): {' '.join(missing)}")
+        if subprocess.run(["sudo", "apt-get", "update", "-q"]).returncode != 0 or \
+                subprocess.run(["sudo", "apt-get", "install", "-y", "-q", *missing]).returncode != 0:
+            fail("apt-get could not install them", "If sudo says you may not use it: as root, usermod -aG sudo " +
+                 os.environ.get("USER", "you") + ", log in again, then run it again.")
+    ok("system packages (compiler, cmake, Vulkan, Mesa's Apple GPU driver, aria2, lsof)")
+    user = os.environ.get("USER") or os.getlogin()
+    groups = subprocess.run(["id", "-nG", user], capture_output=True, text=True).stdout.split()
+    if not {"render", "video"} <= set(groups):
+        run(["sudo", "usermod", "-aG", "render,video", user], "adding you to the GPU's groups (render, video) ...")
+        warn("you are in the GPU's groups now; they apply from your next login (setup itself uses them already)")
+    vk = subprocess.run(["sg", "render", "-c", "vulkaninfo --summary"], capture_output=True, text=True).stdout
+    gpu = re.search(r"deviceName\s*=\s*(Apple[^\n]*)", vk)
+    if gpu:
+        ok(f"the GPU through Vulkan: {gpu.group(1).strip()} (Honeykrisp)")
+    else:
+        warn("Vulkan sees no Apple GPU (only the CPU's llvmpipe): the model will run on the CPU, slowly. "
+             "Check the kernel's asahi driver and Mesa (vulkaninfo --summary)")
+
+
 def tools(yes: bool) -> dict:
     env = path_with_cargo()
+    if LINUX:
+        apt_tools()
     # Python packages (cmake and ninja for the engine, the tokenizer pack's needs)
     if subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r",
                        str(ROOT / "requirements.txt")], cwd=ROOT).returncode != 0:
@@ -237,6 +302,8 @@ def tools(yes: bool) -> dict:
             fail("rustup could not install Rust", "Install it by hand: https://rustup.rs, then run `make setup` again.")
     v = subprocess.run(["cargo", "--version"], capture_output=True, text=True, env=env).stdout.strip()
     ok(f"Rust ({v})")
+    if LINUX:
+        return env
     # aria2: 16 connections a file, from Homebrew (tools/pull_model.py downloads alone without it: one connection)
     brew = brew_path()
     if not shutil.which("aria2c") and not brew:
@@ -268,11 +335,16 @@ def brew_path() -> str | None:
 
 
 def builds(env: dict) -> None:
-    # make build: the Metal engine (strata-metal, strata-vision) into engine-metal/, after the server
+    # make build: the engine (strata-metal, strata-vision: Metal on macOS, Vulkan on Linux) into engine-metal/,
+    # after the server
     if not (ENGINE / "strata-metal").exists():
-        note("building the Metal engine (once, 3-6 minutes) ...")
+        note("building the engine (once: 3-6 minutes on macOS, 10-20 on Linux, where Vulkan's shaders compile too) ...")
     run(["make", "--no-print-directory", "build"], env=env, quiet=False)
-    ok("the Metal engine, the server and strata-files in engine-metal/")
+    ok(f"the engine ({'Vulkan' if LINUX else 'Metal'}), the server and strata-files in engine-metal/")
+    if LINUX:                       # Strata.app is macOS's; on Linux: strata-tui in the terminal, or the page in a browser
+        run(["make", "--no-print-directory", "tui-build"], env=env, quiet=True, what="building strata-tui (Strata.app in a terminal) ...")
+        ok("strata-tui: run it with `make tui` (or engine-metal/strata-tui)")
+        return
     run(["make", "--no-print-directory", "app"], env=env, quiet=True, what="building Strata.app ...")
     ok("Strata.app")
 
@@ -416,9 +488,11 @@ def first_answer(cfg_path: Path) -> tuple[bool, str]:
     """Start the server on a free port with this config, ask one question, stop it.  (ok, why not)."""
     port = free_port()
     log = cfg_path.with_suffix(".setup-test.log")
+    cmd = [str(ENGINE / "strata-server"), "--engine", "strata", "--config", str(cfg_path), "--port", str(port)]
+    if LINUX and grp_gid("render") not in os.getgroups():
+        cmd = ["sg", "render", "-c", " ".join(shlex.quote(c) for c in cmd)]   # the GPU's group before the next login
     with log.open("w") as out:
-        srv = subprocess.Popen([str(ENGINE / "strata-server"), "--engine", "strata", "--config", str(cfg_path),
-                                "--port", str(port)], cwd=ROOT, stdout=out, stderr=subprocess.STDOUT)
+        srv = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT)
     try:
         t0 = time.time()
         while time.time() - t0 < 900:
@@ -449,8 +523,17 @@ def first_answer(cfg_path: Path) -> tuple[bool, str]:
         log.unlink(missing_ok=True)
 
 
+def grp_gid(name: str) -> int:
+    import grp
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        return -1
+
+
 def out_of_memory(why: str) -> bool:
-    return any(s in why.lower() for s in ("out of memory", "insufficient memory", "llama_process failed (-3)", "failed (-3)"))
+    return any(s in why.lower() for s in ("out of memory", "insufficient memory", "llama_process failed (-3)", "failed (-3)",
+                                          "outofdevicememory", "out of device memory"))
 
 
 def shrink(cfg_path: Path) -> bool:
@@ -472,7 +555,7 @@ def shrink(cfg_path: Path) -> bool:
 
 
 def test(cfg_path: Path, yes: bool) -> bool:
-    if subprocess.run(["pgrep", "-f", "Strata.app/Contents/MacOS/Strata$"], capture_output=True).returncode == 0:
+    if not LINUX and subprocess.run(["pgrep", "-f", "Strata.app/Contents/MacOS/Strata$"], capture_output=True).returncode == 0:
         if ask("Strata.app is running (its model uses memory). Quit it for the test? (y/n)", "y", yes).lower() == "y":
             subprocess.run(["make", "--no-print-directory", "app-stop"], cwd=ROOT)
     while True:
@@ -516,6 +599,12 @@ def test(cfg_path: Path, yes: bool) -> bool:
 
 
 def open_app(cfg_path: Path) -> None:
+    if LINUX:                           # no Strata.app: strata-tui in this terminal, or the server's page in a browser
+        ok("open it: make tui (chat, monitor, memory and log in this terminal; Ctrl+S starts the server)")
+        ok(f"or without it: make run PORT=8090 (or engine-metal/strata-server --engine strata --config {cfg_path.name} "
+           "--port 8090), then open http://127.0.0.1:8090 (from another computer: the machine's address, with "
+           "\"host\": \"0.0.0.0\" and an \"api_key\" in the config)")
+        return
     settings = Path.home() / "Library/Application Support/Strata/app.json"
     settings.parent.mkdir(parents=True, exist_ok=True)
     s = json.loads(settings.read_text()) if settings.exists() else {}
@@ -543,11 +632,21 @@ def main() -> None:
         return
 
     total = 6
-    step(1, total, "This Mac")
-    if platform.machine() != "arm64":
-        fail("this Mac has an Intel processor", "Strata's Metal engine runs on Apple Silicon (M1 or newer) only.")
+    step(1, total, "This Mac" + (" (Linux)" if LINUX else ""))
+    hw = apple_silicon()
+    if not hw["apple"]:
+        fail("this is not an Apple Silicon Mac" if LINUX else "this Mac has an Intel processor",
+             "On a PC: python3 bootstrap.py --setup (NVIDIA, AMD or Intel GPUs)." if LINUX
+             else "Strata's Metal engine runs on Apple Silicon (M1 or newer) only.")
+    if hw["rosetta"]:
+        fail("this Terminal (or Python) runs under Rosetta, as an Intel program",
+             "Open Terminal without \"Open using Rosetta\" (Finder > Terminal > Get Info), then run make setup again.")
+    if LINUX and hw["gpu"] != "asahi":
+        warn("no Apple GPU driver (asahi) here" + (" - a virtual machine?" if not hw["soc"] else "") +
+             ": the model will run on the CPU, slowly")
+    note(f"detected by {hw['how']}")
     # memory in binary GB, as macOS names it (a "16 GB" Mac has 17.2e9 bytes); disk in decimal GB, as Finder does
-    ok(f"{me['chip']}, {me['ram'] / GIB:.0f} GB of memory, macOS {me['macos']}")
+    ok(f"{me['chip']}, {me['ram'] / GIB:.0f} GB of memory, {me['macos'] if LINUX else 'macOS ' + me['macos']}")
     ok(f"the GPU may use {me['limit'] / GIB:.1f} GB; {free_now() / GIB:.1f} GB is free right now; "
        f"{disk_free(data) / GB:.0f} GB free disk for {data}")
 
@@ -577,8 +676,8 @@ def main() -> None:
         print(f"{GREEN}{BOLD}Strata is ready.{END}")
     for t in power():
         warn(t)
-    print(f"  model:   {m['title']}  ({cfg.name})\n  app:     open Strata.app   (or: make app-run)\n"
-          f"  browser: make run PORT=8090, then http://127.0.0.1:8090\n  another model: make setup")
+    print(f"  model:   {m['title']}  ({cfg.name})\n" + ("  app:     make tui   (Strata.app in this terminal)\n" if LINUX else "  app:     open Strata.app   (or: make app-run)\n") +
+          "  browser: make run PORT=8090, then http://127.0.0.1:8090\n  another model: make setup")
     if not a.no_open:
         open_app(cfg)
 

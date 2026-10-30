@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const HISTORY: usize = 60;
+#[cfg(target_os = "macos")]
 type Cf = *const c_void;
 
 #[cfg(target_os = "macos")]
@@ -74,6 +75,7 @@ unsafe extern "C" {
     fn host_statistics(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
 }
 
+#[cfg(target_os = "macos")]
 const UTF8: u32 = 0x08000100;
 
 #[cfg(target_os = "macos")]

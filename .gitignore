@@ -71,3 +71,4 @@ server/target
 server/tests
 /Strata.app
 server/tests/golden
+tui/target

@@ -27,6 +27,11 @@ URL         := http://$(if $(filter 0.0.0.0,$(HOST)),127.0.0.1,$(HOST)):$(PORT)
 AUTH        := $(if $(API_KEY),-H "Authorization: Bearer $(API_KEY)",)
 RUN_ARGS    := --port $(PORT) $(if $(filter-out 127.0.0.1,$(HOST)),--host $(HOST),) $(if $(API_KEY),--api-key $(API_KEY),)
 SERVER_PAT  := strata-server --engine strata .*--port $(PORT)
+# Linux on an Apple Silicon Mac (Asahi): the same engine as macOS on Vulkan; setup, build and run take that path
+# (bootstrap.py's apple_silicon(): the device tree's "apple,...", else the CPU's implementer 0x61 in /proc/cpuinfo)
+APPLE_LINUX := $(shell { grep -qa 'apple,' /proc/device-tree/compatible || grep -q 'CPU implementer.*0x61' /proc/cpuinfo; } 2> /dev/null && echo 1)
+CONFIG      ?= $(firstword $(shell ls -t strata-*.json 2> /dev/null))
+SERVER_RUN  := engine-metal/strata-server --engine strata --config $(CONFIG) $(RUN_ARGS)
 
 # fails when another program listens on PORT: names it, and how to pick another port
 PORT_FREE   = @who=$$(lsof -nP -iTCP:$(PORT) -sTCP:LISTEN 2> /dev/null | awk 'NR==2 {print $$1 " (pid " $$2 ")"}'); \
@@ -49,7 +54,7 @@ AB_GGUF     ?=
 AB_PROMPTS  ?=
 AB_ROUNDS   ?= 7
 
-.PHONY: help setup pull check update run start stop status wait chat models build build-ab server app app-run app-stop test test-server test-engine ab clean
+.PHONY: help setup pull check update run start stop status wait chat models build build-ab server app app-run app-stop tui tui-build test test-server test-engine ab clean
 
 help:
 	@echo "Strata - make targets (variables: PORT=$(PORT) HOST=$(HOST) API_KEY=... MODEL=... SETUP_ARGS=...;"
@@ -78,6 +83,7 @@ help:
 	@echo "                     and a menu-bar icon; the server is its child on the config's port (8090)"
 	@echo "  make app-run       build it, stop a running Strata.app (and its server) and open the new one"
 	@echo "  make app-stop      quit Strata.app: its server sends QUIT to the engine and frees its memory first"
+	@echo "  make tui           Strata.app in a terminal (Linux on Apple Silicon, or over SSH): chat, monitor, memory, log"
 	@echo "  make chat          one chat request: make chat PROMPT=\"Write a haiku\" [MAX_TOKENS=100 EFFORT=none|low|medium|high]"
 	@echo "                     REASONING_BUDGET=N: at most N tokens of thinking, then it answers (0: no cap; it counts"
 	@echo "                     toward MAX_TOKENS, so keep it 64+ below; EFFORT=none turns thinking off)"
@@ -92,7 +98,7 @@ help:
 # on a Mac: metal/onboard_mac.py does everything (tools, builds, the model, its run config, a first answer, the app);
 # elsewhere setup.py.  python3 bootstrap.py --setup is setup.py's installer on a Mac too (the Qwen3.8 quants, MTP)
 setup:
-ifeq ($(shell uname -s),Darwin)
+ifneq ($(filter Darwin,$(shell uname -s))$(APPLE_LINUX),)
 	python3 bootstrap.py --onboard $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS)
 else
 	python3 bootstrap.py --setup $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS)
@@ -120,13 +126,21 @@ update:
 run:
 	$(PORT_FREE)
 	$(SET_CONTEXT)
+ifeq ($(APPLE_LINUX),1)
+	$(SERVER_RUN)
+else
 	python3 bootstrap.py $(RUN_ARGS) $(SETUP_ARGS)
+endif
 
 start:
 	$(PORT_FREE)
 	$(SET_CONTEXT)
 	@echo "starting Strata on $(URL) (log: strata-run.log) ..."
+ifeq ($(APPLE_LINUX),1)
+	@nohup $(SERVER_RUN) > strata-run.log 2>&1 &
+else
 	@nohup python3 bootstrap.py $(RUN_ARGS) --no-browser $(SETUP_ARGS) > strata-run.log 2>&1 &
+endif
 	@$(MAKE) --no-print-directory wait
 
 # /health says 503 while the model loads, 200 once it is ready
@@ -175,6 +189,12 @@ ifeq ($(shell uname -s),Darwin)
 	@# installed where the run configs point; rm first: macOS kills a program whose binary was rewritten in place
 	rm -f engine-metal/strata-metal engine-metal/strata-vision
 	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
+else ifeq ($(APPLE_LINUX),1)
+	@# Linux on Apple Silicon: llama.cpp's Vulkan backend (metal/CMakeLists.txt picks it off macOS)
+	$(CMAKE) -S . -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON
+	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
+	mkdir -p engine-metal && rm -f engine-metal/strata-metal engine-metal/strata-vision
+	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
 else
 	@echo "on Linux / Windows setup builds or downloads the engine: make setup (or python3 bootstrap.py --setup --build)"
 endif
@@ -194,6 +214,14 @@ app: server
 	cp app/Info.plist Strata.app/Contents/Info.plist
 	codesign --force --sign - Strata.app
 	@echo "built Strata.app: make app-run, or open Strata.app (or drag it to /Applications; it runs the server from $(CURDIR))"
+
+# strata-tui (tui/, Rust): Strata.app in a terminal, for Linux on an Apple Silicon Mac (and any terminal, SSH too)
+tui-build: server
+	cargo build --release --manifest-path tui/Cargo.toml
+	rm -f engine-metal/strata-tui && cp tui/target/release/strata-tui engine-metal/
+
+tui: tui-build
+	engine-metal/strata-tui
 
 # SIGTERM is the app's Quit: it stops its server the server's way (the engine frees its memory) and exits
 APP_PAT = Strata.app/Contents/MacOS/Strata$$

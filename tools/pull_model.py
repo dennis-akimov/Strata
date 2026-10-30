@@ -139,12 +139,14 @@ def cmake() -> str:
 
 
 def ensure_venv() -> None:
-    """The tokenizer packs and converters need .venv: made here when `make setup` has not run yet."""
-    if PY.exists():
-        return
-    print("making .venv (Python packages for the tokenizer pack) ...", flush=True)
-    sh(sys.executable, "-m", "venv", ".venv")
-    sh(PY, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", "requirements.txt")
+    """The tokenizer packs and converters need .venv with requirements.txt: made or completed here when `make setup`
+    has not run (a .venv a stopped setup left can lack them: checked by importing, not by the folder)."""
+    if not PY.exists():
+        print("making .venv (Python packages for the tokenizer pack) ...", flush=True)
+        sh(sys.executable, "-m", "venv", ".venv")
+    if subprocess.run([str(PY), "-c", "import regex, numpy, jinja2"], stderr=subprocess.DEVNULL).returncode != 0:
+        print("installing the Python packages into .venv (requirements.txt) ...", flush=True)
+        sh(PY, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", "requirements.txt")
 
 
 def pull(name: str, data: Path) -> None:
