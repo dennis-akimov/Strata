@@ -5,14 +5,16 @@
 //! child (engine-metal/strata-server on the config's port): quitting stops it the server's own way (SIGTERM: the
 //! engine frees its memory first).
 //!
-//!   Ctrl+S start / stop   Ctrl+R restart   Ctrl+L load / unload   Ctrl+N next config   Tab next view   Ctrl+Q quit
-//!   (outside Chat the same letters work without Ctrl; in Memory, Up / Down and Enter pick the context)
+//!   Ctrl+S start / stop   Ctrl+R restart   Ctrl+L load / unload   Ctrl+N next config   Ctrl+T thinking effort
+//!   Ctrl+O new chat   Esc stop the answer   PgUp / PgDn scroll   Tab or F1-F5 view   ? keys   Ctrl+Q quit
+//!   (outside Chat the same letters work without Ctrl; Memory: Up / Down and Enter pick the context; Models: Up / Down
+//!   and Enter switch to a model, or download one that is not here with make pull)
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -20,12 +22,22 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const GB: f64 = 1e9;
 const CONTEXTS: [u64; 12] = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
-const TABS: [&str; 4] = ["Chat", "Monitor", "Memory", "Log"];
+const TABS: [&str; 5] = ["Chat", "Monitor", "Memory", "Models", "Log"];
+const EFFORTS: [(&str, &str); 4] = [("none", "off"), ("low", "low"), ("medium", "medium"), ("high", "high")];
+/// The models `make pull` knows (tools/pull_model.py): (its name, the run config it writes, a title, the download in GB)
+const CATALOG: [(&str, &str, &str, f64); 5] = [
+    ("GPT-OSS-20B", "gpt-oss-20b", "GPT-OSS 20B", 12.1),
+    ("QWEN3.6-35B-IQ2", "qwen3.6-35b-a3b-iq2", "Qwen3.6-35B-A3B 2-bit", 11.5),
+    ("QWEN3.6-35B", "qwen3.6-35b-a3b", "Qwen3.6-35B-A3B", 21.7),
+    ("GPT-OSS-120B", "gpt-oss-120b", "GPT-OSS 120B", 63.4),
+    ("GLM-5.3", "glm-5.3-flash-maya-s24", "GLM-5.3-Flash", 94.7),
+];
 
 enum Msg {
     Log(String),
@@ -34,6 +46,7 @@ enum Msg {
     Delta { think: bool, text: String },
     ChatEnd(Option<String>),
     Apps(Vec<(String, f64)>),
+    Pulled(String, bool),
 }
 
 /// Strata's folder: $STRATA_ROOT, else the folder above engine-metal/ (where make installs this), else the source's.
@@ -329,9 +342,10 @@ fn poll(srv: Arc<Mutex<Server>>, tx: Sender<Msg>) {
 }
 
 /// One chat turn, streamed (OpenAI chat completions): the thinking and the answer as they come.
-fn chat(port: u16, key: String, messages: Vec<Value>, tx: Sender<Msg>) {
+fn chat(port: u16, key: String, messages: Vec<Value>, effort: &str, stop: Arc<AtomicBool>, tx: Sender<Msg>) {
+    let effort = effort.to_string();
     std::thread::spawn(move || {
-        let body = json!({"model": "strata", "stream": true, "messages": messages}).to_string();
+        let body = json!({"model": "strata", "stream": true, "reasoning_effort": effort, "messages": messages}).to_string();
         let mut r = agent(None).post(&format!("http://127.0.0.1:{port}/v1/chat/completions")).header("Content-Type", "application/json");
         if !key.is_empty() {
             r = r.header("Authorization", &format!("Bearer {key}"));
@@ -347,6 +361,9 @@ fn chat(port: u16, key: String, messages: Vec<Value>, tx: Sender<Msg>) {
         }
         let reader = BufReader::new(resp.into_body().into_reader());
         for line in reader.lines().map_while(Result::ok) {
+            if stop.load(Ordering::Relaxed) {
+                return drop(tx.send(Msg::ChatEnd(Some("stopped".into())))); // the connection closes: the server stops it
+            }
             let Some(data) = line.strip_prefix("data: ") else { continue };
             if data == "[DONE]" {
                 break;
@@ -393,6 +410,20 @@ struct App {
     pick: usize,
     note: String,
     quit: bool,
+    effort: usize,
+    stop: Arc<AtomicBool>,
+    chat_scroll: u16,
+    mpick: usize,
+    pulling: Option<String>,
+    help: bool,
+}
+
+/// A line of the Models view: a run config here, or a model make pull can bring.
+struct ModelRow {
+    title: String,
+    config: Option<usize>,
+    pull: Option<&'static str>,
+    size: f64,
 }
 
 impl App {
@@ -492,11 +523,78 @@ impl App {
             }
         }
         self.busy = true;
+        self.chat_scroll = 0;
+        self.stop = Arc::new(AtomicBool::new(false));
         let (port, key) = {
             let s = self.srv.lock().unwrap();
             (s.port, s.key.clone())
         };
-        chat(port, key, messages, self.tx.clone());
+        chat(port, key, messages, EFFORTS[self.effort].0, self.stop.clone(), self.tx.clone());
+    }
+
+    /// The Models view's lines: every run config here, then what make pull can download that has no config yet.
+    fn models(&self) -> Vec<ModelRow> {
+        let mut rows: Vec<ModelRow> = self
+            .configs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let c = read_json(p);
+                let gguf = arg(&c, "--gguf").unwrap_or_default();
+                ModelRow {
+                    title: c["model_name"].as_str().map(String::from).unwrap_or_else(|| p.file_stem().unwrap_or_default().to_string_lossy().into_owned()),
+                    config: Some(i),
+                    pull: None,
+                    size: std::fs::metadata(&gguf).map(|m| m.len() as f64 / GB).unwrap_or(0.0),
+                }
+            })
+            .collect();
+        for (pull, cfg, title, size) in CATALOG {
+            if !self.root.join(format!("strata-{cfg}.json")).exists() {
+                rows.push(ModelRow { title: title.into(), config: None, pull: Some(pull), size });
+            }
+        }
+        rows
+    }
+
+    /// Enter in Models: switch to a config (the server restarts on it when running), or download a model.
+    fn activate_model(&mut self) {
+        let rows = self.models();
+        let Some(row) = rows.get(self.mpick) else { return };
+        if let Some(i) = row.config {
+            let was = self.running();
+            self.cfg = i;
+            self.select();
+            self.note = format!("{} selected{}", row.title, if was { ": restarting on it" } else { ": Ctrl+S starts it" });
+            if was {
+                self.restart();
+            }
+        } else if let Some(name) = row.pull {
+            if self.pulling.is_some() {
+                self.note = "a download is already running (F5 Log)".into();
+                return;
+            }
+            self.pulling = Some(name.to_string());
+            self.note = format!("downloading {} ({:.1} GB): progress in Log (F5); it writes the run config", row.title, row.size);
+            let (root, tx, name) = (self.root.clone(), self.tx.clone(), name.to_string());
+            std::thread::spawn(move || {
+                let child = Command::new("make").args(["--no-print-directory", "pull", &format!("MODEL={name}")]).current_dir(&root).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+                let ok = match child {
+                    Ok(mut c) => {
+                        let err = c.stderr.take().unwrap();
+                        let t2 = tx.clone();
+                        std::thread::spawn(move || BufReader::new(err).lines().map_while(Result::ok).for_each(|l| drop(t2.send(Msg::Log(l)))));
+                        BufReader::new(c.stdout.take().unwrap()).lines().map_while(Result::ok).for_each(|l| drop(tx.send(Msg::Log(l))));
+                        c.wait().map(|s| s.success()).unwrap_or(false)
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Log(format!("make pull: {e}")));
+                        false
+                    }
+                };
+                let _ = tx.send(Msg::Pulled(name, ok));
+            });
+        }
     }
 
     fn apply_context(&mut self) {
@@ -519,10 +617,37 @@ impl App {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         let typing = self.tab == 0 && !ctrl;
         let letter = |c: char| matches!(code, KeyCode::Char(x) if x == c) && (ctrl || self.tab != 0);
+        if self.help {
+            self.help = false; // any key closes the keys' list
+            return;
+        }
         match code {
+            KeyCode::Char('?') if self.tab != 0 => self.help = true,
+            _ if letter('t') => {
+                self.effort = (self.effort + 1) % EFFORTS.len();
+                self.note = format!("thinking effort: {} (from the next message)", EFFORTS[self.effort].1);
+            }
+            _ if letter('o') => {
+                if self.busy {
+                    self.note = "an answer is being written: Esc stops it".into();
+                } else {
+                    self.turns.clear();
+                    self.chat_scroll = 0;
+                    self.note = "new chat".into();
+                }
+            }
+            KeyCode::Esc if self.tab == 0 && self.busy => {
+                self.stop.store(true, Ordering::Relaxed);
+                self.note = "stopping the answer ...".into();
+            }
+            KeyCode::PageUp if self.tab == 0 => self.chat_scroll = self.chat_scroll.saturating_add(10),
+            KeyCode::PageDown if self.tab == 0 => self.chat_scroll = self.chat_scroll.saturating_sub(10),
+            KeyCode::Enter if self.tab == 3 => self.activate_model(),
+            KeyCode::Up if self.tab == 3 => self.mpick = self.mpick.saturating_sub(1),
+            KeyCode::Down if self.tab == 3 => self.mpick = (self.mpick + 1).min(self.models().len().saturating_sub(1)),
             KeyCode::Tab => self.tab = (self.tab + 1) % TABS.len(),
             KeyCode::BackTab => self.tab = (self.tab + TABS.len() - 1) % TABS.len(),
-            KeyCode::F(n) if (1..=4).contains(&n) => self.tab = n as usize - 1,
+            KeyCode::F(n) if (1..=5).contains(&n) => self.tab = n as usize - 1,
             _ if letter('q') || (ctrl && code == KeyCode::Char('c')) => self.quit = true,
             _ if letter('s') => self.toggle(),
             _ if letter('r') => self.restart(),
@@ -539,8 +664,8 @@ impl App {
             KeyCode::Enter if self.tab == 2 => self.apply_context(),
             KeyCode::Up if self.tab == 2 => self.pick = self.pick.saturating_sub(1),
             KeyCode::Down if self.tab == 2 => self.pick = (self.pick + 1).min(self.plan["options"].as_array().map(|o| o.len().saturating_sub(1)).unwrap_or(0)),
-            KeyCode::Up | KeyCode::PageUp if self.tab == 3 => self.log_scroll = self.log_scroll.saturating_add(if code == KeyCode::PageUp { 20 } else { 1 }),
-            KeyCode::Down | KeyCode::PageDown if self.tab == 3 => self.log_scroll = self.log_scroll.saturating_sub(if code == KeyCode::PageDown { 20 } else { 1 }),
+            KeyCode::Up | KeyCode::PageUp if self.tab == 4 => self.log_scroll = self.log_scroll.saturating_add(if code == KeyCode::PageUp { 20 } else { 1 }),
+            KeyCode::Down | KeyCode::PageDown if self.tab == 4 => self.log_scroll = self.log_scroll.saturating_sub(if code == KeyCode::PageDown { 20 } else { 1 }),
             KeyCode::Backspace if typing => drop(self.input.pop()),
             KeyCode::Esc if typing => self.input.clear(),
             KeyCode::Char(c) if typing => self.input.push(c),
@@ -566,6 +691,18 @@ impl App {
                 self.plan = p;
             }
             Msg::Apps(a) => self.apps = a,
+            Msg::Pulled(name, ok) => {
+                self.pulling = None;
+                self.configs = configs(&self.root);
+                let cfg = CATALOG.iter().find(|c| c.0 == name).map(|c| format!("strata-{}.json", c.1)).unwrap_or_default();
+                if let Some(i) = self.configs.iter().position(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == cfg)) {
+                    if !self.running() {
+                        self.cfg = i;
+                        self.select();
+                    }
+                }
+                self.note = if ok { format!("{name} downloaded: pick it in Models (F4), then Ctrl+S") } else { format!("{name}: the download stopped (Log, F5); run it again to continue") };
+            }
             Msg::Delta { think, text } => {
                 if let Some(t) = self.turns.last_mut() {
                     if think { t.think.push_str(&text) } else { t.answer.push_str(&text) }
@@ -626,6 +763,7 @@ fn draw(f: &mut Frame, app: &App) {
         Span::raw(format!("{name}  ")),
         Span::styled(format!("context {}  ", arg(&cfg, "--max-context").and_then(|c| c.parse().ok()).map(k).unwrap_or("?".into())), Style::new().fg(Color::Cyan)),
         Span::raw(format!("127.0.0.1:{port}  ")),
+        Span::styled(format!("thinking {}  ", EFFORTS[app.effort].1), Style::new().fg(Color::Magenta)),
         Span::styled(format!("{rate:<12}"), Style::new().fg(Color::Blue)),
         mem,
     ]);
@@ -635,11 +773,55 @@ fn draw(f: &mut Frame, app: &App) {
         0 => draw_chat(f, app, body),
         1 => draw_monitor(f, app, body),
         2 => draw_memory(f, app, body),
+        3 => draw_models(f, app, body),
         _ => draw_log(f, app, body),
     }
-    let keys = if app.tab == 0 { "Enter send · Ctrl+S start/stop · Ctrl+R restart · Ctrl+L load/unload · Ctrl+N config · Tab view · Ctrl+Q quit" } else { "s start/stop · r restart · l load/unload · n config · Tab view · q quit" };
+    let keys = if app.tab == 0 { "Enter send · Esc stop · Ctrl+S start/stop · Ctrl+T thinking · Ctrl+O new chat · PgUp/PgDn · Tab view · Ctrl+Q quit" } else { "s start/stop · r restart · l load/unload · t thinking · F4 models · ? keys · q quit" };
     let help_line = if app.note.is_empty() { Line::from(keys.dim()) } else { Line::from(vec![Span::styled(app.note.clone(), Style::new().fg(Color::Yellow)), Span::raw("   "), keys.dim()]) };
     f.render_widget(Paragraph::new(help_line), help);
+    if app.help {
+        let lines = [
+            "Ctrl+S   start / stop the server (the model loads; quitting stops it)",
+            "Ctrl+R   restart            Ctrl+L   load / unload the model",
+            "Ctrl+N   next run config    F4 Models   switch, or download one (make pull)",
+            "Ctrl+T   thinking effort: off, low, medium, high",
+            "Enter    send               Esc   stop the answer      Ctrl+O   new chat",
+            "PgUp / PgDn   scroll the chat or the log",
+            "F3 Memory: Up / Down, Enter   the context (written to the run config)",
+            "Tab, F1-F5   views          ?   these keys         Ctrl+Q   quit",
+            "",
+            "Outside Chat the letters work without Ctrl (s, r, l, n, t, o, q).   Any key closes this.",
+        ];
+        let w = 84.min(f.area().width.saturating_sub(4));
+        let h = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
+        let r = Rect::new((f.area().width.saturating_sub(w)) / 2, (f.area().height.saturating_sub(h)) / 2, w, h);
+        f.render_widget(Clear, r);
+        f.render_widget(Paragraph::new(lines.iter().map(|l| Line::from(*l)).collect::<Vec<_>>()).block(Block::bordered().title(" Keys ")), r);
+    }
+}
+
+fn draw_models(f: &mut Frame, app: &App, area: Rect) {
+    let ram = if cfg!(target_os = "linux") { meminfo("MemTotal") } else { sysctl("hw.memsize") };
+    let room = ram - (3.0 * 1073741824.0f64).max(ram * 0.15);
+    let rows: Vec<Row> = app.models().iter().enumerate().map(|(i, m)| {
+        let current = m.config == Some(app.cfg);
+        let (state, colour) = match (m.config, m.pull) {
+            _ if current && app.running() => ("running".to_string(), Color::Green),
+            _ if current => ("selected".to_string(), Color::Green),
+            (Some(_), _) => ("installed".to_string(), Color::Reset),
+            (_, Some(p)) if app.pulling.as_deref() == Some(p) => ("downloading …".to_string(), Color::Yellow),
+            _ => (format!("download {:.1} GB", m.size), Color::Cyan),
+        };
+        let fits = if m.size <= 0.0 { "" } else if m.size * GB + 1e9 <= room { "fits" } else { "too big for this Mac" };
+        let style = if i == app.mpick { Style::new().reversed() } else { Style::new().fg(colour) };
+        Row::new([format!("{}{}", if current { "▸ " } else { "  " }, m.title), state, if m.size > 0.0 { format!("{:.1} GB", m.size) } else { "–".into() }, fits.to_string()]).style(style)
+    }).collect();
+    f.render_widget(
+        Table::new(rows, [Constraint::Min(28), Constraint::Length(20), Constraint::Length(10), Constraint::Length(22)])
+            .header(Row::new(["model", "", "file", "for this Mac"]).style(Style::new().bold()))
+            .block(Block::bordered().title(" Models: Up / Down, Enter to switch (or download) ")),
+        area,
+    );
 }
 
 /// How many screen lines a text takes at this width (wrapped).
@@ -666,9 +848,16 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             lines.push(if i == 0 { Line::from(vec!["model ".bold().green(), Span::raw(l.to_string())]) } else { Line::from(format!("      {l}")) });
             raw.push_str(&format!("model {l}\n"));
         }
-        if let Some(e) = &t.error {
-            lines.push(Line::from(Span::styled(format!("error {e}"), Style::new().fg(Color::Red))));
-            raw.push_str(&format!("error {e}\n"));
+        match t.error.as_deref() {
+            Some("stopped") => {
+                lines.push(Line::from("      (stopped)".dim()));
+                raw.push_str("      (stopped)\n");
+            }
+            Some(e) => {
+                lines.push(Line::from(Span::styled(format!("error {e}"), Style::new().fg(Color::Red))));
+                raw.push_str(&format!("error {e}\n"));
+            }
+            None => {}
         }
         lines.push(Line::raw(""));
         raw.push('\n');
@@ -677,7 +866,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from("Type a message and press Enter. The answer streams here; the model's thinking is shown dimmed.".dim()));
     }
     let inner_w = hist.width.saturating_sub(2);
-    let scroll = height(&raw, inner_w).saturating_sub(hist.height.saturating_sub(2));
+    let scroll = height(&raw, inner_w).saturating_sub(hist.height.saturating_sub(2)).saturating_sub(app.chat_scroll);
     f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)).block(Block::bordered().title(" Chat ")), hist);
     let title = if app.busy { " answering … " } else { " message " };
     f.render_widget(Paragraph::new(format!("{}▏", app.input)).block(Block::bordered().title(title)), input);
@@ -767,6 +956,7 @@ fn main() {
     let mut app = App {
         root, configs, cfg: 0, srv: srv.clone(), tx: tx.clone(), tab: 0, status: json!({}), plan: json!({}), apps: vec![], log: VecDeque::new(),
         log_scroll: 0, turns: vec![], input: String::new(), busy: false, pick: 0, note: String::new(), quit: false,
+        effort: 2, stop: Arc::new(AtomicBool::new(false)), chat_scroll: 0, mpick: 0, pulling: None, help: false,
     };
     app.select();
     std::thread::spawn({

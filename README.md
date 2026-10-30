@@ -45,7 +45,7 @@ same Mac:
 
 | Model | macOS 27 (Metal) | Linux, Debian + Asahi kernel 7.1.13 (Vulkan, Mesa 26.1) | Model file |
 | --- | ---: | ---: | ---: |
-| **GPT-OSS 20B** (MXFP4) | 18.6-19.9 tokens/s at an 8K context § | 12.1-12.2 tokens/s at a 32K context ¶ | 12 GB |
+| **GPT-OSS 20B** (MXFP4) | 16.8-19.9 tokens/s at an 8-16K context § | 12.1-12.2 tokens/s at a 32K context ¶ | 12 GB |
 | **Qwen3.6-35B-A3B 2-bit** (Unsloth UD-IQ2_M) | not measured | 2.4 tokens/s at a 32K context ¶ | 11.5 GB |
 
 § Only after raising macOS's GPU memory limit (`sudo sysctl iogpu.wired_limit_mb=13312`, until the next restart): by
@@ -56,6 +56,10 @@ weights. `make setup` and Strata.app offer it.
 `"HK_SYSMEM"` into the run config to give it 13 GB.
 
 On a 16 GB Mac GPT-OSS 20B is the one to use: the 2-bit Qwen fits but answers 5x slower, and 2 bits cost quality.
+The first one or two answers after starting it are slower (8-10 tokens/s on the M1): macOS is still reading the 11 GB
+model from the SSD into memory; from then on 17-20 tokens/s, through the chat page or the API alike. The thinking
+effort (*High* makes it think longer, not slower per token) and the sampling settings (top-k 0 or 40: 16.8 and 17.4
+tokens/s) do not change the speed. An 8K context with a prefill batch of 256 leaves macOS the most room on 16 GB.
 
 Pictures and videos on the same Mac (2026-10-11/12):
 
@@ -167,6 +171,11 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   [lightx2v's Lightning LoRAs](https://huggingface.co/lightx2v/Wan2.2-Lightning) (4 steps instead of 18, one pass a step). A 2 s 832x480 video takes about
   7 minutes (49 without the LoRAs) and 30 GB of memory at its peak. Install: `make pull MODEL=WAN2.2` (29 GB, the
   LoRAs included), then [steps](docs/MACOS.md#videos-from-a-prompt-wan-22-a14b).
+- **Free memory for the model** (Strata.app's **System** button, or its card when the server is stopped): toggles that
+  keep Apple Intelligence & Siri off (its on-device model holds about 0.4 GB; Apple Intelligence's own switch opens
+  in System Settings), keep the moving (aerial) wallpaper off, and set the GPU's memory limit at every startup (a
+  LaunchDaemon for `iogpu.wired_limit_mb`; macOS asks for your password). While the app runs it keeps the first two
+  off. The memory card also lists the apps using the most memory, with **Quit**.
 - **In the terminal:** `make tui` is Strata.app for a terminal (Linux on an Apple Silicon Mac, or over SSH): a bar with
   the state and the memory, **Chat** (the thinking dimmed), **Monitor**, **Memory** (the context to pick, the programs
   using the most memory) and **Log**. Ctrl+S starts or stops the model, Ctrl+Q quits and stops it.
@@ -180,7 +189,9 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
 
 - **It is slow.** Use the *High Power* energy mode where your Mac has it (laptops: *System Settings > Battery > Energy
   Mode*; desktops: *System Settings > Energy*) and keep a laptop plugged in. To see the GPU's clock: `brew install
-  macmon`, then `macmon`.
+  macmon`, then `macmon`. Right after starting, the first answer or two are slower while the model is read into
+  memory. The Monitor's live speed covers the last few seconds and dips while the window redraws; the request table
+  shows each answer's average. On a 16-32 GB Mac, Strata.app's **System** toggles leave the model more memory.
 - **It thinks for a very long time.** Set a lower thinking effort, or a **Thinking budget** (4096-8192): when the
   budget runs out the server closes the thinking and the model writes its answer, if max tokens leaves room for one.
 - **It says the port is in use.** Another program listens on 8080. If it is another Strata, `make stop` or starting a
