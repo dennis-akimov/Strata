@@ -299,10 +299,14 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
             let (gpu, total) = (gpu_need + d, need + d);
             let ok = fits(gpu, total);
             let ok512 = !ok && saved_512 > 0.0 && fits(gpu - saved_512, total - saved_512);
-            // the GPU's share alone (what fit_fix needs: memory free now changes once macOS drops its caches)
-            let gpu512 = gpu > limit && saved_512 > 0.0 && gpu - saved_512 <= limit;
+            // the GPU's share alone (what fit_fix needs: memory free now changes once macOS drops its caches), at this
+            // batch or a smaller one: 512, then 256 (the work buffers scale with it)
+            let batch = [None, Some(512.0), Some(256.0)].into_iter().find(|b| match b {
+                None => gpu <= limit,
+                Some(b) => pb > *b && gpu - (n(&g["compute"]) + n(&h["compute"])) * (1.0 - b / pb) <= limit,
+            });
             json!({"ctx": c, "need": if ok512 { total - saved_512 } else { total }, "fits": ok || ok512, "batch512": ok512,
-                   "gpu_fits": gpu <= limit || gpu512, "gpu_batch512": gpu512})
+                   "gpu_fits": batch.is_some(), "gpu_batch": batch.flatten().map(|b| b as u64)})
         })
         .collect();
     let best = options.iter().rposition(|o| o["fits"] == true);
@@ -343,9 +347,10 @@ fn gpu_limit(recommended: f64) -> (f64, u64, u64) {
     let (wired, ram) = (sysctl("iogpu.wired_limit_mb"), sysctl("hw.memsize"));
     let ram_mb = ram >> 20;
     let suggest = ram_mb.saturating_sub((ram_mb * 15 / 100).max(3072));
-    // 1 GB of the limit stays for the others the GPU holds memory for (the window server's buffers, Metal itself): a
-    // 16 GB M1 at a 13 GB limit ran out at 12.8 GiB and answered at 11.7
-    const OTHERS: f64 = 1073741824.0;
+    // 1.25 GB of the limit stays for the others the GPU holds memory for (the window server's buffers, Metal itself,
+    // and what Metal holds beyond llama.cpp's own count): a 16 GB M1 at 13,312 MB had IOGPU "FAILED To Free" and
+    // WindowServer frames fail at 12.76 GB planned (8K, batch 512), none at 12.53 (8K, batch 256)
+    const OTHERS: f64 = 1.25 * 1073741824.0;
     if wired > 0 {
         return (wired as f64 * 1048576.0 - OTHERS, wired, if suggest > wired { suggest } else { 0 });
     }
@@ -564,6 +569,7 @@ impl State {
     }
 
     fn push_log(&mut self, line: String) {
+        eprintln!("strata-app: {line}"); // the log a run from Terminal (or `open --stderr FILE`) keeps
         if self.log.len() == LOG_KEEP {
             self.log.pop_front();
         }
@@ -587,7 +593,7 @@ fn fit_fix(m: &Value) -> Option<(u64, Option<u64>)> {
         return None;
     }
     let r = m["options"].as_array()?.iter().rev().find(|o| o["gpu_fits"] == true)?;
-    Some((r["ctx"].as_u64()?, (r["gpu_batch512"] == true).then_some(512)))
+    Some((r["ctx"].as_u64()?, r["gpu_batch"].as_u64()))
 }
 
 fn start(st: &Shared, proxy: &EventLoopProxy<Ev>) -> Result<(), String> {
@@ -1303,7 +1309,8 @@ mod tests {
         assert_eq!(fit_fix(&json!({"state": "amber", "options": fit.clone()})), None);
         // the largest the GPU holds, even when none fits the memory free right now ("fits" false everywhere)
         assert_eq!(fit_fix(&opts(fit)), Some((8192, None)));
-        assert_eq!(fit_fix(&opts(json!([{"ctx": 4096, "gpu_fits": true, "gpu_batch512": true}]))), Some((4096, Some(512))));
+        assert_eq!(fit_fix(&opts(json!([{"ctx": 4096, "gpu_fits": true, "gpu_batch": 512}]))), Some((4096, Some(512))));
+        assert_eq!(fit_fix(&opts(json!([{"ctx": 8192, "gpu_fits": true, "gpu_batch": 256}]))), Some((8192, Some(256))));
         assert_eq!(fit_fix(&opts(json!([{"ctx": 4096, "gpu_fits": false}]))), None);
     }
 

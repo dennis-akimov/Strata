@@ -287,15 +287,21 @@ fn stop_server(pid: i32, port: u16) -> bool {
 
 /// The pids of Strata engines already running (strata-metal: a model in memory), of any user.
 fn other_engines() -> Vec<String> {
-    engines_in(&std::process::Command::new("ps").args(["-axo", "pid=,comm="]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default())
+    engines_in(&std::process::Command::new("ps").args(["-axo", "pid=,args="]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default())
 }
 
-/// ps -axo pid=,comm= -> the pids whose program is strata-metal (a path or a bare name).
+/// ps -axo pid=,args= -> the pids whose program is strata-metal (a path, spaces allowed, or a bare name) holding a
+/// model: `--plan` only measures one (no weights read; Strata.app runs it for its memory panel while a server starts).
 fn engines_in(ps: &str) -> Vec<String> {
     ps.lines()
         .filter_map(|l| {
-            let (pid, comm) = l.trim_start().split_once(' ')?;
-            (std::path::Path::new(comm.trim()).file_name()? == "strata-metal").then(|| pid.to_string())
+            let (pid, args) = l.trim_start().split_once(' ')?;
+            let args = args.trim();
+            let at = args.match_indices("strata-metal").map(|(i, _)| i + "strata-metal".len()).find(|&e| {
+                let st = e - "strata-metal".len();
+                (st == 0 || args[..st].ends_with('/')) && matches!(args[e..].chars().next(), None | Some(' '))
+            })?;
+            (!args[at..].split_whitespace().any(|a| a == "--plan")).then(|| pid.to_string())
         })
         .collect()
 }
@@ -669,8 +675,8 @@ mod engine_guard_tests {
 
     #[test]
     fn finds_running_engines_only() {
-        let ps = "    1 /sbin/launchd\n 2148 /home/dadmin/Strata/engine-metal/strata-metal\n 2141 engine-metal/strata-server\n  77 strata-metal\n 99 /usr/bin/strata-metal-helper\n";
-        assert_eq!(engines_in(ps), ["2148", "77"]);
+        let ps = "    1 /sbin/launchd\n 2148 /home/dadmin/Strata/engine-metal/strata-metal --serve --gguf m.gguf\n 2141 engine-metal/strata-server --engine strata\n  77 strata-metal\n 99 /usr/bin/strata-metal-helper\n 120 /Users/x/My Apps/Strata/engine-metal/strata-metal --serve\n 17790 /Users/x/Strata/engine-metal/strata-metal --plan --gguf m.gguf --max-context 8192\n 300 vim notes-about-strata-metal.txt\n";
+        assert_eq!(engines_in(ps), ["2148", "77", "120"]);
         assert!(engines_in("  1 /sbin/init\n").is_empty());
     }
 }

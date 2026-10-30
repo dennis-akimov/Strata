@@ -203,11 +203,13 @@ def gpu_limit(ram: float) -> tuple[float, int, int]:
     ram_mb = int(ram) >> 20
     suggest = ram_mb - max(3072, ram_mb * 15 // 100)
     recommended = metal_limit() or 0.75 * ram
-    # 1 GB of the limit stays for the others the GPU holds memory for (the window server's buffers, Metal itself): a
-    # 16 GB M1 at a 13 GB limit ran out at 12.8 GiB and answered at 11.7
+    # 1.25 GB of the limit stays for the others the GPU holds memory for (the window server's buffers, Metal itself, and
+    # what Metal holds beyond llama.cpp's count): a 16 GB M1 at 13,312 MB had the window server's frames fail at 12.76 GB
+    # planned (8K, batch 512), not at 12.53 (8K, batch 256)
+    others = 1.25 * GIB
     if wired:
-        return wired * 2**20 - GIB, wired, suggest if suggest > wired else 0
-    return (min(recommended, ram * 2 / 3) if ram <= 36 * GIB else recommended) - GIB, 0, suggest
+        return wired * 2**20 - others, wired, suggest if suggest > wired else 0
+    return (min(recommended, ram * 2 / 3) if ram <= 36 * GIB else recommended) - others, 0, suggest
 
 
 def power() -> list[str]:
