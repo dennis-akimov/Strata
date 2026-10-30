@@ -113,7 +113,7 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
     let max_rounds = hub.settings["max_rounds"].as_i64().unwrap_or(8);
     let (mut total, mut rounds) = (0i64, 0i64);
     let mut messages = m.messages;
-    // the round after the limit: no tools, so the model answers from what it has (a reply is never left empty)
+    // the round after the limit answers from what it has: its calls are not run
     let mut tools = tools;
     let mut last = false;
     // the pages the browser read or searched in this answer: listed under it (an answer from the web always says
@@ -164,8 +164,9 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             messages.push(Value::Object(assistant));
             messages.extend(calls.iter().map(|_| json!({"role": "tool", "content": "not run: the limit of tool calls for one answer is reached. Answer the user now from what you have found (say what is missing)."})));
             last = true;
-            tools = None;
-            let (i2, t2, m2) = svc.prepare(&messages, None, &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
+            // the tools stay in the prompt: its start is unchanged, so the engine's cache holds (dropping them re-read
+            // all 10K tokens, 50 s on the M1); a call in this round is not run
+            let (i2, t2, m2) = svc.prepare(&messages, tools.as_deref(), &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
             ids = i2;
             thinking = t2;
             max_new = m2;
@@ -173,6 +174,16 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
         }
         if run_them && last {
             run_them = false;                             // no tools in the last round: any call there is not run
+            if crate::py::strip(&text).is_empty() && tools.is_some() {
+                // it called again instead of answering: without the tools, it can only answer (a reply is never empty)
+                for c in &calls {
+                    emit(Item::Mcp(json!({"event": "result", "id": c.id, "ok": false, "skipped": true, "text": "not run", "chars": 0, "truncated": false, "ms": 0})))?;
+                }
+                tools = None;
+                let (i2, t2, m2) = svc.prepare(&messages, None, &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
+                (ids, thinking, max_new) = (i2, t2, m2);
+                continue;
+            }
         }
         if !run_them {
             for c in &calls {

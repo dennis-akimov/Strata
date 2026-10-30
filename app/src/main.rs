@@ -1067,6 +1067,8 @@ fn main() {
     // the addresses the model's reads showed (all links of the pages it read), and whether it searched: after a
     // search, browser_open takes only those (LFM2.5 guessed addresses and got 404s, round after round)
     let seen_links: std::sync::Arc<Mutex<std::collections::HashSet<String>>> = Default::default();
+    // the last page text the model got (a search's results, a read): the same again is said in one line, not resent
+    let last_read: std::sync::Arc<Mutex<String>> = Default::default();
     let searched: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None); // the last search (the check holds 10 min)
     let next_ask = std::cell::Cell::new(0u64);
     {
@@ -1482,9 +1484,10 @@ fn main() {
                 }
             }
             Event::UserEvent(Ev::SearchRead(w)) => {
-                let seen = seen_links.clone();
+                let (seen, last) = (seen_links.clone(), last_read.clone());
                 eval_reply(&web, &browser_mcp::read_js(1), w, move |v| {
                     remember_links(&seen, &v);
+                    *last.lock().unwrap() = browser_mcp::page_text(&v);
                     Ok(format!("[Read this first. Today is {}: prefer the newest results, and put the year in a query when it matters. Answer the user from these results when they hold the answer (Google's own answer is at the top), and link each source you use as [title](address). Only if they do not: browser_click a result's number.]\n\n{}",
                                v["today"].as_str().unwrap_or("?"), browser_mcp::page_text(&v)))
                 });
@@ -1524,10 +1527,10 @@ fn main() {
                         wait_load(job.reply, 8);
                     }
                     "browser_read" => {
-                        let seen = seen_links.clone();
+                        let (seen, last) = (seen_links.clone(), last_read.clone());
                         eval_reply(&web, &browser_mcp::read_js(job.args["part"].as_i64().unwrap_or(1)), job.reply, move |v| {
                             remember_links(&seen, &v);
-                            Ok(browser_mcp::page_text(&v))
+                            Ok(browser_mcp::once(&mut last.lock().unwrap(), browser_mcp::page_text(&v)))
                         });
                     }
                     "browser_search" => {

@@ -48,14 +48,22 @@ pub const PART: usize = 3500;
 pub fn read_js(part: i64) -> String {
     format!(r#"((part, PART) => {{
   document.querySelectorAll('[data-strata-id]').forEach((e) => e.removeAttribute('data-strata-id'));
-  const root = document.querySelector('main, article, [role=main], #content, #main') || document.body;
+  let root = document.querySelector('main, article, [role=main], #content, #main') || document.body;
   if (!root) return JSON.stringify({{error: 'the page has no content yet: try again in a moment'}});
-  const skip = 'nav, header, footer, aside, script, style, noscript, svg, [role=navigation], [role=banner], [role=contentinfo], [aria-hidden=true]';
+  let skip = 'nav, header, footer, aside, script, style, noscript, svg, [role=navigation], [role=banner], [role=contentinfo], [aria-hidden=true]';
   // the main text without its menus: hidden for the moment innerText takes (the same task: nothing is painted)
-  const hid = [...root.querySelectorAll(skip)], was = hid.map((e) => e.style.display);
-  hid.forEach((e) => e.style.display = 'none');
-  const text = (root.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
-  hid.forEach((e, i) => e.style.display = was[i]);
+  const grab = () => {{
+    const hid = [...root.querySelectorAll(skip)], was = hid.map((e) => e.style.display);
+    hid.forEach((e) => e.style.display = 'none');
+    const t = (root.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
+    hid.forEach((e, i) => e.style.display = was[i]);
+    return t;
+  }};
+  let text = grab();
+  // an empty or tiny landmark (a promo card first in the page): the whole body; content a dialog marked
+  // aria-hidden (a cookie or sign-up box open over it): read it anyway
+  if (text.length < 300 && root !== document.body) {{ root = document.body; text = grab(); }}
+  if (text.length < 300) {{ skip = skip.replace(', [aria-hidden=true]', ''); text = grab(); }}
   const parts = Math.max(1, Math.ceil(text.length / PART)), p = Math.min(Math.max(1, part), parts);
   const sel = 'a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link]';
   const cand = [...new Set([...root.querySelectorAll(sel), ...document.querySelectorAll('input[type=search],input[name=q],textarea[name=q]')])];
@@ -122,9 +130,22 @@ pub fn type_js(n: i64, text: &str, submit: bool) -> String {
 pub fn page_text(v: &Value) -> String {
     let els: Vec<&str> = v["elements"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     let (p, n) = (v["part"].as_i64().unwrap_or(1), v["parts"].as_i64().unwrap_or(1));
-    format!("{}\n{}\n\n{}{}\n\nElements:\n{}", v["title"].as_str().unwrap_or(""), v["url"].as_str().unwrap_or(""), v["text"].as_str().unwrap_or(""),
+    let text = v["text"].as_str().unwrap_or("");
+    let text = if text.is_empty() { "(no text on this page: a bot check, or still loading. browser_read it once more, or use another result)" } else { text };
+    format!("{}\n{}\n\n{}{}\n\nElements:\n{}", v["title"].as_str().unwrap_or(""), v["url"].as_str().unwrap_or(""), text,
             if n > 1 { format!("\n[part {p} of {n}: browser_read with part {} for more]", (p + 1).min(n)) } else { String::new() },
             if els.is_empty() { "(none)".to_string() } else { els.join("\n") })
+}
+
+/// A read the model already has (the search's results read again, the same part twice): one line instead of the
+/// page again; a round of context and prefill saved.
+pub fn once(last: &mut String, text: String) -> String {
+    if *last == text {
+        let head: Vec<&str> = text.lines().take(2).collect();
+        return format!("unchanged: the same text as your last read of this page ({}). Answer from it, use browser_read with another part, or open another page.", head.join(" "));
+    }
+    *last = text.clone();
+    text
 }
 
 /// The MCP endpoint: 127.0.0.1:<port>/mcp, with Authorization: Bearer <key>.  Returns the port.
@@ -247,6 +268,16 @@ mod tests {
         assert!(page_text(&v).contains("[part 1 of 3: browser_read with part 2 for more]"));
         assert!(read_js(2).ends_with("})(2, 3500)"));
         assert!(type_js(3, "a\"b", true).contains(r#""a\"b""#));
+        assert!(page_text(&json!({"title": "T", "url": "u", "text": ""})).contains("(no text on this page"));
+    }
+
+    #[test]
+    fn a_read_the_model_has_is_one_line() {
+        let mut last = String::new();
+        assert_eq!(once(&mut last, "T\nu\n\nbody".into()), "T\nu\n\nbody");
+        let again = once(&mut last, "T\nu\n\nbody".into());
+        assert!(again.starts_with("unchanged") && again.contains("(T u)"), "{again}");
+        assert_eq!(once(&mut last, "T\nu\n\nother".into()), "T\nu\n\nother");
     }
 }
 
@@ -375,6 +406,11 @@ mod in_a_browser {
 <p>PARTSTART %LONG% PARTEND</p><a href="https://en.wikipedia.org/wiki/Light">Light</a><button>Show more</button></main>
 <aside>Sidebar words</aside><footer>Footer words <a href="/privacy">Privacy</a></footer></body></html>"#;
 
+    // an events page: a promo card is the first <article>, and the open cookie dialog marked the content aria-hidden
+    const DIALOG: &str = r#"<html><body><nav>Menu words</nav><article>Ad</article><div aria-hidden="true">
+<h1>Events today</h1><p>Halloween bar crawl, 7 PM, Gaslamp Quarter. Ghost Light Masquerade, 7:30 PM. %LONG%</p>
+<a href="https://x.test/e/1">Bar crawl</a></div><div role="dialog" aria-modal="true">We use cookies <button>Accept</button></div></body></html>"#;
+
     const FORM: &str = r#"<html><body><main><form id="f" onsubmit="window.sent = (window.sent || 0) + 1; return false;">
 <label for="u">Email</label><input id="u" name="email"><input type="password" name="pw" aria-label="Password">
 <textarea name="note" placeholder="Note"></textarea><button type="button" onclick="window.clicked = 'yes'">Go</button>
@@ -415,6 +451,13 @@ mod in_a_browser {
         let c = b.json(&click_js(2));
         assert_eq!(c["clicked"], "Show more");
         assert!(b.json(&click_js(7))["error"].as_str().unwrap().contains("no element [7]"));
+
+        // the content behind a small landmark and an open dialog: still read, not an empty page
+        b.page(&DIALOG.replace("%LONG%", &"more ".repeat(60)));
+        let v = b.json(&read_js(1));
+        let t = v["text"].as_str().unwrap();
+        assert!(t.contains("Halloween bar crawl") && t.contains("Accept") && !t.contains("Menu words"), "{t:.200}");
+        assert!(v["elements"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("Bar crawl")));
 
         // a form: what a field is (for the Allow), a password refused, typing fires input, submit sends the form
         b.page(FORM);
