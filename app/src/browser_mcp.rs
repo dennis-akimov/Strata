@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct Job {
     pub tool: String,
     pub args: Value,
@@ -46,29 +47,33 @@ pub const PART: usize = 3500;
 /// part's text (main / article / role=main, without nav, header, footer, aside), part `part` of it, and up to 40 visible
 /// links, buttons and fields in it (a search field anywhere), numbered (data-strata-id) for click / type.
 pub fn read_js(part: i64) -> String {
-    format!(r#"((part, PART) => {{
+    format!("({READ_FN})({part}, {PART})")
+}
+
+/// The page read as a function of (part, PART): what read_js runs in the page, and the picker bridge in its frame.
+pub const READ_FN: &str = r#"(part, PART) => {
   document.querySelectorAll('[data-strata-id]').forEach((e) => e.removeAttribute('data-strata-id'));
   let root = document.querySelector('main, article, [role=main], #content, #main') || document.body;
-  if (!root) return JSON.stringify({{error: 'the page has no content yet: try again in a moment'}});
+  if (!root) return JSON.stringify({error: 'the page has no content yet: try again in a moment'});
   let skip = 'nav, header, footer, aside, script, style, noscript, svg, [role=navigation], [role=banner], [role=contentinfo], [aria-hidden=true]';
   // the main text without its menus: hidden for the moment innerText takes (the same task: nothing is painted)
-  const grab = () => {{
+  const grab = () => {
     const hid = [...root.querySelectorAll(skip)], was = hid.map((e) => e.style.display);
     hid.forEach((e) => e.style.display = 'none');
     const t = (root.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
     hid.forEach((e, i) => e.style.display = was[i]);
     return t;
-  }};
+  };
   let text = grab();
   // an empty or tiny landmark (a promo card first in the page): the whole body; content a dialog marked
   // aria-hidden (a cookie or sign-up box open over it): read it anyway
-  if (text.length < 300 && root !== document.body) {{ root = document.body; text = grab(); }}
-  if (text.length < 300) {{ skip = skip.replace(', [aria-hidden=true]', ''); text = grab(); }}
+  if (text.length < 300 && root !== document.body) { root = document.body; text = grab(); }
+  if (text.length < 300) { skip = skip.replace(', [aria-hidden=true]', ''); text = grab(); }
   const parts = Math.max(1, Math.ceil(text.length / PART)), p = Math.min(Math.max(1, part), parts);
   const sel = 'a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link]';
   const cand = [...new Set([...root.querySelectorAll(sel), ...document.querySelectorAll('input[type=search],input[name=q],textarea[name=q]')])];
   const items = [], seen = new Set(), hrefs = [];
-  for (const e of cand) {{
+  for (const e of cand) {
     if (items.length >= 40) break;
     if (e.closest(skip) && !e.matches('input,textarea')) continue;
     const r = e.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) continue;
@@ -79,51 +84,104 @@ pub fn read_js(part: i64) -> String {
     seen.add(key);
     e.setAttribute('data-strata-id', items.length + 1);
     if (e.tagName === 'A' && e.href) hrefs.push(e.href);
-    items.push(`[${{items.length + 1}}] ${{kind}} "${{name}}"` + (e.tagName === 'A' && e.href ? ' -> ' + e.href.replace(/^https?:\/\//, '').slice(0, 80) : ''));
-  }}
+    items.push(`[${items.length + 1}] ${kind} "${name}"` + (e.tagName === 'A' && e.href ? ' -> ' + e.href.replace(/^https?:\/\//, '').slice(0, 80) : ''));
+  }
   // every link on the page, and the sites the text names ("www.bbc.com › weather": how Google's plain results show
   // them), for browser_open's check: its site must be one a page read showed.  Google's links are redirects
   // (/url?q=<the address>, or an opaque token): the address, when there is one, too.
-  document.querySelectorAll('a[href]').forEach((a) => {{
+  document.querySelectorAll('a[href]').forEach((a) => {
     if (hrefs.length >= 400 || !a.href.startsWith('http')) return;
     hrefs.push(a.href);
-    try {{ const u = new URL(a.href), q = u.searchParams.get('q') || u.searchParams.get('url');
-      if (u.pathname === '/url' && q && /^https?:/.test(q)) hrefs.push(q); }} catch (e) {{}}
-  }});
+    try { const u = new URL(a.href), q = u.searchParams.get('q') || u.searchParams.get('url');
+      if (u.pathname === '/url' && q && /^https?:/.test(q)) hrefs.push(q); } catch (e) {}
+  });
   const sites = [...new Set((text.match(/\b(?:[a-z0-9-]+\.)+(?:com|org|net|gov|edu|int|info|io|co|ai|app|dev|news|tv|me|us|uk|ca|au|de|fr|es|it|nl|eu|jp|ru|ch|be|at|se|no|dk|fi|pl|pt|ie|in|br|mx|nz)\b/gi) || []).map((h) => h.toLowerCase()))].slice(0, 200);
   const d = new Date(), today = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-  return JSON.stringify({{title: document.title, url: location.href, text: text.slice((p - 1) * PART, p * PART), part: p, parts, elements: items, hrefs, sites, today}});
-}})({part}, {PART})"#)
-}
+  return JSON.stringify({title: document.title, url: location.href, text: text.slice((p - 1) * PART, p * PART), part: p, parts, elements: items, hrefs, sites, today});
+}"#;
 
 /// Element [n]: what it is (for the Allow question), or that it is gone / a password field.
 pub fn describe_js(n: i64) -> String {
-    format!(r#"(() => {{ const e = document.querySelector('[data-strata-id="{n}"]');
-  if (!e) return JSON.stringify({{error: 'no element [{n}] now: browser_read the page again'}});
-  const label = (e.labels && e.labels[0] && e.labels[0].innerText) || e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.name || e.tagName.toLowerCase();
-  return JSON.stringify({{password: e.type === 'password', field: String(label).trim().slice(0, 80), host: location.host}}); }})()"#)
+    format!("({DESCRIBE_FN})({n})")
 }
+
+pub const DESCRIBE_FN: &str = r#"(n) => { const e = document.querySelector('[data-strata-id="' + n + '"]');
+  if (!e) return JSON.stringify({error: 'no element [' + n + '] now: browser_read the page again'});
+  const label = (e.labels && e.labels[0] && e.labels[0].innerText) || e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.name || e.tagName.toLowerCase();
+  return JSON.stringify({password: e.type === 'password', field: String(label).trim().slice(0, 80), host: location.host}); }"#;
 
 pub fn click_js(n: i64) -> String {
-    format!(r#"(() => {{ const e = document.querySelector('[data-strata-id="{n}"]');
-  if (!e) return JSON.stringify({{error: 'no element [{n}] now: browser_read the page again'}});
-  e.scrollIntoView({{block: 'center'}}); e.click();
-  return JSON.stringify({{clicked: (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0, 80)}}); }})()"#)
+    format!("({CLICK_FN})({n})")
 }
 
+pub const CLICK_FN: &str = r#"(n) => { const e = document.querySelector('[data-strata-id="' + n + '"]');
+  if (!e) return JSON.stringify({error: 'no element [' + n + '] now: browser_read the page again'});
+  e.scrollIntoView({block: 'center'}); e.click();
+  return JSON.stringify({clicked: (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0, 80)}); }"#;
+
 pub fn type_js(n: i64, text: &str, submit: bool) -> String {
-    let t = serde_json::to_string(text).unwrap_or_default();
-    format!(r#"(() => {{ const e = document.querySelector('[data-strata-id="{n}"]');
-  if (!e) return JSON.stringify({{error: 'no element [{n}] now: browser_read the page again'}});
-  if (e.type === 'password') return JSON.stringify({{error: 'a password field: the model never types there'}});
+    format!("({TYPE_FN})({n}, {}, {submit})", serde_json::to_string(text).unwrap_or_default())
+}
+
+pub const TYPE_FN: &str = r#"(n, t, submit) => { const e = document.querySelector('[data-strata-id="' + n + '"]');
+  if (!e) return JSON.stringify({error: 'no element [' + n + '] now: browser_read the page again'});
+  if (e.type === 'password') return JSON.stringify({error: 'a password field: the model never types there'});
   e.focus();
   const proto = e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const d = Object.getOwnPropertyDescriptor(proto, 'value');
-  if (d && d.set) d.set.call(e, {t}); else e.value = {t};
-  e.dispatchEvent(new Event('input', {{bubbles: true}})); e.dispatchEvent(new Event('change', {{bubbles: true}}));
-  if ({submit}) {{ if (e.form && e.form.requestSubmit) e.form.requestSubmit();
-    else e.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true}})); }}
-  return JSON.stringify({{typed: true}}); }})()"#)
+  if (d && d.set) d.set.call(e, t); else e.value = t;
+  e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true}));
+  if (submit) { if (e.form && e.form.requestSubmit) e.form.requestSubmit();
+    else e.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true})); }
+  return JSON.stringify({typed: true}); }"#;
+
+// ------------------------------------------------------------------ Google's file picker (My Maps' Import)
+// My Maps (www.google.com/maps/d/) opens Google's file picker as a frame of docs.google.com: another origin, out of the
+// page's scripts' reach.  A script in every frame (the web view's initialization script) wakes only there and runs the
+// read / click / type above for a message from My Maps' page that carries this start's token; the reply goes back the
+// same way.  While the picker is open, browser_read / click / type act in it.
+
+/// Where the picker opens over the page (My Maps).
+pub fn picker_host(url: &str) -> bool {
+    url.starts_with("https://www.google.com/maps/d/")
+}
+
+/// The script for every frame: the picker's end of the bridge.  An action answers with the picker read a moment after.
+pub fn frame_bridge_js(token: &str) -> String {
+    format!(r#"(() => {{
+  if (location.origin !== 'https://docs.google.com' || !location.pathname.startsWith('/picker')) return;
+  const TOKEN = '{token}', PART = {PART};
+  const read = {READ_FN}, ops = {{read, describe: {DESCRIBE_FN}, click: {CLICK_FN}, type: {TYPE_FN}}};
+  addEventListener('message', (e) => {{
+    const d = e.data;
+    if (e.origin !== 'https://www.google.com' || !d || d.strata !== TOKEN || !ops[d.op]) return;
+    const reply = (out) => e.source.postMessage({{strataReply: TOKEN, id: d.id, out}}, e.origin);
+    let out;
+    try {{ out = ops[d.op](...d.args); }} catch (err) {{ out = JSON.stringify({{error: String(err)}}); }}
+    if (d.op === 'click' || d.op === 'type') setTimeout(() => reply(JSON.stringify({{acted: JSON.parse(out), read: JSON.parse(read(1, PART))}})), 1500);
+    else reply(out);
+  }});
+}})();"#)
+}
+
+/// My Maps' end: the op to the open picker ({{sent}}), or {{none}} when no picker is open (the page acts instead).
+pub fn frame_send_js(token: &str, op: &str, args: &Value, id: u64) -> String {
+    format!(r#"(() => {{
+  if (!location.href.startsWith('https://www.google.com/maps/d/')) return JSON.stringify({{none: true}});
+  const f = [...document.querySelectorAll('iframe')].find((f) => (f.src || '').startsWith('https://docs.google.com/picker') && f.getBoundingClientRect().width > 0);
+  if (!f) return JSON.stringify({{none: true}});
+  if (!window.__strataFrame) {{
+    window.__strataFrame = {{}};
+    addEventListener('message', (e) => {{ if (e.origin === 'https://docs.google.com' && e.data && e.data.strataReply === '{token}') window.__strataFrame[e.data.id] = e.data.out; }});
+  }}
+  f.contentWindow.postMessage({{strata: '{token}', op: {op}, args: {args}, id: {id}}}, 'https://docs.google.com');
+  return JSON.stringify({{sent: true}});
+}})()"#, op = serde_json::to_string(op).unwrap_or_default())
+}
+
+/// The picker's answer to op `id`, once it came (null before).
+pub fn frame_collect_js(id: u64) -> String {
+    format!("(() => {{ const o = window.__strataFrame && window.__strataFrame[{id}]; return o === undefined ? 'null' : o; }})()")
 }
 
 /// browser_read's JSON -> what the model reads.

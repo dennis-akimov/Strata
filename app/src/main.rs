@@ -20,6 +20,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use wry::{WebView, WebViewBuilder};
 
 mod browser_mcp;
+mod native_input;
 
 const PANEL: &str = include_str!("panel.html");
 const LOG_KEEP: usize = 2000;
@@ -47,6 +48,10 @@ enum Ev {
     /// the page read for a waiting call: Google's results (true) or a page browser_open / browser_back loaded
     PageRead(std::sync::mpsc::Sender<Result<String, String>>, bool),
     Described(browser_mcp::Job, String),
+    /// the picker bridge (browser_mcp): op `String` (id u64) was sent to the open picker, or there is none
+    FrameSent(browser_mcp::Job, String, u64, String),
+    /// its answer looked for again (the u32-th time)
+    FrameCollect(browser_mcp::Job, String, u64, u32),
     Quit,
 }
 
@@ -991,6 +996,16 @@ fn act_then_read(web: &WebView, js: &str, reply: std::sync::mpsc::Sender<Result<
     });
 }
 
+/// Op `op` to the picker open over My Maps (browser_mcp's bridge); the answer comes as Ev::FrameSent.
+fn frame_send(web: &WebView, proxy: &EventLoopProxy<Ev>, token: &str, id: u64, job: browser_mcp::Job, op: &str, args: Value) {
+    let (p, slot, op2) = (Mutex::new(proxy.clone()), Mutex::new(Some(job)), op.to_string());
+    let _ = web.evaluate_script_with_callback(&browser_mcp::frame_send_js(token, op, &args, id), move |r| {
+        if let Some(j) = slot.lock().unwrap().take() {
+            let _ = p.lock().unwrap().send_event(Ev::FrameSent(j, op2.clone(), id, r));
+        }
+    });
+}
+
 fn js_call(wv: &WebView, f: &str, v: &Value) {
     let _ = wv.evaluate_script(&format!("{f}({v})"));
 }
@@ -1188,10 +1203,18 @@ fn main() {
             .build_as_child(&control_win)
             .expect("webview")
     };
+    // the picker bridge's token (browser_mcp::frame_bridge_js): made at each start, known to this app and the script
+    let frame_token: String = {
+        let mut b = [0u8; 16];
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    };
+    let next_frame_op = std::cell::Cell::new(0u64);
     let web = {
         let (p, p2) = (proxy.clone(), proxy.clone());
         WebViewBuilder::new()
             .with_url("about:blank")
+            .with_initialization_script_for_main_only(browser_mcp::frame_bridge_js(&frame_token), false)
             .with_user_agent(safari_user_agent(&safari_version()))
             // a link for a new window (Gmail's Drive, target=_blank): this pane loads it (no second window to show)
             .with_new_window_req_handler(move |url, _| {
@@ -1436,7 +1459,11 @@ fn main() {
                 "web_allow" => {
                     // the person's answer to browser_type's question
                     if let Some(job) = approvals.borrow_mut().remove(&v["id"].as_u64().unwrap_or(0)) {
-                        if v["yes"] == true {
+                        if v["yes"] == true && job.args["__frame"] == true {
+                            let args = json!([job.args["element"].as_i64().unwrap_or(0), job.args["text"].as_str().unwrap_or(""), job.args["submit"] == true]);
+                            next_frame_op.set(next_frame_op.get() + 1);
+                            frame_send(&web, &proxy, &frame_token, next_frame_op.get(), job, "type", args);
+                        } else if v["yes"] == true {
                             let js = browser_mcp::type_js(job.args["element"].as_i64().unwrap_or(0), job.args["text"].as_str().unwrap_or(""), job.args["submit"] == true);
                             if job.args["submit"] == true {
                                 load_waiters.borrow_mut().push(job.reply.clone());
@@ -1559,7 +1586,19 @@ fn main() {
                     });
                     load_waiters.borrow_mut().push(reply);
                 };
-                match job.tool.as_str() {
+                let tool = job.tool.clone();
+                let in_picker = job.args.get("__top").is_none() && web.url().map(|u| browser_mcp::picker_host(&u)).unwrap_or(false);
+                match tool.as_str() {
+                    // My Maps' Import: the picker frame acts while it is open (its answer: Ev::FrameSent)
+                    "browser_read" | "browser_click" | "browser_type" if in_picker => {
+                        let (op, args) = match tool.as_str() {
+                            "browser_read" => ("read", json!([job.args["part"].as_i64().unwrap_or(1), browser_mcp::PART])),
+                            "browser_click" => ("click", json!([n])),
+                            _ => ("describe", json!([n])),
+                        };
+                        next_frame_op.set(next_frame_op.get() + 1);
+                        frame_send(&web, &proxy, &frame_token, next_frame_op.get(), job, op, args);
+                    }
                     "browser_open" => {
                         let url = web_url(job.args["url"].as_str().unwrap_or(""));
                         if searched.get().is_some_and(|t| t.elapsed() < Duration::from_secs(600)) && !link_seen(&seen_links.lock().unwrap(), &url) {
@@ -1568,6 +1607,25 @@ fn main() {
                         } else {
                             let _ = web.load_url(&url);
                             wait_load(job.reply, 20);
+                        }
+                    }
+                    // a developer's probes of a page (STRATA_BROWSER_EVAL=1 at the app's start; never in the model's list)
+                    t if t.starts_with("dev_") && std::env::var_os("STRATA_BROWSER_EVAL").is_some() => {
+                        let a = &job.args;
+                        let s = |k: &str| a[k].as_str().unwrap_or("").to_string();
+                        match t {
+                            "dev_eval" => {
+                                let r = job.reply;
+                                let _ = web.evaluate_script_with_callback(&s("js"), move |v| { let _ = r.send(Ok(v)); });
+                            }
+                            "dev_paste" => { let _ = job.reply.send(native_input::paste(&web, &s("text")).map(|_| "pasted".into())); }
+                            "dev_key" => {
+                                let mods: Vec<String> = a["mods"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect();
+                                let mods: Vec<&str> = mods.iter().map(String::as_str).collect();
+                                let _ = job.reply.send(native_input::press(&web, &s("key"), &mods).map(|_| "pressed".into()));
+                            }
+                            "dev_click" => { let _ = job.reply.send(native_input::click(&web, a["x"].as_f64().unwrap_or(0.0), a["y"].as_f64().unwrap_or(0.0)).map(|_| "clicked".into())); }
+                            _ => { let _ = job.reply.send(Err(format!("no dev tool {t}"))); }
                         }
                     }
                     "browser_back" => {
@@ -1614,6 +1672,47 @@ fn main() {
                         let _ = job.reply.send(Err(format!("no browser tool {other}")));
                     }
                 }
+            }
+            Event::UserEvent(Ev::FrameSent(mut job, op, id, r)) => {
+                if js_value(&r)["sent"] == true {
+                    let p = Mutex::new(proxy.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(if op == "read" || op == "describe" { 300 } else { 1800 }));
+                        let _ = p.lock().unwrap().send_event(Ev::FrameCollect(job, op, id, 0));
+                    });
+                } else {
+                    // no picker open (it closed): the page acts, as for any page
+                    job.args["__top"] = json!(true);
+                    let _ = proxy.send_event(Ev::Tool(job));
+                }
+            }
+            Event::UserEvent(Ev::FrameCollect(job, op, id, tries)) => {
+                let (p, slot) = (Mutex::new(proxy.clone()), Mutex::new(Some((job, op))));
+                let _ = web.evaluate_script_with_callback(&browser_mcp::frame_collect_js(id), move |r| {
+                    let Some((mut job, op)) = slot.lock().unwrap().take() else { return };
+                    let v = js_value(&r);
+                    let p = p.lock().unwrap().clone();
+                    if v.is_null() {
+                        if tries >= 20 {
+                            let _ = job.reply.send(Err("the file picker did not answer: browser_read the page".into()));
+                        } else {
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(300));
+                                let _ = p.send_event(Ev::FrameCollect(job, op, id, tries + 1));
+                            });
+                        }
+                    } else if op == "describe" {
+                        // the typing's Allow, as on a page; the typing then goes to the picker
+                        job.args["__frame"] = json!(true);
+                        let _ = p.send_event(Ev::Described(job, v.to_string()));
+                    } else {
+                        let page = if op == "read" { v.clone() } else { v["read"].clone() };
+                        let _ = job.reply.send(match v["error"].as_str().or(v["acted"]["error"].as_str()) {
+                            Some(e) => Err(e.to_string()),
+                            None => Ok(format!("[Google's file picker, open over the page: browser_read / click / type act in it]\n\n{}", browser_mcp::page_text(&page))),
+                        });
+                    }
+                });
             }
             Event::UserEvent(Ev::Described(job, r)) => {
                 let v = js_value(&r);
