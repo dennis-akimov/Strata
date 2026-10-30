@@ -20,7 +20,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use wry::{WebView, WebViewBuilder};
 
 mod browser_mcp;
-mod native_input;
+mod google;
 
 const PANEL: &str = include_str!("panel.html");
 const LOG_KEEP: usize = 2000;
@@ -52,6 +52,8 @@ enum Ev {
     FrameSent(browser_mcp::Job, String, u64, String),
     /// its answer looked for again (the u32-th time)
     FrameCollect(browser_mcp::Job, String, u64, u32),
+    /// a Google tool's script (google.rs) looked for its value (id, the u32-th time)
+    AsyncCollect(browser_mcp::Job, u64, u32),
     Quit,
 }
 
@@ -1210,6 +1212,8 @@ fn main() {
         b.iter().map(|x| format!("{x:02x}")).collect()
     };
     let next_frame_op = std::cell::Cell::new(0u64);
+    // Google tools waiting for their page to load (re-run once it has)
+    let job_waiters: std::cell::RefCell<Vec<browser_mcp::Job>> = Default::default();
     let web = {
         let (p, p2) = (proxy.clone(), proxy.clone());
         WebViewBuilder::new()
@@ -1459,7 +1463,15 @@ fn main() {
                 "web_allow" => {
                     // the person's answer to browser_type's question
                     if let Some(job) = approvals.borrow_mut().remove(&v["id"].as_u64().unwrap_or(0)) {
-                        if v["yes"] == true && job.args["__frame"] == true {
+                        if google::ask(&job.tool, &job.args).is_some() {
+                            let mut job = job;
+                            if v["yes"] == true {
+                                job.args["__allowed"] = json!(true);
+                                let _ = proxy.send_event(Ev::Tool(job));
+                            } else {
+                                let _ = job.reply.send(Err("the user said no to the trash: ask them in the chat".into()));
+                            }
+                        } else if v["yes"] == true && job.args["__frame"] == true {
                             let args = json!([job.args["element"].as_i64().unwrap_or(0), job.args["text"].as_str().unwrap_or(""), job.args["submit"] == true]);
                             next_frame_op.set(next_frame_op.get() + 1);
                             frame_send(&web, &proxy, &frame_token, next_frame_op.get(), job, "type", args);
@@ -1549,6 +1561,13 @@ fn main() {
                         }
                     }
                 }
+                for j in job_waiters.borrow_mut().drain(..) {
+                    let p = Mutex::new(proxy.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        let _ = p.lock().unwrap().send_event(Ev::Tool(j));
+                    });
+                }
                 // the page itself, not "opened, now read it": a small model skipped the read and answered from memory
                 // (six opens, no read, no sources); a moment first, for what its scripts draw
                 for w in load_waiters.borrow_mut().drain(..) {
@@ -1589,6 +1608,54 @@ fn main() {
                 let tool = job.tool.clone();
                 let in_picker = job.args.get("__top").is_none() && web.url().map(|u| browser_mcp::picker_host(&u)).unwrap_or(false);
                 match tool.as_str() {
+                    // Google Sheets / My Maps (google.rs): in their page, loaded first when the pane is elsewhere
+                    t if google::is_google(t) => {
+                        let mut job = job;
+                        let here = web.url().unwrap_or_default();
+                        match google::page_for(t, &job.args, &here) {
+                            Err(e) => { let _ = job.reply.send(Err(e)); }
+                            Ok(_) if google::ask(t, &job.args).is_some() && job.args.get("__allowed").is_none() => {
+                                next_ask.set(next_ask.get() + 1);
+                                js_call(&web_bar, "ask", &json!({"id": next_ask.get(), "say": google::ask(t, &job.args)}));
+                                approvals.borrow_mut().insert(next_ask.get(), job);
+                            }
+                            // a page that comes by itself (the new map's editor, after Create): looked for each second
+                            Ok((load, prefix)) if load.is_empty() && !google::on_page(&prefix, &here) => {
+                                let tries = job.args["__tries"].as_u64().unwrap_or(0);
+                                if tries >= 20 {
+                                    let _ = job.reply.send(Err(format!("{t}: the page did not come ({prefix}): browser_read to see where the browser is")));
+                                } else {
+                                    job.args["__tries"] = json!(tries + 1);
+                                    let p = Mutex::new(proxy.clone());
+                                    std::thread::spawn(move || {
+                                        std::thread::sleep(Duration::from_millis(1000));
+                                        let _ = p.lock().unwrap().send_event(Ev::Tool(job));
+                                    });
+                                }
+                            }
+                            Ok((load, prefix)) if job.args.get("__loaded").is_none() && !google::on_page(&prefix, &here) => {
+                                job.args["__loaded"] = json!(true);
+                                let _ = web.load_url(&load);
+                                job_waiters.borrow_mut().push(job);
+                            }
+                            Ok(_) => {
+                                let js = if t.starts_with("maps_") { google::maps_js(t, &job.args, &frame_token) } else { google::sheets_js(t, &job.args) };
+                                match js {
+                                    Err(e) => { let _ = job.reply.send(Err(e)); }
+                                    Ok(body) => {
+                                        next_frame_op.set(next_frame_op.get() + 1);
+                                        let id = next_frame_op.get();
+                                        let _ = web.evaluate_script(&google::async_js(id, &body));
+                                        let p = Mutex::new(proxy.clone());
+                                        std::thread::spawn(move || {
+                                            std::thread::sleep(Duration::from_millis(1000));
+                                            let _ = p.lock().unwrap().send_event(Ev::AsyncCollect(job, id, 0));
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // My Maps' Import: the picker frame acts while it is open (its answer: Ev::FrameSent)
                     "browser_read" | "browser_click" | "browser_type" if in_picker => {
                         let (op, args) = match tool.as_str() {
@@ -1618,13 +1685,6 @@ fn main() {
                                 let r = job.reply;
                                 let _ = web.evaluate_script_with_callback(&s("js"), move |v| { let _ = r.send(Ok(v)); });
                             }
-                            "dev_paste" => { let _ = job.reply.send(native_input::paste(&web, &s("text")).map(|_| "pasted".into())); }
-                            "dev_key" => {
-                                let mods: Vec<String> = a["mods"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect();
-                                let mods: Vec<&str> = mods.iter().map(String::as_str).collect();
-                                let _ = job.reply.send(native_input::press(&web, &s("key"), &mods).map(|_| "pressed".into()));
-                            }
-                            "dev_click" => { let _ = job.reply.send(native_input::click(&web, a["x"].as_f64().unwrap_or(0.0), a["y"].as_f64().unwrap_or(0.0)).map(|_| "clicked".into())); }
                             _ => { let _ = job.reply.send(Err(format!("no dev tool {t}"))); }
                         }
                     }
@@ -1685,6 +1745,33 @@ fn main() {
                     job.args["__top"] = json!(true);
                     let _ = proxy.send_event(Ev::Tool(job));
                 }
+            }
+            Event::UserEvent(Ev::AsyncCollect(job, id, tries)) => {
+                let (p, slot) = (Mutex::new(proxy.clone()), Mutex::new(Some(job)));
+                let _ = web.evaluate_script_with_callback(&google::async_collect_js(id), move |r| {
+                    let Some(job) = slot.lock().unwrap().take() else { return };
+                    let v = js_value(&r);
+                    let p = p.lock().unwrap().clone();
+                    if v.is_null() {
+                        if tries >= 120 {
+                            let _ = job.reply.send(Err(format!("{} did not finish in 60 s: browser_read the page to see where it is", job.tool)));
+                        } else {
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(500));
+                                let _ = p.send_event(Ev::AsyncCollect(job, id, tries + 1));
+                            });
+                        }
+                    } else if v["ok"] == "__next" {
+                        // the script's click took the page away: the next phase where the page goes
+                        let mut job = job;
+                        job.args["__phase"] = json!(2);
+                        let _ = p.send_event(Ev::Tool(job));
+                    } else if let Some(e) = v["error"].as_str() {
+                        let _ = job.reply.send(Err(format!("{}: {e}", job.tool)));
+                    } else {
+                        let _ = job.reply.send(Ok(google::answer(&job.tool, &job.args, &v["ok"])));
+                    }
+                });
             }
             Event::UserEvent(Ev::FrameCollect(job, op, id, tries)) => {
                 let (p, slot) = (Mutex::new(proxy.clone()), Mutex::new(Some((job, op))));

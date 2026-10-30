@@ -30,7 +30,7 @@ function busy(tool){$("busy").textContent="model: "+tool.replace("browser_","");
 let isStopped=false;
 $("stop").onclick=()=>send("web_stop",{on:!isStopped});
 function stopped(on){isStopped=on;$("stop").classList.toggle("on",on);$("stop").textContent=on?"Let the model browse":"Stop model";}
-function ask(o){askId=o.id;$("asktext").textContent=`The model wants to type “${o.text}” into “${o.field}” on ${o.host}${o.submit?" and send it":""}.`;
+function ask(o){askId=o.id;$("asktext").textContent=o.say||`The model wants to type “${o.text}” into “${o.field}” on ${o.host}${o.submit?" and send it":""}.`;
   $("w").style.display="none";$("ask").style.display="flex";}
 function answer(yes){send("web_allow",{id:askId,yes});$("ask").style.display="none";$("w").style.display="flex";}
 $("allow").onclick=()=>answer(true);$("deny").onclick=()=>answer(false);

@@ -21,7 +21,7 @@ pub struct Job {
 
 /// The tools, as tools/list gives them.
 pub fn tools() -> Value {
-    json!([
+    let mut t = json!([
         {"name": "browser_search", "description": "Search Google in the browser beside the chat: its results page, compactly (answers Google shows, the results' titles and snippets, their links numbered for browser_click). Only for what needs the web (news, weather, prices, a site, facts you are unsure of), never for what you already know.",
          "inputSchema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}},
         {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address the user gave, or one from a page you read. After a browser_search only addresses from the results or pages you read are opened (guessed ones were 404s): use browser_click on a result's number. It answers with the page's text (browser_read for its other parts).",
@@ -36,7 +36,12 @@ pub fn tools() -> Value {
          "inputSchema": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["down", "up"]}}}},
         {"name": "browser_back", "description": "Go back to the previous page. It answers with that page's text.",
          "inputSchema": {"type": "object", "properties": {}}}
-    ])
+    ]);
+    // Google Sheets and My Maps through the same pane (google.rs)
+    if let (Some(all), Some(g)) = (t.as_array_mut(), crate::google::tools().as_array()) {
+        all.extend(g.iter().cloned());
+    }
+    t
 }
 
 /// The text read at once: a page's main text in parts this long.  A read was ~5,300 tokens (12,000 characters and up to
@@ -70,15 +75,19 @@ pub const READ_FN: &str = r#"(part, PART) => {
   if (text.length < 300 && root !== document.body) { root = document.body; text = grab(); }
   if (text.length < 300) { skip = skip.replace(', [aria-hidden=true]', ''); text = grab(); }
   const parts = Math.max(1, Math.ceil(text.length / PART)), p = Math.min(Math.max(1, part), parts);
-  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link]';
+  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link],[role=option],[role=gridcell],[role=menuitem],[role=tab],[role=checkbox],[role=radio]';
   const cand = [...new Set([...root.querySelectorAll(sel), ...document.querySelectorAll('input[type=search],input[name=q],textarea[name=q]')])];
   const items = [], seen = new Set(), hrefs = [];
   for (const e of cand) {
     if (items.length >= 40) break;
     if (e.closest(skip) && !e.matches('input,textarea')) continue;
     const r = e.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) continue;
-    const name = (e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.title || e.name || '').trim().replace(/\s+/g, ' ').slice(0, 60);
-    const kind = e.tagName === 'A' ? 'link' : e.tagName === 'INPUT' ? 'field ' + (e.type || 'text') : e.tagName === 'TEXTAREA' ? 'text box' : e.tagName === 'SELECT' ? 'choice' : 'button';
+    // a label elsewhere (aria-labelledby): My Maps' column boxes are named only so (unnamed, all but one were dropped as duplicates)
+    const by = e.getAttribute('aria-labelledby'), lab = by ? by.split(/\s+/).map((id) => (document.getElementById(id) || {}).textContent || '').join(' ') : '';
+    const name = (e.innerText || e.value || e.getAttribute('aria-label') || lab || e.getAttribute('placeholder') || e.title || e.name || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+    const role = e.getAttribute('role'), on = e.getAttribute('aria-checked') === 'true' || e.getAttribute('aria-selected') === 'true';
+    const kind = e.tagName === 'A' ? 'link' : e.tagName === 'INPUT' ? 'field ' + (e.type || 'text') : e.tagName === 'TEXTAREA' ? 'text box' : e.tagName === 'SELECT' ? 'choice'
+      : ['option', 'gridcell', 'menuitem', 'tab', 'checkbox', 'radio'].includes(role) ? role + (on ? ' (on)' : '') : 'button';
     const key = kind + name + (e.href || '');
     if ((!name && kind === 'link') || seen.has(key)) continue;
     seen.add(key);
@@ -116,7 +125,11 @@ pub fn click_js(n: i64) -> String {
 
 pub const CLICK_FN: &str = r#"(n) => { const e = document.querySelector('[data-strata-id="' + n + '"]');
   if (!e) return JSON.stringify({error: 'no element [' + n + '] now: browser_read the page again'});
-  e.scrollIntoView({block: 'center'}); e.click();
+  e.scrollIntoView({block: 'center'});
+  // a mouse's press and release first: Google's menus and buttons act on those (a bare click() opened nothing)
+  const r = e.getBoundingClientRect();
+  for (const t of ['mousedown', 'mouseup']) e.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0}));
+  e.click();
   return JSON.stringify({clicked: (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0, 80)}); }"#;
 
 pub fn type_js(n: i64, text: &str, submit: bool) -> String {
@@ -320,7 +333,9 @@ mod tests {
         assert!(post("Bearer nope", "{}").0.contains("401"));
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<String> = serde_json::from_str::<Value>(&b).unwrap()["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().into()).collect();
-        assert_eq!(names, ["browser_search", "browser_open", "browser_read", "browser_click", "browser_type", "browser_scroll", "browser_back"]);
+        assert_eq!(names, ["browser_search", "browser_open", "browser_read", "browser_click", "browser_type", "browser_scroll", "browser_back",
+                           "sheets_create", "sheets_read", "sheets_append", "sheets_write", "sheets_delete_rows", "sheets_clear", "sheets_trash",
+                           "maps_create", "maps_import_sheet", "maps_trash"]);
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_read","arguments":{}}}"#);
         assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["result"]["content"][0]["text"], "ran browser_read");
         assert!(post("Bearer k1", r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).0.contains("202"));
@@ -550,6 +565,21 @@ mod in_a_browser {
         assert_eq!((lines[0], lines[1].starts_with("data:") || lines[1].starts_with("http") || lines[1].starts_with("about:"), lines[3]), ("Jazz tonight", true, "Quartet at 8 PM."), "{body}");
         b.page("<html><head><title>Just a moment</title></head><body></body></html>");
         assert!(loaded_text(&b.json(&read_js(1)), false).contains("\n(no text on this page"));
+
+        // My Maps' column boxes and the picker's files: named by their label elsewhere and by their role, none dropped
+        b.page(r#"<html><body><main><p>Choose columns to position your placemarks.</p>
+<style>[role=checkbox]{display:inline-block;width:14px;height:14px}</style><span role="checkbox" aria-checked="false" aria-labelledby="l0"></span><span id="l0">Checkbox</span>
+<span role="checkbox" aria-checked="true" aria-labelledby="l1"></span><span id="l1">Address</span>
+<div role="option" aria-selected="true">studios-sandiego-downtown-2026</div>
+<div role="button" id="menu" onmousedown="window.opened = (window.opened || 0) + 1">Open the map menu</div></main></body></html>"#);
+        let v = b.json(&read_js(1));
+        let els: Vec<&str> = v["elements"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(els.iter().any(|e| e.ends_with("checkbox \"Checkbox\"")) && els.iter().any(|e| e.ends_with("checkbox (on) \"Address\"")), "{els:?}");
+        assert!(els.iter().any(|e| e.ends_with("option (on) \"studios-sandiego-downtown-2026\"")), "{els:?}");
+        // a click presses and releases the mouse first: Google's menus open on those
+        let m = els.iter().find(|e| e.contains("Open the map menu")).map(|e| e[1..e.find(']').unwrap()].parse::<i64>().unwrap()).unwrap();
+        b.json(&click_js(m));
+        assert_eq!(b.eval("window.opened"), json!(1));
 
         // a form: what a field is (for the Allow), a password refused, typing fires input, submit sends the form
         b.page(FORM);

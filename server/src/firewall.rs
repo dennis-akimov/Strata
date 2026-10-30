@@ -411,6 +411,24 @@ fn sample() {
     }
 }
 
+/// The child keeps only its stdin, stdout and stderr.  Rust marks a new socket close-on-exec a moment after making it;
+/// this thread starts `log` while main binds port 8090 to see that it is free, and once `log` got that socket: it
+/// outlived the server (its parent gone) and held the port ("port 8090 is already in use" on every start after).
+#[cfg(target_os = "macos")]
+fn only_stdio(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // runs in the child after its stdio is set and before exec: only async-signal-safe calls
+    unsafe {
+        cmd.pre_exec(|| {
+            let max = libc::getdtablesize().clamp(64, 65536);
+            for fd in 3..max {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+}
+
 /// The kernel's own record of every network attempt a jailed process made: "Sandbox: curl(21467) deny(1)
 /// network-outbound /private/var/run/mDNSResponder".  It sees what a 2 s sample misses (a lookup, a ping, a refused
 /// connect lasts microseconds).
@@ -418,11 +436,12 @@ fn sample() {
 fn kernel_log() {
     static LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Sandbox: (.+?)\((\d+)\) deny\(\d+\) (network-[a-z-]+)\s*(.*)").unwrap());
     loop {
-        let child = Command::new("/usr/bin/log")
-            .args(["stream", "--style", "ndjson", "--predicate", r#"sender == "Sandbox" AND eventMessage CONTAINS "deny(1) network""#])
+        let mut cmd = Command::new("/usr/bin/log");
+        cmd.args(["stream", "--style", "ndjson", "--predicate", r#"sender == "Sandbox" AND eventMessage CONTAINS "deny(1) network""#])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        only_stdio(&mut cmd);
+        let child = cmd.spawn();
         let Ok(mut child) = child else { return };
         for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
@@ -443,6 +462,24 @@ fn kernel_log() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_child_gets_no_socket_of_ours() {
+        use std::os::fd::AsRawFd;
+        // a socket made without close-on-exec, as one is for a moment after socket(): the child must not have it
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = l.as_raw_fd();
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", &format!("[ -e /dev/fd/{fd} ] && echo has || echo none")]).stdout(Stdio::piped());
+        only_stdio(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "none");
+        let mut plain = Command::new("/bin/sh");
+        plain.args(["-c", &format!("[ -e /dev/fd/{fd} ] && echo has || echo none")]);
+        assert_eq!(String::from_utf8_lossy(&plain.output().unwrap().stdout).trim(), "has", "the test's socket was inheritable");
+    }
 
     const LSOF: &str = "p10\ncstrata-server\nf18\ntIPv4\nPTCP\nn*:8090\nTST=LISTEN\nTQR=0\n\
 f19\ntIPv4\nPTCP\nn127.0.0.1:8090->127.0.0.1:56200\nTST=ESTABLISHED\n\

@@ -227,7 +227,20 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   (you sign in yourself), and **Stop model** there refuses its browser tools until you let it again. Strata.app serves
   these tools (app/src/browser_mcp.rs: MCP on 127.0.0.1 with a key made at each start) and hands them to the server it
   starts as the MCP server `browser` (not saved; only there while the app runs). Tried on the M1 with LFM2.5-24B:
-  opened example.com, read it, clicked "Learn more", read IANA's page.
+  opened example.com, read it, clicked "Learn more", read IANA's page. Opening a page, clicking, scrolling and going
+  back answer with the page itself, and each tool result says how many tool calls are left for the answer.
+- **Google Sheets and My Maps (Strata.app):** through the same browser pane, signed in to Google as you (no Google
+  API, no Cloud project): `sheets_create` (title and header row), `sheets_read` (rows numbered as in the sheet),
+  `sheets_append` (under the last filled row; rows whose first cell is FALSE/TRUE get tick boxes), `sheets_write` (from
+  a cell), `sheets_delete_rows`, `sheets_clear`, `sheets_trash`, and `maps_create`, `maps_import_sheet` (a sheet's rows
+  as places: an address column to place them, a column to title them, every column kept in each place) and
+  `maps_trash`. The trash tools wait for your **Allow** in the browser's strip. They run scripts in Google's pages
+  (app/src/google.rs: a cell range by the address's `#range=`, a paste event for writing, a copy event for reading,
+  the menus by mouse events). My Maps' Import opens Google's file picker from another origin (docs.google.com); a
+  script the browser puts in every frame wakes only there and answers My Maps' page for a token made at each start, so
+  `browser_read`/`click`/`type` also work inside the picker. Tried on the M1 (30 Oct 2026): a sheet of 18 downtown San
+  Diego studios and a map of them; create 10 s, append 6 s, read 2–3 s, map create 7 s, import 9 s. Google's pages
+  change: when a tool says it found no button or menu item, that is where.
 - **Scheduled prompts:** the calendar button by the chat's message box. A prompt that runs at
   set times: once, every N minutes (5 or more), hourly, daily, weekdays, weekly, monthly, or a cron expression
   (`minute hour day-of-month month day-of-week`, with `*`, lists, ranges, `*/N`, names; both day fields set: either
