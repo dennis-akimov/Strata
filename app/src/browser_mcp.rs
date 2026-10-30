@@ -23,7 +23,7 @@ pub fn tools() -> Value {
     json!([
         {"name": "browser_search", "description": "Search Google in the browser beside the chat: its results page, compactly (answers Google shows, the results' titles and snippets, their links numbered for browser_click). Only for what needs the web (news, weather, prices, a site, facts you are unsure of), never for what you already know.",
          "inputSchema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}},
-        {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address the user gave or one from a page you read. Never guess an address (guessed ones are often 404s): browser_search, then browser_click a result. Then browser_read it.",
+        {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address the user gave, or one from a page you read. After a browser_search only addresses from the results or pages you read are opened (guessed ones were 404s): use browser_click on a result's number. Then browser_read it.",
          "inputSchema": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}},
         {"name": "browser_read", "description": "The page in the browser now, compactly: its main text (in parts of 3,500 characters: part 2, 3... for more) and up to 40 links, buttons and fields numbered [n] for browser_click / browser_type.",
          "inputSchema": {"type": "object", "properties": {"part": {"type": "integer", "description": "which part of the text (default 1)"}}}},
@@ -59,7 +59,7 @@ pub fn read_js(part: i64) -> String {
   const parts = Math.max(1, Math.ceil(text.length / PART)), p = Math.min(Math.max(1, part), parts);
   const sel = 'a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link]';
   const cand = [...new Set([...root.querySelectorAll(sel), ...document.querySelectorAll('input[type=search],input[name=q],textarea[name=q]')])];
-  const items = [], seen = new Set();
+  const items = [], seen = new Set(), hrefs = [];
   for (const e of cand) {{
     if (items.length >= 40) break;
     if (e.closest(skip) && !e.matches('input,textarea')) continue;
@@ -70,9 +70,13 @@ pub fn read_js(part: i64) -> String {
     if ((!name && kind === 'link') || seen.has(key)) continue;
     seen.add(key);
     e.setAttribute('data-strata-id', items.length + 1);
+    if (e.tagName === 'A' && e.href) hrefs.push(e.href);
     items.push(`[${{items.length + 1}}] ${{kind}} "${{name}}"` + (e.tagName === 'A' && e.href ? ' -> ' + e.href.replace(/^https?:\/\//, '').slice(0, 80) : ''));
   }}
-  return JSON.stringify({{title: document.title, url: location.href, text: text.slice((p - 1) * PART, p * PART), part: p, parts, elements: items}});
+  // every link on the page (for browser_open's check: an address must come from a page read), and today's date
+  document.querySelectorAll('a[href]').forEach((a) => {{ if (hrefs.length < 400 && a.href.startsWith('http')) hrefs.push(a.href); }});
+  const d = new Date(), today = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  return JSON.stringify({{title: document.title, url: location.href, text: text.slice((p - 1) * PART, p * PART), part: p, parts, elements: items, hrefs, today}});
 }})({part}, {PART})"#)
 }
 

@@ -43,6 +43,8 @@ enum Ev {
     WebText(String),
     /// a browser tool's call from the model (browser_mcp), and an element described for browser_type's Allow
     Tool(browser_mcp::Job),
+    /// a search's results page, read a moment after it loaded (Google fills it in after its load event)
+    SearchRead(std::sync::mpsc::Sender<Result<String, String>>),
     Described(browser_mcp::Job, String),
     Quit,
 }
@@ -900,6 +902,25 @@ fn env_api_key(cfg: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// An address without its scheme, "www." and a last "/": how a read's links and browser_open's address are compared.
+fn link_key(u: &str) -> String {
+    let u = u.trim();
+    let u = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
+    let u = u.strip_prefix("www.").unwrap_or(u);
+    u.split('#').next().unwrap_or(u).trim_end_matches('/').to_lowercase()
+}
+
+fn link_seen(seen: &std::collections::HashSet<String>, url: &str) -> bool {
+    seen.contains(&link_key(url))
+}
+
+fn remember_links(seen: &Mutex<std::collections::HashSet<String>>, v: &Value) {
+    let mut s = seen.lock().unwrap();
+    for h in v["hrefs"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        s.insert(link_key(h));
+    }
+}
+
 /// A script's value from evaluate_script_with_callback: JSON-encoded (a string holding the JSON the script built).
 fn js_value(r: &str) -> Value {
     serde_json::from_str::<String>(r).ok().and_then(|s| serde_json::from_str(&s).ok()).or_else(|| serde_json::from_str(r).ok()).unwrap_or(Value::Null)
@@ -1025,6 +1046,10 @@ fn main() {
     let load_waiters: std::cell::RefCell<Vec<std::sync::mpsc::Sender<Result<String, String>>>> = Default::default();
     let approvals: std::cell::RefCell<HashMap<u64, browser_mcp::Job>> = Default::default();
     let search_waiters: std::cell::RefCell<Vec<std::sync::mpsc::Sender<Result<String, String>>>> = Default::default();
+    // the addresses the model's reads showed (all links of the pages it read), and whether it searched: after a
+    // search, browser_open takes only those (LFM2.5 guessed addresses and got 404s, round after round)
+    let seen_links: std::sync::Arc<Mutex<std::collections::HashSet<String>>> = Default::default();
+    let searched: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None); // the last search (the check holds 10 min)
     let next_ask = std::cell::Cell::new(0u64);
     {
         let p = proxy.clone();
@@ -1411,13 +1436,25 @@ fn main() {
                         if blocked {
                             let _ = w.send(Err("Google asks to prove this is a person (the browser shows it): the user can do that, then search again".into()));
                         } else {
-                            eval_reply(&web, &browser_mcp::read_js(1), w, |v| Ok(format!("{}\n\n[Google's own answer, when it shows one, is at the top: answer from these results when they hold the answer. To read a result, browser_click its number; do not guess addresses.]", browser_mcp::page_text(&v))));
+                            let p = Mutex::new(proxy.clone());
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(800));
+                                let _ = p.lock().unwrap().send_event(Ev::SearchRead(w));
+                            });
                         }
                     }
                 }
                 for w in load_waiters.borrow_mut().drain(..) {
                     let _ = w.send(Ok(format!("opened {url}: browser_read it")));
                 }
+            }
+            Event::UserEvent(Ev::SearchRead(w)) => {
+                let seen = seen_links.clone();
+                eval_reply(&web, &browser_mcp::read_js(1), w, move |v| {
+                    remember_links(&seen, &v);
+                    Ok(format!("[Read this first. Today is {}: prefer the newest results, and put the year in a query when it matters. Answer the user from these results when they hold the answer (Google's own answer is at the top). Only if they do not: browser_click a result's number.]\n\n{}",
+                               v["today"].as_str().unwrap_or("?"), browser_mcp::page_text(&v)))
+                });
             }
             Event::UserEvent(Ev::Tool(job)) => {
                 // the model's browser tools work in the pane people see: it opens for them
@@ -1440,15 +1477,27 @@ fn main() {
                 };
                 match job.tool.as_str() {
                     "browser_open" => {
-                        let _ = web.load_url(&web_url(job.args["url"].as_str().unwrap_or("")));
-                        wait_load(job.reply, 20);
+                        let url = web_url(job.args["url"].as_str().unwrap_or(""));
+                        if searched.get().is_some_and(|t| t.elapsed() < Duration::from_secs(600)) && !link_seen(&seen_links.lock().unwrap(), &url) {
+                            let _ = job.reply.send(Err(format!("not opened: {url} was in none of the results or pages you read (guessed addresses are usually 404s). Use browser_click with a result's number, or browser_search again.")));
+                        } else {
+                            let _ = web.load_url(&url);
+                            wait_load(job.reply, 20);
+                        }
                     }
                     "browser_back" => {
                         let _ = web.evaluate_script("history.back()");
                         wait_load(job.reply, 8);
                     }
-                    "browser_read" => eval_reply(&web, &browser_mcp::read_js(job.args["part"].as_i64().unwrap_or(1)), job.reply, |v| Ok(browser_mcp::page_text(&v))),
+                    "browser_read" => {
+                        let seen = seen_links.clone();
+                        eval_reply(&web, &browser_mcp::read_js(job.args["part"].as_i64().unwrap_or(1)), job.reply, move |v| {
+                            remember_links(&seen, &v);
+                            Ok(browser_mcp::page_text(&v))
+                        });
+                    }
                     "browser_search" => {
+                        searched.set(Some(Instant::now()));
                         // Google's results, read when the page has loaded (no full page read for a search)
                         let _ = web.load_url(&web_url(&format!("{} ", job.args["query"].as_str().unwrap_or("")).replace('.', " ")));
                         let late = job.reply.clone();
@@ -1649,6 +1698,16 @@ mod tests {
         assert_eq!(wire_limit_for(13312, gb16), gb16 - (2 << 30));
         // a 64 GB Mac at 48 GB: the GPU's 48 GiB + 1.5 GB
         assert_eq!(wire_limit_for(49152, 68_719_476_736), 49152 * 1048576 + 1_500_000_000);
+    }
+
+    #[test]
+    fn after_a_search_only_seen_addresses_open() {
+        let seen: Mutex<std::collections::HashSet<String>> = Default::default();
+        remember_links(&seen, &json!({"hrefs": ["https://www.bbc.com/weather/2988507", "https://en.wikipedia.org/wiki/Paris#Climate"]}));
+        let s = seen.lock().unwrap();
+        assert!(link_seen(&s, "http://bbc.com/weather/2988507/"));          // scheme, www., a last slash: the same
+        assert!(link_seen(&s, "https://en.wikipedia.org/wiki/Paris"));     // an anchor: the same page
+        assert!(!link_seen(&s, "https://www.bbc.com/weather/today"));      // a guess
     }
 
     #[test]

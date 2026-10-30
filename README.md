@@ -212,9 +212,14 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   or words to search with DuckDuckGo). **Send page to chat** puts the page you read (its title, address and text, up
   to 20,000 characters) into the message box as an attached file, to ask about it. A full WebKit view: sign-ins
   stay like in Safari. The chat's globe button opens and closes it too.
-- **The model browses (Strata.app):** with the chat's MCP switch on, the model has `browser_open`, `browser_read` (the
-  page's text and its links, buttons and fields numbered `[n]`), `browser_click`, `browser_type`, `browser_scroll` and
-  `browser_back`, in that same pane, in front of you: "find the opening hours on example.org". Typing waits for your
+- **The model browses (Strata.app):** with the chat's MCP switch on, the model has `browser_search` (Google's results
+  page, read compactly, with today's date), `browser_open`, `browser_read` (the main text in parts of 3,500 characters
+  and up to 40 links, buttons and fields numbered `[n]`), `browser_click`, `browser_type`, `browser_scroll` and
+  `browser_back`, in that same pane, in front of you. After a search it opens only addresses from the results or pages
+  it read (guessed ones were 404s); at the tool-round limit (`mcp.max_rounds`, 8) it answers from what it has, and
+  when tool results outgrow the context the oldest ones are compacted to a note (auto-compact) instead of failing. On
+  the 16 GB M1 with LFM2.5-24B: "Paris weather today" 30 s (one search), "the most recent F1 race" 127 s (right, 2026);
+  a page read went from ~5,300 tokens (~25 s to read) to ~1,500. Google is the start page and the search. Typing waits for your
   **Allow** in the browser's strip (it says what goes into which field on which site), a password field is refused
   (you sign in yourself), and **Stop model** there refuses its browser tools until you let it again. Strata.app serves
   these tools (app/src/browser_mcp.rs: MCP on 127.0.0.1 with a key made at each start) and hands them to the server it
