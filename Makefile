@@ -23,6 +23,8 @@ REASONING_BUDGET ?=
 WAIT_S      ?= 600
 PY          := $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 CMAKE       := $(if $(wildcard .venv/bin/cmake),.venv/bin/cmake,cmake)
+# rustup puts cargo in ~/.cargo/bin and on PATH only for shells started after it: found there too
+CARGO       := $(or $(shell command -v cargo 2> /dev/null),$(wildcard $(HOME)/.cargo/bin/cargo),cargo)
 URL         := http://$(if $(filter 0.0.0.0,$(HOST)),127.0.0.1,$(HOST)):$(PORT)
 AUTH        := $(if $(API_KEY),-H "Authorization: Bearer $(API_KEY)",)
 RUN_ARGS    := --port $(PORT) $(if $(filter-out 127.0.0.1,$(HOST)),--host $(HOST),) $(if $(API_KEY),--api-key $(API_KEY),)
@@ -201,14 +203,14 @@ endif
 
 # the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
 server:
-	cargo build --release --manifest-path server/Cargo.toml
+	$(CARGO) build --release --manifest-path server/Cargo.toml
 	@# rm first: a new file (macOS kills a program whose binary was rewritten in place)
 	mkdir -p engine-metal && rm -f engine-metal/strata-server engine-metal/strata-files && cp server/target/release/strata-server server/target/release/strata-files engine-metal/
 
 # the Mac app (app/, Rust): Strata.app in this folder runs the server as its child with full control (config, port,
 # start/stop/restart, load/unload, live status, log, chat window, menu-bar icon); quitting it stops the server
 app: server
-	cargo build --release --manifest-path app/Cargo.toml
+	$(CARGO) build --release --manifest-path app/Cargo.toml
 	rm -rf Strata.app && mkdir -p Strata.app/Contents/MacOS
 	cp app/target/release/strata-app Strata.app/Contents/MacOS/Strata
 	cp app/Info.plist Strata.app/Contents/Info.plist
@@ -217,7 +219,7 @@ app: server
 
 # strata-tui (tui/, Rust): Strata.app in a terminal, for Linux on an Apple Silicon Mac (and any terminal, SSH too)
 tui-build: server
-	cargo build --release --manifest-path tui/Cargo.toml
+	$(CARGO) build --release --manifest-path tui/Cargo.toml
 	rm -f engine-metal/strata-tui && cp tui/target/release/strata-tui engine-metal/
 
 tui: tui-build
@@ -236,8 +238,8 @@ app-run: app app-stop
 # (server/golden/e2e.py --replay; the packs it needs are the ones on this Mac, a missing one is skipped)
 PACKS ?= $(HOME)/dennis-akimov/Strata-data/packs
 test-server:
-	cargo test --release --manifest-path server/Cargo.toml
-	cargo build --manifest-path server/Cargo.toml
+	$(CARGO) test --release --manifest-path server/Cargo.toml
+	$(CARGO) build --manifest-path server/Cargo.toml
 	@for p in qwen3.6-35b-a3b gpt-oss-120b-heretic-v2 glm-5.3-flash-maya-s24; do \
 	  if [ -d $(PACKS)/$$p ]; then $(PY) server/golden/e2e.py server/target/debug/strata-server $(PACKS)/$$p/tokenizer --replay mock-$$p || exit 1; fi; done
 	@for p in qwen3.6-35b-a3b gpt-oss-120b-heretic-v2; do \

@@ -226,7 +226,9 @@ def power_mac() -> list[str]:
 
 def mac() -> dict:
     if LINUX:
-        # no Metal limit: Vulkan's memory is the system's (the unified memory), less what Linux needs
+        # Vulkan's GPU memory is one heap that Mesa's Honeykrisp sizes at about half the memory unless HK_SYSMEM (bytes)
+        # says otherwise (src/asahi/vulkan/hk_physical_device.c): the run config sets it to the memory less what Linux
+        # needs, and that is the limit (a 16 GB M1: the default 7.65 GiB could not hold gpt-oss-20b, 13 GiB ran it)
         ram = meminfo("MemTotal")
         chip = apple_silicon()["chip"] or "Apple Silicon"
         usable = ram - max(3 * GB, 0.15 * ram)
@@ -391,8 +393,9 @@ def disk_free(path: Path) -> float:
 
 def plan(gguf: Path, ctx: int, pb: int) -> dict:
     """The engine's own measurement of what the model needs (no weights read): see metal/strata_metal.cpp --plan."""
+    env = dict(os.environ, HK_SYSMEM=str(int(mac()["limit"]))) if LINUX else None
     r = subprocess.run([str(ENGINE / "strata-metal"), "--plan", "--gguf", str(gguf), "--max-context", str(ctx),
-                        "--kv", "f16", "--prefill-batch", str(pb)], capture_output=True, text=True, timeout=300)
+                        "--kv", "f16", "--prefill-batch", str(pb)], capture_output=True, text=True, timeout=300, env=env)
     line = next((l for l in r.stdout.splitlines() if l.startswith("{")), "")
     if not line:
         fail("the engine could not measure the model", (r.stderr or r.stdout).strip()[-800:])
@@ -402,9 +405,10 @@ def plan(gguf: Path, ctx: int, pb: int) -> dict:
 def need(p: dict, ctx: int) -> tuple[float, float]:
     """(GPU bytes, all bytes) at a context of ctx tokens, from one plan (linear in the context)."""
     g, h = p["gpu"], p["host"]
-    # Metal maps the whole model file: the part llama.cpp counts on the CPU side is in the GPU's share too
-    gpu = g["model"] + h["model"] + g["context"] + g["compute"] + p["per_token"] * (ctx - p["context"])
-    return gpu, gpu + h["context"] + h["compute"]
+    # Metal maps the whole model file: the part llama.cpp counts on the CPU side is in the GPU's share too (not so on
+    # Vulkan: that part stays in system memory)
+    gpu = g["model"] + g["context"] + g["compute"] + p["per_token"] * (ctx - p["context"]) + (0 if LINUX else h["model"])
+    return gpu, gpu + h["context"] + h["compute"] + (h["model"] if LINUX else 0)
 
 
 def size_context(gguf: Path, want: int, me: dict) -> tuple[int, int, float]:
@@ -448,6 +452,8 @@ def write_config(key: str, data: Path, me: dict) -> Path:
            "log": str(ROOT / f"strata-{m['name']}.log")}
     if m["sampling"]:
         cfg["sampling"] = m["sampling"]
+    if LINUX:
+        cfg["env"] = {"HK_SYSMEM": str(int(me["limit"]))}     # the GPU's heap (Honeykrisp): see mac()
     path = config_path(key)
     old = json.loads(path.read_text()) if path.exists() else {}
     for k in ("api_key", "mcp_servers", "mcp", "firewall", "port", "host"):    # what the user set stays
@@ -589,10 +595,15 @@ def test(cfg_path: Path, yes: bool) -> bool:
                      int(a[a.index("--prefill-batch") + 1]) if "--prefill-batch" in a else 2048)
             total = need(p, p["context"])[1]
             hogs = ", ".join(f"{name} {b / GIB:.1f} GB" for name, b in memory_apps())
-            warn(f"it did not fit: the model needs about {total / GIB:.1f} GB and {free_now() / GIB:.1f} GB is free; "
-                 f"quit apps to free {max(0.1, (total - free_now()) / GIB):.1f} GB more"
-                 + (f" (using the most now: {hogs})" if hogs else "") +
-                 ", then `make setup` again (or Start in Strata.app, which lists them with Quit buttons)")
+            where = "Memory view of make tui" if LINUX else "Strata.app, which lists them with Quit buttons"
+            if total > free_now():
+                warn(f"it did not fit: the model needs about {total / GIB:.1f} GB and {free_now() / GIB:.1f} GB is free; "
+                     f"quit apps to free {(total - free_now()) / GIB:.1f} GB more"
+                     + (f" (using the most now: {hogs})" if hogs else "") + f", then `make setup` again (or the {where})")
+            else:
+                warn(f"it did not fit the GPU's memory ({mac()['limit'] / GIB:.1f} GB" +
+                     (", HK_SYSMEM in the run config" if LINUX else "") + ") although "
+                     f"{free_now() / GIB:.1f} GB is free: pick a smaller model, or see the engine's log ({cfg['log']})")
             return False
         warn(f"the first answer failed: {said}")
         return False

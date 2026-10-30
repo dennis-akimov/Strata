@@ -90,8 +90,12 @@ It does what `make setup` does on macOS, with Linux's parts:
 | Tools | with sudo: `build-essential make pkg-config cmake ninja-build git curl ca-certificates python3-venv python3-pip aria2 lsof libvulkan-dev glslc spirv-headers glslang-tools mesa-vulkan-drivers vulkan-tools`; you in the groups `render` and `video` (the GPU's device files; they apply from your next login, setup itself uses them at once); Rust (rustup) |
 | GPU check | `vulkaninfo --summary` must list `Apple M1 (G13G B1)` / Honeykrisp. Only `llvmpipe` means the GPU is not reachable: the groups above, or the kernel's `asahi` driver |
 | Engine | `build-metal/metal/strata-metal` built with `GGML_VULKAN` (10-20 minutes the first time: Vulkan's shaders compile too) |
-| Memory | no Metal limit: the model may use the memory less 3 GB (or 15%) for Linux |
-| At the end | no Strata.app (it is macOS's): `make run PORT=8090` and http://127.0.0.1:8090; `make start` / `make stop` in the background |
+| Memory | Vulkan's GPU memory is one heap that Honeykrisp makes about half the memory (7.65 GiB on a 16 GB M1: too small for gpt-oss-20b's 11 GB of weights); the run config's `"env": {"HK_SYSMEM": "<bytes>"}` raises it to the memory less 3 GB (or 15%), and that is the limit setup sizes the context for |
+| At the end | `make tui`: Strata.app in the terminal (bar with the state and memory, Chat, Monitor, Memory with the context picker, Log; Ctrl+S starts the server, Ctrl+Q quits and stops it). Or `make run PORT=8090` and http://127.0.0.1:8090 |
+
+Measured on the 16 GB M1 (Debian, kernel 7.1.13-asahi, Mesa 26.1.6): gpt-oss-20b at a 32K context answers at 12
+tok/s (Metal on the same Mac under macOS: 19-20). `python3 bootstrap.py --detect` prints what setup sees (chip, SoC,
+the GPU driver).
 
 `make run` and `make start` start the newest `strata-*.json` (`make run CONFIG=strata-x.json` for another). Not on
 Linux: Strata.app, the kernel sandbox of the Firewall tab (sandbox-exec is macOS's: the engine and MCP programs run

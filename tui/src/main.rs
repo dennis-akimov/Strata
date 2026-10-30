@@ -106,13 +106,15 @@ fn free_now() -> f64 {
     (pages("Pages free") + pages("Pages inactive") + pages("Pages speculative") + pages("Pages purgeable")) * page
 }
 
-/// What the GPU may hold, less 1 GB for the display and the driver.  Linux (Vulkan on the unified memory): the memory
-/// less 3 GB or 15%; macOS: iogpu.wired_limit_mb, else about two thirds of the memory up to 36 GB, else Metal's.
-fn gpu_limit(recommended: f64) -> f64 {
-    let ram = if cfg!(target_os = "linux") { meminfo("MemTotal") } else { sysctl("hw.memsize") };
-    let limit = if cfg!(target_os = "linux") {
-        ram - (3.0 * 1073741824.0f64).max(ram * 0.15)
-    } else {
+/// What the GPU may hold.  Linux (Vulkan): Honeykrisp's heap, HK_SYSMEM from the run config's "env" (setup sets it to
+/// the memory less what Linux needs), else Vulkan's own (about half the memory).  macOS: iogpu.wired_limit_mb, else
+/// about two thirds of the memory up to 36 GB, else Metal's; less 1 GB for the display and the driver.
+fn gpu_limit(recommended: f64, cfg: &Value) -> f64 {
+    if cfg!(target_os = "linux") {
+        return cfg["env"]["HK_SYSMEM"].as_str().and_then(|v| v.parse().ok()).unwrap_or(recommended);
+    }
+    let ram = sysctl("hw.memsize");
+    let limit = {
         let wired = sysctl("iogpu.wired_limit_mb");
         if wired > 0.0 { wired * 1048576.0 } else if ram <= 36.0 * 1073741824.0 { (ram * 2.0 / 3.0).min(recommended) } else { recommended }
     };
@@ -124,7 +126,8 @@ fn memory(cfg_path: &Path) -> Value {
     let cfg = read_json(cfg_path);
     let exe = cfg["exe"].as_str().unwrap_or("").to_string();
     let args: Vec<String> = cfg["args"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-    let out = match Command::new(&exe).arg("--plan").args(&args).stderr(Stdio::null()).output() {
+    let envs: Vec<(String, String)> = cfg["env"].as_object().map(|e| e.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()).unwrap_or_default();
+    let out = match Command::new(&exe).arg("--plan").args(&args).envs(envs).stderr(Stdio::null()).output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(e) => return json!({"error": format!("{exe}: {e} (make build)")}),
     };
@@ -135,10 +138,12 @@ fn memory(cfg_path: &Path) -> Value {
     let (g, h) = (&p["gpu"], &p["host"]);
     let ctx = n(&p["context"]);
     let per_token = n(&p["per_token"]);
-    let limit = gpu_limit(n(&g["limit"]));
-    // Metal maps the whole model file: the CPU side's share of the weights counts on the GPU too
-    let gpu_need = n(&g["model"]) + n(&h["model"]) + n(&g["context"]) + n(&g["compute"]);
-    let need = gpu_need + n(&h["context"]) + n(&h["compute"]);
+    let limit = gpu_limit(n(&g["limit"]), &cfg);
+    // Metal maps the whole model file: the CPU side's share of the weights counts on the GPU too (on Vulkan it stays
+    // in system memory)
+    let host_on_gpu = if cfg!(target_os = "linux") { 0.0 } else { n(&h["model"]) };
+    let gpu_need = n(&g["model"]) + host_on_gpu + n(&g["context"]) + n(&g["compute"]);
+    let need = gpu_need + n(&h["model"]) - host_on_gpu + n(&h["context"]) + n(&h["compute"]);
     let train = n(&p["n_ctx_train"]);
     let mut options: Vec<Value> = CONTEXTS
         .iter()
@@ -725,7 +730,7 @@ fn draw_memory(f: &mut Frame, app: &App, area: Rect) {
         let n = |k: &str| p[k].as_f64().unwrap_or(0.0);
         vec![
             Line::from(format!("at a context of {} tokens this model needs {}: weights {} + conversation cache {} + work buffers {}", n("context") as u64, gb(n("need")), gb(n("weights")), gb(n("cache")), gb(n("work")))),
-            Line::from(format!("the GPU can use {} (1 GB kept for the display and the driver) · {} free right now", gb(n("limit")), gb(n("free")))),
+            Line::from(format!("the GPU can use {} · {} free right now", gb(n("limit")), gb(n("free")))),
             Line::from(if n("gpu_need") > n("limit") { Span::styled("too big at this context: pick a smaller one below".to_string(), Style::new().fg(Color::Red)) } else { Span::styled("fits".to_string(), Style::new().fg(Color::Green)) }),
         ]
     } else {
