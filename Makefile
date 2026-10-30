@@ -10,6 +10,12 @@
 # your own defaults (PORT := 8090, API_KEY := ...), kept out of git: Makefile.local
 -include Makefile.local
 
+# what Strata.app and its helpers are signed with: an "Apple Development" identity when the keychain has one, else
+# ad-hoc.  macOS keeps a permission (the Downloads folder, the microphone, Reminders) for a signer's identity; an ad-hoc
+# signature is the binary's hash, new on every build, so each build asked again and the app waited on a prompt
+SIGN ?= $(shell security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*\([0-9A-F]\{40\}\) "Apple Development.*/\1/p' | head -1)
+SIGN_ID = $(if $(SIGN),$(SIGN),-)
+
 PORT        ?= 8080
 HOST        ?= 127.0.0.1
 API_KEY     ?=
@@ -199,6 +205,7 @@ ifeq ($(shell uname -s),Darwin)
 	@# macOS Reminders for the model (the chat's settings switch): an MCP server over EventKit
 	@rm -f engine-metal/strata-reminders; swiftc -O -parse-as-library metal/reminders/strata_reminders.swift -o engine-metal/strata-reminders \
 	  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker metal/reminders/Info.plist 2>/dev/null || echo "strata-reminders not built (macOS 14 or later)"
+	@for h in strata-afm strata-voice strata-reminders; do [ -f engine-metal/$$h ] && codesign --force --sign $(SIGN_ID) engine-metal/$$h 2>/dev/null || codesign --force --sign - engine-metal/$$h; done; true
 else ifeq ($(APPLE_LINUX),1)
 	@# Linux on Apple Silicon: llama.cpp's Vulkan backend (metal/CMakeLists.txt picks it off macOS)
 	$(CMAKE) -S . -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON
@@ -227,7 +234,8 @@ app: server
 	rm -rf Strata.app && mkdir -p Strata.app/Contents/MacOS
 	cp app/target/release/strata-app Strata.app/Contents/MacOS/Strata
 	cp app/Info.plist Strata.app/Contents/Info.plist
-	codesign --force --sign - Strata.app
+	@# a locked keychain (an ssh session: errSecInternalComponent) signs ad-hoc instead, and says so
+	codesign --force --sign $(SIGN_ID) Strata.app || { echo "signed ad-hoc: unlock the keychain (security unlock-keychain) to sign as $(SIGN_ID); macOS will ask for its permissions again"; codesign --force --sign - Strata.app; }
 	@echo "built Strata.app: make app-run, or open Strata.app (or drag it to /Applications; it runs the server from $(CURDIR))"
 
 # strata-tui (tui/, Rust): Strata.app in a terminal, for Linux on an Apple Silicon Mac (and any terminal, SSH too)

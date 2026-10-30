@@ -50,6 +50,18 @@ enum Ev {
     Quit,
 }
 
+/// The browser pane's User-Agent: Safari's own.  A web view's default leaves out "Version/... Safari/...", and Google
+/// (Gmail, Drive, sign-in) answers that with "this browser is no longer supported".  Safari keeps the macOS version in
+/// it at 10_15_7 (frozen); the Safari version is the installed one.
+fn safari_user_agent(version: &str) -> String {
+    format!("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{version} Safari/605.1.15")
+}
+
+fn safari_version() -> String {
+    let out = Command::new("defaults").args(["read", "/Applications/Safari.app/Contents/Info.plist", "CFBundleShortVersionString"]).output();
+    out.ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.')).unwrap_or_else(|| "26.0".into())
+}
+
 /// The browser pane's address field: an address as typed, a bare host (has a dot, no space) over https, anything else
 /// a Google search.
 fn web_url(input: &str) -> String {
@@ -1177,9 +1189,15 @@ fn main() {
             .expect("webview")
     };
     let web = {
-        let p = proxy.clone();
+        let (p, p2) = (proxy.clone(), proxy.clone());
         WebViewBuilder::new()
             .with_url("about:blank")
+            .with_user_agent(safari_user_agent(&safari_version()))
+            // a link for a new window (Gmail's Drive, target=_blank): this pane loads it (no second window to show)
+            .with_new_window_req_handler(move |url, _| {
+                let _ = p2.send_event(Ev::Ipc(json!({"cmd": "web_open", "url": url})));
+                wry::NewWindowResponse::Deny
+            })
             .with_bounds(rect(640.0, BAR + WEB_BAR, 640.0, 900.0 - BAR - WEB_BAR))
             .with_visible(false)
             .with_on_page_load_handler(move |e, url| {
@@ -1798,6 +1816,13 @@ mod tests {
         assert!(link_seen(&s, "https://weather.bbc.com/paris"));           // a part of a site that showed
         assert!(!link_seen(&s, "https://bbc.co.uk/weather"));              // another site, however alike
         assert!(!link_seen(&s, "https://com/x"));                          // never a bare top-level domain
+    }
+
+    #[test]
+    fn the_browser_says_it_is_safari() {
+        assert_eq!(safari_user_agent("27.0.1"), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0.1 Safari/605.1.15");
+        let v = safari_version();
+        assert!(!v.is_empty() && v.split('.').all(|n| n.parse::<u32>().is_ok()), "{v}");
     }
 
     #[test]
