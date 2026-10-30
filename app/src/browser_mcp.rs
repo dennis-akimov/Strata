@@ -21,10 +21,12 @@ pub struct Job {
 /// The tools, as tools/list gives them.
 pub fn tools() -> Value {
     json!([
-        {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address, a site like example.com, or words to search with DuckDuckGo. Then browser_read it.",
+        {"name": "browser_search", "description": "Search Google in the browser beside the chat: its results page, compactly (answers Google shows, the results' titles and snippets, their links numbered for browser_click). Only for what needs the web (news, weather, prices, a site, facts you are unsure of), never for what you already know.",
+         "inputSchema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}},
+        {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address or a site like example.com. Then browser_read it.",
          "inputSchema": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}},
-        {"name": "browser_read", "description": "The page in the browser now: its title, address, text, and its links, buttons and fields numbered [n] for browser_click / browser_type.",
-         "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "browser_read", "description": "The page in the browser now, compactly: its main text (in parts of 3,500 characters: part 2, 3... for more) and up to 40 links, buttons and fields numbered [n] for browser_click / browser_type.",
+         "inputSchema": {"type": "object", "properties": {"part": {"type": "integer", "description": "which part of the text (default 1)"}}}},
         {"name": "browser_click", "description": "Click element [n] of the last browser_read (a link, a button). Then browser_read again: the page may have changed.",
          "inputSchema": {"type": "object", "required": ["element"], "properties": {"element": {"type": "integer"}}}},
         {"name": "browser_type", "description": "Type text into field [n] of the last browser_read (the user is asked to allow it; never a password). submit: press Enter / send its form.",
@@ -36,20 +38,43 @@ pub fn tools() -> Value {
     ])
 }
 
-/// Numbers the visible links, buttons and fields (data-strata-id) and returns the page: title, address, text, items.
-pub const READ_JS: &str = r#"(() => {
+/// The text read at once: a page's main text in parts this long.  A read was ~5,300 tokens (12,000 characters and up to
+/// 150 elements, menus and footers included): ~25 s of prompt reading each on a 16 GB M1 (~250 tok/s); now ~1,500.
+pub const PART: usize = 3500;
+
+/// The page compactly (the accessibility-tree browsers' lesson: only what can be acted on, named by its text): the main
+/// part's text (main / article / role=main, without nav, header, footer, aside), part `part` of it, and up to 40 visible
+/// links, buttons and fields in it (a search field anywhere), numbered (data-strata-id) for click / type.
+pub fn read_js(part: i64) -> String {
+    format!(r#"((part, PART) => {{
   document.querySelectorAll('[data-strata-id]').forEach((e) => e.removeAttribute('data-strata-id'));
-  const els = [...document.querySelectorAll('a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link]')].filter((e) => {
-    const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; }).slice(0, 150);
-  const items = els.map((e, i) => {
-    e.setAttribute('data-strata-id', i + 1);
-    const t = (e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.title || e.name || '').trim().replace(/\s+/g, ' ').slice(0, 80);
-    const k = e.tagName === 'A' ? 'link' : e.tagName === 'INPUT' ? 'field ' + (e.type || 'text') : e.tagName === 'TEXTAREA' ? 'text box' : e.tagName === 'SELECT' ? 'choice' : 'button';
-    return `[${i + 1}] ${k} "${t}"` + (e.tagName === 'A' && e.href ? ' -> ' + e.href.slice(0, 120) : '');
-  });
-  const text = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n');
-  return JSON.stringify({title: document.title, url: location.href, text: text.slice(0, 12000), cut: text.length > 12000, elements: items});
-})()"#;
+  const root = document.querySelector('main, article, [role=main], #content, #main') || document.body;
+  if (!root) return JSON.stringify({{error: 'the page has no content yet: try again in a moment'}});
+  const skip = 'nav, header, footer, aside, script, style, noscript, svg, [role=navigation], [role=banner], [role=contentinfo], [aria-hidden=true]';
+  // the main text without its menus: hidden for the moment innerText takes (the same task: nothing is painted)
+  const hid = [...root.querySelectorAll(skip)], was = hid.map((e) => e.style.display);
+  hid.forEach((e) => e.style.display = 'none');
+  const text = (root.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
+  hid.forEach((e, i) => e.style.display = was[i]);
+  const parts = Math.max(1, Math.ceil(text.length / PART)), p = Math.min(Math.max(1, part), parts);
+  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link]';
+  const cand = [...new Set([...root.querySelectorAll(sel), ...document.querySelectorAll('input[type=search],input[name=q],textarea[name=q]')])];
+  const items = [], seen = new Set();
+  for (const e of cand) {{
+    if (items.length >= 40) break;
+    if (e.closest(skip) && !e.matches('input,textarea')) continue;
+    const r = e.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) continue;
+    const name = (e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.title || e.name || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+    const kind = e.tagName === 'A' ? 'link' : e.tagName === 'INPUT' ? 'field ' + (e.type || 'text') : e.tagName === 'TEXTAREA' ? 'text box' : e.tagName === 'SELECT' ? 'choice' : 'button';
+    const key = kind + name + (e.href || '');
+    if ((!name && kind === 'link') || seen.has(key)) continue;
+    seen.add(key);
+    e.setAttribute('data-strata-id', items.length + 1);
+    items.push(`[${{items.length + 1}}] ${{kind}} "${{name}}"` + (e.tagName === 'A' && e.href ? ' -> ' + e.href.replace(/^https?:\/\//, '').slice(0, 80) : ''));
+  }}
+  return JSON.stringify({{title: document.title, url: location.href, text: text.slice((p - 1) * PART, p * PART), part: p, parts, elements: items}});
+}})({part}, {PART})"#)
+}
 
 /// Element [n]: what it is (for the Allow question), or that it is gone / a password field.
 pub fn describe_js(n: i64) -> String {
@@ -84,8 +109,9 @@ pub fn type_js(n: i64, text: &str, submit: bool) -> String {
 /// browser_read's JSON -> what the model reads.
 pub fn page_text(v: &Value) -> String {
     let els: Vec<&str> = v["elements"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let (p, n) = (v["part"].as_i64().unwrap_or(1), v["parts"].as_i64().unwrap_or(1));
     format!("{}\n{}\n\n{}{}\n\nElements:\n{}", v["title"].as_str().unwrap_or(""), v["url"].as_str().unwrap_or(""), v["text"].as_str().unwrap_or(""),
-            if v["cut"] == true { "\n[the page goes on: cut at 12,000 characters; browser_scroll and read again for more]" } else { "" },
+            if n > 1 { format!("\n[part {p} of {n}: browser_read with part {} for more]", (p + 1).min(n)) } else { String::new() },
             if els.is_empty() { "(none)".to_string() } else { els.join("\n") })
 }
 
@@ -192,7 +218,7 @@ mod tests {
         assert!(post("Bearer nope", "{}").0.contains("401"));
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<String> = serde_json::from_str::<Value>(&b).unwrap()["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().into()).collect();
-        assert_eq!(names, ["browser_open", "browser_read", "browser_click", "browser_type", "browser_scroll", "browser_back"]);
+        assert_eq!(names, ["browser_search", "browser_open", "browser_read", "browser_click", "browser_type", "browser_scroll", "browser_back"]);
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_read","arguments":{}}}"#);
         assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["result"]["content"][0]["text"], "ran browser_read");
         assert!(post("Bearer k1", r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).0.contains("202"));
@@ -203,8 +229,11 @@ mod tests {
 
     #[test]
     fn the_page_reads_as_text_with_numbered_elements() {
-        let v = json!({"title": "T", "url": "https://x/", "text": "hello", "cut": false, "elements": ["[1] link \"a\" -> https://x/a"]});
-        assert_eq!(page_text(&v), "T\nhttps://x/\n\nhello\n\nElements:\n[1] link \"a\" -> https://x/a");
+        let v = json!({"title": "T", "url": "https://x/", "text": "hello", "part": 1, "parts": 1, "elements": ["[1] link \"a\" -> x/a"]});
+        assert_eq!(page_text(&v), "T\nhttps://x/\n\nhello\n\nElements:\n[1] link \"a\" -> x/a");
+        let v = json!({"title": "T", "url": "u", "text": "t", "part": 1, "parts": 3, "elements": []});
+        assert!(page_text(&v).contains("[part 1 of 3: browser_read with part 2 for more]"));
+        assert!(read_js(2).ends_with("})(2, 3500)"));
         assert!(type_js(3, "a\"b", true).contains(r#""a\"b""#));
     }
 }

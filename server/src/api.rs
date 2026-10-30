@@ -59,6 +59,29 @@ impl Run<'_> {
     }
 }
 
+/// The conversation's tool results, shortened one at a time when they no longer fit the context: the oldest still-whole
+/// result becomes a note (its size and first 200 characters); when only the newest is left, it is halved (from 2,000
+/// characters on).  The user's and the model's own messages are never touched.  (index, its characters before) or None.
+pub fn compact_one(messages: &mut [Value]) -> Option<(usize, usize)> {
+    let tools: Vec<usize> = messages.iter().enumerate().filter(|(_, m)| m["role"] == "tool").map(|(i, _)| i).collect();
+    let newest = *tools.last()?;
+    let text = |m: &Value| m["content"].as_str().unwrap_or("").to_string();
+    if let Some(&i) = tools.iter().find(|&&i| i != newest && text(&messages[i]).chars().count() > 300 && !text(&messages[i]).starts_with("[compacted")) {
+        let c = text(&messages[i]);
+        let head: String = c.chars().take(200).collect();
+        messages[i]["content"] = json!(format!("[compacted to fit the context: an earlier tool result of {} characters; it began: {head} ...]", c.chars().count()));
+        return Some((i, c.chars().count()));
+    }
+    let c = text(&messages[newest]);
+    let n = c.chars().count();
+    if n < 2000 {
+        return None;
+    }
+    let keep: String = c.chars().take(n / 2).collect();
+    messages[newest]["content"] = json!(format!("{keep}\n[cut to fit the context: {} of {n} characters shown]", n / 2));
+    Some((newest, n))
+}
+
 /// Service::run with the MCP tools executed here, up to max_rounds; one Done at the very end.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: bool, tools: Option<Vec<Value>>, mut max_new: i64, sampling: &Map<String, Value>, cancel: &Arc<Flag>, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(), Stop<Fail>> {
@@ -149,7 +172,19 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
         assistant.insert("tool_calls".into(), Value::Array(calls.iter().map(|c| json!({"function": {"name": c.name, "arguments": Value::Object(c.arguments.clone())}})).collect()));
         messages.push(Value::Object(assistant));
         messages.extend(results.into_iter().map(|r| json!({"role": "tool", "content": r})));
-        let (i2, t2, m2) = svc.prepare(&messages, tools.as_deref(), &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
+        let (i2, t2, m2) = loop {
+            match svc.prepare(&messages, tools.as_deref(), &m.kw, Some(m.max_req), None, None) {
+                Ok(r) => break r,
+                Err(Fail::Value(e)) if e.contains("exceeds the context window") => {
+                    // auto-compact: tool results fill the context (a browsing session: a page per round); the oldest
+                    // one still whole gives way to a note, the newest (the one the model reads now) last, only halved
+                    let Some((i, chars)) = compact_one(&mut messages) else { return Err(Stop::Err(Fail::Value(e))) };
+                    say(&format!("auto-compact: an earlier tool result ({} characters) shortened to fit the context", crate::mcp::thousands(chars as i64)));
+                    emit(Item::Mcp(json!({"event": "compacted", "message": i, "chars": chars})))?;
+                }
+                Err(e) => return Err(Stop::Err(e)),
+            }
+        };
         ids = i2;
         thinking = t2;
         max_new = m2;
@@ -453,4 +488,24 @@ pub fn anthropic_collect(events: &[(&'static str, Value)]) -> Value {
     }
     msg["content"] = Value::Array(blocks.into_iter().map(Value::Object).collect());
     msg
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn the_oldest_tool_result_goes_first_the_newest_is_only_halved() {
+        let page = |n: usize| "x".repeat(n);
+        let mut m = vec![json!({"role": "user", "content": page(5000)}), json!({"role": "tool", "content": page(5000)}),
+                         json!({"role": "assistant", "content": "a"}), json!({"role": "tool", "content": page(4000)})];
+        assert_eq!(compact_one(&mut m), Some((1, 5000)));
+        assert!(m[1]["content"].as_str().unwrap().starts_with("[compacted to fit the context: an earlier tool result of 5000 characters"));
+        assert_eq!(m[0]["content"].as_str().unwrap().len(), 5000);           // the user's message stays whole
+        assert_eq!(compact_one(&mut m), Some((3, 4000)));                    // only the newest left: halved
+        assert!(m[3]["content"].as_str().unwrap().ends_with("[cut to fit the context: 2000 of 4000 characters shown]"));
+        let n = m[3]["content"].as_str().unwrap().chars().count();         // halved again on the next overflow
+        assert_eq!(compact_one(&mut m), Some((3, n)));
+        assert_eq!(compact_one(&mut vec![json!({"role": "user", "content": "hi"})]), None);
+    }
 }

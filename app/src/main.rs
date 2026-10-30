@@ -48,7 +48,7 @@ enum Ev {
 }
 
 /// The browser pane's address field: an address as typed, a bare host (has a dot, no space) over https, anything else
-/// a DuckDuckGo search.
+/// a Google search.
 fn web_url(input: &str) -> String {
     let t = input.trim();
     if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("about:") {
@@ -58,7 +58,7 @@ fn web_url(input: &str) -> String {
         return format!("https://{t}");
     }
     let q: String = form_urlencoded_q(t);
-    format!("https://duckduckgo.com/?q={q}")
+    format!("https://www.google.com/search?q={q}")
 }
 
 fn form_urlencoded_q(s: &str) -> String {
@@ -1024,6 +1024,7 @@ fn main() {
     }
     let load_waiters: std::cell::RefCell<Vec<std::sync::mpsc::Sender<Result<String, String>>>> = Default::default();
     let approvals: std::cell::RefCell<HashMap<u64, browser_mcp::Job>> = Default::default();
+    let search_waiters: std::cell::RefCell<Vec<std::sync::mpsc::Sender<Result<String, String>>>> = Default::default();
     let next_ask = std::cell::Cell::new(0u64);
     {
         let p = proxy.clone();
@@ -1322,7 +1323,7 @@ fn main() {
                 "web" => {
                     web_open.set(!web_open.get());
                     if web_open.get() && web.url().map(|u| u == "about:blank").unwrap_or(true) {
-                        let _ = web.load_url("https://duckduckgo.com/");
+                        let _ = web.load_url("https://www.google.com/");
                     }
                     layout(full.get());
                     js_call(&control_view, "webOpen", &json!(web_open.get()));
@@ -1402,6 +1403,18 @@ fn main() {
             }
             Event::UserEvent(Ev::Web(url)) => {
                 js_call(&web_bar, "setUrl", &json!(url));
+                if url.contains("google.") && (url.contains("/search") || url.contains("/sorry/")) {
+                    // the results page read compactly (Google gives this web view a plain page: its answers and the
+                    // results' snippets read well as text); a "prove you are a person" page is said as such
+                    let blocked = url.contains("/sorry/");
+                    for w in search_waiters.borrow_mut().drain(..) {
+                        if blocked {
+                            let _ = w.send(Err("Google asks to prove this is a person (the browser shows it): the user can do that, then search again".into()));
+                        } else {
+                            eval_reply(&web, &browser_mcp::read_js(1), w, |v| Ok(browser_mcp::page_text(&v)));
+                        }
+                    }
+                }
                 for w in load_waiters.borrow_mut().drain(..) {
                     let _ = w.send(Ok(format!("opened {url}: browser_read it")));
                 }
@@ -1434,7 +1447,17 @@ fn main() {
                         let _ = web.evaluate_script("history.back()");
                         wait_load(job.reply, 8);
                     }
-                    "browser_read" => eval_reply(&web, browser_mcp::READ_JS, job.reply, |v| Ok(browser_mcp::page_text(&v))),
+                    "browser_read" => eval_reply(&web, &browser_mcp::read_js(job.args["part"].as_i64().unwrap_or(1)), job.reply, |v| Ok(browser_mcp::page_text(&v))),
+                    "browser_search" => {
+                        // Google's results, read when the page has loaded (no full page read for a search)
+                        let _ = web.load_url(&web_url(&format!("{} ", job.args["query"].as_str().unwrap_or("")).replace('.', " ")));
+                        let late = job.reply.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(15));
+                            let _ = late.send(Ok("the results did not load in 15 s: browser_read the page".into()));
+                        });
+                        search_waiters.borrow_mut().push(job.reply);
+                    }
                     "browser_click" => eval_reply(&web, &browser_mcp::click_js(n), job.reply,
                                                   |v| Ok(format!("clicked \"{}\": browser_read the page now", v["clicked"].as_str().unwrap_or("")))),
                     "browser_scroll" => {
@@ -1632,8 +1655,8 @@ mod tests {
     fn the_address_field_takes_addresses_hosts_and_searches() {
         assert_eq!(web_url("https://example.com/a?b=1"), "https://example.com/a?b=1");
         assert_eq!(web_url("  news.ycombinator.com "), "https://news.ycombinator.com");
-        assert_eq!(web_url("rust tokio select"), "https://duckduckgo.com/?q=rust+tokio+select");
-        assert_eq!(web_url("C++ & Rust?"), "https://duckduckgo.com/?q=C%2B%2B+%26+Rust%3F");
+        assert_eq!(web_url("rust tokio select"), "https://www.google.com/search?q=rust+tokio+select");
+        assert_eq!(web_url("C++ & Rust?"), "https://www.google.com/search?q=C%2B%2B+%26+Rust%3F");
     }
 
     #[test]
