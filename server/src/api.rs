@@ -59,6 +59,12 @@ impl Run<'_> {
     }
 }
 
+/// A tool call's arguments for the log, cut to 300 characters (which columns a write gave is what a wrong sheet asked).
+pub fn args_brief(args: &Map<String, Value>) -> String {
+    let t = Value::Object(args.clone()).to_string();
+    if t.chars().count() > 300 { format!("{}...", t.chars().take(300).collect::<String>()) } else { t }
+}
+
 /// A browser result's page (browser_mcp's page_text: its title on the first line, its address on the second; a search
 /// result starts with a note in [...] first): (title, address); a Google results page as "Google: <query>".
 pub fn page_source(text: &str) -> Option<(String, String)> {
@@ -244,7 +250,10 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             }
             let Ok(Ok(r)) = worker.join() else { break };
             let num = |k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-            say(&format!("tool {}: {}, {} characters in {:.1} s{}", c.name, if truthy(&r["ok"]) { "ok" } else { "error" }, crate::mcp::thousands(num("chars") as i64), num("ms") / 1000.0, if truthy(&r["truncated"]) { " (truncated for the model)" } else { "" }));
+            say(&format!("tool {}: {}, {} characters in {:.1} s{} {}", c.name, if truthy(&r["ok"]) { "ok" } else { "error" }, crate::mcp::thousands(num("chars") as i64), num("ms") / 1000.0, if truthy(&r["truncated"]) { " (truncated for the model)" } else { "" }, args_brief(&c.arguments)));
+            if !truthy(&r["ok"]) {
+                say(&format!("tool {} said: {}", c.name, r["text"].as_str().unwrap_or("").chars().take(300).collect::<String>()));
+            }
             results.push(r["text"].as_str().unwrap_or("").to_string());
             if server == json!("browser") && truthy(&r["ok"]) && matches!(tool.as_str(), "browser_read" | "browser_search" | "browser_open" | "browser_back") {
                 let text = r["text"].as_str().unwrap_or("");
@@ -626,6 +635,15 @@ mod compact_tests {
 #[cfg(test)]
 mod sources_tests {
     use super::*;
+
+    #[test]
+    fn tool_arguments_in_the_log_are_cut() {
+        let short = json!({"row": 3, "values": {"Price": "$1"}}).as_object().cloned().unwrap();
+        assert_eq!(args_brief(&short), r#"{"row":3,"values":{"Price":"$1"}}"#);
+        let long = json!({"rows": "x".repeat(1000)}).as_object().cloned().unwrap();
+        let b = args_brief(&long);
+        assert!(b.ends_with("...") && b.chars().count() == 303, "{}", b.len());
+    }
 
     #[test]
     fn an_answer_from_the_web_lists_its_pages() {

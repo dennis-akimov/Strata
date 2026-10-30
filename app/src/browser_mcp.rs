@@ -381,7 +381,12 @@ mod in_a_browser {
     use super::*;
     use std::process::{Child, Command, Stdio};
 
+    /// One headless Chrome at a time: two at once (cargo runs tests in parallel) reset each other's DevTools socket
+    /// ("Connection reset without closing handshake") in 3 of 10 runs; one at a time, 10 of 10 passed.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct Browser {
+        _turn: std::sync::MutexGuard<'static, ()>,
         child: Child,
         ws: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
         id: u64,
@@ -403,9 +408,13 @@ mod in_a_browser {
                 eprintln!("no Chrome at {exe}: the page scripts' browser tests are skipped");
                 return None;
             }
+            // a test that failed (panicked) while holding the turn still hands it on
+            let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!("strata-js-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             std::fs::create_dir_all(&dir).ok()?;
-            let child = Command::new(&exe).args(["--headless=new", "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check"])
+            // a fresh profile, no network chatter or updates in the background: the same browser every run
+            let child = Command::new(&exe).args(["--headless=new", "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check",
+                                                  "--disable-background-networking", "--disable-component-update", "--disable-extensions", "--disable-sync"])
                 .arg(format!("--user-data-dir={}", dir.display())).arg("about:blank").stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()?;
             // Chrome says its port in DevToolsActivePort
             let mut port = None;
@@ -441,7 +450,7 @@ mod in_a_browser {
             if let tungstenite::stream::MaybeTlsStream::Plain(t) = ws.get_ref() {
                 let _ = t.set_read_timeout(Some(Duration::from_secs(20))); // a hang fails the test, not the run
             }
-            Some(Browser { child, ws, id: 0, dir })
+            Some(Browser { _turn: turn, child, ws, id: 0, dir })
         }
 
         fn cdp(&mut self, method: &str, params: Value) -> Value {
@@ -452,6 +461,10 @@ mod in_a_browser {
                     Ok(tungstenite::Message::Text(t)) => {
                         let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
                         if v["id"] == self.id {
+                            // a refused command fails here, by name (it was a silent null)
+                            if let Some(e) = v.get("error") {
+                                panic!("{method}: Chrome refused it: {e}");
+                            }
                             return v["result"].clone();
                         }
                     }
@@ -462,19 +475,60 @@ mod in_a_browser {
         }
 
         /// A page from this HTML (a data: URL), loaded.
+        /// The page from a local HTTP server: a real origin, where the address's #fragment fires hashchange (a data:
+        /// page never does: the fake sheet's selection did not move).  One page, any path; framed by Content-Length
+        /// and Connection: close (RFC 9112), so Chrome never waits for more.
+        fn page_http(&mut self, html: &'static str) {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for mut s in l.incoming().flatten() {
+                    let mut r = BufReader::new(s.try_clone().unwrap());
+                    let mut line = String::new();
+                    while r.read_line(&mut line).map(|n| n > 0 && line != "\r\n").unwrap_or(false) {
+                        line.clear();
+                    }
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
+                }
+            });
+            self.go(&format!("http://127.0.0.1:{port}/spreadsheets/d/fake/edit"));
+        }
+
         fn page(&mut self, html: &str) {
             let url = format!("data:text/html;charset=utf-8,{}", html.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>());
+            self.go(&url);
+        }
+
+        fn go(&mut self, url: &str) {
+            // the old page marked: "complete" from it is not the new one's (that race returned early)
+            self.eval("window.__strataOld = true");
             self.cdp("Page.navigate", json!({"url": url}));
-            for _ in 0..50 {
-                if self.eval("document.readyState") == "complete" {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if self.eval("!window.__strataOld && document.readyState === 'complete'") == true {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                assert!(std::time::Instant::now() < deadline, "the page did not load in 10 s (readyState {})", self.eval("document.readyState"));
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
 
+        /// A script's value; a script that throws fails the test with its message (it was a silent null).
         fn eval(&mut self, js: &str) -> Value {
-            self.cdp("Runtime.evaluate", json!({"expression": js, "returnByValue": true}))["result"]["value"].clone()
+            let r = self.cdp("Runtime.evaluate", json!({"expression": js, "returnByValue": true}));
+            if let Some(e) = r.get("exceptionDetails") {
+                panic!("the script threw: {}", e["exception"]["description"].as_str().or(e["text"].as_str()).unwrap_or("?"));
+            }
+            r["result"]["value"].clone()
+        }
+
+        /// An async script's value: Ok(value), or Err(its error's message) when it rejects (a tool's own error).
+        fn run(&mut self, js: &str) -> Result<Value, String> {
+            let r = self.cdp("Runtime.evaluate", json!({"expression": js, "returnByValue": true, "awaitPromise": true, "timeout": 30000}));
+            match r.get("exceptionDetails") {
+                Some(e) => Err(e["exception"]["description"].as_str().or(e["text"].as_str()).unwrap_or("?").lines().next().unwrap_or("").trim_start_matches("Error: ").to_string()),
+                None => Ok(r["result"]["value"].clone()),
+            }
         }
 
         /// A page script's JSON string, parsed (as the app's js_value does).
@@ -507,6 +561,123 @@ mod in_a_browser {
 <label for="u">Email</label><input id="u" name="email"><input type="password" name="pw" aria-label="Password">
 <textarea name="note" placeholder="Note"></textarea><button type="button" onclick="window.clicked = 'yes'">Go</button>
 </form></main><script>document.getElementById('u').addEventListener('input', () => window.inputs = (window.inputs || 0) + 1)</script></body></html>"#;
+
+
+    /// Google Sheets as the tools found it live (2026-10-30), small: the cell editor (#waffle-rich-text-editor) takes a
+    /// paste as tab-separated cells at the selection and a copy gives the selection back; #range= in the address selects
+    /// (a range past the last row is ignored, as Google ignores it: the Name Box keeps the old one); Delete clears the
+    /// selection; the File / Edit / Insert menus act on mouse events; the title saves on change.  window.grid is the truth.
+    const FAKE_SHEET: &str = r#"<html><head><title>Untitled spreadsheet - Google Sheets</title></head><body>
+<input class="docs-title-input" value="Untitled spreadsheet"><input id="t-name-box" value="A1">
+<div id="docs-file-menu">File</div><div id="docs-edit-menu">Edit</div><div id="docs-insert-menu">Insert</div>
+<div class="goog-menu" id="menu"></div><div id="waffle-rich-text-editor" contenteditable="true">.</div>
+<script>
+let rows = 30; const COLS = 26;
+window.grid = Array.from({length: rows}, () => Array(COLS).fill('')); window.boxes = new Set(); window.trashed = false;
+let sel = {r1: 0, c1: 0, r2: 0, c2: 0};
+const col = (s) => [...s].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+const parse = (range) => {
+  const [a, b = a] = range.split(':');
+  const p = (x, end) => { const m = x.match(/^([A-Z]+)(\d*)$/); return m && {c: col(m[1]), r: m[2] ? +m[2] - 1 : (end ? rows - 1 : 0)}; };
+  const s = p(a, false), e = p(b, true);
+  return s && e && e.r < rows && e.c < COLS && s.r <= e.r ? {r1: s.r, c1: s.c, r2: e.r, c2: e.c} : null;
+};
+addEventListener('hashchange', () => {
+  const r = new URLSearchParams(location.hash.slice(1)).get('range') || 'A1', p = parse(r);
+  if (!p) return;                                  // past the sheet: ignored, without a word
+  sel = p; const [a, b] = r.split(':'); document.querySelector('#t-name-box').value = b === a ? a : r;
+});
+const ed = document.querySelector('#waffle-rich-text-editor');
+ed.addEventListener('paste', (e) => { e.preventDefault();
+  e.clipboardData.getData('text/plain').split('\n').forEach((line, i) => line.split('\t').forEach((v, j) => {
+    if (sel.r1 + i < rows && sel.c1 + j < COLS) grid[sel.r1 + i][sel.c1 + j] = v; })); });
+ed.addEventListener('copy', (e) => { e.preventDefault(); const out = [];
+  for (let r = sel.r1; r <= sel.r2; r++) { const row = []; for (let c = sel.c1; c <= sel.c2; c++) row.push(grid[r][c]); out.push(row.join('\t')); }
+  e.clipboardData.setData('text/plain', out.join('\n')); });
+ed.addEventListener('keydown', (e) => { if (e.key !== 'Delete') return;
+  for (let r = sel.r1; r <= sel.r2; r++) for (let c = sel.c1; c <= sel.c2; c++) grid[r][c] = boxes.has(r + ',' + c) ? 'FALSE' : ''; });
+document.querySelector('.docs-title-input').addEventListener('change', (e) => { document.title = e.target.value + ' - Google Sheets'; });
+const menu = document.querySelector('#menu');
+const item = (text, act) => { const d = document.createElement('div'); d.className = 'goog-menuitem'; d.innerText = text; d.addEventListener('click', act); menu.appendChild(d); };
+const open = (items) => { menu.innerHTML = ''; items.forEach(([t, a]) => item(t, a)); };
+document.querySelector('#docs-insert-menu').addEventListener('mousedown', () => open([['Checkbox', () => {
+  for (let r = sel.r1; r <= sel.r2; r++) { boxes.add(r + ',' + sel.c1); if (grid[r][sel.c1] !== 'TRUE') grid[r][sel.c1] = 'FALSE'; } menu.innerHTML = ''; }]]));
+document.querySelector('#docs-edit-menu').addEventListener('mousedown', () => open([['Delete►', () => {
+  const n = sel.r2 - sel.r1 + 1, t = n === 1 ? 'Row ' + (sel.r1 + 1) : 'Rows ' + (sel.r1 + 1) + ' - ' + (sel.r2 + 1);
+  item(t, () => { grid.splice(sel.r1, n); rows -= n; menu.innerHTML = ''; }); }]]));
+document.querySelector('#docs-file-menu').addEventListener('mousedown', () => open([['Move to trash', () => { window.trashed = true; menu.innerHTML = ''; }]]));
+</script></body></html>"#;
+
+    /// A Google tool's script (google.rs) run in the page as the app runs it; its answer as the model reads it.
+    fn tool(b: &mut Browser, name: &str, args: Value) -> Result<String, String> {
+        let js = crate::google::sheets_js(name, &args)?;
+        b.run(&format!("(async () => {{ window.__strataPace = 0.02; {js} }})()")).map(|v| crate::google::answer(name, &args, &v))
+    }
+
+    fn grid(b: &mut Browser, rows: usize) -> Vec<Vec<String>> {
+        serde_json::from_value(b.eval(&format!("grid.slice(0, {rows}).map((r) => r.slice(0, 10))"))).unwrap()
+    }
+
+    #[test]
+    fn sheets_tools_on_a_fake_sheet() {
+        let Some(mut b) = Browser::start() else { return };
+        b.page_http(FAKE_SHEET);
+        let cols = ["Checkbox", "Rating", "Address", "Price", "Sq feet", "Time", "Link", "Description", "Availability", "Confirmation"];
+        let out = tool(&mut b, "sheets_create", json!({"title": "studios", "columns": cols})).unwrap();
+        assert!(out.starts_with("created studios (") && out.contains("10 columns"), "{out}");
+        assert_eq!(b.eval("document.title"), "studios - Google Sheets");
+        assert_eq!(grid(&mut b, 1)[0], cols);
+
+        // rows by column name land under their names; FALSE first cells become tick boxes in these rows only
+        let out = tool(&mut b, "sheets_append", json!({"rows": [
+            {"Checkbox": "FALSE", "Rating": "4.0 (122)", "Address": "1440 Columbia St", "Price": "$2,916"},
+            {"checkbox": "FALSE", "address": "801 A St", "description": "The Rey: a\ntower"}]})).unwrap();
+        assert!(out.contains("added 2 rows at rows 2-3") && out.contains("filling Checkbox, Rating, Address, Price, Description") && out.contains("(Checkbox as tick boxes)"), "{out}");
+        let g = grid(&mut b, 4);
+        assert_eq!(g[1], ["FALSE", "4.0 (122)", "1440 Columbia St", "$2,916", "", "", "", "", "", ""]);
+        assert_eq!((g[2][2].as_str(), g[2][7].as_str(), g[2][1].as_str()), ("801 A St", "The Rey: a tower", ""));
+        assert_eq!(b.eval("[...boxes].sort().join(' ')"), "1,0 2,0");
+
+        // the failure seen in the chat: [name, address, price] by position. Refused, the sheet as it was
+        let before = grid(&mut b, 5);
+        let e = tool(&mut b, "sheets_append", json!({"rows": [["The Artisan", "1601 Broadway", "$2,411+"]]})).unwrap_err();
+        assert!(e.starts_with("a row of 3 cells for 10 columns: give each row as {column: value}; the columns are: Checkbox, Rating"), "{e}");
+        assert!(tool(&mut b, "sheets_append", json!({"rows": [{"Name": "The Artisan"}]})).unwrap_err().starts_with("no column \"Name\""));
+        assert_eq!(grid(&mut b, 5), before);
+
+        // an update changes the named cells only
+        let out = tool(&mut b, "sheets_write", json!({"row": 3, "values": {"Price": "$2,101", "Rating": "4.3"}})).unwrap();
+        assert!(out.starts_with("updated row 3 of studios"), "{out}");
+        assert_eq!(grid(&mut b, 3)[2][..4], ["FALSE", "4.3", "801 A St", "$2,101"]);
+        assert_eq!(grid(&mut b, 3)[2][7], "The Rey: a tower");
+        // a value set to "" clears that cell, the rest stay
+        tool(&mut b, "sheets_write", json!({"row": 3, "values": {"Rating": ""}})).unwrap();
+        assert_eq!(grid(&mut b, 3)[2][..4], ["FALSE", "", "801 A St", "$2,101"]);
+
+        // the read: rows numbered as in the sheet, empty ones at the end left out
+        let out = tool(&mut b, "sheets_read", json!({})).unwrap();
+        assert!(out.contains("row 1: Checkbox | Rating | Address") && out.contains("row 2: FALSE | 4.0 (122) | 1440 Columbia St | $2,916") && !out.contains("row 4:"), "{out}");
+        assert!(tool(&mut b, "sheets_read", json!({"range": "A1:Z5000"})).unwrap_err().contains("is not in the sheet"), "a range past the last row is an error, not the old selection");
+
+        // delete a row: the rows under move up, and the next append goes under the last filled row (it once wrote
+        // over row 2: the range it counted rows in was past the sheet and ignored)
+        tool(&mut b, "sheets_delete_rows", json!({"from": 2})).unwrap();
+        assert_eq!(grid(&mut b, 2)[1][2], "801 A St");
+        let out = tool(&mut b, "sheets_append", json!({"rows": [{"Checkbox": "FALSE", "Address": "702 Broadway"}]})).unwrap();
+        assert!(out.contains("at rows 3-3"), "{out}");
+        assert_eq!((grid(&mut b, 3)[1][2].as_str(), grid(&mut b, 3)[2][2].as_str()), ("801 A St", "702 Broadway"));
+
+        // a row with no FALSE / TRUE first: no tick box made
+        let boxes = b.eval("boxes.size");
+        let out = tool(&mut b, "sheets_append", json!({"rows": [{"Address": "9 B St"}]})).unwrap();
+        assert!(out.contains("at rows 4-4") && !out.contains("tick boxes"), "{out}");
+        assert_eq!(b.eval("boxes.size"), boxes);
+
+        tool(&mut b, "sheets_clear", json!({"range": "D2:D2"})).unwrap();
+        assert_eq!(grid(&mut b, 2)[1][3], "");
+        assert!(tool(&mut b, "sheets_trash", json!({})).unwrap().starts_with("moved to the trash: studios"));
+        assert_eq!(b.eval("trashed"), true);
+    }
 
     #[test]
     fn page_scripts_read_click_and_type_in_a_browser() {
@@ -580,6 +751,19 @@ mod in_a_browser {
         let m = els.iter().find(|e| e.contains("Open the map menu")).map(|e| e[1..e.find(']').unwrap()].parse::<i64>().unwrap()).unwrap();
         b.json(&click_js(m));
         assert_eq!(b.eval("window.opened"), json!(1));
+
+        // Google Sheets' rows by column name (google.rs place): each value under its own column, never shifted
+        let place = |b: &mut Browser, rows: &str| -> Value {
+            b.json(&format!("(() => {{ {} ; try {{ return JSON.stringify(place(['Checkbox', 'Rating', 'Address', 'Price'], {rows})); }} catch (e) {{ return JSON.stringify({{error: e.message}}); }} }})()", crate::google::PRELUDE))
+        };
+        assert_eq!(place(&mut b, r#"[{"address": "1 A St", "Price": "$2,100\n/mo", "Checkbox": "FALSE"}]"#), json!([["FALSE", "", "1 A St", "$2,100 /mo"]]));
+        // the failure seen: three positional cells (name, address, price) for four columns are refused, not shifted
+        let e = place(&mut b, r#"[["The Rey", "801 A St", "$2,101"]]"#);
+        assert_eq!(e["error"], "a row of 3 cells for 4 columns: give each row as {column: value}; the columns are: Checkbox, Rating, Address, Price");
+        assert_eq!(place(&mut b, r#"[["TRUE", "4.3", "801 A St", "$2,101"]]"#), json!([["TRUE", "4.3", "801 A St", "$2,101"]]));
+        assert_eq!(place(&mut b, r#"[{"Name": "The Rey"}]"#)["error"], "no column \"Name\"; the columns are: Checkbox, Rating, Address, Price");
+        assert!(place(&mut b, "[]")["error"].as_str().unwrap().starts_with("rows:"));
+        assert_eq!(b.json(&format!("(() => {{ {} ; return JSON.stringify([letter(0), letter(9), letter(25), letter(26), letter(27)]); }})()", crate::google::PRELUDE)), json!(["A", "J", "Z", "AA", "AB"]));
 
         // a form: what a field is (for the Allow), a password refused, typing fires input, submit sends the form
         b.page(FORM);

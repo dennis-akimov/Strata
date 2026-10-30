@@ -10,17 +10,18 @@ use serde_json::{json, Value};
 
 /// The tools, as tools/list gives them (after the browser's).
 pub fn tools() -> Value {
-    let rows = json!({"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "rows of cells, e.g. [[\"4.5\", \"123 Main St\"]]"});
+    let rows = json!({"type": "array", "items": {"type": "object", "additionalProperties": {"type": "string"}}, "description": "one object per row, its values by column name (the header row's names, as sheets_read shows them), e.g. [{\"Address\": \"123 Main St\", \"Price\": \"$2,100\"}]; a column left out stays empty"});
     let url = json!({"type": "string", "description": "the spreadsheet's address (docs.google.com/spreadsheets/d/...); default: the one open in the browser"});
     json!([
         {"name": "sheets_create", "description": "Create a Google Sheets spreadsheet in the user's Google Drive (the browser beside the chat, signed in as them): its title and its header row. Answers with its address.",
          "inputSchema": {"type": "object", "required": ["title", "columns"], "properties": {"title": {"type": "string"}, "columns": {"type": "array", "items": {"type": "string"}}}}},
         {"name": "sheets_read", "description": "Read a Google Sheets spreadsheet: its rows, numbered as in the sheet (row 1 is the header), cells as shown.",
          "inputSchema": {"type": "object", "properties": {"url": url, "range": {"type": "string", "description": "e.g. A1:J50 (default: A:Z, the whole sheet up to its last filled row; 300 rows at a time)"}}}},
-        {"name": "sheets_append", "description": "Add rows under the last filled row of a Google Sheets spreadsheet (one array per row, cells in the columns' order). When every row's first cell is FALSE or TRUE, column A of these rows becomes tick boxes.",
+        {"name": "sheets_append", "description": "Add rows under the last filled row of a Google Sheets spreadsheet, each value under its column's name (read the sheet first to see them). When every row's first-column value is FALSE or TRUE, those cells become tick boxes.",
          "inputSchema": {"type": "object", "required": ["rows"], "properties": {"url": url, "rows": rows}}},
-        {"name": "sheets_write", "description": "Write rows into a Google Sheets spreadsheet starting at a cell (e.g. B5): replaces what is there (update).",
-         "inputSchema": {"type": "object", "required": ["cell", "rows"], "properties": {"url": url, "cell": {"type": "string"}, "rows": rows}}},
+        {"name": "sheets_write", "description": "Change cells of one row of a Google Sheets spreadsheet by column name (update): the other cells of the row stay as they are.",
+         "inputSchema": {"type": "object", "required": ["row", "values"], "properties": {"url": url, "row": {"type": "integer", "description": "the row's number as sheets_read shows it (2 or more)"},
+             "values": {"type": "object", "additionalProperties": {"type": "string"}, "description": "{column name: new value}"}}}},
         {"name": "sheets_delete_rows", "description": "Delete rows from..to of a Google Sheets spreadsheet (the rows under move up); row 1, the header, stays.",
          "inputSchema": {"type": "object", "required": ["from"], "properties": {"url": url, "from": {"type": "integer"}, "to": {"type": "integer"}}}},
         {"name": "sheets_clear", "description": "Empty the cells of a range of a Google Sheets spreadsheet (e.g. A5:J5 for row 5).",
@@ -86,12 +87,6 @@ pub fn sheet_base(url: &str) -> Option<String> {
     (id.len() > 10).then(|| format!("https://docs.google.com/spreadsheets/d/{id}"))
 }
 
-/// Every row's first cell FALSE or TRUE: a tick-box column.
-pub fn first_cells_boolean(rows: &Value) -> bool {
-    let rows = rows.as_array().map(Vec::as_slice).unwrap_or(&[]);
-    !rows.is_empty() && rows.iter().all(|r| matches!(r.get(0).and_then(Value::as_str).map(str::trim), Some("FALSE" | "TRUE")))
-}
-
 /// A cell address or range the fragment can take (A1, B5, A2:J40): nothing else goes into the script.
 pub fn range_ok(r: &str) -> bool {
     let parts: Vec<&str> = r.split(':').collect();
@@ -150,8 +145,9 @@ pub fn first_row(range: &str) -> usize {
 }
 
 /// Sheets' helpers, before each body.
-const PRELUDE: &str = r#"
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+pub const PRELUDE: &str = r#"
+// window.__strataPace: tests run the same waits shorter (a fake sheet answers at once)
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms * (window.__strataPace || 1)));
 const editor = () => document.querySelector('#waffle-rich-text-editor');
 const ready = async () => { for (let i = 0; i < 40 && !editor(); i++) await sleep(250); if (!editor()) throw new Error('the spreadsheet did not open (signed in to Google in the browser?)'); };
 const go = async (range) => {
@@ -172,6 +168,33 @@ const menu = async (id, item) => { const m = document.querySelector(id); if (!m)
   mouse(m); await sleep(400);
   const it = [...document.querySelectorAll('.goog-menu .goog-menuitem')].find((e) => e.offsetParent && e.innerText.trim().split('\n')[0].trim().startsWith(item));
   if (!it) { mouse(m); throw new Error('no menu item ' + item); } mouse(it); await sleep(600); };
+// rows by column name -> cells in the header's order.  Positional rows went wrong: a model wrote [name, address, price]
+// from B5, under Rating, Address and Price, and each row then held halves of two buildings.  A row as a list must
+// fill every column; a name that is no column is refused (with the columns), never put somewhere.
+const place = (header, rows) => {
+  const cols = header.map((h) => String(h).trim()), key = (k) => String(k).trim().toLowerCase();
+  const cell = (v) => (v === null || v === undefined ? '' : String(v)).replace(/[\t\r\n]+/g, ' ').trim();
+  const list = cols.join(', ');
+  if (!Array.isArray(rows) || !rows.length) throw new Error('rows: a list of {column: value}; the columns are: ' + list);
+  return rows.map((r) => {
+    if (Array.isArray(r)) {
+      if (r.length !== cols.length) throw new Error('a row of ' + r.length + ' cells for ' + cols.length + ' columns: give each row as {column: value}; the columns are: ' + list);
+      return r.map(cell);
+    }
+    if (!r || typeof r !== 'object') throw new Error('each row: {column: value}; the columns are: ' + list);
+    const out = cols.map(() => '');
+    for (const [k, v] of Object.entries(r)) {
+      const i = cols.findIndex((c) => key(c) === key(k));
+      if (i < 0) throw new Error('no column "' + k + '"; the columns are: ' + list);
+      out[i] = cell(v);
+    }
+    return out;
+  });
+};
+const letter = (i) => { let s = ''; for (i++; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s; return s; };
+// the header row's names (row 1 up to its last named column)
+const header = async () => { await go('A1:Z1'); const h = clip('copy').split('\n')[0].split('\t').map((c) => c.trim());
+  while (h.length && !h[h.length - 1]) h.pop(); if (!h.length) throw new Error('row 1 has no column names: sheets_create gives a sheet its header'); return h; };
 // a cell with something in it: an unticked (or ticked) box alone does not fill a row
 const filled = (c) => c.trim() && c.trim() !== 'FALSE' && c.trim() !== 'TRUE';
 const title = () => (document.querySelector('.docs-title-input') || {}).value || document.title;
@@ -202,24 +225,33 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
             format!(r#"await ready(); await go('{r}'); const t = clip('copy'); await go('A1'); return JSON.stringify({{where: where(), text: t}});"#)
         }
         "sheets_append" => {
-            let rows = tsv(&args["rows"])?;
-            let n = args["rows"].as_array().map_or(0, |r| r.len());
-            format!(r#"await ready(); await go('A:Z');
+            let rows = serde_json::to_string(&args["rows"]).unwrap_or_default();
+            format!(r#"await ready(); const h = await header(); const rows = place(h, {rows}), n = rows.length;
+  await go('A:Z');
   const have = clip('copy').split('\n'); let last = 0;
   have.forEach((l, i) => {{ if (l.split('\t').some(filled)) last = i + 1; }});
-  await go('A' + (last + 1)); clip('paste', {rows}); await sleep(800);
+  await go('A' + (last + 1)); clip('paste', rows.map((r) => r.join('\t')).join('\n')); await sleep(800);
   // first cells all FALSE / TRUE: tick boxes, in these rows only (pre-filled boxes under the data were rows to
   // My Maps' import: 181 rows with no address, and "trouble finding those locations")
-  if ({boxes}) {{ await go('A' + (last + 1) + ':A' + (last + {n})); await menu('#docs-insert-menu', 'Checkbox'); }}
+  const boxes = rows.every((r) => r[0] === 'FALSE' || r[0] === 'TRUE');
+  if (boxes) {{ await go('A' + (last + 1) + ':A' + (last + n)); await menu('#docs-insert-menu', 'Checkbox'); }}
   await go('A1');
-  return 'added {n} rows at rows ' + (last + 1) + '-' + (last + {n}) + ' of ' + where() + ({boxes} ? ', column A as tick boxes' : '');"#,
-                    rows = serde_json::to_string(&rows).unwrap_or_default(), boxes = first_cells_boolean(&args["rows"]))
+  const used = h.filter((c, i) => rows.some((r) => r[i]));
+  return 'added ' + n + ' rows at rows ' + (last + 1) + '-' + (last + n) + ' of ' + where() + ', filling ' + used.join(', ') + (boxes ? ' (' + h[0] + ' as tick boxes)' : '');"#)
         }
         "sheets_write" => {
-            let c = range("cell", "A1")?;
-            let rows = tsv(&args["rows"])?;
-            format!(r#"await ready(); await go('{c}'); clip('paste', {rows}); await sleep(800); await go('A1'); return 'wrote from {c} in ' + where();"#,
-                    rows = serde_json::to_string(&rows).unwrap_or_default())
+            let row = args["row"].as_u64().unwrap_or(0);
+            if row < 2 {
+                return Err("row: the row's number, 2 or more (row 1 is the header; sheets_read shows the numbers)".into());
+            }
+            let values = serde_json::to_string(&args["values"]).unwrap_or_default();
+            format!(r#"await ready(); const h = await header(); const end = letter(h.length - 1);
+  const [want] = place(h, [{values}]);
+  await go('A{row}:' + end + '{row}');
+  const now = clip('copy').split('\n')[0].split('\t');
+  const merged = h.map((c, i) => (want[i] !== '' || Object.keys({values}).some((k) => k.trim().toLowerCase() === c.toLowerCase())) ? want[i] : (now[i] || '').trim());
+  await go('A{row}'); clip('paste', merged.join('\t')); await sleep(800); await go('A1');
+  return 'updated row {row} of ' + where() + ': ' + Object.keys({values}).join(', ');"#)
         }
         "sheets_delete_rows" => {
             let (from, to) = (args["from"].as_u64().unwrap_or(0), args["to"].as_u64().or(args["from"].as_u64()).unwrap_or(0));
@@ -410,11 +442,9 @@ mod tests {
     }
 
     #[test]
-    fn tick_boxes_only_for_boolean_first_cells() {
-        assert!(first_cells_boolean(&json!([["FALSE", "a"], ["TRUE", "b"]])));
-        assert!(!first_cells_boolean(&json!([["FALSE", "a"], ["x", "b"]])));
-        assert!(!first_cells_boolean(&json!([])));
-        assert!(sheets_js("sheets_append", &json!({"rows": [["FALSE", "a"]]})).unwrap().contains("if (true)"));
+    fn rows_by_number_and_name() {
+        assert!(sheets_js("sheets_write", &json!({"row": 1, "values": {"A": "x"}})).is_err(), "the header stays");
+        assert!(sheets_js("sheets_write", &json!({"row": 5, "values": {"Price": "$1"}})).unwrap().contains("go('A5:' + end + '5')"));
         assert!(sheets_js("sheets_delete_rows", &json!({"from": 1})).is_err(), "the header stays");
         assert!(sheets_js("sheets_delete_rows", &json!({"from": 5, "to": 7})).unwrap().contains("Rows 5 - 7"));
         assert!(sheets_js("sheets_delete_rows", &json!({"from": 5})).unwrap().contains("'Row 5'"));
@@ -423,8 +453,8 @@ mod tests {
     #[test]
     fn scripts_take_only_checked_ranges() {
         assert!(sheets_js("sheets_clear", &json!({"range": "A1');x('"})).is_err());
-        let js = sheets_js("sheets_write", &json!({"cell": "b5", "rows": [["it's \"q\""]]})).unwrap();
-        assert!(js.contains("go('B5')") && js.contains(r#""it's \"q\"""#));
+        let js = sheets_js("sheets_append", &json!({"rows": [{"Name": "it's \"q\""}]})).unwrap();
+        assert!(js.contains(r#"[{"Name":"it's \"q\""}]"#));
         assert!(!sheets_js("sheets_create", &json!({"title": "t", "columns": ["A", "B"]})).unwrap().contains("Checkbox"), "no tick boxes before there are rows");
     }
 }
