@@ -139,6 +139,8 @@ impl Service {
             Box::new(HarmonyParser::new())
         } else if self.glm {
             Box::new(GlmParser::new(thinking, tools, self.set.tool_call_recovery))
+        } else if self.lfm {
+            Box::new(GlmParser::lfm(thinking, tools, self.set.tool_call_recovery))
         } else {
             Box::new(OutputParser::new(thinking, tools, true, self.set.tool_call_recovery))
         };

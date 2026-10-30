@@ -32,9 +32,10 @@ const TABS: [&str; 7] = ["Chat", "Monitor", "Memory", "Models", "MCP", "Network"
 const LOG_TAB: usize = 6;
 const EFFORTS: [(&str, &str); 4] = [("none", "off"), ("low", "low"), ("medium", "medium"), ("high", "high")];
 /// The models `make pull` knows (tools/pull_model.py): (its name, the run config it writes, a title, the download in GB)
-const CATALOG: [(&str, &str, &str, f64); 5] = [
+const CATALOG: [(&str, &str, &str, f64); 6] = [
     ("GPT-OSS-20B", "gpt-oss-20b", "GPT-OSS 20B", 12.1),
-    ("QWEN3.6-35B-IQ2", "qwen3.6-35b-a3b-iq2", "Qwen3.6-35B-A3B 2-bit", 11.5),
+    ("LFM2.5-24B", "lfm2.5-24b-a2b", "LFM2.5-24B-A2B", 11.5),
+    ("LFM2.5-8B", "lfm2.5-8b-a1b", "LFM2.5-8B-A1B", 9.0),
     ("QWEN3.6-35B", "qwen3.6-35b-a3b", "Qwen3.6-35B-A3B", 21.7),
     ("GPT-OSS-120B", "gpt-oss-120b", "GPT-OSS 120B", 63.4),
     ("GLM-5.3", "glm-5.3-flash-maya-s24", "GLM-5.3-Flash", 94.7),

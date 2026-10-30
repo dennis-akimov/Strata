@@ -99,6 +99,8 @@ PRE = {
     "qwen35": (QWEN35_PATTERN, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)", False),
     "gpt-4o": (GPT4O_PATTERN, "openai/gpt-oss-120b tokenizer.json pre_tokenizer (o200k); model.ignore_merges", True),
     "glm4": (GLM4_PATTERN, "zai-org/GLM-5.3-Flash tokenizer.json pre_tokenizer; model.ignore_merges", True),
+    # LFM2 / LFM2.5 (LiquidAI): their tokenizer.json's pattern is glm4's, character for character
+    "lfm2": (GLM4_PATTERN, "LiquidAI/LFM2.5-24B-A2B tokenizer.json pre_tokenizer (= glm4's); model.ignore_merges", True),
     "hunyuan": (HUNYUAN_PATTERN, "tencent/HunyuanImage-3.0-Instruct-Distil tokenizer.json pre_tokenizer; "
                                  "model.ignore_merges", True),
 }

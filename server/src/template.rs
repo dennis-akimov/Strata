@@ -3,7 +3,7 @@
 //! (a 400 with the template's message) and `strftime_now` (GPT-OSS dates its system message with it).
 
 use crate::frontend::{has_image, text_of, BadRequest};
-use crate::parser::{glm_call_to_qwen, parse_tool_call, ToolCall, CALL_END, CALL_START};
+use crate::parser::{glm_call_to_qwen, parse_tool_call, PyLit, ToolCall, CALL_END, CALL_START};
 use crate::py::{self, get};
 use crate::pyjson;
 use minijinja::value::{Kwargs, Value as MjValue};
@@ -59,6 +59,14 @@ fn strftime(fmt: &str) -> String {
     chrono::Local::now().format(fmt).to_string()
 }
 
+/// transformers' own tags that jinja2 alone does not know: `{% generation %}...{% endgeneration %}` marks the assistant's
+/// tokens for training masks and renders its body unchanged (LiquidAI's LFM2.5 templates use it).  Rewritten to
+/// `{% if true %}...{% endif %}`, the whitespace dashes kept.
+fn hf_tags(source: &str) -> String {
+    let re = regex::Regex::new(r"\{%(-?)\s*(end)?generation\s*(-?)%\}").expect("regex");
+    re.replace_all(source, |c: &regex::Captures| format!("{{%{} {} {}%}}", &c[1], if c.get(2).is_some() { "endif" } else { "if true" }, &c[3])).into_owned()
+}
+
 impl ChatTemplate {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         Self::from_source(std::fs::read_to_string(path)?)
@@ -73,7 +81,7 @@ impl ChatTemplate {
             Err(Error::new(ErrorKind::InvalidOperation, format!("{RAISED}{msg}")))
         });
         env.add_function("strftime_now", |fmt: String| strftime(&fmt));
-        env.add_template_owned("chat", source.clone())?;
+        env.add_template_owned("chat", hf_tags(&source))?;
         let mut t = ChatTemplate { env, source, caps: Caps::default() };
         t.caps = t.detect_caps();
         Ok(t)
@@ -142,6 +150,7 @@ impl ChatTemplate {
         let tool_prompt = self.probe(&[user.clone()], Some(&tools));
         let harmony = self.source.contains("<|channel|>");
         let glm = self.source.contains("<arg_key>");
+        let lfm = self.source.contains("<|tool_call_start|>");
         let calls_supported = |count: usize| -> bool {
             let calls: Vec<Value> = (0..count).map(|i| json!({"name": format!("strata_caps_call_{i}"), "arguments": {"arg": format!("strata_caps_arg_{i}")}})).collect();
             let mut messages = vec![user.clone(), json!({"role": "assistant", "content": "", "tool_calls": calls.iter().map(|c| json!({"function": c})).collect::<Vec<_>>()})];
@@ -154,6 +163,12 @@ impl ChatTemplate {
                 re.captures_iter(&prompt)
                     .map(|c| serde_json::from_str::<Value>(&c[2]).ok().and_then(|v| v.as_object().cloned()).map(|a| ToolCall::new(&c[1], a)))
                     .collect()
+            } else if lfm {
+                let re = regex::Regex::new(r"(?s)<\|tool_call_start\|>(.*?)<\|tool_call_end\|>").unwrap();
+                re.captures_iter(&prompt)
+                    .map(|c| PyLit::new(&c[1]).calls())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|v| v.into_iter().flatten().map(|(n, a)| ToolCall::new(n, a)).collect())
             } else if glm {
                 let re = regex::Regex::new(r"(?s)<tool_call>strata_caps_call_\d+<arg_key>.*?</tool_call>").unwrap();
                 re.find_iter(&prompt)
@@ -171,7 +186,7 @@ impl ChatTemplate {
             let got: Vec<Value> = parsed.iter().map(|c| json!({"name": c.name, "arguments": Value::Object(c.arguments.clone())})).collect();
             got == calls && replies.iter().all(|r| prompt.contains(r.as_str()))
         };
-        let marks: &[&str] = if harmony { &["namespace functions"] } else if glm { &["<tools>", "<arg_key>"] } else { &["<tool_call>", "<function="] };
+        let marks: &[&str] = if harmony { &["namespace functions"] } else if lfm { &["List of tools:"] } else if glm { &["<tools>", "<arg_key>"] } else { &["<tool_call>", "<function="] };
         let history = [user.clone(), json!({"role": "assistant", "content": "strata_caps_answer", "reasoning_content": "strata_caps_reasoning"}), user.clone()];
         Caps {
             supports_tools: ["strata_caps_call_0", "strata_caps_description"].iter().chain(marks).all(|s| tool_prompt.contains(s)),
@@ -180,5 +195,34 @@ impl ChatTemplate {
             supports_parallel_tool_calls: calls_supported(2),
             supports_preserve_reasoning: self.probe(&history, None).contains("strata_caps_reasoning"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lfm_tool_calls_round_trip_through_its_template() {
+        // LiquidAI's LFM2.5 template's call rendering and tool list, the rest cut down
+        let src = r#"{%- macro fa(v) -%}{%- if v is string -%}{{ "'" + v + "'" }}{%- elif v is mapping -%}{{ v | tojson }}{%- else -%}{{ v | string }}{%- endif -%}{%- endmacro -%}
+{%- if tools -%}<|im_start|>system
+List of tools: [{%- for t in tools -%}{{ t | tojson }}{% if not loop.last %}, {% endif %}{%- endfor -%}]<|im_end|>
+{% endif -%}
+{%- for m in messages -%}<|im_start|>{{ m.role }}
+{%- if m.tool_calls is defined -%}{%- set ns = namespace(c=[]) -%}{%- for tc in m.tool_calls -%}{%- set a = namespace(s=[]) -%}{%- for k, v in tc.function.arguments.items() -%}{%- set a.s = a.s + [k + "=" + fa(v)] -%}{%- endfor -%}{%- set ns.c = ns.c + [tc.function.name + "(" + (a.s | join(", ")) + ")"] -%}{%- endfor -%}{{ "<|tool_call_start|>[" + (ns.c | join(", ")) + "]<|tool_call_end|>" }}{%- endif -%}
+{{ m.content }}<|im_end|>
+{% endfor -%}"#;
+        let t = ChatTemplate::from_source(src.into()).unwrap();
+        assert!(t.caps.supports_tools && t.caps.supports_tool_calls && t.caps.supports_parallel_tool_calls, "{:?}", t.caps);
+    }
+
+    #[test]
+    fn generation_tags_render_their_body() {
+        assert_eq!(hf_tags("a{%- generation -%} b {%- endgeneration -%}c{% generation %}d{% endgeneration %}"),
+                   "a{%- if true -%} b {%- endif -%}c{% if true %}d{% endif %}");
+        let t = ChatTemplate::from_source("{%- for m in messages %}<{{ m.role }}>{%- generation -%} {{ m.content }} {%- endgeneration -%}</>{% endfor %}".into()).unwrap();
+        let p = t.render(&[json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "yo"})], None, false, &Map::new()).unwrap();
+        assert_eq!(p, "<user>hi</><assistant>yo</>");
     }
 }

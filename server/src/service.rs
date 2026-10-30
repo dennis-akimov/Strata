@@ -488,6 +488,8 @@ pub struct Service {
     pub conv_log: Mutex<crate::engine::ConvCacheLog>,
     pub harmony: bool,
     pub glm: bool,
+    /// LFM2 / LFM2.5 (LiquidAI): tool calls as `<|tool_call_start|>[f(a=1)]<|tool_call_end|>`
+    pub lfm: bool,
     pub stop_ids: Vec<u32>,
     pub mcp: Option<Arc<crate::mcp::McpHub>>,
     pub telemetry: Mutex<Option<Arc<crate::telemetry::Telemetry>>>,
@@ -507,6 +509,7 @@ impl Service {
         // GPT-OSS: harmony (its tokenizer has <|channel|>); GLM: <|observation|>
         let harmony = special("<|channel|>") && is_special(&*tok, "<|channel|>");
         let glm = is_special(&*tok, "<|observation|>");
+        let lfm = !glm && is_special(&*tok, crate::parser::LFM_CALL_START);
         let ends: Vec<&str> = if harmony { vec!["<|return|>", "<|call|>", "<|endoftext|>"] } else if glm { vec!["<|endoftext|>", "<|user|>", "<|observation|>"] } else { vec![IM_END, "<|endoftext|>"] };
         let mut stop_ids = vec![];
         for s in ends {
@@ -544,6 +547,7 @@ impl Service {
             conv_log: Mutex::new(crate::engine::ConvCacheLog::default()),
             harmony,
             glm,
+            lfm,
             stop_ids,
             mcp: None,
             telemetry: Mutex::new(None),

@@ -1286,15 +1286,167 @@ pub fn glm_call_to_qwen(call: &str) -> String {
     format!("{CALL_START}\n<function={name}>\n{params}</function>\n{CALL_END}")
 }
 
-/// GLM: Qwen's reasoning and text, and its own call form, held whole and handed to OutputParser in OutputParser's form.
+// ------------------------------------------------------------------ LFM2 / LFM2.5 (LiquidAI): its tool-call form
+pub const LFM_CALL_START: &str = "<|tool_call_start|>";
+pub const LFM_CALL_END: &str = "<|tool_call_end|>";
+
+/// `<|tool_call_start|>[name(k="v", n=1), other()]<|tool_call_end|>` (Python call syntax, Python literals) ->
+/// OutputParser's form, one block a call; anything it cannot read is returned as it is.
+pub fn lfm_call_to_qwen(call: &str) -> String {
+    let body = call.strip_prefix(LFM_CALL_START).unwrap_or(call);
+    let body = body.strip_suffix(LFM_CALL_END).unwrap_or(body);
+    let Some(calls) = PyLit::new(body).calls() else { return call.to_string() };
+    calls.iter().map(|(name, args)| {
+        let params: String = args.iter().map(|(k, v)| format!("<parameter={k}>\n{}\n</parameter>\n", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect();
+        format!("{CALL_START}\n<function={name}>\n{params}</function>\n{CALL_END}")
+    }).collect()
+}
+
+/// The calls of an LFM tool-call list: `[f(a=1), g(b='x')]`, the values Python literals (and JSON's true/false/null).
+pub struct PyLit<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl<'a> PyLit<'a> {
+    pub fn new(s: &'a str) -> Self {
+        PyLit { s: s.as_bytes(), i: 0 }
+    }
+    fn ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.ws();
+        let ok = self.s.get(self.i) == Some(&c);
+        self.i += ok as usize;
+        ok
+    }
+    fn ident(&mut self) -> Option<String> {
+        self.ws();
+        let st = self.i;
+        while self.i < self.s.len() && (self.s[self.i].is_ascii_alphanumeric() || b"_.-".contains(&self.s[self.i])) {
+            self.i += 1;
+        }
+        (self.i > st).then(|| String::from_utf8_lossy(&self.s[st..self.i]).into_owned())
+    }
+    /// A list of comma-separated items up to `close` (a trailing comma allowed).
+    fn items<T>(&mut self, close: u8, mut item: impl FnMut(&mut Self) -> Option<T>) -> Option<Vec<T>> {
+        let mut out = vec![];
+        loop {
+            if self.eat(close) {
+                return Some(out);
+            }
+            out.push(item(self)?);
+            if !self.eat(b',') {
+                return self.eat(close).then_some(out);
+            }
+        }
+    }
+    pub fn calls(&mut self) -> Option<Vec<(String, Map<String, Value>)>> {
+        let bracket = self.eat(b'[');
+        let mut calls = vec![];
+        loop {
+            let name = self.ident()?;
+            if !self.eat(b'(') {
+                return None;
+            }
+            let args = self.items(b')', |p| {
+                let k = p.ident()?;
+                p.eat(b'=').then_some(())?;
+                Some((k, p.value()?))
+            })?;
+            calls.push((name, args.into_iter().collect()));
+            if !self.eat(b',') {
+                break;
+            }
+        }
+        if bracket && !self.eat(b']') {
+            return None;
+        }
+        self.ws();
+        (self.i == self.s.len()).then_some(calls)
+    }
+    fn value(&mut self) -> Option<Value> {
+        self.ws();
+        match *self.s.get(self.i)? {
+            q @ (b'\'' | b'"') => self.string(q).map(Value::String),
+            b'[' => {
+                self.i += 1;
+                self.items(b']', |p| p.value()).map(Value::Array)
+            }
+            b'{' => {
+                self.i += 1;
+                let kv = self.items(b'}', |p| {
+                    let k = match p.value()? {
+                        Value::String(k) => k,
+                        v => v.to_string(),
+                    };
+                    p.eat(b':').then_some(())?;
+                    Some((k, p.value()?))
+                })?;
+                Some(Value::Object(kv.into_iter().collect()))
+            }
+            _ => {
+                let w = self.ident()?;
+                match w.as_str() {
+                    "True" | "true" => Some(Value::Bool(true)),
+                    "False" | "false" => Some(Value::Bool(false)),
+                    "None" | "null" => Some(Value::Null),
+                    _ => serde_json::from_str::<Value>(&w).ok().filter(Value::is_number),
+                }
+            }
+        }
+    }
+    fn string(&mut self, q: u8) -> Option<String> {
+        self.i += 1;
+        let mut out = Vec::new();
+        while let Some(&c) = self.s.get(self.i) {
+            self.i += 1;
+            if c == q {
+                return String::from_utf8(out).ok();
+            }
+            if c != b'\\' {
+                out.push(c);
+                continue;
+            }
+            let e = *self.s.get(self.i)?;
+            self.i += 1;
+            match e {
+                b'n' => out.push(b'\n'),
+                b't' => out.push(b'\t'),
+                b'r' => out.push(b'\r'),
+                b'u' => {
+                    let h = std::str::from_utf8(self.s.get(self.i..self.i + 4)?).ok()?;
+                    self.i += 4;
+                    let ch = char::from_u32(u32::from_str_radix(h, 16).ok()?)?;
+                    out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+                _ => out.push(e),
+            }
+        }
+        None
+    }
+}
+
+/// GLM and LFM: Qwen's reasoning and text, and their own call form (between `start` and `end`), held whole and handed
+/// to OutputParser in OutputParser's form by `convert`.
 pub struct GlmParser {
     inner: OutputParser,
     hold: String,
+    start: &'static str,
+    end: &'static str,
+    convert: fn(&str) -> String,
 }
 
 impl GlmParser {
     pub fn new(thinking: bool, tools: Option<&[Value]>, recover: bool) -> Self {
-        GlmParser { inner: OutputParser::new(thinking, tools, false, recover), hold: String::new() }
+        GlmParser { inner: OutputParser::new(thinking, tools, false, recover), hold: String::new(), start: CALL_START, end: CALL_END, convert: glm_call_to_qwen }
+    }
+
+    pub fn lfm(thinking: bool, tools: Option<&[Value]>, recover: bool) -> Self {
+        GlmParser { inner: OutputParser::new(thinking, tools, false, recover), hold: String::new(), start: LFM_CALL_START, end: LFM_CALL_END, convert: lfm_call_to_qwen }
     }
 }
 
@@ -1303,11 +1455,11 @@ impl Parse for GlmParser {
         self.hold.push_str(delta);
         let mut out = vec![];
         while !self.hold.is_empty() {
-            let Some(i) = self.hold.find(CALL_START) else {
-                let max = self.hold.len().min(CALL_START.len() - 1);
+            let Some(i) = self.hold.find(self.start) else {
+                let max = self.hold.len().min(self.start.len() - 1);
                 let keep = (1..=max).rev().find(|&k| {
                     let at = self.hold.len() - k;
-                    self.hold.is_char_boundary(at) && CALL_START.starts_with(&self.hold[at..])
+                    self.hold.is_char_boundary(at) && self.start.starts_with(&self.hold[at..])
                 }).unwrap_or(0);
                 let n = self.hold.len() - keep;
                 let head = self.hold[..n].to_string();
@@ -1320,10 +1472,10 @@ impl Parse for GlmParser {
                 out.extend(self.inner.feed_inner(&head)?);
                 self.hold = self.hold[i..].to_string();
             }
-            let Some(j) = self.hold.find(CALL_END) else { return Ok(out) };
-            let call = self.hold[..j + CALL_END.len()].to_string();
-            self.hold = self.hold[j + CALL_END.len()..].to_string();
-            out.extend(self.inner.feed_inner(&glm_call_to_qwen(&call))?);
+            let Some(j) = self.hold.find(self.end) else { return Ok(out) };
+            let call = self.hold[..j + self.end.len()].to_string();
+            self.hold = self.hold[j + self.end.len()..].to_string();
+            out.extend(self.inner.feed_inner(&(self.convert)(&call))?);
         }
         Ok(out)
     }
@@ -1332,7 +1484,7 @@ impl Parse for GlmParser {
         let mut out = vec![];
         if !self.hold.is_empty() {
             let h = std::mem::take(&mut self.hold);
-            let text = if h.starts_with(CALL_START) && matches!(reason, None | Some("stop")) { glm_call_to_qwen(&h) } else { h };
+            let text = if h.starts_with(self.start) && matches!(reason, None | Some("stop")) { (self.convert)(&h) } else { h };
             out.extend(self.inner.feed_inner(&text)?);
         }
         out.extend(self.inner.finish_inner(reason)?);
@@ -1353,5 +1505,45 @@ impl Parse for GlmParser {
     }
     fn refused(&self) -> usize {
         self.inner.refused
+    }
+}
+
+#[cfg(test)]
+mod lfm_tests {
+    use super::*;
+
+    #[test]
+    fn lfm_calls_become_outputparser_calls() {
+        let q = lfm_call_to_qwen(r#"<|tool_call_start|>[get_weather(city="Paris", days=3), note(text='it\'s "ok"\nyes', tags=["a", 'b'], opts={"x": True, 'y': None}, t=-1.5)]<|tool_call_end|>"#);
+        assert_eq!(q.matches(CALL_START).count(), 2);
+        assert!(q.contains("<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>"), "{q}");
+        assert!(q.contains("<parameter=text>\nit's \"ok\"\nyes\n</parameter>"), "{q}");
+        assert!(q.contains(r#"<parameter=tags>
+["a","b"]"#) && q.contains(r#"{"x":true,"y":null}"#) && q.contains("<parameter=t>\n-1.5\n"), "{q}");
+        assert_eq!(lfm_call_to_qwen("<|tool_call_start|>[f()]<|tool_call_end|>"), format!("{CALL_START}\n<function=f>\n</function>\n{CALL_END}"));
+        for bad in ["<|tool_call_start|>[f(x=)]<|tool_call_end|>", "<|tool_call_start|>[f(x=1]<|tool_call_end|>", "<|tool_call_start|>hello<|tool_call_end|>"] {
+            assert_eq!(lfm_call_to_qwen(bad), bad);
+        }
+    }
+
+    #[test]
+    fn lfm_stream_split_anywhere_gives_one_call() {
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}})];
+        let text = "Let me check.<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>";
+        for cut in 1..text.len() {
+            if !text.is_char_boundary(cut) {
+                continue;
+            }
+            let mut p = GlmParser::lfm(false, Some(&tools), true);
+            let mut ev = p.feed(&text[..cut]).unwrap();
+            ev.extend(p.feed(&text[cut..]).unwrap());
+            ev.extend(p.finish(Some("stop")).unwrap());
+            let calls: Vec<&ToolCall> = ev.iter().filter_map(|e| e.call.as_ref()).collect();
+            assert_eq!(calls.len(), 1, "cut {cut}: {ev:?}");
+            assert_eq!(calls[0].name, "get_weather");
+            assert_eq!(calls[0].arguments["city"], "Paris");
+            let shown: String = ev.iter().filter(|e| e.call.is_none()).map(|e| e.text.as_str()).collect();
+            assert!(!shown.contains("tool_call"), "cut {cut}: {shown:?}");
+        }
     }
 }

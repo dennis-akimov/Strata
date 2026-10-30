@@ -64,11 +64,15 @@ MODELS = {
                         mem_full=29, how="pull", gguf="Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
                         pack="qwen3.6-35b-a3b", name="qwen3.6-35b-a3b", context=131072,
                         sampling={"temperature": 0.6, "top_p": 0.95, "top_k": 20}),
-    "QWEN3.6-35B-IQ2": dict(title="Qwen3.6-35B-A3B 2-bit", about="UD-IQ2_M: fits a 16 GB Mac, below the 4-bit in quality",
-                            download=11.5, mem_min=12.2, mem_full=15, how="pull",
-                            gguf="Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-IQ2_M.gguf", pack="qwen3.6-35b-a3b",
-                            name="qwen3.6-35b-a3b-iq2", context=131072,
-                            sampling={"temperature": 0.6, "top_p": 0.95, "top_k": 20}),
+    "LFM2.5-24B": dict(title="LFM2.5-24B-A2B", about="LiquidAI's, 2.45B active per token, always thinks; Q3_K_M fits a 16 GB Mac",
+                       download=11.5, mem_min=12.5, mem_full=14, how="pull",
+                       gguf="LFM2.5-24B-A2B/LFM2.5-24B-A2B.Q3_K_M.gguf", pack="lfm2.5-24b-a2b",
+                       name="lfm2.5-24b-a2b", context=131072,
+                       sampling={"temperature": 0.1, "top_k": 50, "repetition_penalty": 1.05}),
+    "LFM2.5-8B": dict(title="LFM2.5-8B-A1B", about="LiquidAI's, 1.5B active per token, thinks; Q8_0", download=9.0,
+                      mem_min=10.0, mem_full=12, how="pull", gguf="LFM2.5-8B-A1B/LFM2.5-8B-A1B-Q8_0.gguf",
+                      pack="lfm2.5-8b-a1b", name="lfm2.5-8b-a1b", context=131072,
+                      sampling={"temperature": 0.2, "top_k": 64, "repetition_penalty": 1.05}),  # LiquidAI: top_k 80; the engine's sampler takes up to 64
     "Q2_0": dict(title="Qwen3.8-Flash-Next Q2_0", about="the default and the most tested on a Mac", download=66.4,
                  mem_min=52, mem_full=60, how="setup"),
     "GPT-OSS-120B": dict(title="GPT-OSS 120B", about="about 5B active per token", download=63.4, mem_min=62,
@@ -400,7 +404,8 @@ def plan(gguf: Path, ctx: int, pb: int) -> dict:
     """The engine's own measurement of what the model needs (no weights read): see metal/strata_metal.cpp --plan."""
     env = dict(os.environ, HK_SYSMEM=str(int(mac()["limit"]))) if LINUX else None
     r = subprocess.run([str(ENGINE / "strata-metal"), "--plan", "--gguf", str(gguf), "--max-context", str(ctx),
-                        "--kv", "f16", "--prefill-batch", str(pb)], capture_output=True, text=True, timeout=300, env=env)
+                        "--kv", "f16", "--prefill-batch", str(pb)], capture_output=True, text=True, errors="replace",
+                       timeout=300, env=env)  # llama.cpp logs vocabulary pieces: bytes, not always whole UTF-8
     line = next((l for l in r.stdout.splitlines() if l.startswith("{")), "")
     if not line:
         fail("the engine could not measure the model", (r.stderr or r.stdout).strip()[-800:])

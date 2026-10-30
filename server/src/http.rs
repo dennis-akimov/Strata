@@ -1010,9 +1010,10 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     if tool_choice_of(get(&rv, "tool_choice")).0 == "none" {
         tools = None;
         let stop = stop_strings(&json!({"stop": get(&rv, "stop")}))?;
-        if stop.len() < 4 && !stop.iter().any(|s| s == CALL_START) {
+        let opener = if svc.lfm { crate::parser::LFM_CALL_START } else { CALL_START };
+        if stop.len() < 4 && !stop.iter().any(|s| s == opener) {
             let mut s = stop.clone();
-            s.push(CALL_START.into());
+            s.push(opener.into());
             req.insert("stop".into(), json!(s));
         }
     }

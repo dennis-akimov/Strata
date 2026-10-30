@@ -10,8 +10,11 @@ Hugging Face revision; a stopped download continues when you run the same line a
                  (strata-metal --dflash; it needs metal/patches/core/0002)
   GPT-OSS-20B    gpt-oss-20b MXFP4 (12.1 GB, sha-256 checked) and its tokenizer pack
   QWEN3.6-35B    Qwen3.6-35B-A3B MXFP4_MOE (21.7 GB, sha-256 checked) and its tokenizer pack
-  QWEN3.6-35B-IQ2  the same model in Unsloth's 2-bit UD-IQ2_M (11.5 GB, sha-256 checked): fits a 16 GB Mac, below the
-                 4-bit in quality; the same tokenizer pack
+  LFM2.5-24B     LiquidAI's LFM2.5-24B-A2B (2.45B active, always thinks) in mradermacher's Q3_K_M (11.5 GB, sha-256
+                 checked): fits a 16 GB Mac; and its tokenizer pack.  Not Unsloth's UD-Q3_K_XL: its IQ3_XXS experts
+                 decode at 1.3 tok/s on Linux's Apple GPU driver (that mat-vec runs 15-30x slower there)
+  LFM2.5-8B      LiquidAI's LFM2.5-8B-A1B (1.5B active, thinks) in their Q8_0 (9.0 GB, sha-256 checked) and its
+                 tokenizer pack
   NUCLEUS        Nucleus-Image: ~50 GB downloaded, converted to 3 GGUFs (~21 GB), the downloads deleted
   HUNYUAN        HunyuanImage-3.0-Instruct-Distil: 169 GB streamed shard by shard into one 54 GB GGUF
   WAN2.2         Wan 2.2 T2V A14B for videos: both experts (Q4_K_M), UMT5 (Q8_0), the VAE, the Lightning LoRAs (29 GB),
@@ -39,7 +42,7 @@ ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 PY = ROOT / ".venv" / "bin" / "python"
 MTP_PY = ROOT / ".venv-mtp" / "bin" / "python"
-NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "QWEN3.6-35B-IQ2",
+NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "LFM2.5-24B", "LFM2.5-8B",
          "NUCLEUS", "HUNYUAN", "WAN2.2")
 
 
@@ -213,10 +216,14 @@ def pull(name: str, data: Path) -> None:
         g = get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
                 "2fdd20997c4d88ee25f70f500c61f8b999378d92ab055f9d450fc70d617158d3")
         tokenizer(g, data / "packs" / "qwen3.6-35b-a3b")
-    elif name == "QWEN3.6-35B-IQ2":
-        g = get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-IQ2_M.gguf",
-                "2be7ef1ed7e1af8b10d3829102cf9a6c2bd5ddb64d675b4ece23a60799403d43")
-        tokenizer(g, data / "packs" / "qwen3.6-35b-a3b")
+    elif name == "LFM2.5-24B":
+        g = get(m / "LFM2.5-24B-A2B", "https://huggingface.co/mradermacher/LFM2.5-24B-A2B-GGUF/resolve/38c24e5c182245615c52f66a4d6e58ea430ba7c5/LFM2.5-24B-A2B.Q3_K_M.gguf",
+                "5d91897ff9357e9ecb2a1be7134be78eb1d9fb3c07909427605f0aada665069b")
+        tokenizer(g, data / "packs" / "lfm2.5-24b-a2b")
+    elif name == "LFM2.5-8B":
+        g = get(m / "LFM2.5-8B-A1B", "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q8_0.gguf",
+                "33ab3b8ce6a964fb8ebac89360c9b3cf72c4fa418d5e4c0a94d46883124d5c02")
+        tokenizer(g, data / "packs" / "lfm2.5-8b-a1b")
     elif name == "NUCLEUS":
         d = m / "Nucleus-Image"
         outs = [d / "nucleus-dit-q4_0.gguf", d / "nucleus-vae.gguf", d / "qwen3vl-8b-text-q8_0.gguf"]

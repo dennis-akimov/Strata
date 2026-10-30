@@ -46,7 +46,8 @@ same Mac:
 | Model | macOS 27 (Metal) | Linux, Debian + Asahi kernel 7.1.13 (Vulkan, Mesa 26.1) | Model file |
 | --- | ---: | ---: | ---: |
 | **GPT-OSS 20B** (MXFP4) | 16.8-19.9 tokens/s at an 8-16K context § | 13.3-13.7 tokens/s at a 32K context ¶ | 12 GB |
-| **Qwen3.6-35B-A3B 2-bit** (Unsloth UD-IQ2_M) | not measured | 2.4 tokens/s at a 32K context ¶ | 11.5 GB |
+| **LFM2.5-8B-A1B** (LiquidAI Q8_0) | not measured | 22.9 tokens/s at a 128K context; prompt 185 tokens/s | 9.0 GB |
+| **LFM2.5-24B-A2B** (mradermacher Q3_K_M) | not measured | 12.2 tokens/s at a 32K context; prompt 61 tokens/s ‖ | 11.5 GB |
 
 § Only after raising macOS's GPU memory limit (`sudo sysctl iogpu.wired_limit_mb=13312`, until the next restart): by
 default macOS lets the GPU of a Mac up to 36 GB hold about two thirds of the memory, too little for the model's 11 GB of
@@ -54,6 +55,12 @@ weights. `make setup` and Strata.app offer it.
 
 ¶ Linux's Apple GPU driver (Honeykrisp) gives the GPU half the memory by default (7.65 GB here); setup writes
 `"HK_SYSMEM"` into the run config to give it 13 GB.
+
+‖ Avoid IQ2/IQ3 files on Linux: their experts' mat-vec runs 15-30x slower on Honeykrisp than the K-quants'. Unsloth's
+LFM2.5-24B UD-Q3_K_XL (IQ3_XXS experts) answered at 1.3 tokens/s, 91% of each token in that one step; mradermacher's
+Q3_K_M of the same model at 12.2 (Qwen3.6-35B's 2-bit UD-IQ2_M, since taken out of `make pull`, at 2.4). The LFM2.5 models (`make pull MODEL=LFM2.5-8B` / `LFM2.5-24B`, LiquidAI, both
+think before answering) passed the M1's checks (arithmetic, a fact, letter counting, Russian, code, a tool call): the
+server reads their `<|tool_call_start|>[f(a=1)]<|tool_call_end|>` calls and their template's `{% generation %}` tag.
 
 On Linux the GPU sets the pace (the engine uses under 10% of the CPU; the GPU's clock is its firmware's, the same top
 1278 MHz as under macOS, with no Linux setting). What was measured on the M1, 2026-10-29:
@@ -70,7 +77,7 @@ The rest of the gap to Metal is the driver: Honeykrisp has no integer dot produc
 llama.cpp's fast paths need; 57% of the GPU's time per token is the MXFP4 experts' mat-vec. Details and how to measure
 (`GGML_VK_PERF_LOGGER=1`): [docs/MACOS.md](docs/MACOS.md#linux-on-an-apple-silicon-mac-asahi).
 
-On a 16 GB Mac GPT-OSS 20B is the one to use: the 2-bit Qwen fits but answers 5x slower, and 2 bits cost quality.
+On a 16 GB Mac: GPT-OSS 20B, or on Linux LFM2.5-8B-A1B (the fastest there) and LFM2.5-24B-A2B.
 The first one or two answers after starting it are slower (8-10 tokens/s on the M1): macOS is still reading the 11 GB
 model from the SSD into memory; from then on 17-20 tokens/s, through the chat page or the API alike. The thinking
 effort (*High* makes it think longer, not slower per token) and the sampling settings (top-k 0 or 40: 16.8 and 17.4
@@ -152,7 +159,8 @@ in your browser.
 | GPT-OSS 120B + DFlash draft | 1.6 GB more | about 72 GB (estimate) | Faster on math and step-by-step answers (about +35%), slower on chat (about -20%). `make pull MODEL=GPT-OSS-120B-DFLASH`, then [steps](docs/MACOS.md#gpt-oss-120b-with-a-dflash-draft) |
 | GPT-OSS 20B | 12 GB | 19 GB (measured) | The fastest here (about 3.6B parameters active per token), less capable than the 120B. `make pull MODEL=GPT-OSS-20B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
 | Qwen3.6-35B-A3B | 22 GB | 29 GB (measured) | About 3B parameters active per token, but no faster than GPT-OSS 120B here. `make pull MODEL=QWEN3.6-35B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
-| Qwen3.6-35B-A3B 2-bit (UD-IQ2_M) | 11.5 GB | about 13 GB at 32K (measured) | The same model squeezed to 2 bits to fit a 16 GB Mac; 2.4 tokens/s there on Linux, 5x slower than GPT-OSS 20B, and below the 4-bit in quality. `make pull MODEL=QWEN3.6-35B-IQ2` (it writes its run config) |
+| LFM2.5-8B-A1B | 9.0 GB | about 13 GB at 128K (measured) | LiquidAI's, 1.5B parameters active per token, thinks before answering; 22.9 tokens/s on the 16 GB M1 under Linux. `make pull MODEL=LFM2.5-8B` (it writes its run config) |
+| LFM2.5-24B-A2B | 11.5 GB | about 13 GB at 32K (measured) | LiquidAI's, 2.45B active, thinks before answering; 12.2 tokens/s on the M1 under Linux. `make pull MODEL=LFM2.5-24B` |
 | GLM-5.3-Flash (Maya-S24) | 95 GB | 89 GB at 32K (measured) | The largest here (320B parameters, about 18B active per token), and the slowest. Chat, thinking and tool calls work. Install: `make pull MODEL=GLM-5.3`, then [steps](docs/MACOS.md#glm-53-flash) |
 | HunyuanImage-3.0 (pictures) | 169 GB, streamed (54 GB kept) | 54 GB mapped + 0.3 GB | 80B; about 90 s a picture. Its license excludes the EU, the UK and South Korea. `make pull MODEL=HUNYUAN` (about 2 hours) |
 | Nucleus-Image (pictures) | about 50 GB (21 GB kept) | 12 GB mapped + 2 GB | 17B, Apache-2.0; about 45 s a picture. `make pull MODEL=NUCLEUS` |
