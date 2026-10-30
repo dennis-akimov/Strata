@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 
 const GB: f64 = 1e9;
 const CONTEXTS: [u64; 12] = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
-const TABS: [&str; 5] = ["Chat", "Monitor", "Memory", "Models", "Log"];
+const TABS: [&str; 7] = ["Chat", "Monitor", "Memory", "Models", "MCP", "Network", "Log"];
+const LOG_TAB: usize = 6;
 const EFFORTS: [(&str, &str); 4] = [("none", "off"), ("low", "low"), ("medium", "medium"), ("high", "high")];
 /// The models `make pull` knows (tools/pull_model.py): (its name, the run config it writes, a title, the download in GB)
 const CATALOG: [(&str, &str, &str, f64); 5] = [
@@ -47,6 +48,7 @@ enum Msg {
     ChatEnd(Option<String>),
     Apps(Vec<(String, f64)>),
     Pulled(String, bool),
+    Mcp(Value),
 }
 
 /// Strata's folder: $STRATA_ROOT, else the folder above engine-metal/ (where make installs this), else the source's.
@@ -212,6 +214,116 @@ fn set_context(cfg_path: &Path, ctx: u64, batch512: bool) -> Result<(), String> 
     std::fs::write(cfg_path, serde_json::to_string_pretty(&cfg).unwrap() + "\n").map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------------------------ MCP and the network (the run config)
+
+fn write_cfg(p: &Path, cfg: &Value) -> Result<(), String> {
+    std::fs::write(p, serde_json::to_string_pretty(cfg).unwrap() + "\n").map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// The run config's MCP servers when the server is not running (as GET /mcp lists them, less their state).
+fn config_mcp(cfg: &Value) -> Value {
+    let list: Vec<Value> = cfg["mcp_servers"].as_object().map(|m| m.iter().map(|(name, e)| {
+        json!({"name": name, "transport": if e["url"].is_string() { "http" } else { "stdio" }, "status": "server stopped",
+               "url": e["url"], "command": e["command"], "args": e["args"], "tools": [], "editable": false})
+    }).collect()).unwrap_or_default();
+    Value::Array(list)
+}
+
+/// A folder the model may read (strata-files, read-only): "files", or "files-2", ... when taken.  Returns the name.
+fn add_folder(cfg: &mut Value, exe: &str, dir: &str) -> String {
+    if !cfg["mcp_servers"].is_object() {
+        cfg["mcp_servers"] = json!({});
+    }
+    let taken = |n: &str| cfg["mcp_servers"].get(n).is_some();
+    let name = std::iter::once("files".to_string()).chain((2..).map(|i| format!("files-{i}"))).find(|n| !taken(n)).unwrap();
+    cfg["mcp_servers"][&name] = json!({"command": exe, "args": [dir]});
+    name
+}
+
+fn remove_mcp(cfg: &mut Value, name: &str) -> bool {
+    cfg["mcp_servers"].as_object_mut().is_some_and(|m| m.shift_remove(name).is_some())
+}
+
+fn is_shared(cfg: &Value) -> bool {
+    !matches!(cfg["host"].as_str().unwrap_or("127.0.0.1"), "127.0.0.1" | "localhost" | "::1" | "")
+}
+
+/// On the local network: host 0.0.0.0, and an API key (a new random one when the config has none: an open port is
+/// never left without one).  Off: 127.0.0.1.  True when a key was made.
+fn share_config(cfg: &mut Value, on: bool) -> bool {
+    cfg["host"] = json!(if on { "0.0.0.0" } else { "127.0.0.1" });
+    if on && api_key(cfg).is_empty() {
+        cfg["api_key"] = json!(random_key());
+        return true;
+    }
+    false
+}
+
+fn random_key() -> String {
+    let mut b = [0u8; 18];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut b);
+    }
+    format!("sk-strata-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+}
+
+/// This machine's IPv4 addresses other than loopback (what other devices on the network use).
+fn lan_ips() -> Vec<String> {
+    let mut out = vec![];
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return out;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let a = (*cur).ifa_addr;
+            if !a.is_null() && (*a).sa_family as i32 == libc::AF_INET {
+                let sin = &*(a as *const libc::sockaddr_in);
+                let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                if !ip.is_loopback() && !ip.is_link_local() {
+                    let name = std::ffi::CStr::from_ptr((*cur).ifa_name).to_string_lossy();
+                    out.push(format!("{ip} ({name})"));
+                }
+            }
+            cur = (*cur).ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
+/// One line for a tool call in the chat (the server's strata_mcp chunks): what the model called, and what came back.
+fn tool_line(v: &Value) -> Option<String> {
+    match v["event"].as_str()? {
+        "call" => {
+            let args = v["arguments"].to_string();
+            let args: String = if args.chars().count() > 80 { args.chars().take(80).collect::<String>() + "…" } else { args };
+            Some(format!("⚙ {}.{}({args})", v["server"].as_str().unwrap_or("?"), v["tool"].as_str().unwrap_or("?")))
+        }
+        "result" => Some(format!("  ↳ {} ({} characters{})", if v["ok"] == true { "done" } else { "failed" }, v["chars"].as_u64().unwrap_or(0),
+                                 if v["truncated"] == true { ", cut" } else { "" })),
+        _ => None,
+    }
+}
+
+fn post_json(url: &str, key: &str, body: &Value) -> Value {
+    let mut r = agent(Some(Duration::from_secs(60))).post(url).header("Content-Type", "application/json");
+    if !key.is_empty() {
+        r = r.header("Authorization", &format!("Bearer {key}"));
+    }
+    match r.send(&body.to_string()) {
+        Ok(mut resp) => {
+            let t = resp.body_mut().read_to_string().unwrap_or_default();
+            serde_json::from_str::<Value>(&t).map(|v| match v["error"]["message"].as_str() {
+                Some(m) => json!({"error": m}),
+                None => v,
+            }).unwrap_or(json!({"error": t}))
+        }
+        Err(e) => json!({"error": e.to_string()}),
+    }
+}
+
 // ------------------------------------------------------------------ the server
 
 struct Server {
@@ -342,10 +454,11 @@ fn poll(srv: Arc<Mutex<Server>>, tx: Sender<Msg>) {
 }
 
 /// One chat turn, streamed (OpenAI chat completions): the thinking and the answer as they come.
-fn chat(port: u16, key: String, messages: Vec<Value>, effort: &str, stop: Arc<AtomicBool>, tx: Sender<Msg>) {
+fn chat(port: u16, key: String, messages: Vec<Value>, effort: &str, tools: bool, stop: Arc<AtomicBool>, tx: Sender<Msg>) {
     let effort = effort.to_string();
     std::thread::spawn(move || {
-        let body = json!({"model": "strata", "stream": true, "reasoning_effort": effort, "messages": messages}).to_string();
+        // strata_mcp: this server may run its MCP servers' tools for the model (the web chat's switch)
+        let body = json!({"model": "strata", "stream": true, "reasoning_effort": effort, "strata_mcp": tools, "messages": messages}).to_string();
         let mut r = agent(None).post(&format!("http://127.0.0.1:{port}/v1/chat/completions")).header("Content-Type", "application/json");
         if !key.is_empty() {
             r = r.header("Authorization", &format!("Bearer {key}"));
@@ -371,6 +484,9 @@ fn chat(port: u16, key: String, messages: Vec<Value>, effort: &str, stop: Arc<At
             let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
             if let Some(m) = v["error"]["message"].as_str() {
                 return drop(tx.send(Msg::ChatEnd(Some(m.to_string()))));
+            }
+            if let Some(t) = tool_line(&v["strata_mcp"]) {
+                let _ = tx.send(Msg::Delta { think: true, text: format!("\n{t}\n") });
             }
             let d = &v["choices"][0]["delta"];
             for (k, think) in [("reasoning_content", true), ("content", false)] {
@@ -417,6 +533,10 @@ struct App {
     pulling: Option<String>,
     help: bool,
     power_peak: f64,
+    mcp: Value,
+    mcp_pick: usize,
+    mcp_chat: bool,
+    prompt: Option<(&'static str, String)>,
 }
 
 /// A line of the Models view: a run config here, or a model make pull can bring.
@@ -530,7 +650,7 @@ impl App {
             let s = self.srv.lock().unwrap();
             (s.port, s.key.clone())
         };
-        chat(port, key, messages, EFFORTS[self.effort].0, self.stop.clone(), self.tx.clone());
+        chat(port, key, messages, EFFORTS[self.effort].0, self.mcp_chat, self.stop.clone(), self.tx.clone());
     }
 
     /// `p` on Monitor: the CPU governor to performance (clocks stay up) or back (Linux, sudo; macOS: Strata.app's
@@ -545,6 +665,150 @@ impl App {
         let cmd = format!("for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do echo {to} > $f; done");
         let ok = Command::new("sudo").args(["-n", "sh", "-c", &cmd]).status().map(|s| s.success()).unwrap_or(false);
         self.note = if ok { format!("CPU governor: {to}") } else { format!("needs sudo: sudo sh -c '{cmd}'") };
+    }
+
+    /// GET /mcp: the MCP servers and their tools (a running server); else the run config's entries.
+    fn mcp_refresh(&mut self) {
+        let (port, key, alive) = {
+            let s = self.srv.lock().unwrap();
+            (s.port, s.key.clone(), s.child.is_some())
+        };
+        if !alive {
+            let cfg = self.cfg_path().map(|p| read_json(p)).unwrap_or(json!({}));
+            self.mcp = json!({"servers": config_mcp(&cfg), "stopped": true});
+            return;
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Mcp(get(&format!("http://127.0.0.1:{port}/mcp"), &key).unwrap_or(json!({"error": "the server's MCP list did not answer"}))));
+        });
+    }
+
+    fn prompt_done(&mut self, kind: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match kind {
+            "mcp-url" => {
+                // name url [key]: an address server, added the way the web page adds one (saved in the run config)
+                let parts: Vec<&str> = text.split_whitespace().collect();
+                let (Some(name), Some(url)) = (parts.first(), parts.get(1)) else {
+                    self.note = "type: name url [api key], e.g. search http://127.0.0.1:3000/mcp".into();
+                    return;
+                };
+                if !self.running() {
+                    self.note = "start the server first (s): it checks and saves the address".into();
+                    return;
+                }
+                let mut req = json!({"name": name, "url": url});
+                if let Some(k) = parts.get(2) {
+                    req["key"] = json!(k);
+                }
+                let (port, key, tx) = {
+                    let s = self.srv.lock().unwrap();
+                    (s.port, s.key.clone(), self.tx.clone())
+                };
+                std::thread::spawn(move || {
+                    let r = post_json(&format!("http://127.0.0.1:{port}/mcp/servers"), &key, &req);
+                    let _ = tx.send(Msg::Mcp(r));
+                    let _ = tx.send(Msg::Mcp(get(&format!("http://127.0.0.1:{port}/mcp"), &key).unwrap_or(json!({}))));
+                });
+                self.note = format!("adding {name} ...");
+            }
+            "mcp-folder" => {
+                // a folder the model may read: strata-files (read-only) in the run config; the server restarts on it
+                let dir = std::fs::canonicalize(text.replace('~', &std::env::var("HOME").unwrap_or_default())).map(|p| p.to_string_lossy().into_owned());
+                let Ok(dir) = dir else {
+                    self.note = format!("{text}: no such folder");
+                    return;
+                };
+                let Some(p) = self.cfg_path().cloned() else { return };
+                let mut cfg = read_json(&p);
+                let exe = self.root.join("engine-metal/strata-files").to_string_lossy().into_owned();
+                let name = add_folder(&mut cfg, &exe, &dir);
+                match write_cfg(&p, &cfg) {
+                    Ok(()) => {
+                        self.note = format!("{name}: the model may read {dir} (read-only){}", if self.running() { ": restarting" } else { "" });
+                        if self.running() {
+                            self.restart();
+                        }
+                    }
+                    Err(e) => self.note = e,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// d in MCP: an address the page or this view added goes through the server; a program from the config file is
+    /// taken out of the file (the server restarts without it).
+    fn mcp_remove(&mut self) {
+        let Some(sv) = self.mcp["servers"].as_array().and_then(|s| s.get(self.mcp_pick)).cloned() else { return };
+        let name = sv["name"].as_str().unwrap_or("").to_string();
+        if sv["editable"] == true && self.running() {
+            let (port, key, tx) = {
+                let s = self.srv.lock().unwrap();
+                (s.port, s.key.clone(), self.tx.clone())
+            };
+            std::thread::spawn(move || {
+                let r = agent(Some(Duration::from_secs(10))).delete(&format!("http://127.0.0.1:{port}/mcp/servers/{name}")).header("Authorization", &format!("Bearer {key}")).call();
+                let _ = tx.send(Msg::Log(format!("── MCP {name} removed: {} ──", r.map(|r| r.status().to_string()).unwrap_or_else(|e| e.to_string()))));
+                let _ = tx.send(Msg::Mcp(get(&format!("http://127.0.0.1:{port}/mcp"), &key).unwrap_or(json!({}))));
+            });
+            return;
+        }
+        let Some(p) = self.cfg_path().cloned() else { return };
+        let mut cfg = read_json(&p);
+        if !remove_mcp(&mut cfg, &name) {
+            self.note = format!("{name} is not in the run config (it may come from --mcp-config)");
+            return;
+        }
+        match write_cfg(&p, &cfg) {
+            Ok(()) => {
+                self.note = format!("{name} removed from the run config");
+                if self.running() {
+                    self.restart();
+                } else {
+                    self.mcp_refresh();
+                }
+            }
+            Err(e) => self.note = e,
+        }
+    }
+
+    /// h in Network: the server on the local network (host 0.0.0.0, with an API key: one is made when there is none)
+    /// or on this Mac only (127.0.0.1).  The server restarts on it.
+    fn share(&mut self) {
+        let Some(p) = self.cfg_path().cloned() else { return };
+        let mut cfg = read_json(&p);
+        let on = !is_shared(&cfg);
+        let made = share_config(&mut cfg, on);
+        if let Err(e) = write_cfg(&p, &cfg) {
+            self.note = e;
+            return;
+        }
+        self.select();
+        self.note = format!("{}{}{}", if on { "on the local network" } else { "on this Mac only" }, if made { "; a new API key is in the run config" } else { "" }, if self.running() { ": restarting" } else { ": takes effect at the next start" });
+        if self.running() {
+            self.restart();
+        }
+    }
+
+    /// l in Network (Linux): the lid closed keeps the machine running (systemd-logind ignores the lid switch), so the
+    /// server keeps answering other devices; again: the lid suspends it as before.
+    fn lid(&mut self) {
+        if !cfg!(target_os = "linux") {
+            self.note = "on macOS: sudo pmset -a disablesleep 1 (0 to undo)".into();
+            return;
+        }
+        let on = !Path::new(LID_CONF).exists();
+        let cmd = lid_command(on);
+        let ok = Command::new("sudo").args(["-n", "sh", "-c", &cmd]).status().map(|s| s.success()).unwrap_or(false);
+        self.note = match (ok, on) {
+            (true, true) => "lid closed: keeps running (the server stays reachable); l again to suspend on close".into(),
+            (true, false) => "lid closed: suspends again".into(),
+            (false, _) => format!("needs sudo: sudo sh -c '{cmd}'"),
+        };
     }
 
     /// The Models view's lines: every run config here, then what make pull can download that has no config yet.
@@ -586,11 +850,11 @@ impl App {
             }
         } else if let Some(name) = row.pull {
             if self.pulling.is_some() {
-                self.note = "a download is already running (F5 Log)".into();
+                self.note = "a download is already running (F7 Log)".into();
                 return;
             }
             self.pulling = Some(name.to_string());
-            self.note = format!("downloading {} ({:.1} GB): progress in Log (F5); it writes the run config", row.title, row.size);
+            self.note = format!("downloading {} ({:.1} GB): progress in Log (F7); it writes the run config", row.title, row.size);
             let (root, tx, name) = (self.root.clone(), self.tx.clone(), name.to_string());
             std::thread::spawn(move || {
                 let child = Command::new("make").args(["--no-print-directory", "pull", &format!("MODEL={name}")]).current_dir(&root).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
@@ -636,6 +900,20 @@ impl App {
             self.help = false; // any key closes the keys' list
             return;
         }
+        if let Some((kind, text)) = self.prompt.as_mut() {
+            match code {
+                KeyCode::Esc => self.prompt = None,
+                KeyCode::Backspace => drop(text.pop()),
+                KeyCode::Char(c) => text.push(c),
+                KeyCode::Enter => {
+                    let (kind, text) = (*kind, text.trim().to_string());
+                    self.prompt = None;
+                    self.prompt_done(kind, &text);
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
             KeyCode::Char('?') if self.tab != 0 => self.help = true,
             _ if letter('t') => {
@@ -658,12 +936,33 @@ impl App {
             KeyCode::PageUp if self.tab == 0 => self.chat_scroll = self.chat_scroll.saturating_add(10),
             KeyCode::PageDown if self.tab == 0 => self.chat_scroll = self.chat_scroll.saturating_sub(10),
             KeyCode::Char('p') if self.tab == 1 => self.performance(),
+            KeyCode::Char('a') if self.tab == 4 => self.prompt = Some(("mcp-url", String::new())),
+            KeyCode::Char('f') if self.tab == 4 => self.prompt = Some(("mcp-folder", String::new())),
+            KeyCode::Char('d') | KeyCode::Delete if self.tab == 4 => self.mcp_remove(),
+            KeyCode::Char('t') if self.tab == 4 => {
+                self.mcp_chat = !self.mcp_chat;
+                self.note = format!("tools in chat: {}", if self.mcp_chat { "on (the model may call the MCP servers' tools)" } else { "off" });
+            }
+            KeyCode::Up if self.tab == 4 => self.mcp_pick = self.mcp_pick.saturating_sub(1),
+            KeyCode::Down if self.tab == 4 => self.mcp_pick = (self.mcp_pick + 1).min(self.mcp["servers"].as_array().map(|s| s.len().saturating_sub(1)).unwrap_or(0)),
+            KeyCode::Char('h') if self.tab == 5 => self.share(),
+            KeyCode::Char('l') if self.tab == 5 => self.lid(),
             KeyCode::Enter if self.tab == 3 => self.activate_model(),
             KeyCode::Up if self.tab == 3 => self.mpick = self.mpick.saturating_sub(1),
             KeyCode::Down if self.tab == 3 => self.mpick = (self.mpick + 1).min(self.models().len().saturating_sub(1)),
-            KeyCode::Tab => self.tab = (self.tab + 1) % TABS.len(),
+            KeyCode::Tab => {
+                self.tab = (self.tab + 1) % TABS.len();
+                if self.tab == 4 {
+                    self.mcp_refresh();
+                }
+            }
             KeyCode::BackTab => self.tab = (self.tab + TABS.len() - 1) % TABS.len(),
-            KeyCode::F(n) if (1..=5).contains(&n) => self.tab = n as usize - 1,
+            KeyCode::F(n) if (1..=7).contains(&n) => {
+                self.tab = n as usize - 1;
+                if self.tab == 4 {
+                    self.mcp_refresh();
+                }
+            }
             _ if letter('q') || (ctrl && code == KeyCode::Char('c')) => self.quit = true,
             _ if letter('s') => self.toggle(),
             _ if letter('r') => self.restart(),
@@ -680,8 +979,8 @@ impl App {
             KeyCode::Enter if self.tab == 2 => self.apply_context(),
             KeyCode::Up if self.tab == 2 => self.pick = self.pick.saturating_sub(1),
             KeyCode::Down if self.tab == 2 => self.pick = (self.pick + 1).min(self.plan["options"].as_array().map(|o| o.len().saturating_sub(1)).unwrap_or(0)),
-            KeyCode::Up | KeyCode::PageUp if self.tab == 4 => self.log_scroll = self.log_scroll.saturating_add(if code == KeyCode::PageUp { 20 } else { 1 }),
-            KeyCode::Down | KeyCode::PageDown if self.tab == 4 => self.log_scroll = self.log_scroll.saturating_sub(if code == KeyCode::PageDown { 20 } else { 1 }),
+            KeyCode::Up | KeyCode::PageUp if self.tab == LOG_TAB => self.log_scroll = self.log_scroll.saturating_add(if code == KeyCode::PageUp { 20 } else { 1 }),
+            KeyCode::Down | KeyCode::PageDown if self.tab == LOG_TAB => self.log_scroll = self.log_scroll.saturating_sub(if code == KeyCode::PageDown { 20 } else { 1 }),
             KeyCode::Backspace if typing => drop(self.input.pop()),
             KeyCode::Esc if typing => self.input.clear(),
             KeyCode::Char(c) if typing => self.input.push(c),
@@ -712,6 +1011,14 @@ impl App {
                 self.plan = p;
             }
             Msg::Apps(a) => self.apps = a,
+            Msg::Mcp(v) => {
+                if let Some(e) = v["error"].as_str() {
+                    self.note = e.to_string();
+                }
+                if v["servers"].is_array() {
+                    self.mcp = v;
+                }
+            }
             Msg::Pulled(name, ok) => {
                 self.pulling = None;
                 self.configs = configs(&self.root);
@@ -722,7 +1029,7 @@ impl App {
                         self.select();
                     }
                 }
-                self.note = if ok { format!("{name} downloaded: pick it in Models (F4), then Ctrl+S") } else { format!("{name}: the download stopped (Log, F5); run it again to continue") };
+                self.note = if ok { format!("{name} downloaded: pick it in Models (F4), then Ctrl+S") } else { format!("{name}: the download stopped (Log, F7); run it again to continue") };
             }
             Msg::Delta { think, text } => {
                 if let Some(t) = self.turns.last_mut() {
@@ -813,6 +1120,18 @@ fn power_gauge(hw: &Value, peak: f64) -> (f64, String) {
 }
 
 /// The CPU governor `p` switches to: performance, or back to the kernel's usual one.
+const LID_CONF: &str = "/etc/systemd/logind.conf.d/strata-lid.conf";
+
+/// The shell command that makes the lid switch ignored (on) or not; logind rereads its config on SIGHUP.
+fn lid_command(on: bool) -> String {
+    let set = if on {
+        format!("mkdir -p /etc/systemd/logind.conf.d && printf '[Login]\\nHandleLidSwitch=ignore\\nHandleLidSwitchExternalPower=ignore\\nHandleLidSwitchDocked=ignore\\n' > {LID_CONF}")
+    } else {
+        format!("rm -f {LID_CONF}")
+    };
+    format!("{set} && systemctl kill -s HUP systemd-logind")
+}
+
 fn governor_target(current: &str) -> &'static str {
     if current == "performance" { "schedutil" } else { "performance" }
 }
@@ -870,10 +1189,15 @@ fn draw(f: &mut Frame, app: &App) {
         1 => draw_monitor(f, app, body),
         2 => draw_memory(f, app, body),
         3 => draw_models(f, app, body),
+        4 => draw_mcp(f, app, body),
+        5 => draw_network(f, app, body),
         _ => draw_log(f, app, body),
     }
     let keys = if app.tab == 0 { "Enter send · Esc stop · Ctrl+S start/stop · Ctrl+T thinking · Ctrl+O new chat · PgUp/PgDn · Tab view · Ctrl+Q quit" } else { "s start/stop · r restart · l load/unload · t thinking · F4 models · ? keys · q quit" };
-    let help_line = if app.note.is_empty() { Line::from(keys.dim()) } else { Line::from(vec![Span::styled(app.note.clone(), Style::new().fg(Color::Yellow)), Span::raw("   "), keys.dim()]) };
+    let help_line = if let Some((kind, text)) = &app.prompt {
+        let ask = if *kind == "mcp-url" { "MCP address: name url [api key]" } else { "a folder the model may read" };
+        Line::from(vec![Span::styled(format!("{ask}: "), Style::new().fg(Color::Yellow)), Span::raw(format!("{text}▏")), "   Enter adds · Esc cancels".dim()])
+    } else if app.note.is_empty() { Line::from(keys.dim()) } else { Line::from(vec![Span::styled(app.note.clone(), Style::new().fg(Color::Yellow)), Span::raw("   "), keys.dim()]) };
     f.render_widget(Paragraph::new(help_line), help);
     if app.help {
         let lines = [
@@ -884,7 +1208,8 @@ fn draw(f: &mut Frame, app: &App) {
             "Enter    send               Esc   stop the answer      Ctrl+O   new chat",
             "PgUp / PgDn   scroll the chat or the log      p (Monitor)   CPU performance mode",
             "F3 Memory: Up / Down, Enter   the context (written to the run config)",
-            "Tab, F1-F5   views          ?   these keys         Ctrl+Q   quit",
+            "F5 MCP: a address · f folder · d remove · t tools in chat      F6 Network: h local network · l lid",
+            "Tab, F1-F7   views          ?   these keys         Ctrl+Q   quit",
             "",
             "Outside Chat the letters work without Ctrl (s, r, l, n, t, o, q).   Any key closes this.",
         ];
@@ -894,6 +1219,73 @@ fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Clear, r);
         f.render_widget(Paragraph::new(lines.iter().map(|l| Line::from(*l)).collect::<Vec<_>>()).block(Block::bordered().title(" Keys ")), r);
     }
+}
+
+fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
+    let servers = app.mcp["servers"].as_array().cloned().unwrap_or_default();
+    let [list, tools, help] = Layout::vertical([Constraint::Min(5), Constraint::Length(8), Constraint::Length(3)]).areas(area);
+    let rows: Vec<Row> = servers.iter().enumerate().map(|(i, sv)| {
+        let ok = sv["status"] == "ready";
+        let style = if i == app.mcp_pick { Style::new().reversed() } else if ok { Style::new() } else { Style::new().fg(Color::Yellow) };
+        let at = sv["url"].as_str().map(String::from).unwrap_or_else(|| format!("{} {}", sv["command"].as_str().map(|c| Path::new(c).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default(),
+            sv["args"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default()));
+        Row::new([sv["name"].as_str().unwrap_or("").to_string(), sv["status"].as_str().unwrap_or("").to_string(),
+                  sv["tools"].as_array().map(|t| t.len().to_string()).unwrap_or_default(), at, if sv["editable"] == true { "added here".into() } else { "run config".into() }]).style(style)
+    }).collect();
+    let title = format!(" MCP servers · tools in chat: {} (t) ", if app.mcp_chat { "on" } else { "off" });
+    let empty = rows.is_empty();
+    f.render_widget(Table::new(rows, [Constraint::Length(16), Constraint::Length(14), Constraint::Length(6), Constraint::Min(30), Constraint::Length(12)])
+        .header(Row::new(["name", "state", "tools", "address / program", "from"]).style(Style::new().bold())).block(Block::bordered().title(title)), list);
+    let names: Vec<Line> = servers.get(app.mcp_pick).and_then(|s| s["tools"].as_array().cloned()).unwrap_or_default().iter()
+        .map(|t| Line::from(vec![Span::raw(format!("{}  ", t["tool"].as_str().or(t["name"].as_str()).unwrap_or(""))), Span::styled(t["description"].as_str().unwrap_or("").chars().take(90).collect::<String>(), Style::new().fg(Color::DarkGray))]))
+        .collect();
+    let tools_text = if empty { vec![Line::from("No MCP servers. a adds an address (a Streamable HTTP MCP server), f a folder the model may read.".dim())] } else { names };
+    f.render_widget(Paragraph::new(tools_text).block(Block::bordered().title(" its tools ")), tools);
+    let stopped = if app.mcp["stopped"] == true { "  (from the run config: start the server to see their state and tools)" } else { "" };
+    f.render_widget(Paragraph::new(Line::from(vec!["a ".bold(), "add an address   ".into(), "f ".bold(), "add a folder (read-only)   ".into(), "d ".bold(), "remove   ".into(), "t ".bold(), format!("tools in chat on / off{stopped}").into()])).block(Block::bordered()), help);
+}
+
+fn draw_network(f: &mut Frame, app: &App, area: Rect) {
+    let cfg = app.cfg_path().map(|p| read_json(p)).unwrap_or(json!({}));
+    let port = app.srv.lock().unwrap().port;
+    let shared = is_shared(&cfg);
+    let key = api_key(&cfg);
+    let mut lines = vec![
+        Line::from(vec![Span::styled(format!("{:<12}", "Reachable"), Style::new().bold()),
+            if shared { Span::styled("from the local network (host 0.0.0.0)", Style::new().fg(Color::Yellow)) } else { Span::raw("from this Mac only (127.0.0.1)") }]),
+        Line::from(vec![Span::styled(format!("{:<12}", "API key"), Style::new().bold()),
+            Span::raw(if key.is_empty() { "none (anyone who reaches the port may use the model)".to_string() } else { key.clone() })]),
+        Line::raw(""),
+    ];
+    if shared {
+        lines.push(Line::from("From another device, use one of these:".bold()));
+        for ip in lan_ips() {
+            let a = ip.split(' ').next().unwrap_or("").to_string();
+            lines.push(Line::raw(format!("  chat in a browser   http://{a}:{port}")));
+            lines.push(Line::raw(format!("  OpenAI API base     http://{a}:{port}/v1      {}", ip.split_once(' ').map(|x| x.1).unwrap_or(""))).dim());
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from("Not encrypted (plain http): keep it to a network you trust, or a VPN. For the internet, the router would have to".fg(Color::Yellow)));
+        lines.push(Line::from("forward the port, and anyone in between could read the chats: use a VPN or an HTTPS proxy instead.".fg(Color::Yellow)));
+    } else {
+        lines.push(Line::from("h puts it on the local network: other computers and phones reach it at this machine's address with the API key.".dim()));
+        let ips: Vec<String> = lan_ips();
+        if !ips.is_empty() {
+            lines.push(Line::from(format!("This machine's addresses: {}", ips.join(", ")).dim()));
+        }
+    }
+    lines.push(Line::raw(""));
+    if cfg!(target_os = "linux") {
+        let kept = Path::new(LID_CONF).exists();
+        lines.push(Line::from(vec![Span::styled(format!("{:<12}", "Lid closed"), Style::new().bold()),
+            Span::raw(if kept { "keeps running (the server stays reachable)" } else { "suspends (the server stops answering)" })]));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(vec!["h ".bold(), format!("{} (the server restarts on it)", if shared { "this Mac only" } else { "on the local network" }).into()]));
+    if cfg!(target_os = "linux") {
+        lines.push(Line::from(vec!["l ".bold(), "lid closed: keep running / suspend".into()]));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(" Network ")), area);
 }
 
 fn draw_models(f: &mut Frame, app: &App, area: Rect) {
@@ -1078,6 +1470,7 @@ fn main() {
         root, configs, cfg: 0, srv: srv.clone(), tx: tx.clone(), tab: 0, status: json!({}), plan: json!({}), apps: vec![], log: VecDeque::new(),
         log_scroll: 0, turns: vec![], input: String::new(), busy: false, pick: 0, note: String::new(), quit: false,
         effort: 2, stop: Arc::new(AtomicBool::new(false)), chat_scroll: 0, mpick: 0, pulling: None, help: false, power_peak: 0.0,
+        mcp: json!({}), mcp_pick: 0, mcp_chat: true, prompt: None,
     };
     app.select();
     std::thread::spawn({
@@ -1152,6 +1545,44 @@ mod tests {
         assert_eq!(clusters_text(&c), "E-cores 0.6 of 2.1 GHz · P-cores 3.0 of 3.0 GHz");
         let line = meter("RAM", 0.5, "8.0 of 16.0 GB  (50%)");
         assert_eq!(line.spans.iter().map(|s| s.content.as_ref()).collect::<String>(), "RAM         ███████████░░░░░░░░░░░  8.0 of 16.0 GB  (50%)");
+    }
+
+    #[test]
+    fn mcp_and_network_config_edits() {
+        let mut cfg = json!({"args": ["--gguf", "m.gguf"], "port": 8090});
+        assert_eq!(add_folder(&mut cfg, "/s/engine-metal/strata-files", "/home/d/notes"), "files");
+        assert_eq!(add_folder(&mut cfg, "/s/engine-metal/strata-files", "/home/d/docs"), "files-2");
+        assert_eq!(cfg["mcp_servers"]["files"], json!({"command": "/s/engine-metal/strata-files", "args": ["/home/d/notes"]}));
+        assert_eq!(config_mcp(&cfg)[1]["name"], "files-2");
+        assert!(remove_mcp(&mut cfg, "files"));
+        assert!(!remove_mcp(&mut cfg, "files"));
+        assert!(!is_shared(&cfg));
+        assert!(share_config(&mut cfg, true)); // no key yet: one is made
+        assert!(is_shared(&cfg) && api_key(&cfg).starts_with("sk-strata-") && api_key(&cfg).len() == 46);
+        let k = api_key(&cfg);
+        assert!(!share_config(&mut cfg, true)); // a key stays
+        assert_eq!(api_key(&cfg), k);
+        share_config(&mut cfg, false);
+        assert_eq!(cfg["host"], "127.0.0.1");
+        assert_ne!(random_key(), random_key());
+    }
+
+    #[test]
+    fn tool_calls_in_the_chat() {
+        let call = json!({"event": "call", "server": "files", "tool": "read_text_file", "arguments": {"path": "/a.txt"}});
+        assert_eq!(tool_line(&call).unwrap(), "⚙ files.read_text_file({\"path\":\"/a.txt\"})");
+        let res = json!({"event": "result", "ok": true, "chars": 1200, "truncated": false});
+        assert_eq!(tool_line(&res).unwrap(), "  ↳ done (1200 characters)");
+        assert!(tool_line(&json!(null)).is_none());
+        assert!(lan_ips().iter().all(|ip| !ip.starts_with("127.")));
+    }
+
+    #[test]
+    fn lid_switch_drop_in() {
+        let on = lid_command(true);
+        assert!(on.contains("HandleLidSwitch=ignore") && on.contains("HandleLidSwitchExternalPower=ignore") && on.contains(LID_CONF));
+        assert!(on.ends_with("systemctl kill -s HUP systemd-logind"));
+        assert_eq!(lid_command(false), format!("rm -f {LID_CONF} && systemctl kill -s HUP systemd-logind"));
     }
 
     #[test]

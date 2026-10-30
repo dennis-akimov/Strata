@@ -93,8 +93,25 @@ It does what `make setup` does on macOS, with Linux's parts:
 | Memory | Vulkan's GPU memory is one heap that Honeykrisp makes about half the memory (7.65 GiB on a 16 GB M1: too small for gpt-oss-20b's 11 GB of weights); the run config's `"env": {"HK_SYSMEM": "<bytes>"}` raises it to the memory less 3 GB (or 15%), and that is the limit setup sizes the context for |
 | At the end | `make tui`: Strata.app in the terminal (bar with the state and memory, Chat, Monitor, Memory with the context picker, Log; Ctrl+S starts the server, Ctrl+Q quits and stops it). Or `make run PORT=8090` and http://127.0.0.1:8090 |
 
-Measured on the 16 GB M1 (Debian, kernel 7.1.13-asahi, Mesa 26.1.6): gpt-oss-20b at a 32K context answers at 12
-tok/s (Metal on the same Mac under macOS: 19-20). `python3 bootstrap.py --detect` prints what setup sees (chip, SoC,
+Measured on the 16 GB M1 (Debian, kernel 7.1.13-asahi, Mesa 26.1.6): gpt-oss-20b at a 32K context answers at
+13.3-13.7 tok/s (Metal on the same Mac under macOS: 19-20).
+
+**Speed on Linux.** The GPU waits for nothing else: the engine uses 1-9% of the CPU, the fan stays off. Measured
+2026-10-29, 200-token answers:
+
+- The GPU's clock is its firmware's (up to 1278 MHz, the same as under macOS); Linux has no setting for it.
+- The CPU's `performance` governor (`p` in the TUI's Monitor) adds about 3% (12.2 -> 12.6); boost does nothing.
+- `GGML_VK_PERF_LOGGER=1` in the run config's `env` prints each GPU step's time into the log. Per answer token, 57% of
+  the GPU's time went to the MXFP4 experts' mat-vec, which read memory at about 25 GB/s (the q8_0 layers: 47-51).
+- `metal/patches/core/0003-honeykrisp-mat-vec.patch` gives Honeykrisp's mat-vec large workgroups and 2 rows per
+  workgroup (the defaults: subgroup-sized, 4): 12.2 -> 13.3-13.7 tok/s. Tried and no faster: `GGML_VK_FORCE_MMVQ`,
+  `GGML_VK_DISABLE_FUSION`, `GGML_VK_DISABLE_GRAPH_OPTIMIZE`, `HK_PERFTEST=batch`, 1 or 8 rows.
+- The rest of the gap to Metal is the driver: Honeykrisp has no integer dot product and no cooperative matrix (Mesa
+  26.3 neither), which llama.cpp's fast paths need.
+- Newer is not faster here (same M1, the 0003 patch in each): llama.cpp b12000 (2026-10-29, 487 commits past the pin)
+  answered at 12.8 tok/s instead of 13.7 and read a 706-token prompt at 60.6 tok/s instead of 59.5; Mesa 26.2.6 at
+  13.7 and 59 (26.1.6: 13.7 and 59.4); Mesa 26.2.6 with the unmerged lighter compute barrier (mesa!44041, 7 -> 4 us
+  per GPU step) at 13.8 and 59.6. A step costs little next to the experts' mat-vec, so that one is where speed is. `python3 bootstrap.py --detect` prints what setup sees (chip, SoC,
 the GPU driver).
 
 `make run` and `make start` start the newest `strata-*.json` (`make run CONFIG=strata-x.json` for another). Not on

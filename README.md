@@ -45,7 +45,7 @@ same Mac:
 
 | Model | macOS 27 (Metal) | Linux, Debian + Asahi kernel 7.1.13 (Vulkan, Mesa 26.1) | Model file |
 | --- | ---: | ---: | ---: |
-| **GPT-OSS 20B** (MXFP4) | 16.8-19.9 tokens/s at an 8-16K context § | 12.1-12.2 tokens/s at a 32K context ¶ | 12 GB |
+| **GPT-OSS 20B** (MXFP4) | 16.8-19.9 tokens/s at an 8-16K context § | 13.3-13.7 tokens/s at a 32K context ¶ | 12 GB |
 | **Qwen3.6-35B-A3B 2-bit** (Unsloth UD-IQ2_M) | not measured | 2.4 tokens/s at a 32K context ¶ | 11.5 GB |
 
 § Only after raising macOS's GPU memory limit (`sudo sysctl iogpu.wired_limit_mb=13312`, until the next restart): by
@@ -54,6 +54,21 @@ weights. `make setup` and Strata.app offer it.
 
 ¶ Linux's Apple GPU driver (Honeykrisp) gives the GPU half the memory by default (7.65 GB here); setup writes
 `"HK_SYSMEM"` into the run config to give it 13 GB.
+
+On Linux the GPU sets the pace (the engine uses under 10% of the CPU; the GPU's clock is its firmware's, the same top
+1278 MHz as under macOS, with no Linux setting). What was measured on the M1, 2026-10-29:
+
+| Change | Answer speed | Kept |
+| --- | ---: | --- |
+| `metal/patches/core/0003-honeykrisp-mat-vec.patch` (llama.cpp's mat-vec: large workgroups, 2 rows each) | 12.2 -> 13.7 tokens/s | yes, built in |
+| CPU governor `performance` (`p` in the TUI's Monitor) | +3% | your choice |
+| llama.cpp b12000 (newest, 487 commits later) | 12.8 tokens/s | no |
+| Mesa 26.2.6, or 26.2.6 with the unmerged mesa!44041 | 13.7-13.8 tokens/s | no |
+| `GGML_VK_FORCE_MMVQ`, `GGML_VK_DISABLE_FUSION`, `GGML_VK_DISABLE_GRAPH_OPTIMIZE`, `HK_PERFTEST=batch` | 11.8-13.3 tokens/s | no |
+
+The rest of the gap to Metal is the driver: Honeykrisp has no integer dot product and no cooperative matrix, which
+llama.cpp's fast paths need; 57% of the GPU's time per token is the MXFP4 experts' mat-vec. Details and how to measure
+(`GGML_VK_PERF_LOGGER=1`): [docs/MACOS.md](docs/MACOS.md#linux-on-an-apple-silicon-mac-asahi).
 
 On a 16 GB Mac GPT-OSS 20B is the one to use: the 2-bit Qwen fits but answers 5x slower, and 2 bits cost quality.
 The first one or two answers after starting it are slower (8-10 tokens/s on the M1): macOS is still reading the 11 GB

@@ -60,6 +60,15 @@ else()
   string(MD5 _sig "${_sig}")
   string(SUBSTRING "${_sig}" 0 10 _sig)
   set(_src "${FETCHCONTENT_BASE_DIR}/llama_cpp-src-${_sig}")
+  # Vulkan's shader generator is its own CMake project, whose cache names the source folder it was configured from: a
+  # new set of patches (a new folder) would fail it with "does not match the source ... used to generate cache"
+  set(_gen "${FETCHCONTENT_BASE_DIR}/llama_cpp-build/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix")
+  if(EXISTS "${_gen}/src/vulkan-shaders-gen-build/CMakeCache.txt")
+    file(STRINGS "${_gen}/src/vulkan-shaders-gen-build/CMakeCache.txt" _home REGEX "^CMAKE_HOME_DIRECTORY:")
+    if(NOT _home MATCHES "llama_cpp-src-${_sig}/")
+      file(REMOVE_RECURSE "${_gen}")
+    endif()
+  endif()
   FetchContent_Declare(llama_cpp URL https://github.com/ggml-org/llama.cpp/archive/${STRATA_LLAMA_COMMIT}.tar.gz
                        SOURCE_DIR "${_src}" ${_patch})
   FetchContent_MakeAvailable(llama_cpp)
