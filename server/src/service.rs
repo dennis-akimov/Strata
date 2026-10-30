@@ -1003,9 +1003,10 @@ impl Service {
         s.shift_remove("x");
         let n = if all_requests { hist.len() } else { 12 };
         let requests: Vec<Value> = hist.iter().rev().take(n).cloned().collect();
+        let hardware = gpu_memory_from_engine(tel["now"].clone(), &engine);
         json!({"engine": engine, "live": live, "requests": requests,
             "conversation_cache": conversation_cache_view(&engine, &hist, &totals, &parked),
-            "requests_kept": hist.len(), "totals": totals, "hardware": tel["now"], "hardware_static": tel["static"],
+            "requests_kept": hist.len(), "totals": totals, "hardware": hardware, "hardware_static": tel["static"],
             "history": tel["history"], "time": t})
     }
 
@@ -1427,4 +1428,14 @@ pub fn add_f(m: &mut Map<String, Value>, k: &str, d: f64) {
 /// A number as Python formats it in an f-string (int stays int, float repr).
 pub fn py_num(x: f64) -> String {
     if x == x.trunc() && x.abs() < 1e16 { format!("{}", x as i64) } else { crate::pyjson::float_repr(x) }
+}
+
+/// No GPU counters of the OS (Asahi Linux): the GPU memory the engine measured once the model was in it (its INFO
+/// gpu_used / gpu_total); the OS's own numbers win where there are some (macOS).
+pub fn gpu_memory_from_engine(mut hardware: Value, engine: &Map<String, Value>) -> Value {
+    if hardware["gpu_mem_used"].is_null() && engine.get("gpu_total").and_then(Value::as_f64).unwrap_or(0.0) > 0.0 {
+        hardware["gpu_mem_used"] = engine["gpu_used"].clone();
+        hardware["gpu_mem_total"] = engine["gpu_total"].clone();
+    }
+    hardware
 }

@@ -355,6 +355,12 @@ fn gpu_limit(recommended: f64) -> (f64, u64, u64) {
 fn power() -> Value {
     let g = Command::new("/usr/bin/pmset").arg("-g").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let batt = Command::new("/usr/bin/pmset").args(["-g", "batt"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    power_from(&g, &batt)
+}
+
+/// pmset -g and pmset -g batt -> {low, high_capable, high, battery}.  A Mac with High Power Mode lists `powermode`
+/// (0 automatic, 1 low, 2 high); the others only `lowpowermode`.
+fn power_from(g: &str, batt: &str) -> Value {
     let field = |k: &str| g.lines().find_map(|l| { let mut f = l.split_whitespace(); (f.next() == Some(k)).then(|| f.next().and_then(|v| v.parse::<u8>().ok())).flatten() });
     json!({"low": field("lowpowermode") == Some(1) || field("powermode") == Some(1), "high_capable": field("powermode").is_some(),
            "high": field("powermode") == Some(2), "battery": batt.contains("'Battery Power'")})
@@ -406,7 +412,7 @@ fn system_state() -> Value {
     let (_, _, suggest) = gpu_limit(f64::MAX);
     json!({"keep_ai_off": settings["keep_ai_off"] == true, "ai_running": ai, "ai_bytes": ai_b, "siri": siri,
            "keep_still_wallpaper": settings["keep_still_wallpaper"] == true, "aerial_running": aer.len(), "aerial_bytes": aer_b,
-           "gpu_daemon_mb": daemon_mb, "wired_mb": wired, "suggest_mb": suggest})
+           "gpu_daemon_mb": daemon_mb, "wired_mb": wired, "suggest_mb": suggest, "power": power()})
 }
 
 fn still_wallpaper() {
@@ -441,6 +447,19 @@ fn system_toggle(what: &str, on: bool, mb: u64) -> Result<(), String> {
                 still_wallpaper();
             } else {
                 let _ = Command::new("/usr/bin/open").arg("x-apple.systempreferences:com.apple.Wallpaper-Settings.extension").status();
+            }
+        }
+        "power" => {
+            // battery and power adapter both (-a): High Power Mode where the Mac has it, else Low Power Mode off
+            let capable = power()["high_capable"] == true;
+            let shell = match (capable, on) {
+                (true, true) => "pmset -a powermode 2",
+                (true, false) => "pmset -a powermode 0",
+                (false, true) => "pmset -a lowpowermode 0",
+                (false, false) => return Ok(()), // nothing to undo: Low Power Mode stays as the user sets it
+            };
+            if !admin(shell) {
+                return Err("not changed (the password dialog was cancelled)".into());
             }
         }
         "gpu" => {
@@ -1252,5 +1271,16 @@ mod tests {
             assert!(v.get(k).is_some(), "{k} missing: {v}");
         }
         eprintln!("{v}");
+    }
+
+    #[test]
+    fn reads_the_power_mode() {
+        let m5 = power_from(" lowpowermode         0\n powermode            2\n", "Now drawing from 'AC Power'");
+        assert_eq!(m5, json!({"low": false, "high_capable": true, "high": true, "battery": false}));
+        let m1 = power_from(" lowpowermode         1\n", "Now drawing from 'Battery Power'");
+        assert_eq!(m1, json!({"low": true, "high_capable": false, "high": false, "battery": true}));
+        let auto = power_from(" powermode            0\n", "");
+        assert_eq!(auto["high_capable"], true);
+        assert_eq!(auto["high"], false);
     }
 }

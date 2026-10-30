@@ -927,9 +927,30 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (e.o.plan) return 0;
-    out("INFO engine=" STRATA_VERSION "-metal backend=metal llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
-        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d\n", (long long) e.o.max_context,
-        e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0, e.spec ? e.o.spec : 0);
+    // the GPU's memory once the model is in it (Metal: its working set; Vulkan: the heap, Honeykrisp's HK_SYSMEM on
+    // Linux): what the server's Monitor shows where the OS has no GPU counters of its own (Asahi Linux)
+    size_t gpu_free = 0, gpu_total = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        const auto t = ggml_backend_dev_type(d);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            ggml_backend_dev_memory(d, &gpu_free, &gpu_total);
+            break;
+        }
+    }
+    // a Vulkan driver without the memory-budget extension (Honeykrisp) reports the heap's free as its total: the model's
+    // own weights are then the closest measure of what it holds
+    size_t gpu_used = gpu_total - gpu_free;
+    if (gpu_used == 0 && e.model) gpu_used = (size_t) llama_model_size(e.model);
+#ifdef __APPLE__
+    const char* backend = "metal";
+#else
+    const char* backend = "vulkan";
+#endif
+    out("INFO engine=" STRATA_VERSION "-metal backend=%s llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
+        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu\n", backend,
+        (long long) e.o.max_context, e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0,
+        e.spec ? e.o.spec : 0, gpu_used, gpu_total);
     out("READY %lld stop\n", (long long) e.o.max_context);
     g_slots = e.o.batch;
     g_bstop.reset(new std::atomic<bool>[(size_t) std::max(1, g_slots)]());

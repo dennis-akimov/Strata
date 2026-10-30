@@ -304,6 +304,52 @@ pub use other::{cpu_ticks, metal_working_set_bytes, ram};
 #[cfg(not(target_os = "macos"))]
 use other::{sysctl_u64, MacSensors};
 
+/// The SMC's power sensors on Asahi (hwmon macsmc_hwmon): (heatpipe watts = CPU + GPU, total system watts).
+#[cfg(target_os = "linux")]
+fn linux_power() -> (Option<f64>, Option<f64>) {
+    hwmon_power(std::path::Path::new("/sys/class/hwmon"))
+}
+
+/// linux_power() under any root (a test's folder): power<N>_label / power<N>_input in microwatts.
+pub fn hwmon_power(root: &std::path::Path) -> (Option<f64>, Option<f64>) {
+    let (mut chip, mut system) = (None, None);
+    for h in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let d = h.path();
+        for i in 1..=12 {
+            let Ok(label) = std::fs::read_to_string(d.join(format!("power{i}_label"))) else { continue };
+            let w = std::fs::read_to_string(d.join(format!("power{i}_input"))).ok().and_then(|v| v.trim().parse::<f64>().ok()).map(|uw| uw / 1e6);
+            match label.trim() {
+                "Heatpipe Power" => chip = w,
+                "Total System Power" => system = w,
+                _ => {}
+            }
+        }
+    }
+    (chip, system)
+}
+
+/// Each CPU cluster's clock (cpufreq policies: the M1's E-cores and P-cores): [{"cpus", "mhz", "max_mhz", "governor"}].
+#[cfg(target_os = "linux")]
+fn cpu_clusters() -> Value {
+    cpufreq_clusters(std::path::Path::new("/sys/devices/system/cpu/cpufreq"))
+}
+
+/// cpu_clusters() under any root (a test's folder): policy*/{related_cpus, scaling_cur_freq, cpuinfo_max_freq (kHz),
+/// scaling_governor}.
+pub fn cpufreq_clusters(root: &std::path::Path) -> Value {
+    let read = |p: &std::path::Path, f: &str| std::fs::read_to_string(p.join(f)).map(|s| s.trim().to_string()).unwrap_or_default();
+    let mut v: Vec<Value> = std::fs::read_dir(root).into_iter().flatten().flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("policy"))
+        .map(|e| {
+            let p = e.path();
+            json!({"cpus": read(&p, "related_cpus"), "mhz": read(&p, "scaling_cur_freq").parse::<f64>().ok().map(|k| k / 1000.0),
+                   "max_mhz": read(&p, "cpuinfo_max_freq").parse::<f64>().ok().map(|k| k / 1000.0), "governor": read(&p, "scaling_governor")})
+        })
+        .collect();
+    v.sort_by(|a, b| a["cpus"].as_str().cmp(&b["cpus"].as_str()));
+    Value::Array(v)
+}
+
 /// ioreg's PerformanceStatistics line -> (utilization %, bytes in use).
 pub fn parse_ioreg(text: &str) -> (Option<i64>, Option<i64>) {
     let u = regex::Regex::new(r#""Device Utilization %"=(\d+)"#).unwrap();
@@ -418,6 +464,18 @@ impl Telemetry {
                         s.insert("gpu_power".into(), json!(power));
                         s.insert("gpu_temp".into(), json!(temp));
                     }
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Linux on Apple Silicon: no GPU load or temperature from the driver; the SMC's power sensors
+                        // (heatpipe = CPU + GPU) and the CPU clusters' clocks
+                        let (chip, system) = linux_power();
+                        if chip.is_some() {
+                            s.insert("gpu_power".into(), json!(chip));
+                            s.insert("chip_power_is_cpu_gpu".into(), json!(true));
+                        }
+                        s.insert("system_power".into(), json!(system));
+                        s.insert("cpu_clusters".into(), cpu_clusters());
+                    }
                     // psutil.cpu_percent(interval=None): the share busy since the previous call
                     let cur = cpu_ticks();
                     let cpu = match (cur, cpu_prev) {
@@ -503,5 +561,66 @@ mod tests {
         let (used, total) = ram();
         assert!(total.unwrap() > 1 << 30 && used.unwrap() > 0);
         assert!(metal_working_set_bytes() > 0);
+    }
+}
+
+#[cfg(test)]
+mod linux_reader_tests {
+    //! The Linux-on-Apple-Silicon readers on a fake sysfs (they run the same on any OS), and the GPU memory the
+    //! Monitor takes from the engine where the OS has no counters.
+    use super::{cpufreq_clusters, hwmon_power};
+    use crate::service::gpu_memory_from_engine;
+    use serde_json::json;
+    use std::fs;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("strata-tel-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn reads_the_smc_power_sensors() {
+        let root = dir("hwmon");
+        let smc = root.join("hwmon3");
+        fs::create_dir_all(&smc).unwrap();
+        for (i, label, uw) in [(1, "Total System Power", "18470479"), (2, "AC Input Power", "30771217"), (4, "Heatpipe Power", "10377352")] {
+            fs::write(smc.join(format!("power{i}_label")), format!("{label}\n")).unwrap();
+            fs::write(smc.join(format!("power{i}_input")), format!("{uw}\n")).unwrap();
+        }
+        fs::create_dir_all(root.join("hwmon0")).unwrap(); // a sensor chip without power readings (nvme)
+        let (chip, system) = hwmon_power(&root);
+        assert!((chip.unwrap() - 10.377352).abs() < 1e-9 && (system.unwrap() - 18.470479).abs() < 1e-9);
+        assert_eq!(hwmon_power(&dir("empty")), (None, None));
+    }
+
+    #[test]
+    fn reads_the_cpu_clusters() {
+        let root = dir("cpufreq");
+        for (p, cpus, cur, max, gov) in [("policy4", "4 5 6 7", "1056000", "2988000", "performance"), ("policy0", "0 1 2 3", "1704000", "2064000", "schedutil")] {
+            let d = root.join(p);
+            fs::create_dir_all(&d).unwrap();
+            for (f, v) in [("related_cpus", cpus), ("scaling_cur_freq", cur), ("cpuinfo_max_freq", max), ("scaling_governor", gov)] {
+                fs::write(d.join(f), format!("{v}\n")).unwrap();
+            }
+        }
+        let v = cpufreq_clusters(&root);
+        assert_eq!(v, json!([
+            {"cpus": "0 1 2 3", "mhz": 1704.0, "max_mhz": 2064.0, "governor": "schedutil"},
+            {"cpus": "4 5 6 7", "mhz": 1056.0, "max_mhz": 2988.0, "governor": "performance"}
+        ]));
+    }
+
+    #[test]
+    fn gpu_memory_comes_from_the_engine_only_without_the_os_numbers() {
+        let engine = json!({"gpu_used": 11000000000u64, "gpu_total": 13958643712u64}).as_object().unwrap().clone();
+        let filled = gpu_memory_from_engine(json!({"gpu_mem_used": null, "cpu": 3.0}), &engine);
+        assert_eq!(filled["gpu_mem_used"], 11000000000u64);
+        assert_eq!(filled["gpu_mem_total"], 13958643712u64);
+        let mac = gpu_memory_from_engine(json!({"gpu_mem_used": 5, "gpu_mem_total": 9}), &engine);
+        assert_eq!((mac["gpu_mem_used"].clone(), mac["gpu_mem_total"].clone()), (json!(5), json!(9))); // the OS's own win
+        let none = gpu_memory_from_engine(json!({"gpu_mem_used": null}), &json!({}).as_object().unwrap().clone());
+        assert!(none["gpu_mem_used"].is_null());
     }
 }

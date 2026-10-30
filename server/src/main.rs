@@ -285,6 +285,21 @@ fn stop_server(pid: i32, port: u16) -> bool {
     free()
 }
 
+/// The pids of Strata engines already running (strata-metal: a model in memory), of any user.
+fn other_engines() -> Vec<String> {
+    engines_in(&std::process::Command::new("ps").args(["-axo", "pid=,comm="]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default())
+}
+
+/// ps -axo pid=,comm= -> the pids whose program is strata-metal (a path or a bare name).
+fn engines_in(ps: &str) -> Vec<String> {
+    ps.lines()
+        .filter_map(|l| {
+            let (pid, comm) = l.trim_start().split_once(' ')?;
+            (std::path::Path::new(comm.trim()).file_name()? == "strata-metal").then(|| pid.to_string())
+        })
+        .collect()
+}
+
 fn listen_problem(host: &str, port: u16, e: &std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::AddrInUse => format!("port {port} is already in use - is Strata (or another server) already running? Close it, or start this one with a different --port"),
@@ -389,6 +404,17 @@ fn main() {
                 Ok(v) => vision = Some(Arc::new(v)),
                 Err(e) => exit_msg(&format!("[strata] {e}")),
             }
+        }
+        // two engines need the memory for two models: on a 16 GB Mac the kernel's out-of-memory killer then ends one of
+        // them (and systemd the session it ran in: a TUI was lost that way).  --replace has already stopped this port's.
+        let others = other_engines();
+        if !others.is_empty() && std::env::var("STRATA_ALLOW_SECOND_ENGINE").map(|v| v != "1").unwrap_or(true) {
+            exit_msg(&format!(
+                "[strata] another Strata engine is running (pid {}): two models need the memory of both, and the system ends one when it runs out. \
+                 Stop that one first (Ctrl+S in its make tui, Stop in Strata.app, or make stop), or start this one with --replace on its port. \
+                 To run both anyway: STRATA_ALLOW_SECOND_ENGINE=1",
+                others.join(", ")
+            ));
         }
         println!("{}", if lazy { "model unloaded; the first request loads it ..." } else { "loading the model (the first start takes a minute or two) ..." });
         warn_budget_over_ram(&engine_args(&cfgv));
@@ -635,4 +661,16 @@ fn main() {
         v.shutdown();
     }
     say("stopped");
+}
+
+#[cfg(test)]
+mod engine_guard_tests {
+    use super::engines_in;
+
+    #[test]
+    fn finds_running_engines_only() {
+        let ps = "    1 /sbin/launchd\n 2148 /home/dadmin/Strata/engine-metal/strata-metal\n 2141 engine-metal/strata-server\n  77 strata-metal\n 99 /usr/bin/strata-metal-helper\n";
+        assert_eq!(engines_in(ps), ["2148", "77"]);
+        assert!(engines_in("  1 /sbin/init\n").is_empty());
+    }
 }

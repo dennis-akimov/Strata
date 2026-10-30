@@ -174,6 +174,11 @@ function system(v){
     row('wallpaper',v.keep_still_wallpaper,'Keep the moving wallpaper off',
       v.aerial_running?`the moving (aerial) wallpaper runs now: ${v.aerial_running} process, ${mb(v.aerial_bytes)}`:'the moving wallpaper is not running',
       `Wallpaper ${v.aerial_running?'moving':'still'}. A still colour takes its place; while Strata runs, it ends the aerial again if one returns.`)+
+    (()=>{const pw=v.power||{};return pw.high_capable
+      ?row('power',!!pw.high,'High Power Mode on battery and power adapter',pw.high?'on':'off (Automatic)',
+        `The fans keep the GPU's clock up through long answers. <code>sudo pmset -a powermode 2</code>; off: Automatic.`)
+      :row('power',!pw.low,'Full speed on battery and power adapter (Low Power Mode off)',pw.low?'Low Power Mode is on: it slows the GPU':'Low Power Mode is off',
+        `This Mac has no High Power Mode; off is its fastest. <code>sudo pmset -a lowpowermode 0</code>${pw.battery?' · on battery now: plug in for full speed':''}`);})()+
     (target?row('gpu',gpuOn,`GPU memory limit ${(target/1024).toFixed(1)} GB at every startup`,
       `the GPU may hold ${v.wired_mb?(v.wired_mb/1024).toFixed(1)+' GB now':"macOS's default now (about two thirds of the memory)"}`,
       `<code>sudo sysctl iogpu.wired_limit_mb=${target}</code> at every boot (a LaunchDaemon); off puts macOS's default back. macOS asks for your password.`):'')+

@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -416,6 +416,7 @@ struct App {
     mpick: usize,
     pulling: Option<String>,
     help: bool,
+    power_peak: f64,
 }
 
 /// A line of the Models view: a run config here, or a model make pull can bring.
@@ -532,6 +533,20 @@ impl App {
         chat(port, key, messages, EFFORTS[self.effort].0, self.stop.clone(), self.tx.clone());
     }
 
+    /// `p` on Monitor: the CPU governor to performance (clocks stay up) or back (Linux, sudo; macOS: Strata.app's
+    /// System card has High Power Mode).
+    fn performance(&mut self) {
+        if !cfg!(target_os = "linux") {
+            self.note = "on macOS: Strata.app > System > High Power Mode (or sudo pmset -a powermode 2)".into();
+            return;
+        }
+        let cur = std::fs::read_to_string("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor").unwrap_or_default();
+        let to = governor_target(cur.trim());
+        let cmd = format!("for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do echo {to} > $f; done");
+        let ok = Command::new("sudo").args(["-n", "sh", "-c", &cmd]).status().map(|s| s.success()).unwrap_or(false);
+        self.note = if ok { format!("CPU governor: {to}") } else { format!("needs sudo: sudo sh -c '{cmd}'") };
+    }
+
     /// The Models view's lines: every run config here, then what make pull can download that has no config yet.
     fn models(&self) -> Vec<ModelRow> {
         let mut rows: Vec<ModelRow> = self
@@ -642,6 +657,7 @@ impl App {
             }
             KeyCode::PageUp if self.tab == 0 => self.chat_scroll = self.chat_scroll.saturating_add(10),
             KeyCode::PageDown if self.tab == 0 => self.chat_scroll = self.chat_scroll.saturating_sub(10),
+            KeyCode::Char('p') if self.tab == 1 => self.performance(),
             KeyCode::Enter if self.tab == 3 => self.activate_model(),
             KeyCode::Up if self.tab == 3 => self.mpick = self.mpick.saturating_sub(1),
             KeyCode::Down if self.tab == 3 => self.mpick = (self.mpick + 1).min(self.models().len().saturating_sub(1)),
@@ -685,7 +701,12 @@ impl App {
                 }
                 self.log.push_back(l);
             }
-            Msg::Status(s) => self.status = s,
+            Msg::Status(s) => {
+                let hw = &s["metrics"]["hardware"];
+                let w = hw["system_power"].as_f64().or(hw["gpu_power"].as_f64()).unwrap_or(0.0);
+                self.power_peak = self.power_peak.max(w);
+                self.status = s;
+            }
             Msg::Plan(p) => {
                 self.pick = p["options"].as_array().and_then(|o| o.iter().position(|x| x["ctx"].as_f64() == p["context"].as_f64())).unwrap_or(0);
                 self.plan = p;
@@ -719,6 +740,81 @@ impl App {
             }
         }
     }
+}
+
+/// How much of the context window the chat uses: (tokens, the window).  Writing: the prompt plus what is written so
+/// far; else the last request's prompt and answer (the next message starts from there).
+fn context_fill(status: &Value, busy: bool, chatting: bool) -> Option<(u64, u64)> {
+    let max = status["health"]["max_context"].as_u64()?;
+    let m = &status["metrics"];
+    let used = if busy {
+        let l = &m["live"];
+        l["prompt_tokens"].as_u64().or(l["prompt_total"].as_u64()).unwrap_or(0) + l["generated"].as_u64().unwrap_or(0)
+    } else if chatting {
+        let r = &m["requests"][0];
+        r["prompt_tokens"].as_u64()? + r["output_tokens"].as_u64().unwrap_or(0)
+    } else {
+        return None;
+    };
+    Some((used, max))
+}
+
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The clusters' clocks in words: "E-cores 0.6 of 2.1 GHz · P-cores 3.0 of 3.0 GHz".
+fn clusters_text(v: &Value) -> String {
+    let Some(c) = v.as_array().filter(|c| !c.is_empty()) else { return String::new() };
+    let low = c.iter().filter_map(|x| x["max_mhz"].as_f64()).fold(f64::MAX, f64::min);
+    c.iter()
+        .map(|x| {
+            let name = if c.len() > 1 && x["max_mhz"].as_f64() == Some(low) { "E-cores" } else { "P-cores" };
+            format!("{name} {:.1} of {:.1} GHz", x["mhz"].as_f64().unwrap_or(0.0) / 1000.0, x["max_mhz"].as_f64().unwrap_or(0.0) / 1000.0)
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// A bar of `width` cells for a share 0..1: filled █, empty ░.
+fn bar(ratio: f64, width: usize) -> String {
+    let full = (ratio.clamp(0.0, 1.0) * width as f64).round() as usize;
+    format!("{}{}", "█".repeat(full), "░".repeat(width - full))
+}
+
+/// One Monitor line: the name, a grey bar, the value in words.
+fn meter(name: &str, ratio: f64, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{name:<12}"), Style::new().bold()),
+        Span::styled(bar(ratio, 22), Style::new().fg(Color::Gray)),
+        Span::raw(format!("  {value}")),
+    ])
+}
+
+/// The Power bar: watts against the highest seen this session (at least 20 W, about an M1's chip under load).
+/// Linux: the whole system's, with the chip's (CPU + GPU, the SMC heatpipe) beside it; macOS: the GPU's.
+fn power_gauge(hw: &Value, peak: f64) -> (f64, String) {
+    let w = |x: f64| format!("{x:.1} W");
+    let (now, label) = match (hw["system_power"].as_f64(), hw["gpu_power"].as_f64()) {
+        (Some(sys), chip) => (sys, format!("{} system{}", w(sys), chip.map(|c| format!(" · {} chip (CPU + GPU)", w(c))).unwrap_or_default())),
+        (None, Some(gpu)) => (gpu, format!("{} GPU", w(gpu))),
+        (None, None) => return (0.0, "–".into()),
+    };
+    let top = peak.max(now).max(20.0);
+    ((now / top).clamp(0.0, 1.0), format!("{label} · peak {}", w(peak.max(now))))
+}
+
+/// The CPU governor `p` switches to: performance, or back to the kernel's usual one.
+fn governor_target(current: &str) -> &'static str {
+    if current == "performance" { "schedutil" } else { "performance" }
 }
 
 fn gb(b: f64) -> String {
@@ -786,7 +882,7 @@ fn draw(f: &mut Frame, app: &App) {
             "Ctrl+N   next run config    F4 Models   switch, or download one (make pull)",
             "Ctrl+T   thinking effort: off, low, medium, high",
             "Enter    send               Esc   stop the answer      Ctrl+O   new chat",
-            "PgUp / PgDn   scroll the chat or the log",
+            "PgUp / PgDn   scroll the chat or the log      p (Monitor)   CPU performance mode",
             "F3 Memory: Up / Down, Enter   the context (written to the run config)",
             "Tab, F1-F5   views          ?   these keys         Ctrl+Q   quit",
             "",
@@ -867,7 +963,17 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     }
     let inner_w = hist.width.saturating_sub(2);
     let scroll = height(&raw, inner_w).saturating_sub(hist.height.saturating_sub(2)).saturating_sub(app.chat_scroll);
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)).block(Block::bordered().title(" Chat ")), hist);
+    let fill = context_fill(&app.status, app.busy, !app.turns.is_empty());
+    let mut chat_title = " Chat ".to_string();
+    if let Some((used, max)) = fill {
+        chat_title = format!(" Chat · context {} / {} ({:.1}%) ", thousands(used), thousands(max), 100.0 * used as f64 / max.max(1) as f64);
+    }
+    if app.busy {
+        if let Some(t) = app.status["metrics"]["live"]["elapsed_s"].as_f64() {
+            chat_title.push_str(&format!("· {t:.1} s "));
+        }
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)).block(Block::bordered().title(chat_title)), hist);
     let title = if app.busy { " answering … " } else { " message " };
     f.render_widget(Paragraph::new(format!("{}▏", app.input)).block(Block::bordered().title(title)), input);
 }
@@ -878,7 +984,7 @@ fn draw_monitor(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new("The server is not running, or not answering yet. Ctrl+S / s starts it.").block(Block::bordered().title(" Monitor ")), area);
         return;
     }
-    let [top, gauges, reqs] = Layout::vertical([Constraint::Length(4), Constraint::Length(6), Constraint::Min(4)]).areas(area);
+    let [top, gauges, reqs] = Layout::vertical([Constraint::Length(4), Constraint::Length(9), Constraint::Min(4)]).areas(area);
     let (l, hw) = (&m["live"], &m["hardware"]);
     let s = |v: &Value| match v {
         Value::Null => "–".to_string(),
@@ -891,18 +997,33 @@ fn draw_monitor(f: &mut Frame, app: &App, area: Rect) {
     );
     let model = format!("model {}   context {}   engine {}", s(&app.status["health"]["model"]), s(&app.status["health"]["max_context"]), s(&m["engine"]["engine"]));
     f.render_widget(Paragraph::new(vec![Line::from(state), Line::from(model.dim())]).block(Block::bordered().title(" Model ")), top);
-    let rows = Layout::vertical([Constraint::Length(1); 4]).split(Block::bordered().title(" Hardware ").inner(gauges));
-    f.render_widget(Block::bordered().title(" Hardware "), gauges);
+    // one line each: the name, a bar, and the value in words beside it (a value printed inside a bar is unreadable
+    // over its filled part)
+    let gbs = |v: &Value| v.as_f64().unwrap_or(0.0) / GB;
     let ratio = |a: &Value, b: &Value| (a.as_f64().unwrap_or(0.0) / b.as_f64().unwrap_or(1.0).max(1.0)).clamp(0.0, 1.0);
-    let bars = [
-        ("GPU memory", ratio(&hw["gpu_mem_used"], &hw["gpu_mem_total"]), format!("{} / {}", gb(hw["gpu_mem_used"].as_f64().unwrap_or(0.0)), gb(hw["gpu_mem_total"].as_f64().unwrap_or(0.0)))),
-        ("GPU load", hw["gpu_util"].as_f64().unwrap_or(0.0) / 100.0, format!("{}%  {} °C  {} W", s(&hw["gpu_util"]), s(&hw["gpu_temp"]), s(&hw["gpu_power"]))),
-        ("RAM", ratio(&hw["ram_used"], &hw["ram_total"]), format!("{} / {}", gb(hw["ram_used"].as_f64().unwrap_or(0.0)), gb(hw["ram_total"].as_f64().unwrap_or(0.0)))),
-        ("CPU", hw["cpu"].as_f64().unwrap_or(0.0) / 100.0, format!("{}%", s(&hw["cpu"]))),
-    ];
-    for (i, (name, r, label)) in bars.into_iter().enumerate() {
-        f.render_widget(Gauge::default().ratio(r.clamp(0.0, 1.0)).label(format!("{name}  {label}")).gauge_style(Style::new().fg(Color::Green)), rows[i]);
+    let mut lines: Vec<Line> = vec![];
+    let used_of = |a: &Value, b: &Value| format!("{:.1} of {:.1} GB  ({:.0}%)", gbs(a), gbs(b), 100.0 * ratio(a, b));
+    lines.push(meter("GPU memory", ratio(&hw["gpu_mem_used"], &hw["gpu_mem_total"]), &used_of(&hw["gpu_mem_used"], &hw["gpu_mem_total"])));
+    lines.push(if hw["gpu_util"].is_null() {
+        // Asahi Linux: the driver reports no GPU load or temperature
+        Line::from(vec![Span::styled(format!("{:<12}", "GPU"), Style::new().bold()), "load not reported by Linux's Apple GPU driver".dim()])
+    } else {
+        meter("GPU load", hw["gpu_util"].as_f64().unwrap_or(0.0) / 100.0, &format!("{}%   {} °C", s(&hw["gpu_util"]), s(&hw["gpu_temp"])))
+    });
+    lines.push(meter("RAM", ratio(&hw["ram_used"], &hw["ram_total"]), &used_of(&hw["ram_used"], &hw["ram_total"])));
+    let cpu = hw["cpu"].as_f64().unwrap_or(0.0);
+    lines.push(meter("CPU", cpu / 100.0, &format!("{cpu:.0}%   {}", clusters_text(&hw["cpu_clusters"]))));
+    let (pr, pl) = power_gauge(hw, app.power_peak);
+    lines.push(meter("Power", pr, &pl));
+    if let Some(g) = hw["cpu_clusters"][0]["governor"].as_str() {
+        let next = governor_target(g);
+        lines.push(Line::from(vec![Span::styled(format!("{:<12}", "Governor"), Style::new().bold()), Span::raw(format!("{g}   ")), format!("(p: {next})").dim()]));
     }
+    if !hw["disk_read_mb"].is_null() {    // macOS reads the disk's counters; Linux leaves them out
+        lines.push(Line::from(vec![Span::styled(format!("{:<12}", "Disk"), Style::new().bold()),
+            Span::raw(format!("read {} MB/s · write {} MB/s", s(&hw["disk_read_mb"]), s(&hw["disk_write_mb"])))]));
+    }
+    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Hardware ")), gauges);
     let header = Row::new(["status", "prompt", "reused", "output", "prefill t/s", "decode t/s", "seconds"]).style(Style::new().bold());
     let list: Vec<Row> = m["requests"].as_array().map(|r| r.iter().take(12).map(|q| {
         Row::new([s(&q["finish"]), s(&q["prompt_tokens"]), s(&q["reused"]), s(&q["output_tokens"]), s(&q["prefill_tok_s"]), s(&q["decode_tok_s"]), s(&q["duration_s"])].map(Cell::from))
@@ -956,7 +1077,7 @@ fn main() {
     let mut app = App {
         root, configs, cfg: 0, srv: srv.clone(), tx: tx.clone(), tab: 0, status: json!({}), plan: json!({}), apps: vec![], log: VecDeque::new(),
         log_scroll: 0, turns: vec![], input: String::new(), busy: false, pick: 0, note: String::new(), quit: false,
-        effort: 2, stop: Arc::new(AtomicBool::new(false)), chat_scroll: 0, mpick: 0, pulling: None, help: false,
+        effort: 2, stop: Arc::new(AtomicBool::new(false)), chat_scroll: 0, mpick: 0, pulling: None, help: false, power_peak: 0.0,
     };
     app.select();
     std::thread::spawn({
@@ -982,5 +1103,61 @@ fn main() {
     if app.running() {
         println!("stopping the server (the engine frees its memory first) ...");
         stop_and_wait(&srv);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_fill_counts_the_conversation() {
+        let st = json!({"health": {"max_context": 32768}, "metrics": {"live": {"prompt_tokens": 1200, "generated": 300},
+                        "requests": [{"prompt_tokens": 1000, "output_tokens": 234}]}});
+        assert_eq!(context_fill(&st, true, true), Some((1500, 32768))); // writing: prompt + so far
+        assert_eq!(context_fill(&st, false, true), Some((1234, 32768))); // between messages: the last request
+        assert_eq!(context_fill(&st, false, false), None); // a new chat uses nothing yet
+        assert_eq!(context_fill(&json!({}), true, true), None); // no server
+    }
+
+    #[test]
+    fn formats_the_clusters_and_numbers() {
+        let c = json!([{"cpus": "0 1 2 3", "mhz": 1704.0, "max_mhz": 2064.0, "governor": "schedutil"},
+                       {"cpus": "4 5 6 7", "mhz": 2988.0, "max_mhz": 2988.0, "governor": "schedutil"}]);
+        assert_eq!(clusters_text(&c), "E-cores 1.7 of 2.1 GHz · P-cores 3.0 of 3.0 GHz");
+        assert_eq!(clusters_text(&json!(null)), "");
+        assert_eq!(thousands(32768), "32,768");
+        assert_eq!(thousands(1048576), "1,048,576");
+        assert_eq!(thousands(7), "7");
+    }
+
+    #[test]
+    fn power_bar_in_watts() {
+        let linux = json!({"gpu_power": 10.4, "system_power": 18.3});
+        let (r, l) = power_gauge(&linux, 21.0);
+        assert_eq!(l, "18.3 W system · 10.4 W chip (CPU + GPU) · peak 21.0 W");
+        assert!((r - 18.3 / 21.0).abs() < 1e-9);
+        let (r, l) = power_gauge(&json!({"gpu_power": 8.3}), 0.0); // macOS: the GPU's; the bar's top is at least 20 W
+        assert_eq!(l, "8.3 W GPU · peak 8.3 W");
+        assert!((r - 8.3 / 20.0).abs() < 1e-9);
+        assert_eq!(power_gauge(&json!({}), 5.0), (0.0, "–".to_string()));
+    }
+
+    #[test]
+    fn readable_meters() {
+        assert_eq!(bar(0.5, 10), "█████░░░░░");
+        assert_eq!(bar(0.0, 4), "░░░░");
+        assert_eq!(bar(1.7, 4), "████"); // clamped
+        let c = json!([{"mhz": 600.0, "max_mhz": 2064.0}, {"mhz": 2988.0, "max_mhz": 2988.0}]);
+        assert_eq!(clusters_text(&c), "E-cores 0.6 of 2.1 GHz · P-cores 3.0 of 3.0 GHz");
+        let line = meter("RAM", 0.5, "8.0 of 16.0 GB  (50%)");
+        assert_eq!(line.spans.iter().map(|s| s.content.as_ref()).collect::<String>(), "RAM         ███████████░░░░░░░░░░░  8.0 of 16.0 GB  (50%)");
+    }
+
+    #[test]
+    fn performance_toggles_the_governor() {
+        assert_eq!(governor_target("schedutil"), "performance");
+        assert_eq!(governor_target("performance"), "schedutil");
+        assert_eq!(governor_target(""), "performance");
     }
 }
