@@ -2047,6 +2047,8 @@ pub struct MockEngine {
     scripts: Vec<Vec<u32>>,
     turns: Mutex<usize>,
     pub last_prompt: Mutex<Vec<u32>>,
+    /// every prompt it got, in order (tests compare the rounds of a tool loop)
+    pub prompts: Mutex<Vec<Vec<u32>>>,
 }
 
 impl MockEngine {
@@ -2058,10 +2060,12 @@ impl MockEngine {
             scripts: scripts.iter().map(|s| tok.encode(s, true).into_iter().chain(end.iter().copied()).collect()).collect(),
             turns: Mutex::new(0),
             last_prompt: Mutex::new(vec![]),
+            prompts: Mutex::new(vec![]),
         }
     }
 
     pub fn generate(&self, ids: Vec<u32>, max_new: i64, cancel: Arc<Event>) -> Generation {
+        self.prompts.lock().unwrap().push(ids.clone());
         *self.last_prompt.lock().unwrap() = ids;
         let script = if self.scripts.len() > 1 {
             let mut t = self.turns.lock().unwrap();

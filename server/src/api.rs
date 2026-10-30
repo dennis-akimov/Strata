@@ -601,3 +601,112 @@ mod sources_tests {
         assert_eq!(sources_text(&[], "x"), None);
     }
 }
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    use crate::engine::{Engine, MockEngine};
+    use crate::tokenizer::ByteTokenizer;
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    /// An MCP server over HTTP with one tool, `read`, that answers "page N".
+    fn fake_mcp() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut n = 0;
+            for s in l.incoming().flatten() {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut len = 0;
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; len];
+                let _ = r.read_exact(&mut body);
+                let req: Value = serde_json::from_slice(&body).unwrap_or_default();
+                let result = match req["method"].as_str().unwrap_or("") {
+                    "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}),
+                    "tools/list" => json!({"tools": [{"name": "read", "description": "read the page", "inputSchema": {"type": "object", "properties": {}}}]}),
+                    "tools/call" => {
+                        n += 1;
+                        json!({"content": [{"type": "text", "text": format!("page {n}")}]})
+                    }
+                    _ => Value::Null,                        // a notification: 202, no body (RFC 9110 15.3.3)
+                };
+                let mut s = s;
+                if req.get("id").is_none() {
+                    let _ = write!(s, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let out = json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string();
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len());
+            }
+        });
+        port
+    }
+
+    /// The loop with max_rounds 2 and the model's scripted turns; what it emitted and every prompt the engine got.
+    fn run(scripts: &[&str]) -> (Vec<Value>, String, Vec<Vec<u32>>) {
+        let tok = Arc::new(ByteTokenizer);
+        let mock = Arc::new(MockEngine::new(&*tok, &scripts.iter().map(|s| s.to_string()).collect::<Vec<_>>(), 32768, 0.0));
+        let tpl = crate::template::ChatTemplate::load(&crate::root().join("server/chat_template.jinja")).unwrap();
+        let mut svc = Service::new(Engine::Mock(mock.clone()), tok, tpl, "m".into(), None, Default::default());
+        let servers = indexmap::IndexMap::from([("web".to_string(), json!({"url": format!("http://127.0.0.1:{}/mcp", fake_mcp())}))]);
+        let hub = Arc::new(crate::mcp::McpHub::new(servers, json!({"max_rounds": 2}).as_object().cloned().unwrap(), &[]));
+        hub.start();
+        hub.wait(Some(10.0));
+        let tools = hub.template_tools(&[]);
+        assert_eq!(tools.len(), 1, "the fake server's tool: {tools:?}");
+        let names: HashSet<String> = tools.iter().filter_map(|t| get(t, "name").as_str().map(String::from)).collect();
+        svc.mcp = Some(hub);
+        let messages = vec![json!({"role": "user", "content": "find events"})];
+        let kw = Map::new();
+        let (ids, thinking, max_new) = svc.prepare(&messages, Some(&tools), &kw, Some(200), None, None).unwrap();
+        let m = McpRun { messages, kw, max_req: 200, names };
+        let (mut mcp, mut text) = (vec![], String::new());
+        run_with_mcp(&svc, m, ids, thinking, Some(tools), max_new, &Map::new(), &Arc::new(Flag::new()), &mut |item| {
+            match item {
+                Item::Mcp(v) => mcp.push(v),
+                Item::Event(e) if e.kind == Kind::Content => text.push_str(&e.text),
+                _ => {}
+            }
+            Ok(())
+        }).map_err(|_| "the loop failed").unwrap();
+        let prompts = mock.prompts.lock().unwrap().clone();
+        (mcp, text, prompts)
+    }
+
+    // the default template opens a thinking block: each turn closes it first
+    const CALL: &str = "</think>\n\n<tool_call>\n<function=web__read>\n</function>\n</tool_call>";
+
+    fn not_run(mcp: &[Value]) -> usize {
+        mcp.iter().filter(|v| v["event"] == "result" && v["skipped"] == true).count()
+    }
+
+    #[test]
+    fn at_the_limit_it_answers_with_the_tools_still_in_the_prompt() {
+        let (mcp, text, prompts) = run(&[CALL, CALL, CALL, "</think>\n\nTwo pages read."]);
+        assert_eq!(mcp.iter().filter(|v| v["event"] == "call").count(), 2, "max_rounds calls run: {mcp:?} {text:?}");
+        assert_eq!(mcp.iter().filter(|v| v["event"] == "limit").count(), 1);
+        assert_eq!(not_run(&mcp), 1, "the third call is not run");
+        assert!(text.contains("Two pages read."), "{text}");
+        assert_eq!(prompts.len(), 4);
+        // the last round's prompt extends the round before it: the engine's cache holds (the tools were not dropped)
+        assert!(prompts[3].starts_with(&prompts[2]), "the final round re-reads the prompt from the start");
+    }
+
+    #[test]
+    fn a_call_again_instead_of_an_answer_gets_a_round_without_tools() {
+        let (mcp, text, prompts) = run(&[CALL, CALL, CALL, CALL, "</think>\n\nFrom page 1 and 2."]);
+        assert_eq!(not_run(&mcp), 2, "the limit's call and the final round's call");
+        assert!(text.contains("From page 1 and 2."), "a reply is never empty: {text:?}");
+        assert_eq!(prompts.len(), 5);
+        assert!(!prompts[4].starts_with(&prompts[3]), "the tools are gone from the last prompt");
+    }
+}

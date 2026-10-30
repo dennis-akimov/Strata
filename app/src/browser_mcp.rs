@@ -458,6 +458,10 @@ mod in_a_browser {
         let t = v["text"].as_str().unwrap();
         assert!(t.contains("Halloween bar crawl") && t.contains("Accept") && !t.contains("Menu words"), "{t:.200}");
         assert!(v["elements"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("Bar crawl")));
+        // an empty <main> (the content beside it): the body, still without its menus
+        b.page(&format!("<html><body><header>Site menu</header><main></main><div><h1>Calendar</h1><p>{}</p></div></body></html>", "Concert tonight. ".repeat(30)));
+        let t = b.json(&read_js(1))["text"].as_str().unwrap().to_string();
+        assert!(t.starts_with("Calendar") && !t.contains("Site menu"), "{t:.120}");
 
         // a form: what a field is (for the Allow), a password refused, typing fires input, submit sends the form
         b.page(FORM);
