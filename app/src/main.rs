@@ -299,7 +299,10 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
             let (gpu, total) = (gpu_need + d, need + d);
             let ok = fits(gpu, total);
             let ok512 = !ok && saved_512 > 0.0 && fits(gpu - saved_512, total - saved_512);
-            json!({"ctx": c, "need": if ok512 { total - saved_512 } else { total }, "fits": ok || ok512, "batch512": ok512})
+            // the GPU's share alone (what fit_fix needs: memory free now changes once macOS drops its caches)
+            let gpu512 = gpu > limit && saved_512 > 0.0 && gpu - saved_512 <= limit;
+            json!({"ctx": c, "need": if ok512 { total - saved_512 } else { total }, "fits": ok || ok512, "batch512": ok512,
+                   "gpu_fits": gpu <= limit || gpu512, "gpu_batch512": gpu512})
         })
         .collect();
     let best = options.iter().rposition(|o| o["fits"] == true);
@@ -575,12 +578,28 @@ fn server_exe(root: &Path) -> PathBuf {
 }
 
 /// Start the server with the chosen config; its output goes to the log view.
+/// A config too big for the GPU's share (memory()'s "red") -> the largest context that fits, and the prefill batch it
+/// needs.  Run as it is, the model leaves the window server too little of the GPU's memory: the screen glitches
+/// (WindowServer: kIOGPUCommandBufferCallbackErrorOutOfMemory) and the answers slow down (a 16 GB M1 at 16K: 10.6-15
+/// tok/s with 0.34 GB left over).
+fn fit_fix(m: &Value) -> Option<(u64, Option<u64>)> {
+    if m["state"] != "red" {
+        return None;
+    }
+    let r = m["options"].as_array()?.iter().rev().find(|o| o["gpu_fits"] == true)?;
+    Some((r["ctx"].as_u64()?, (r["gpu_batch512"] == true).then_some(512)))
+}
+
 fn start(st: &Shared, proxy: &EventLoopProxy<Ev>) -> Result<(), String> {
+    let cfg = st.lock().unwrap().config.clone().ok_or("pick a model config first")?;
+    if let Some((ctx, batch)) = fit_fix(&memory(&cfg, false)) {
+        set_context(&cfg, ctx, batch)?;
+        st.lock().unwrap().push_log(format!("[app] the config was too big for the GPU's memory: context {ctx}{} so the screen keeps its share", batch.map(|b| format!(", prefill batch {b}")).unwrap_or_default()));
+    }
     let mut s = st.lock().unwrap();
     if s.child.is_some() {
         return Err("the server is already running".into());
     }
-    let cfg = s.config.clone().ok_or("pick a model config first")?;
     let exe = server_exe(&s.root);
     if !exe.is_file() {
         return Err(format!("{} is missing: build it with `make server` in {}", exe.display(), s.root.display()));
@@ -1213,6 +1232,9 @@ fn main() {
                 stop_and_wait(&st); // the engine's memory is free before the app is gone
                 *control_flow = ControlFlow::Exit;
             }
+            // a quit from outside (the Dock, logging out, AppleScript's quit) ends the loop without Ev::Quit: the
+            // server would outlive the app, holding the model's memory
+            Event::LoopDestroyed => stop_and_wait(&st),
             Event::WindowEvent { event: WindowEvent::Resized(_), .. } => layout(full.get()),
             Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. } => {
                 // closing a window hides it: the app stays in the menu bar with the server running
@@ -1271,6 +1293,18 @@ mod tests {
             assert!(v.get(k).is_some(), "{k} missing: {v}");
         }
         eprintln!("{v}");
+    }
+
+    #[test]
+    fn a_config_too_big_is_fitted_before_it_starts() {
+        let opts = |o: Value| json!({"state": "red", "options": o});
+        let fit = json!([{"ctx": 4096, "gpu_fits": true}, {"ctx": 8192, "gpu_fits": true}, {"ctx": 16384, "gpu_fits": false}]);
+        assert_eq!(fit_fix(&json!({"state": "green", "options": fit.clone()})), None);
+        assert_eq!(fit_fix(&json!({"state": "amber", "options": fit.clone()})), None);
+        // the largest the GPU holds, even when none fits the memory free right now ("fits" false everywhere)
+        assert_eq!(fit_fix(&opts(fit)), Some((8192, None)));
+        assert_eq!(fit_fix(&opts(json!([{"ctx": 4096, "gpu_fits": true, "gpu_batch512": true}]))), Some((4096, Some(512))));
+        assert_eq!(fit_fix(&opts(json!([{"ctx": 4096, "gpu_fits": false}]))), None);
     }
 
     #[test]

@@ -83,6 +83,13 @@ model from the SSD into memory; from then on 17-20 tokens/s, through the chat pa
 effort (*High* makes it think longer, not slower per token) and the sampling settings (top-k 0 or 40: 16.8 and 17.4
 tokens/s) do not change the speed. An 8K context with a prefill batch of 256 leaves macOS the most room on 16 GB.
 
+**The screen glitches while it answers?** The model and the window server share the GPU's memory limit
+(`iogpu.wired_limit_mb`). On the 16 GB M1 at 13,312 MB, gpt-oss-20b at a 16K context with a prefill batch of 512 took
+12.97 GB of it, leaving the screen 0.34 GB: WindowServer's frames failed (`log show` has
+`kIOGPUCommandBufferCallbackErrorOutOfMemory` and IOGPUFamily `FAILED To Free ... total accelerator = max`) and answers
+fell to 10.6-15 tokens/s. Strata keeps 1 GB of the limit for the screen; Strata.app now shrinks a config that does not
+leave it (the largest context that fits, written into the config and its log) before it starts the model.
+
 Pictures and videos on the same Mac (2026-10-11/12):
 
 | Model | Output | Time | Memory |
