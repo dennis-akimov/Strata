@@ -23,7 +23,7 @@ pub fn tools() -> Value {
     json!([
         {"name": "browser_search", "description": "Search Google in the browser beside the chat: its results page, compactly (answers Google shows, the results' titles and snippets, their links numbered for browser_click). Only for what needs the web (news, weather, prices, a site, facts you are unsure of), never for what you already know.",
          "inputSchema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}},
-        {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address the user gave, or one from a page you read. After a browser_search only addresses from the results or pages you read are opened (guessed ones were 404s): use browser_click on a result's number. Then browser_read it.",
+        {"name": "browser_open", "description": "Open a web page in the browser beside the chat (the user sees it): an address the user gave, or one from a page you read. After a browser_search only addresses from the results or pages you read are opened (guessed ones were 404s): use browser_click on a result's number. It answers with the page's text (browser_read for its other parts).",
          "inputSchema": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}},
         {"name": "browser_read", "description": "The page in the browser now (when you answer from it, link it: [its title](its address)), compactly: its main text (in parts of 3,500 characters: part 2, 3... for more) and up to 40 links, buttons and fields numbered [n] for browser_click / browser_type.",
          "inputSchema": {"type": "object", "properties": {"part": {"type": "integer", "description": "which part of the text (default 1)"}}}},
@@ -135,6 +135,17 @@ pub fn page_text(v: &Value) -> String {
     format!("{}\n{}\n\n{}{}\n\nElements:\n{}", v["title"].as_str().unwrap_or(""), v["url"].as_str().unwrap_or(""), text,
             if n > 1 { format!("\n[part {p} of {n}: browser_read with part {} for more]", (p + 1).min(n)) } else { String::new() },
             if els.is_empty() { "(none)".to_string() } else { els.join("\n") })
+}
+
+/// What browser_search, browser_open and browser_back answer with: the page read, under a note on using it.
+pub fn loaded_text(v: &Value, search: bool) -> String {
+    let today = v["today"].as_str().unwrap_or("?");
+    let note = if search {
+        format!("[Read this first. Today is {today}: prefer the newest results, and put the year in a query when it matters. Answer the user from these results when they hold the answer (Google's own answer is at the top), and link each source you use as [title](address). Only if they do not: browser_click a result's number.]")
+    } else {
+        format!("[Today is {today}. Answer only from what this page says, and link it as [title](address).]")
+    };
+    format!("{note}\n\n{}", page_text(v))
 }
 
 /// A read the model already has (the search's results read again, the same part twice): one line instead of the
@@ -269,6 +280,14 @@ mod tests {
         assert!(read_js(2).ends_with("})(2, 3500)"));
         assert!(type_js(3, "a\"b", true).contains(r#""a\"b""#));
         assert!(page_text(&json!({"title": "T", "url": "u", "text": ""})).contains("(no text on this page"));
+    }
+
+    #[test]
+    fn an_opened_page_answers_with_its_text() {
+        let v = json!({"title": "Events | Reader", "url": "https://r.test/events", "text": "Jazz at 8", "today": "2026-10-30", "elements": []});
+        let t = loaded_text(&v, false);
+        assert!(t.starts_with("[Today is 2026-10-30. Answer only from what this page says") && t.contains("Events | Reader\nhttps://r.test/events\n\nJazz at 8"), "{t}");
+        assert!(loaded_text(&v, true).starts_with("[Read this first. Today is 2026-10-30"));
     }
 
     #[test]

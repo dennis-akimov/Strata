@@ -44,7 +44,8 @@ enum Ev {
     /// a browser tool's call from the model (browser_mcp), and an element described for browser_type's Allow
     Tool(browser_mcp::Job),
     /// a search's results page, read a moment after it loaded (Google fills it in after its load event)
-    SearchRead(std::sync::mpsc::Sender<Result<String, String>>),
+    /// the page read for a waiting call: Google's results (true) or a page browser_open / browser_back loaded
+    PageRead(std::sync::mpsc::Sender<Result<String, String>>, bool),
     Described(browser_mcp::Job, String),
     Quit,
 }
@@ -1474,22 +1475,27 @@ fn main() {
                             let p = Mutex::new(proxy.clone());
                             std::thread::spawn(move || {
                                 std::thread::sleep(Duration::from_millis(800));
-                                let _ = p.lock().unwrap().send_event(Ev::SearchRead(w));
+                                let _ = p.lock().unwrap().send_event(Ev::PageRead(w, true));
                             });
                         }
                     }
                 }
+                // the page itself, not "opened, now read it": a small model skipped the read and answered from memory
+                // (six opens, no read, no sources); a moment first, for what its scripts draw
                 for w in load_waiters.borrow_mut().drain(..) {
-                    let _ = w.send(Ok(format!("opened {url}: browser_read it")));
+                    let p = Mutex::new(proxy.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(800));
+                        let _ = p.lock().unwrap().send_event(Ev::PageRead(w, false));
+                    });
                 }
             }
-            Event::UserEvent(Ev::SearchRead(w)) => {
+            Event::UserEvent(Ev::PageRead(w, search)) => {
                 let (seen, last) = (seen_links.clone(), last_read.clone());
                 eval_reply(&web, &browser_mcp::read_js(1), w, move |v| {
                     remember_links(&seen, &v);
                     *last.lock().unwrap() = browser_mcp::page_text(&v);
-                    Ok(format!("[Read this first. Today is {}: prefer the newest results, and put the year in a query when it matters. Answer the user from these results when they hold the answer (Google's own answer is at the top), and link each source you use as [title](address). Only if they do not: browser_click a result's number.]\n\n{}",
-                               v["today"].as_str().unwrap_or("?"), browser_mcp::page_text(&v)))
+                    Ok(browser_mcp::loaded_text(&v, search))
                 });
             }
             Event::UserEvent(Ev::Tool(job)) => {

@@ -62,7 +62,11 @@ impl Run<'_> {
 /// A browser result's page (browser_mcp's page_text: its title on the first line, its address on the second; a search
 /// result starts with a note in [...] first): (title, address); a Google results page as "Google: <query>".
 pub fn page_source(text: &str) -> Option<(String, String)> {
-    let body = if text.starts_with("[Read this first") { text.split_once("\n\n").map(|x| x.1).unwrap_or(text) } else { text };
+    // the browser's note on top ("[Read this first. ...]", "[Today is ...]") is not the page
+    let body = if text.starts_with('[') { text.split_once("\n\n").map(|x| x.1).unwrap_or(text) } else { text };
+    if body.contains("\n(no text on this page") {
+        return None;                                      // a bot check or a blank page: nothing came from it
+    }
     let mut lines = body.lines();
     let title = lines.next()?.trim().to_string();
     let url = lines.next()?.trim().to_string();
@@ -215,7 +219,7 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             let num = |k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0);
             say(&format!("tool {}: {}, {} characters in {:.1} s{}", c.name, if truthy(&r["ok"]) { "ok" } else { "error" }, crate::mcp::thousands(num("chars") as i64), num("ms") / 1000.0, if truthy(&r["truncated"]) { " (truncated for the model)" } else { "" }));
             results.push(r["text"].as_str().unwrap_or("").to_string());
-            if server == json!("browser") && truthy(&r["ok"]) && matches!(tool.as_str(), "browser_read" | "browser_search") {
+            if server == json!("browser") && truthy(&r["ok"]) && matches!(tool.as_str(), "browser_read" | "browser_search" | "browser_open" | "browser_back") {
                 if let Some(s) = page_source(r["text"].as_str().unwrap_or("")) {
                     if !sources.iter().any(|x| x.1 == s.1) {
                         sources.push(s);
@@ -591,6 +595,9 @@ mod sources_tests {
         assert_eq!(page_source(read), Some(("Paris - BBC Weather".into(), "https://www.bbc.com/weather/2988507".into())));
         assert_eq!(page_source(search), Some(("paris weather".into(), "https://www.google.com/search?q=paris+weather".into())));
         assert_eq!(page_source("opened https://x: browser_read it"), None);
+        let opened = "[Today is 2026-10-30. Answer only from what this page says, and link it as [title](address).]\n\nEvents | Reader\nhttps://r.test/events\n\nJazz";
+        assert_eq!(page_source(opened), Some(("Events | Reader".into(), "https://r.test/events".into())));
+        assert_eq!(page_source("[Today is x.]\n\nJust a moment\nhttps://cf.test/\n\n(no text on this page: a bot check)\n\nElements:\n(none)"), None);
         let both = vec![page_source(search).unwrap(), page_source(read).unwrap()];
         // a page was read: the search page is not listed
         assert_eq!(sources_text(&both, "It is sunny."), Some("\n\n**Sources**\n- [Paris - BBC Weather](https://www.bbc.com/weather/2988507)".into()));
@@ -609,8 +616,8 @@ mod loop_tests {
     use crate::tokenizer::ByteTokenizer;
     use std::io::{BufRead, BufReader, Read, Write};
 
-    /// An MCP server over HTTP with one tool, `read`, that answers "page N".
-    fn fake_mcp() -> u16 {
+    /// An MCP server over HTTP with one tool, `tool`, that answers with page N (as the browser's tools do).
+    fn fake_mcp(tool: &'static str, reply: fn(usize) -> String) -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -632,10 +639,10 @@ mod loop_tests {
                 let req: Value = serde_json::from_slice(&body).unwrap_or_default();
                 let result = match req["method"].as_str().unwrap_or("") {
                     "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}),
-                    "tools/list" => json!({"tools": [{"name": "read", "description": "read the page", "inputSchema": {"type": "object", "properties": {}}}]}),
+                    "tools/list" => json!({"tools": [{"name": tool, "description": "read the page", "inputSchema": {"type": "object", "properties": {}}}]}),
                     "tools/call" => {
                         n += 1;
-                        json!({"content": [{"type": "text", "text": format!("page {n}")}]})
+                        json!({"content": [{"type": "text", "text": reply(n)}]})
                     }
                     _ => Value::Null,                        // a notification: 202, no body (RFC 9110 15.3.3)
                 };
@@ -653,11 +660,20 @@ mod loop_tests {
 
     /// The loop with max_rounds 2 and the model's scripted turns; what it emitted and every prompt the engine got.
     fn run(scripts: &[&str]) -> (Vec<Value>, String, Vec<Vec<u32>>) {
+        run_on("web", "read", page, scripts)
+    }
+
+    /// Page n, as the browser's tools answer.
+    fn page(n: usize) -> String {
+        format!("[Today is 2026-10-30.]\n\nPage {n}\nhttps://p.test/{n}\n\nJazz at {n}")
+    }
+
+    fn run_on(server: &str, tool: &'static str, reply: fn(usize) -> String, scripts: &[&str]) -> (Vec<Value>, String, Vec<Vec<u32>>) {
         let tok = Arc::new(ByteTokenizer);
         let mock = Arc::new(MockEngine::new(&*tok, &scripts.iter().map(|s| s.to_string()).collect::<Vec<_>>(), 32768, 0.0));
         let tpl = crate::template::ChatTemplate::load(&crate::root().join("server/chat_template.jinja")).unwrap();
         let mut svc = Service::new(Engine::Mock(mock.clone()), tok, tpl, "m".into(), None, Default::default());
-        let servers = indexmap::IndexMap::from([("web".to_string(), json!({"url": format!("http://127.0.0.1:{}/mcp", fake_mcp())}))]);
+        let servers = indexmap::IndexMap::from([(server.to_string(), json!({"url": format!("http://127.0.0.1:{}/mcp", fake_mcp(tool, reply))}))]);
         let hub = Arc::new(crate::mcp::McpHub::new(servers, json!({"max_rounds": 2}).as_object().cloned().unwrap(), &[]));
         hub.start();
         hub.wait(Some(10.0));
@@ -708,5 +724,48 @@ mod loop_tests {
         assert!(text.contains("From page 1 and 2."), "a reply is never empty: {text:?}");
         assert_eq!(prompts.len(), 5);
         assert!(!prompts[4].starts_with(&prompts[3]), "the tools are gone from the last prompt");
+    }
+
+    #[test]
+    fn pages_the_browser_opened_are_listed_under_the_answer() {
+        let (_, text, _) = run_on("browser", "browser_open", page, &[OPEN, OPEN, "</think>\n\nJazz tonight."]);
+        assert!(text.ends_with("**Sources**\n- [Page 1](https://p.test/1)\n- [Page 2](https://p.test/2)"), "{text:?}");
+    }
+
+    const OPEN: &str = "</think>\n\n<tool_call>\n<function=browser__browser_open>\n<parameter=url>\nhttps://p.test/1\n</parameter>\n</function>\n</tool_call>";
+
+    #[test]
+    fn a_page_gone_back_to_is_a_source_too() {
+        let back = "</think>\n\n<tool_call>\n<function=browser__browser_back>\n</function>\n</tool_call>";
+        let (_, text, _) = run_on("browser", "browser_back", page, &[back, "</think>\n\nJazz."]);
+        assert!(text.ends_with("**Sources**\n- [Page 1](https://p.test/1)"), "{text:?}");
+    }
+
+    #[test]
+    fn the_same_page_twice_is_listed_once() {
+        let (_, text, _) = run_on("browser", "browser_open", |_| page(7), &[OPEN, OPEN, "</think>\n\nJazz."]);
+        assert_eq!(text.matches("https://p.test/7").count(), 1, "{text:?}");
+    }
+
+    #[test]
+    fn blank_refused_and_linked_pages_add_no_list() {
+        // a bot check, then a guessed address held back: nothing came from either
+        let (_, text, _) = run_on("browser", "browser_open", |n| if n == 1 {
+            "[Today is x.]\n\nJust a moment\nhttps://cf.test/\n\n(no text on this page: a bot check, or still loading.)\n\nElements:\n(none)".into()
+        } else {
+            "not opened: guess.test is a site none of the results or pages you read showed".into()
+        }, &[OPEN, OPEN, "</think>\n\nI could not read a page."]);
+        assert!(!text.contains("Sources"), "{text:?}");
+        // the answer linked the page itself: no list under it
+        let (_, text, _) = run_on("browser", "browser_open", page, &[OPEN, "</think>\n\nJazz ([Page 1](https://p.test/1))."]);
+        assert!(!text.contains("Sources"), "{text:?}");
+    }
+
+    #[test]
+    fn other_servers_results_are_not_sources() {
+        // a tool of another server that answers like a page: only the browser's pages are cited
+        let call = "</think>\n\n<tool_call>\n<function=web__browser_open>\n</function>\n</tool_call>";
+        let (_, text, _) = run_on("web", "browser_open", page, &[call, "</think>\n\nJazz."]);
+        assert!(!text.contains("Sources"), "{text:?}");
     }
 }
