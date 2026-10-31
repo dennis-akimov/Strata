@@ -660,7 +660,7 @@ mod in_a_browser {
 <div id="docs-file-menu">File</div><div id="docs-edit-menu">Edit</div><div id="docs-insert-menu">Insert</div>
 <div class="goog-menu" id="menu"></div><div id="waffle-rich-text-editor" contenteditable="true">.</div>
 <script>
-let rows = 30; const COLS = 26;
+let rows = 30; let COLS = 26;
 window.grid = Array.from({length: rows}, () => Array(COLS).fill('')); window.boxes = new Set(); window.trashed = false;
 let sel = {r1: 0, c1: 0, r2: 0, c2: 0};
 const col = (s) => [...s].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
@@ -943,9 +943,46 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         // the tab is pinned when the sheet is ready: another tab chosen during the call does not move it
         let pinned = b.run(&format!("(async () => {{ let GID = null; {} await ready(); location.hash = 'gid=5'; return tabOf(); }})()", crate::google::PRELUDE)).unwrap();
         assert_eq!(pinned, "9");
+        b.eval("history.replaceState(null, '', location.pathname + location.search)");
         // ... and one chosen during go()'s wait (the same range selected there): refused before a cell is touched
-        let e = b.run(&format!("(async () => {{ let GID = null; {} await ready(); setTimeout(() => {{ location.hash = 'gid=5&range=B2'; }}, 20); await go('B2'); clip('paste', 'x'); }})()", crate::google::PRELUDE)).unwrap_err();
+        let e = b.run(&format!("(async () => {{ let GID = null; {} await ready(); addEventListener('hashchange', () => {{ location.hash = 'gid=5&range=B2'; }}, {{once: true}}); await go('B2'); clip('paste', 'x'); }})()", crate::google::PRELUDE)).unwrap_err();
         assert!(e.starts_with("another tab (gid 5) was chosen during the call, not tab 9"), "{e}");
+        // ... and during table_sync's read of the header: the sync stops, nothing is pasted over the person's edits
+        b.eval("history.replaceState(null, '', location.pathname + location.search); pastes.length = 0; addEventListener('hashchange', () => { location.hash = 'gid=5&range=A1:Z1'; }, {once: true})");
+        let e = tool(&mut b, "table_sync", json!({})).unwrap_err();
+        assert!(e.contains("another tab (gid 5) was chosen"), "{e}");
+        assert_eq!(b.eval("pastes.length"), 0);
+        // a sheet with columns past Z (never read, yet whole rows are deleted): not synced
+        b.eval("history.replaceState(null, '', location.pathname + location.search); COLS = 28; grid.forEach((r) => r.push('', '')); pastes.length = 0");
+        let e = tool(&mut b, "table_sync", json!({})).unwrap_err();
+        assert!(e.contains("this sheet has columns past Z"), "{e}");
+        assert_eq!(b.eval("pastes.length"), 0);
+        // ... also when the sheet takes its first selection late (a sheet just opened)
+        b.eval("window.coldHashes = 1; document.querySelector('#t-name-box').value = 'A1'; history.replaceState(null, '', location.pathname + location.search)");
+        assert!(tool(&mut b, "table_sync", json!({})).unwrap_err().contains("this sheet has columns past Z"));
+        // ... also when AA1 is selected late (after the header's selection went through at once)
+        b.eval("history.replaceState(null, '', location.pathname + location.search); window.lateAA = true; addEventListener('hashchange', () => { if (window.lateAA && location.hash.includes('AA1')) { window.lateAA = false; const nb = document.querySelector('#t-name-box'), was = nb.value; setTimeout(() => nb.value = 'AA1', 30); nb.value = was; } })");
+        assert!(tool(&mut b, "table_sync", json!({})).unwrap_err().contains("this sheet has columns past Z"));
+        // ... and another tab chosen during the AA1 wait on a narrow sheet (its retry must not hide the switch)
+        b.eval("COLS = 26; grid.forEach((r) => r.length = 26); history.replaceState(null, '', location.pathname + location.search); window.tabOnAA = true; addEventListener('hashchange', () => { if (window.tabOnAA && location.hash.includes('AA1')) { window.tabOnAA = false; location.hash = 'gid=5&range=AA1'; } })");
+        assert!(tool(&mut b, "table_sync", json!({})).unwrap_err().contains("another tab (gid 5) was chosen"));
+        // ... also during the retry's pause (its tab-only address): the switch is seen before the retry goes on
+        b.eval("history.replaceState(null, '', location.pathname + location.search); window.tabOnRetry = true; addEventListener('hashchange', () => { if (window.tabOnRetry && location.hash === '#gid=9') { window.tabOnRetry = false; location.hash = 'gid=5'; } })");
+        assert!(tool(&mut b, "table_sync", json!({})).unwrap_err().contains("another tab (gid 5) was chosen"));
+        b.eval("COLS = 28; grid.forEach((r) => r.push('', '')); history.replaceState(null, '', location.pathname + location.search)");
+        // ... and when the selection moves elsewhere during the probe: no evidence either way, nothing synced
+        b.eval("history.replaceState(null, '', location.pathname + location.search); window.moveOnAA = true; addEventListener('hashchange', (e) => { if (window.moveOnAA && location.hash.includes('AA1')) document.querySelector('#t-name-box').value = 'B2'; })");
+        assert!(tool(&mut b, "table_sync", json!({})).unwrap_err().contains("the selection changed while table_sync checked"));
+        b.eval("window.moveOnAA = false");
+        b.eval("COLS = 26; grid.forEach((r) => r.length = 26); document.querySelector('#t-name-box').value = 'A1'");
+        // a blank row 1 over data: not an empty sheet, nothing pasted
+        b.eval("history.replaceState(null, '', location.pathname + location.search); grid.forEach((r) => r.fill('')); grid[1][2] = 'https://kept'; pastes.length = 0");
+        let e = tool(&mut b, "table_sync", json!({})).unwrap_err();
+        assert!(e.contains("row 1 of this sheet is empty but rows below it have data"), "{e}");
+        assert_eq!(b.eval("pastes.length"), 0);
+        b.eval("grid[1][2] = ''");
+        let pulled: Value = serde_json::from_str(tool(&mut b, "table_sync", json!({})).unwrap().as_str()).unwrap();
+        assert_eq!(pulled["rows"], 0, "an empty sheet: synced");
         b.eval("history.replaceState(null, '', location.pathname + location.search)");
         b.eval("tabs.length = 0");
         tool(&mut b, "sheets_read", json!({})).unwrap();

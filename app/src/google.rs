@@ -201,13 +201,16 @@ const go = async (range) => { live();
   // a sheet just opened takes the hash late (the first read after a start said "not in the sheet; selected A1:Z1"):
   // wait for it, and set the hash once more (the same hash again fires nothing: the tab alone first), before calling
   // the range missing
+  // another tab chosen during the wait (Sheets puts it in the address): the same range there is not this one; checked
+  // before the retry below sets this tab's address again (it would hide the switch)
+  const moved = () => { const now = new URLSearchParams(location.hash.slice(1)).get('gid');
+    if (now && now !== gid) throw new Error('another tab (gid ' + now + ') was chosen during the call, not tab ' + gid + ': nothing more was changed'); };
   for (let i = 0; nb && nb.value !== shown && i < 10; i++) {
-    if (i === 4) { location.hash = 'gid=' + gid; await sleep(300); location.hash = 'gid=' + gid + '&range=' + range; }
+    moved();
+    if (i === 4) { location.hash = 'gid=' + gid; await sleep(300); moved(); location.hash = 'gid=' + gid + '&range=' + range; }
     await sleep(500); }
+  moved();
   if (nb && nb.value !== shown) throw new Error('range ' + range + ' is not in the sheet (it has fewer rows or columns); selected: ' + nb.value);
-  // another tab chosen during the wait (Sheets puts it in the address): the same range there is not this one
-  const now = new URLSearchParams(location.hash.slice(1)).get('gid');
-  if (now && now !== gid) throw new Error('another tab (gid ' + now + ') was chosen during the call, not tab ' + gid + ': nothing more was changed');
 };
 const clip = (type, text) => { if (type !== 'copy') live(); const dt = new DataTransfer(); if (text !== undefined) dt.setData('text/plain', text);
   editor().dispatchEvent(new ClipboardEvent(type, {clipboardData: dt, bubbles: true, cancelable: true})); return dt.getData('text/plain'); };
@@ -361,8 +364,25 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
         // table_sync step 1: the sheet as it is (the person's edits); step 2: the app's paste of the merged table
         "table_sync" if args["__phase"] == 2 => args["__push"].as_str().ok_or("no table to put")?.to_string(),
         "table_sync" => r#"await ready();
-  let h = []; try { h = await header(); } catch (e) {}
-  if (!h.length) return JSON.stringify({pulled: '', rows: 0, gid: tabOf()});
+  // an empty row 1 is an empty sheet; any other failure (another tab chosen, stopped) ends the sync before a paste
+  let h = []; try { h = await header(); } catch (e) { if (!/^row 1 has no column names/.test(e.message)) throw e; }
+  // columns past Z are never read, yet the push deletes whole rows: a sheet that has them is not synced (a new sheet
+  // has A to Z; after the header's selection: the sheet takes selections by now)
+  // narrow only on positive evidence: the selection left as it was (Sheets ignores a range it does not have); moved
+  // elsewhere during the probe, it says nothing and nothing is synced
+  // (from A1: the probe's retry selects the tab alone, which puts the selection there)
+  await go('A1');
+  const nbox = document.querySelector('#t-name-box'), before = nbox && nbox.value;
+  // (as patient as every selection: a late answer is waited for, about 5 s on a sheet without AA)
+  let wide = true; try { await go('AA1'); } catch (e) { if (!/^range AA1 is not in the sheet/.test(e.message)) throw e; wide = false; }
+  if (!wide && nbox && nbox.value !== before) throw new Error('the selection changed while table_sync checked the sheet\'s width: nothing was synced (try again)');
+  if (wide) throw new Error('this sheet has columns past Z, which table_sync does not read (it would delete rows with data there): nothing was synced');
+  if (!h.length) {
+    // no header: an empty sheet takes the table; one with data under a blank row 1 is not pasted over
+    await go('A:Z');
+    if (clip('copy').split('\n').some((l) => l.split('\t').some((c, j) => filled(c, j)))) throw new Error('row 1 of this sheet is empty but rows below it have data: nothing was synced (put the column names back in row 1, or use an empty sheet)');
+    return JSON.stringify({pulled: '', rows: 0, gid: tabOf()});
+  }
   await go('A:' + letter(Math.max(h.length, 26) - 1));
   const t = clip('copy'); let last = 0;
   t.split('\n').forEach((l, i) => { if (l.split('\t').some((c, j) => filled(c, j))) last = i + 1; });

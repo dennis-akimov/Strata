@@ -153,7 +153,26 @@ pub fn merge(table: &mut Table, sheet_tsv: &str, key: &str, mine: &[String], del
         return Err(format!("the sheet's header has no {key:?}: is it the sheet of this table?"));
     };
     let (mut took, mut added) = (0, 0);
-    for srow in sheet.iter().skip(1).filter(|r| r.iter().any(|c| !c.is_empty() && c != "FALSE")) {
+    // a row the person began without its key: the push would delete it (it is in no row of the file), so nothing is
+    // synced until it has one
+    // a row with data (a lone TRUE / FALSE in column A is a tick box, not data: google.rs filled())
+    let data = |r: &Vec<String>| r.iter().enumerate().any(|(j, c)| !c.is_empty() && (j > 0 || (c != "FALSE" && c != "TRUE")));
+    let keyless: Vec<String> = sheet.iter().enumerate().skip(1)
+        .filter(|(_, r)| data(r) && r.get(sk).is_none_or(|v| v.is_empty()))
+        .map(|(i, _)| (i + 1).to_string()).collect();
+    if !keyless.is_empty() {
+        return Err(format!("row {} of the sheet has data but no {key}: give it its {key} (or delete it) in the sheet, then table_sync again; nothing was synced", keyless.join(", ")));
+    }
+    // two rows with one key: one would be merged, the other deleted by the push
+    let mut seen: std::collections::HashMap<&str, usize> = Default::default();
+    for (i, r) in sheet.iter().enumerate().skip(1).filter(|(_, r)| data(r)) {
+        if let Some(kv) = r.get(sk).map(|v| v.as_str()).filter(|v| !v.is_empty()) {
+            if let Some(first) = seen.insert(kv, i + 1) {
+                return Err(format!("rows {first} and {} of the sheet have the same {key} ({kv}): keep one, then table_sync again; nothing was synced", i + 1));
+            }
+        }
+    }
+    for srow in sheet.iter().skip(1).filter(|r| data(r)) {
         let Some(kv) = srow.get(sk).filter(|v| !v.is_empty()) else { continue };
         match table.iter().skip(1).position(|r| r.get(k).is_some_and(|x| x.trim() == kv)) {
             Some(p) => {
@@ -211,6 +230,14 @@ pub fn table_for_sheet(dir: &Path, sheet_base: &str) -> Option<String> {
         let name = p.file_name()?.to_str()?.strip_suffix(".csv.sheet")?.to_string();
         (std::fs::read_to_string(&p).ok()?.lines().next()?.trim().split('#').next() == Some(sheet_base)).then_some(name)
     })
+}
+
+/// A table table_sync can put in a sheet: columns A to Z (its reads of the sheet go that far; sheets_create's limit).
+pub fn fits_a_to_z(table: &Table) -> Result<(), String> {
+    match table.first().map_or(0, Vec::len) {
+        n if n > 26 => Err(format!("the table has {n} columns; table_sync handles up to 26 (A to Z): nothing was synced")),
+        _ => Ok(()),
+    }
 }
 
 /// The address of the sheet (and tab) a table was synced to, if any.
@@ -331,7 +358,8 @@ pub fn sync_push_js(table: &Table, old: usize) -> String {
     let rows = serde_json::to_string(&tsv(table)).unwrap_or_default();
     let n = table.len();
     let box_col = table.first().and_then(|h| col(h, "Checkbox"));
-    let boxes = box_col.map(|i| format!("await go(letter({i}) + '2:' + letter({i}) + '{n}'); await menu('#docs-insert-menu', 'Checkbox');")).unwrap_or_default();
+    // no rows (the last one deleted): no boxes to make (A2:A1 would reach the header)
+    let boxes = box_col.filter(|_| n > 1).map(|i| format!("await go(letter({i}) + '2:' + letter({i}) + '{n}'); await menu('#docs-insert-menu', 'Checkbox');")).unwrap_or_default();
     let extra = if old > n {
         let item = if old == n + 1 { format!("Row {old}") } else { format!("Rows {} - {old}", n + 1) };
         format!(r#"await go('A{a}:A{old}'); await menu('#docs-edit-menu', 'Delete');
@@ -417,6 +445,20 @@ mod tests {
         ];
         // in the sheet: the person ticked a, wrote a confirmation, edited the address (not theirs), added a row
         let sheet = "Checkbox\tAddress\tLink\tConfirmation\nTRUE\t1 A St (edited)\thttps://a\tcalled Mon\nFALSE\t9 Z St\thttps://z\t\nFALSE\t\t\t";
+        // a row they began without its Link: refused (the push would delete it), the file untouched
+        let mut t2 = t.clone();
+        let e = merge(&mut t2, "Checkbox\tAddress\tLink\tConfirmation\nFALSE\t1 A St\thttps://a\t\nFALSE\t5 New St\t\t\nTRUE\t\t\t", "Link", &["Checkbox".into()], &[]).unwrap_err();
+        assert!(e.starts_with("row 3 of the sheet has data but no Link"), "{e}");
+        assert_eq!(t2, t);
+        let e = merge(&mut t2, "Checkbox\tAddress\tLink\tConfirmation\nFALSE\t1 A St\thttps://a\tcalled\nFALSE\t1 A St\thttps://a\temailed", "Link", &["Checkbox".into()], &[]).unwrap_err();
+        assert!(e.starts_with("rows 2 and 3 of the sheet have the same Link (https://a)"), "{e}");
+        assert_eq!(t2, t);
+        // a row whose key is the word FALSE is data (only column A's lone box is not): kept, not deleted by the push
+        let mut t3: Table = vec![vec!["Checkbox".into(), "Link".into()]];
+        assert_eq!(merge(&mut t3, "Checkbox\tLink\nFALSE\tFALSE", "Link", &[], &[]).unwrap(), (0, 1));
+        // key in column A: rows that are a lone FALSE there are empty tick-box rows, not two rows with one key
+        let mut t4: Table = vec![vec!["Link".into(), "Note".into()]];
+        assert_eq!(merge(&mut t4, "Link\tNote\nhttps://a\tx\nFALSE\t\nFALSE\t", "Link", &[], &[]).unwrap(), (0, 1));
         let mine: Vec<String> = vec!["Checkbox".into(), "Confirmation".into()];
         assert_eq!(merge(&mut t.clone(), sheet, "Link", &mine, &["https://z".into()]).unwrap(), (2, 0), "a row the file deleted is not taken back");
         assert_eq!(merge(&mut t, sheet, "Link", &mine, &[]).unwrap(), (2, 1));
@@ -444,6 +486,8 @@ mod tests {
         assert!(js.contains("clip('paste', \"Checkbox\\tLink\\nFALSE\\thttps://a b\")"));
         assert!(js.contains("'Rows 3 - 5'") && js.contains("go(letter(0) + '2:' + letter(0) + '2')"), "{js}");
         assert!(!sync_push_js(&t, 2).contains("Delete"), "nothing to remove");
+        // the last row deleted: the header alone, no tick boxes (A2:A1 would reach it)
+        assert!(!sync_push_js(&t[..1].to_vec(), 2).contains("Checkbox');"), "no boxes without rows");
     }
 
     #[test]
@@ -458,6 +502,8 @@ mod tests {
         assert_eq!(table_for_sheet(&dir, base).as_deref(), Some("studios"));
         assert_eq!(sheet_of(&dir, "studios"), Some(format!("{base}/edit")));
         assert_eq!(sheet_of(&dir, "other"), None);
+        assert_eq!(fits_a_to_z(&vec![vec!["c".to_string(); 26]]), Ok(()));
+        assert!(fits_a_to_z(&vec![vec!["c".to_string(); 27]]).unwrap_err().contains("27 columns"));
         // linked to a tab: the sync goes to that tab; the sheet is still found by its base address
         set_sheet(&dir.join("studios.csv"), &format!("{base}#gid=77"), &["Notes".into(), "Checkbox".into()]).unwrap();
         assert_eq!(sheet_of(&dir, "studios"), Some(format!("{base}/edit#gid=77")));

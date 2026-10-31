@@ -1728,7 +1728,7 @@ fn main() {
                         // table_sync: its file, set by the app (a caller's __ keys are removed)
                         if t == "table_sync" && job.args.get("__table").is_none() {
                             let dir = st.lock().unwrap().root.join("../Strata-data/sheets");
-                            match table::path_of(&dir, job.args["name"].as_str().unwrap_or("")) {
+                            match table::path_of(&dir, job.args["name"].as_str().unwrap_or("")).and_then(|p| table::load(&p).and_then(|t| table::fits_a_to_z(&t)).map(|_| p)) {
                                 Ok(p) => job.args["__table"] = json!(p.to_string_lossy()),
                                 Err(e) => { let _ = job.reply.send(Err(e)); return; }
                             }
