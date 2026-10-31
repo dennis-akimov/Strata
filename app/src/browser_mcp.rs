@@ -346,9 +346,16 @@ fn handle(mut s: TcpStream, key: &str, stopped: &AtomicBool, to_loop: &dyn Fn(Jo
                 Err("the user stopped the model's browsing (the browser's Stop): ask them, do not retry".to_string())
             } else {
                 let (tx, rx) = mpsc::channel();
-                to_loop(Job { tool: m["params"]["name"].as_str().unwrap_or("").to_string(), args: caller_args(&m["params"]["arguments"]), reply: tx });
+                let tool = m["params"]["name"].as_str().unwrap_or("").to_string();
+                to_loop(Job { tool: tool.clone(), args: caller_args(&m["params"]["arguments"]), reply: tx });
                 // a typed text waits for the person's Allow: up to 2 minutes
-                rx.recv_timeout(Duration::from_secs(150)).unwrap_or_else(|_| Err("the browser did not answer in time".into()))
+                rx.recv_timeout(Duration::from_secs(150)).unwrap_or_else(|_| {
+                    // what it did in the end goes to the log (an Allow clicked late ran a tool no one heard back from)
+                    std::thread::spawn(move || if let Ok(r) = rx.recv_timeout(Duration::from_secs(600)) {
+                        eprintln!("strata-app: {tool} answered after its caller stopped waiting: {}", crate::short(&format!("{r:?}"), 500));
+                    });
+                    Err("the browser did not answer in time".into())
+                })
             };
             match out {
                 Ok(t) => json!({"content": [{"type": "text", "text": t}]}),

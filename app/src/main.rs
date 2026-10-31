@@ -1119,6 +1119,11 @@ fn open(args: &[&str]) {
     let _ = Command::new("open").args(args).spawn();
 }
 
+/// The first n characters of a text (for the log).
+pub fn short(t: &str, n: usize) -> String {
+    t.chars().take(n).collect()
+}
+
 /// How long an Allow is good for: less than browser_mcp's 150 s wait for an answer.
 const ALLOW_WITHIN_S: u64 = 140;
 
@@ -1525,6 +1530,8 @@ fn main() {
                 "web_allow" => {
                     // the person's answer to browser_type's question
                     let asked = approvals.borrow_mut().remove(&v["id"].as_u64().unwrap_or(0));
+                    eprintln!("strata-app: ask {} answered {} ({})", v["id"], if v["yes"] == true { "Allow" } else { "No" },
+                        asked.as_ref().map_or("not waiting".to_string(), |(at, j)| format!("{} after {} s{}", j.tool, at.elapsed().as_secs(), if at.elapsed().as_secs() >= ALLOW_WITHIN_S { ": too late, not run" } else { "" })));
                     if let Some((_, job)) = asked.filter(|(at, _)| at.elapsed() < Duration::from_secs(ALLOW_WITHIN_S)) {
                         if google::ask(&job.tool, &job.args).is_some() {
                             let mut job = job;
@@ -1749,6 +1756,7 @@ fn main() {
                             Ok(_) if google::ask(t, &job.args).is_some() && job.args["__allowed"] != true => {
                                 next_ask.set(next_ask.get() + 1);
                                 js_call(&web_bar, "ask", &json!({"id": next_ask.get(), "say": google::ask(t, &job.args)}));
+                                eprintln!("strata-app: ask {}: {}", next_ask.get(), google::ask(t, &job.args).unwrap_or_default());
                                 approvals.borrow_mut().insert(next_ask.get(), (std::time::Instant::now(), job));
                             }
                             // a page that comes by itself (the new map's editor, after Create): looked for each second
