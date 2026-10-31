@@ -735,6 +735,9 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         let js = crate::google::maps_js("maps_export", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=MAP1", "name": "t"}), "tok").unwrap();
         let out: Value = serde_json::from_str(b.run(&format!("(async () => {{ {js} }})()")).unwrap().as_str().unwrap()).unwrap();
         assert!(out["kml"].as_str().unwrap().contains("<Placemark>"));
+        // the places My Maps has saved (an import waits for its new layer to be among them): the KML's placemarks
+        let saved = |b: &mut Browser| b.run(&format!("(async () => {{ {} return await savedPlaces('MAP1'); }})()", crate::google::MAPS_PRELUDE)).unwrap();
+        assert_eq!(saved(&mut b), 3);
         let places = out["places"].as_array().unwrap();
         assert_eq!(places.len(), 2, "the two geocoded places, not the viewport's numbers: {places:?}");
         assert_eq!((places[0]["lat"].clone(), places[0]["lng"].clone(), places[0]["data"]["Link"].clone()), (json!(32.7203183), json!(-117.1676694), json!("https://a")));
@@ -768,6 +771,9 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         b.site(vec![("/maps/d/kml", "<html>Sign in</html>".into(), "text/html"), ("/maps/d/edit", my_maps_page(&[]), "text/html")], "/maps/d/edit?mid=MAP1");
         let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
         assert!(e.starts_with("My Maps did not give KML"), "{e}");
+        assert_eq!(saved(&mut b), -1, "a sign-in page is not a count");
+        b.site(vec![("/maps/d/edit", my_maps_page(&[]), "text/html")], "/maps/d/edit?mid=MAP1");
+        assert_eq!(saved(&mut b), -1, "no KML (404): not known");
     }
 
     #[test]

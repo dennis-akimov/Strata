@@ -370,6 +370,9 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
 
 /// My Maps' helpers, before each body.
 pub const MAPS_PRELUDE: &str = r#"
+// the places My Maps has saved on a map: its KML export's placemarks (-1: not known)
+const savedPlaces = async (mid) => { try { const r = await fetch('/maps/d/kml?mid=' + mid + '&forcekml=1', {credentials: 'include'});
+  const t = r.ok ? await r.text() : ''; return /<kml[\s>]/.test(t.slice(0, 500)) ? (t.match(/<Placemark[\s>]/g) || []).length : -1; } catch (e) { return -1; } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const byText = (sel, t) => [...document.querySelectorAll(sel)].find((e) => e.offsetParent && (e.innerText || e.textContent || '').trim() === t);
 const live = () => { if (typeof __ID !== 'undefined' && (window.__strataStop || {})[__ID]) throw new Error('stopped: it ran past its time; nothing more was changed'); };
@@ -502,6 +505,8 @@ if (!location.pathname.startsWith('/maps/d/edit')) {{
 // layers already named after this sheet (an earlier import): done is one more of them, not an old one
 const layersNamed = () => [...document.querySelectorAll('*')].filter((e) => e.offsetParent && e.textContent.trim() === sheet && ![...e.children].some((c) => c.textContent.trim() === sheet)).length;
 const layersBefore = layersNamed();
+// an export just after an import got the map without the new layer: the import waits for My Maps to save it (below)
+const saved = () => savedPlaces(MID), savedBefore = await saved();
 // the map asked for, not another one the pane went to while it loaded (found by a codex review)
 const here = new URLSearchParams(location.search).get('mid');
 if (here !== MID) throw new Error('the browser is at another map (' + here + '), not ' + MID + ': nothing imported');
@@ -538,8 +543,11 @@ const done = await wait(() => /trouble finding those locations/.test(document.bo
 if (done === 'fail') throw new Error('My Maps could not place the rows by ' + loc + ' (rows with nothing in that column?)');
 await sleep(2000);
 const t = document.body.innerText, placed = layerCount(t, sheet), bad = t.match(/(\d+) rows? couldn.t be shown/);
+let kept = savedBefore < 0 || placed === null;
+for (let i = 0; !kept && i < 15; i++) {{ live(); kept = (await saved()) >= savedBefore + placed; if (!kept) await sleep(1000); }}
 return 'imported ' + sheet + ' into ' + document.title + ' as a layer' + (placed !== null ? ' of ' + placed + ' places' : '') + ', placed by ' + names[li] + ', titled by ' + names[ti]
   + (bad ? '; ' + bad[1] + ' row(s) could not be placed (My Maps found no place for their ' + loc + ': fix them in the sheet, then import again)' : '')
+  + (kept ? '' : '; My Maps has not saved the new places yet (maps_export now would miss them: wait, then export)')
   + ' (' + location.href.split('&')[0] + ')';"#,
                     sheet = s("sheet_title"), loc = s("location_column"), ttl = s("title_column"),
                     mid = serde_json::to_string(&map_id(args["map_url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into())),
