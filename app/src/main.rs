@@ -1695,12 +1695,10 @@ fn main() {
                         if t.starts_with("sheets_") && t != "sheets_create" {
                             let dir = st.lock().unwrap().root.join("../Strata-data/sheets");
                             let url = job.args["url"].as_str().filter(|u| !u.is_empty()).unwrap_or(&here).to_string();
-                            if let Some(name) = google::sheet_base(&url).and_then(|b| table::table_for_sheet(&dir, &b)) {
-                                if matches!(t, "sheets_append" | "sheets_write" | "sheets_delete_rows" | "sheets_clear") {
-                                    let _ = job.reply.send(Err(table::redirect(t, &name)));
-                                    return;
-                                }
-                                job.args["__note"] = json!(format!("[This sheet's master copy is the local table \"{name}\": to change rows use table_upsert / table_delete, then table_sync.]\n"));
+                            match table::sheet_guard(&dir, t, google::sheet_base(&url).as_deref()) {
+                                Err(e) => { let _ = job.reply.send(Err(e)); return; }
+                                Ok(Some(note)) => job.args["__note"] = json!(note),
+                                Ok(None) => {}
                             }
                         }
                         // table_sync: its file, set by the app (a caller's __ keys are removed)

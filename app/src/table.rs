@@ -210,6 +210,16 @@ pub fn redirect(tool: &str, table: &str) -> String {
     format!("{tool} was not run: this sheet's master copy is the local table \"{table}\" (a change made only in the sheet is overwritten by the next sync). Instead: {instead}, then table_sync with name \"{table}\" and this sheet's url.")
 }
 
+/// A sheets_ tool on a sheet with a local table: a change is refused with the table tools to use instead (the
+/// next sync would undo it), anything else gets a note naming the table.
+pub fn sheet_guard(dir: &Path, tool: &str, sheet_base: Option<&str>) -> Result<Option<String>, String> {
+    let Some(name) = sheet_base.and_then(|b| table_for_sheet(dir, b)) else { return Ok(None) };
+    if matches!(tool, "sheets_append" | "sheets_write" | "sheets_delete_rows" | "sheets_clear") {
+        return Err(redirect(tool, &name));
+    }
+    Ok(Some(format!("[This sheet's master copy is the local table \"{name}\": to change rows use table_upsert / table_delete, then table_sync.]\n")))
+}
+
 /// Read a table's file (missing: empty).
 pub fn load(path: &Path) -> Result<Table, String> {
     match std::fs::read_to_string(path) {
@@ -398,6 +408,12 @@ mod tests {
         let r = redirect("sheets_append", "studios");
         assert!(r.starts_with("sheets_append was not run: this sheet's master copy is the local table \"studios\"") && r.contains("table_upsert with name \"studios\"") && r.contains("then table_sync"), "{r}");
         assert!(redirect("sheets_delete_rows", "studios").contains("table_delete"));
+        for t in ["sheets_append", "sheets_write", "sheets_delete_rows", "sheets_clear"] {
+            assert!(sheet_guard(&dir, t, Some(base)).unwrap_err().starts_with(&format!("{t} was not run")), "{t}");
+            assert_eq!(sheet_guard(&dir, t, Some("https://docs.google.com/spreadsheets/d/other")), Ok(None));
+            assert_eq!(sheet_guard(&dir, t, None), Ok(None));
+        }
+        assert!(sheet_guard(&dir, "sheets_read", Some(base)).unwrap().unwrap().contains("local table \"studios\""));
         assert!(local_tool(&dir, "table_read", &json!({"name": "nope"})).unwrap_err().contains("(tables: studios)"));
         let _ = std::fs::remove_dir_all(&dir);
     }
