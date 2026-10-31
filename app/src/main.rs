@@ -1016,20 +1016,24 @@ fn frame_send(web: &WebView, proxy: &EventLoopProxy<Ev>, token: &str, id: u64, j
 }
 
 /// maps_export's files: the KML, a GeoJSON copy, and Lat / Lng into the table of the same name (when there is one).
-fn save_map_export(args: &Value, kml: &str, title: &str) -> Result<String, String> {
+fn save_map_export(args: &Value, kml: &str, title: &str, page: &Value) -> Result<String, String> {
     let kml_path = std::path::PathBuf::from(args["__map"].as_str().unwrap_or(""));
-    let places = mapfile::parse_kml(kml);
+    let key = args["key"].as_str().filter(|k| !k.is_empty()).unwrap_or("Link");
+    let mut places = mapfile::parse_kml(kml);
+    // My Maps' KML has no points for places it placed by address: the page's, by key, into the places and the file
+    let pointed = mapfile::add_points(&mut places, &mapfile::page_places(page), key);
+    let kml = mapfile::kml_with_points(kml, &places, key);
+    let without = places.iter().filter(|p| p.lat.is_none()).count();
     if places.is_empty() {
         return Err(format!("maps_export: the map {title} has no places to save"));
     }
     if let Some(d) = kml_path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    std::fs::write(&kml_path, kml).map_err(|e| format!("{}: {e}", kml_path.display()))?;
+    std::fs::write(&kml_path, &kml).map_err(|e| format!("{}: {e}", kml_path.display()))?;
     let gj = kml_path.with_extension("geojson");
     std::fs::write(&gj, serde_json::to_string_pretty(&mapfile::geojson(&places)).unwrap_or_default()).map_err(|e| format!("{}: {e}", gj.display()))?;
     let table_path = std::path::PathBuf::from(args["__table"].as_str().unwrap_or(""));
-    let key = args["key"].as_str().filter(|k| !k.is_empty()).unwrap_or("Link");
     let mut tbl = table::load(&table_path)?;
     let filled = if tbl.is_empty() {
         format!("no local table {} to give coordinates to", table_path.display())
@@ -1038,7 +1042,8 @@ fn save_map_export(args: &Value, kml: &str, title: &str) -> Result<String, Strin
         table::save(&table_path, &tbl)?;
         format!("Lat / Lng written for {n} rows of {} by {key}{}", table_path.display(), if missed > 0 { format!(" ({missed} places matched no row)") } else { String::new() })
     };
-    Ok(format!("saved {} places of {title}: {} and {}; {filled}. table_sync puts the new columns in the sheet.", places.len(), kml_path.display(), gj.display()))
+    Ok(format!("saved {} places of {title} ({pointed} points from the map's page{}): {} and {}; {filled}. table_sync puts the new columns in the sheet.",
+               places.len(), if without > 0 { format!(", {without} with none") } else { String::new() }, kml_path.display(), gj.display()))
 }
 
 /// The page read `ms` from now as the call's answer (what a click or typing led to).
@@ -1974,7 +1979,7 @@ fn main() {
                         let _ = job.reply.send(Err(format!("{}: {e}", job.tool)));
                     } else if job.tool == "maps_export" && v["ok"].is_string() {
                         let got: Value = serde_json::from_str(v["ok"].as_str().unwrap_or("")).unwrap_or_default();
-                        let _ = job.reply.send(save_map_export(&job.args, got["kml"].as_str().unwrap_or(""), got["title"].as_str().unwrap_or("")));
+                        let _ = job.reply.send(save_map_export(&job.args, got["kml"].as_str().unwrap_or(""), got["title"].as_str().unwrap_or(""), &got["places"]));
                     } else if job.tool == "table_sync" {
                         let _ = job.reply.send(Ok(format!("{}{}", job.args["__took"].as_str().unwrap_or(""), v["ok"].as_str().unwrap_or(""))));
                     } else {

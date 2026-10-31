@@ -444,7 +444,31 @@ const r = await fetch('/maps/d/kml?mid=' + MID + '&forcekml=1', {{credentials: '
 if (!r.ok) throw new Error('My Maps answered ' + r.status + ' for the KML');
 const kml = await r.text();
 if (!/<kml[\s>]/.test(kml.slice(0, 500))) throw new Error('My Maps did not give KML (a sign-in page?): ' + kml.slice(0, 80));
-return JSON.stringify({{kml, title: document.title}});"#, mid = serde_json::to_string(&map_id(args["map_url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into())),
+// the points: the KML has none for places placed by address; the page's _pageData has each one ("geocoded"),
+// beside its columns (names base64 after "str:")
+const src = [...document.scripts].map((x) => x.text).join('\n'), at = src.indexOf('_pageData = {{');
+const places = [];
+if (at >= 0) {{
+  let j = src.indexOf('{{', at), depth = 0, inStr = false, k = j;
+  for (; k < src.length; k++) {{ const ch = src[k];
+    if (inStr) {{ if (ch === '\\') k++; else if (ch === '"') inStr = false; continue; }}
+    if (ch === '"') inStr = true; else if (ch === '{{') depth++; else if (ch === '}}') {{ depth--; if (!depth) break; }} }}
+  const name = (s) => {{ try {{ return decodeURIComponent(escape(atob(s.slice(4)))); }} catch (e) {{ return ''; }} }};
+  const visit = (a) => {{
+    if (!Array.isArray(a)) return;
+    const geo = a.find((f) => Array.isArray(f) && f[4] === 'geocoded' && Array.isArray(f[6]));
+    if (geo) {{
+      let c = geo[6]; while (Array.isArray(c) && Array.isArray(c[0])) c = c[0];
+      const data = {{}};
+      for (const f of a) if (Array.isArray(f) && typeof f[9] === 'string' && f[9].startsWith('str:') && typeof f[4] === 'string') data[name(f[9])] = f[4];
+      if (typeof c[0] === 'number' && typeof c[1] === 'number') places.push({{lat: c[0], lng: c[1], data}});
+      return;
+    }}
+    a.forEach(visit);
+  }};
+  try {{ for (const v of Object.values(JSON.parse(src.slice(j, k + 1)))) if (typeof v === 'string' && v.startsWith('[')) {{ try {{ visit(JSON.parse(v)); }} catch (e) {{}} }} }} catch (e) {{}}
+}}
+return JSON.stringify({{kml, title: document.title, places}});"#, mid = serde_json::to_string(&map_id(args["map_url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into())),
         "maps_import_sheet" => format!(r#"
 // the picker is another origin's frame: its end of the bridge (browser_mcp::frame_bridge_js) acts for these messages
 const TOKEN = '{token}';

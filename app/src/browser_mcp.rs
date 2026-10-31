@@ -542,6 +542,30 @@ mod in_a_browser {
             self.page_http_at(html, "/spreadsheets/d/fake/edit");
         }
 
+        /// A small site: each request answered by the first route its path starts with (else 404), the page `path`
+        /// opened.  (My Maps' editor and its KML address: two answers from one origin.)
+        fn site(&mut self, routes: Vec<(&'static str, String, &'static str)>, path: &str) {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for mut s in l.incoming().flatten() {
+                    let mut r = BufReader::new(s.try_clone().unwrap());
+                    let mut first = String::new();
+                    let _ = r.read_line(&mut first);
+                    let mut line = String::new();
+                    while r.read_line(&mut line).map(|n| n > 0 && line != "\r\n").unwrap_or(false) {
+                        line.clear();
+                    }
+                    let want = first.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    match routes.iter().find(|(p, _, _)| want.starts_with(p)) {
+                        Some((_, body, ty)) => { let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()); }
+                        None => { let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); }
+                    }
+                }
+            });
+            self.go(&format!("http://127.0.0.1:{port}{path}"));
+        }
+
         fn page_http_at(&mut self, html: &'static str, path: &str) {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = l.local_addr().unwrap().port();
@@ -681,6 +705,68 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
 
     fn grid(b: &mut Browser, rows: usize) -> Vec<Vec<String>> {
         serde_json::from_value(b.eval(&format!("grid.slice(0, {rows}).map((r) => r.slice(0, 10))"))).unwrap()
+    }
+
+    /// My Maps' page data as seen live: a feature's fields, one "geocoded" with [[[lat, lng]]], the columns as
+    /// [.., value, .., "str:<base64 name>"]; the viewport's numbers beside them (not places).
+    fn my_maps_page(places: &[(f64, f64, &str, &str)]) -> String {
+        let b64 = |s: &str| match s { "Link" => "TGluaw==", "Address" => "QWRkcmVzcw==", _ => "" };
+        let features: Vec<Value> = places.iter().enumerate().map(|(i, (lat, lng, link, addr))| json!([format!("F{i}"), null, null, null, null, null, null, null, null, null, null, [
+            [null, null, null, null, "geocoded", null, [[[lat, lng]]], null, null, "strgeo:Z21l"],
+            [null, null, null, null, link, null, null, null, null, format!("str:{}", b64("Link"))],
+            [null, null, null, null, addr, null, null, null, null, format!("str:{}", b64("Address"))]]])).collect();
+        let mapdata = json!([[null, [-117.17, -117.14, 32.72, 32.70]], features]).to_string();
+        let page = json!({"version": "x", "viewportJson": "[null,[-117.17,-117.14,32.72,32.70]]", "mapdataJson": mapdata});
+        format!("<html><body><div>Add layer</div><div>Import</div><script>var _pageData = {page};</script></body></html>")
+    }
+
+    #[test]
+    fn maps_export_from_a_fake_my_maps() {
+        let Some(mut b) = Browser::start() else { return };
+        // My Maps' KML for places placed by address: no <coordinates> (as exported live)
+        let kml = r#"<?xml version="1.0"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><Folder>
+<Placemark><name>Luma</name><address>1440 Columbia St</address><ExtendedData><Data name="Link"><value>https://a</value></Data></ExtendedData></Placemark>
+<Placemark><name>City Villas</name><address>845 16th St</address><ExtendedData><Data name="Link"><value>https://b</value></Data></ExtendedData></Placemark>
+<Placemark><name>Unplaced</name><address>nowhere</address><ExtendedData><Data name="Link"><value>https://c</value></Data></ExtendedData></Placemark>
+</Folder></Document></kml>"#;
+        let page = my_maps_page(&[(32.7203183, -117.1676694, "https://a", "1440 Columbia St"), (32.714485, -117.149218, "https://b", "845 16th St")]);
+        b.site(vec![("/maps/d/kml", kml.to_string(), "application/vnd.google-earth.kml+xml"), ("/maps/d/edit", page, "text/html")], "/maps/d/edit?mid=MAP1");
+        let js = crate::google::maps_js("maps_export", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=MAP1", "name": "t"}), "tok").unwrap();
+        let out: Value = serde_json::from_str(b.run(&format!("(async () => {{ {js} }})()")).unwrap().as_str().unwrap()).unwrap();
+        assert!(out["kml"].as_str().unwrap().contains("<Placemark>"));
+        let places = out["places"].as_array().unwrap();
+        assert_eq!(places.len(), 2, "the two geocoded places, not the viewport's numbers: {places:?}");
+        assert_eq!((places[0]["lat"].clone(), places[0]["lng"].clone(), places[0]["data"]["Link"].clone()), (json!(32.7203183), json!(-117.1676694), json!("https://a")));
+        assert_eq!(places[1]["data"]["Address"], "845 16th St");
+
+        // the app's half: the files, the points, Lat / Lng into the table by Link
+        let dir = std::env::temp_dir().join(format!("strata-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let table = dir.join("sheets/t.csv");
+        crate::table::save(&table, &vec![vec!["Address".into(), "Link".into()], vec!["1440 Columbia St".into(), "https://a".into()], vec!["845 16th St".into(), "https://b".into()]]).unwrap();
+        let args = json!({"__map": dir.join("maps/t.kml").to_string_lossy(), "__table": table.to_string_lossy()});
+        let said = crate::save_map_export(&args, out["kml"].as_str().unwrap(), "t", &out["places"]).unwrap();
+        assert!(said.starts_with("saved 3 places of t (2 points from the map's page, 1 with none)") && said.contains("Lat / Lng written for 2 rows"), "{said}");
+        let written = std::fs::read_to_string(dir.join("maps/t.kml")).unwrap();
+        assert_eq!(written.matches("<coordinates>").count(), 2);
+        let back = crate::mapfile::parse_kml(&written);
+        assert_eq!((back[0].lat, back[1].lng, back[2].lat), (Some(32.7203183), Some(-117.149218), None));
+        let gj: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("maps/t.geojson")).unwrap()).unwrap();
+        assert_eq!(gj["features"][1]["geometry"]["coordinates"], json!([-117.149218, 32.714485]), "longitude first");
+        assert_eq!(gj["features"][2]["geometry"], Value::Null);
+        let t = crate::table::load(&table).unwrap();
+        assert_eq!(t[0], ["Address", "Link", "Lat", "Lng"]);
+        assert_eq!(t[2], ["845 16th St", "https://b", "32.714485", "-117.149218"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // the export of another map than the one asked for: nothing
+        b.site(vec![("/maps/d/edit", my_maps_page(&[]), "text/html")], "/maps/d/edit?mid=OTHER");
+        let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
+        assert!(e.starts_with("the map did not open"), "{e}");
+        // a KML address that answers with a sign-in page, not KML: said
+        b.site(vec![("/maps/d/kml", "<html>Sign in</html>".into(), "text/html"), ("/maps/d/edit", my_maps_page(&[]), "text/html")], "/maps/d/edit?mid=MAP1");
+        let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
+        assert!(e.starts_with("My Maps did not give KML"), "{e}");
     }
 
     #[test]
@@ -828,6 +914,16 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         assert_eq!(&g[2][..3], ["FALSE", "2 B St", "https://b"]);
         assert_eq!(g[3][2], "", "the dropped row is gone");
         assert_eq!(b.eval("pastes.length"), 1, "one paste for the whole table");
+        // the file grew columns (Lat, Lng from maps_export): the next sync puts them in the sheet, the person's cells kept
+        b.eval("grid[1][3] = 'emailed'");
+        let pulled: Value = serde_json::from_str(tool(&mut b, "table_sync", json!({})).unwrap().as_str()).unwrap();
+        crate::mapfile::fill_lat_lng(&mut file, &crate::mapfile::page_places(&json!([{"lat": 32.72, "lng": -117.16, "data": {"Link": "https://a"}}])), "Link").unwrap();
+        crate::table::merge(&mut file, pulled["pulled"].as_str().unwrap(), "Link", &["Checkbox".into(), "Confirmation".into()], &[]).unwrap();
+        tool(&mut b, "table_sync", json!({"__phase": 2, "__push": crate::table::sync_push_js(&file, pulled["rows"].as_u64().unwrap() as usize)})).unwrap();
+        let g = grid(&mut b, 3);
+        assert_eq!(&g[0][..6], ["Checkbox", "Address", "Link", "Confirmation", "Lat", "Lng"]);
+        assert_eq!(&g[1][..6], ["TRUE", "1 A St", "https://a", "emailed", "32.720000", "-117.160000"]);
+        assert_eq!(&g[2][4..6], ["", ""], "no point yet: empty");
 
         // no url, an address with ?gid=9 (no #fragment): that tab, not tab 0
         b.page_http_at(FAKE_SHEET, "/spreadsheets/d/fake/edit?gid=9");

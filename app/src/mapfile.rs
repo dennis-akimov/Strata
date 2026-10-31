@@ -1,15 +1,22 @@
-//! A My Maps map kept on this Mac: its KML (what My Maps exports: each place's name, its columns as ExtendedData and
-//! the point Google placed it at), a GeoJSON copy (RFC 7946: [longitude, latitude]), and the coordinates written into
-//! the table it came from, as Lat / Lng by its key (Link), so the table knows where each place is.
+//! A My Maps map kept on this Mac: its KML (what My Maps exports: each place's name, address and columns as
+//! ExtendedData), a GeoJSON copy (RFC 7946: [longitude, latitude]), and the coordinates written into the table it came
+//! from, as Lat / Lng by its key (Link).  My Maps' KML has no coordinates for places it placed by address (tried live:
+//! 21 placemarks, 0 <coordinates>); the map's page has them (its _pageData, "geocoded"): they are added by Link.
 use serde_json::{json, Value};
 
 /// One place of the map.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Place {
     pub name: String,
-    pub lng: f64,
-    pub lat: f64,
+    pub lng: Option<f64>,
+    pub lat: Option<f64>,
     pub data: Vec<(String, String)>,
+}
+
+impl Place {
+    pub fn get(&self, column: &str) -> Option<&str> {
+        self.data.iter().find(|(n, _)| n.trim().eq_ignore_ascii_case(column)).map(|(_, v)| v.trim()).filter(|v| !v.is_empty())
+    }
 }
 
 /// XML text: the five entities and CDATA (what My Maps writes).
@@ -29,7 +36,7 @@ fn inner<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
     Some(&block[open..open + close])
 }
 
-/// The places of a KML document: every Placemark with a Point.
+/// The places of a KML document: every Placemark with a point or an address (a line or a shape is no place).
 pub fn parse_kml(kml: &str) -> Vec<Place> {
     let mut out = vec![];
     let mut rest = kml;
@@ -37,9 +44,8 @@ pub fn parse_kml(kml: &str) -> Vec<Place> {
         let Some(j) = rest[i..].find("</Placemark>") else { break };
         let block = &rest[i..i + j];
         rest = &rest[i + j + 12..];
-        let Some(coords) = inner(block, "coordinates") else { continue };   // a line or a shape: not a place
-        let nums: Vec<f64> = coords.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-        if nums.len() < 2 {
+        let nums: Vec<f64> = inner(block, "coordinates").map(|c| c.split(',').filter_map(|n| n.trim().parse().ok()).collect()).unwrap_or_default();
+        if nums.len() < 2 && inner(block, "address").is_none() {
             continue;
         }
         let mut data = vec![];
@@ -52,7 +58,8 @@ pub fn parse_kml(kml: &str) -> Vec<Place> {
             data.push((name, inner(&after[..end], "value").map(text).unwrap_or_default()));
             d = &after[end..];
         }
-        out.push(Place { name: inner(block, "name").map(text).unwrap_or_default(), lng: nums[0], lat: nums[1], data });
+        let (lng, lat) = if nums.len() >= 2 { (Some(nums[0]), Some(nums[1])) } else { (None, None) };
+        out.push(Place { name: inner(block, "name").map(text).unwrap_or_default(), lng, lat, data });
     }
     out
 }
@@ -65,7 +72,9 @@ pub fn geojson(places: &[Place]) -> Value {
         for (k, v) in &p.data {
             props.insert(k.clone(), json!(v));
         }
-        json!({"type": "Feature", "geometry": {"type": "Point", "coordinates": [p.lng, p.lat]}, "properties": props})
+        // a place with no point yet: geometry null, as RFC 7946 3.2 allows
+        let geometry = match (p.lng, p.lat) { (Some(x), Some(y)) => json!({"type": "Point", "coordinates": [x, y]}), _ => Value::Null };
+        json!({"type": "Feature", "geometry": geometry, "properties": props})
     }).collect::<Vec<_>>()})
 }
 
@@ -83,21 +92,67 @@ pub fn fill_lat_lng(table: &mut crate::table::Table, places: &[Place], key: &str
     let (lat, lng, width) = (col(header, "Lat").unwrap(), col(header, "Lng").unwrap(), header.len());
     let (mut filled, mut unmatched) = (0, 0);
     for p in places {
-        let Some(kv) = p.data.iter().find(|(n, _)| n.trim().eq_ignore_ascii_case(key)).map(|(_, v)| v.trim()).filter(|v| !v.is_empty()) else {
+        let (Some(kv), Some(y), Some(x)) = (p.get(key), p.lat, p.lng) else {
             unmatched += 1;
             continue;
         };
         match table.iter_mut().skip(1).find(|r| r.get(k).is_some_and(|x| x.trim() == kv)) {
             Some(row) => {
                 row.resize(width, String::new());
-                row[lat] = format!("{:.6}", p.lat);
-                row[lng] = format!("{:.6}", p.lng);
+                row[lat] = format!("{y:.6}");
+                row[lng] = format!("{x:.6}");
                 filled += 1;
             }
             None => unmatched += 1,
         }
     }
     Ok((filled, unmatched))
+}
+
+/// The points the map's page knows (by key) into places that have none.  How many got one.
+pub fn add_points(places: &mut [Place], page: &[Place], key: &str) -> usize {
+    let mut n = 0;
+    for p in places.iter_mut().filter(|p| p.lat.is_none()) {
+        if let Some(q) = p.get(key).and_then(|k| page.iter().find(|q| q.get(key) == Some(k) && q.lat.is_some())) {
+            (p.lat, p.lng) = (q.lat, q.lng);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The KML with a <Point> for each placemark that had none, from `places` by key (a KML for any map app).
+pub fn kml_with_points(kml: &str, places: &[Place], key: &str) -> String {
+    let mut out = String::with_capacity(kml.len() + places.len() * 80);
+    let mut rest = kml;
+    while let Some(i) = rest.find("</Placemark>") {
+        let block = &rest[..i];
+        let start = block.rfind("<Placemark").unwrap_or(0);
+        let mark = &block[start..];
+        out.push_str(block);
+        if !mark.contains("<coordinates>") {
+            let k = mark.find(&format!("<Data name=\"{key}\">")).and_then(|d| inner(&mark[d..], "value")).map(text);
+            if let Some(p) = k.and_then(|k| places.iter().find(|p| p.get(key) == Some(k.trim()))) {
+                if let (Some(x), Some(y)) = (p.lng, p.lat) {
+                    out.push_str(&format!("<Point><coordinates>{x},{y},0</coordinates></Point>"));
+                }
+            }
+        }
+        out.push_str("</Placemark>");
+        rest = &rest[i + 12..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The map page's places (its script's {lat, lng, data}) as Places.
+pub fn page_places(v: &Value) -> Vec<Place> {
+    v.as_array().into_iter().flatten().filter_map(|p| Some(Place {
+        name: String::new(),
+        lat: Some(p["lat"].as_f64()?),
+        lng: Some(p["lng"].as_f64()?),
+        data: p["data"].as_object()?.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect(),
+    })).collect()
 }
 
 #[cfg(test)]
@@ -123,13 +178,33 @@ mod tests {
         let p = parse_kml(KML);
         assert_eq!(p.len(), 3, "a line is not a place");
         assert_eq!(p[0].name, "Luma Apartments: Little Italy high-rise");
-        assert_eq!((p[0].lng, p[0].lat), (-117.1675, 32.7215));
+        assert_eq!((p[0].lng, p[0].lat), (Some(-117.1675), Some(32.7215)));
         assert_eq!(p[0].data, [("Rating".to_string(), "4.0 (122)".to_string()), ("Link".into(), "https://www.rentluma.com/floorplans".into()), ("Price".into(), "$2,916&more".into())]);
         assert_eq!(p[1].name, "City Villas", "CDATA names");
         // GeoJSON: longitude first (RFC 7946 A.1)
         let g = geojson(&p);
         assert_eq!(g["features"][0]["geometry"], json!({"type": "Point", "coordinates": [-117.1675, 32.7215]}));
         assert_eq!(g["features"][0]["properties"]["Link"], "https://www.rentluma.com/floorplans");
+    }
+
+    // My Maps' KML for places placed by address: <address>, the columns, no <coordinates> (as exported live)
+    const KML_NO_POINTS: &str = r#"<kml><Document><Folder><Placemark><name>Luma</name><address>1440 Columbia St, San Diego, CA 92101</address>
+<ExtendedData><Data name="Link"><value>https://www.rentluma.com/floorplans</value></Data><Data name="Time"><value/></Data></ExtendedData></Placemark>
+<Placemark><name>Gone</name><address>1 Nowhere</address><ExtendedData><Data name="Link"><value>https://gone</value></Data></ExtendedData></Placemark></Folder></Document></kml>"#;
+
+    #[test]
+    fn points_from_the_page_into_a_kml_without_them() {
+        let mut p = parse_kml(KML_NO_POINTS);
+        assert_eq!(p.len(), 2, "placemarks with an address are places");
+        assert_eq!((p[0].lat, p[0].get("Time")), (None, None), "no point yet; an empty <value/> is no value");
+        let page = page_places(&json!([{"lat": 32.7203183, "lng": -117.1676694, "data": {"Link": "https://www.rentluma.com/floorplans"}}]));
+        assert_eq!(add_points(&mut p, &page, "Link"), 1);
+        assert_eq!((p[0].lat, p[0].lng), (Some(32.7203183), Some(-117.1676694)));
+        let k = kml_with_points(KML_NO_POINTS, &p, "Link");
+        assert!(k.contains("<Point><coordinates>-117.1676694,32.7203183,0</coordinates></Point></Placemark>"), "{k}");
+        assert_eq!(k.matches("<Point>").count(), 1, "no point for a place the page does not know");
+        assert_eq!(parse_kml(&k)[0].lat, Some(32.7203183), "the written KML reads back with its point");
+        assert_eq!(geojson(&p)["features"][1]["geometry"], Value::Null, "no point: geometry null");
     }
 
     #[test]
