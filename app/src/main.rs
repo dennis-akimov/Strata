@@ -1460,6 +1460,7 @@ fn main() {
                 "web" => {
                     web_open.set(!web_open.get());
                     if web_open.get() && web.url().map(|u| u == "about:blank").unwrap_or(true) {
+                        nav_epoch.set(nav_epoch.get() + 1);
                         let _ = web.load_url("https://www.google.com/");
                     }
                     layout(full.get());
@@ -1667,6 +1668,9 @@ fn main() {
                             }
                             Ok((load, prefix)) if job.args.get("__loaded").is_none() && !google::on_page(&prefix, &here) => {
                                 job.args["__loaded"] = json!(true);
+                                // every load counts, this one too: its epoch is the one after its own (a browser_open
+                                // overlapping a create was not counted: found by a codex review)
+                                nav_epoch.set(nav_epoch.get() + 1);
                                 job.args["__epoch"] = json!(nav_epoch.get());
                                 // the document open before: a "new" sheet that is this one is not new
                                 job.args["__before"] = json!(here.split('/').nth(5).unwrap_or(""));
@@ -1727,6 +1731,7 @@ fn main() {
                             // said as a result, not an error: the browser held a guess back on purpose (the chat showed red errors)
                             let _ = job.reply.send(Ok(format!("not opened: {} is a site none of the results or pages you read showed (guessed addresses are usually 404s). Use browser_click with a result's number, or browser_search again.", site_of(&url))));
                         } else {
+                            nav_epoch.set(nav_epoch.get() + 1);
                             let _ = web.load_url(&url);
                             wait_load(job.reply, 20);
                         }
@@ -1744,6 +1749,7 @@ fn main() {
                         }
                     }
                     "browser_back" => {
+                        nav_epoch.set(nav_epoch.get() + 1);
                         let _ = web.evaluate_script("history.back()");
                         wait_load(job.reply, 8);
                     }
@@ -1757,6 +1763,7 @@ fn main() {
                     "browser_search" => {
                         searched.set(Some(Instant::now()));
                         // Google's results, read when the page has loaded (no full page read for a search)
+                        nav_epoch.set(nav_epoch.get() + 1);
                         let _ = web.load_url(&web_url(&format!("{} ", job.args["query"].as_str().unwrap_or("")).replace('.', " ")));
                         let late = job.reply.clone();
                         std::thread::spawn(move || {
@@ -1766,6 +1773,7 @@ fn main() {
                         search_waiters.borrow_mut().push(job.reply);
                     }
                     "browser_click" => {
+                        nav_epoch.set(nav_epoch.get() + 1);   // a link it clicks may load a page
                         // where the element is, then a real click there (Ev::Native)
                         let (p, slot) = (Mutex::new(proxy.clone()), Mutex::new(Some(job)));
                         let _ = web.evaluate_script_with_callback(&browser_mcp::target_js(n), move |r| {
