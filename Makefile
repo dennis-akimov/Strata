@@ -217,6 +217,16 @@ else
 endif
 
 # the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
+# the tool-call grammar against llama.cpp's own GBNF validator (the engine's llama.cpp, after make metal)
+LLAMA_SRC = $(firstword $(wildcard build-metal/_deps/llama_cpp-src-*))
+LLAMA_LIB = build-metal/_deps/llama_cpp-build
+grammar-check:
+	c++ -std=c++17 -O1 -I$(LLAMA_SRC)/include -I$(LLAMA_SRC)/ggml/include -I$(LLAMA_SRC)/src $(LLAMA_SRC)/tests/test-gbnf-validator.cpp \
+	  $(LLAMA_LIB)/src/libllama.a $(LLAMA_LIB)/ggml/src/libggml.a $(LLAMA_LIB)/ggml/src/libggml-cpu.a $(LLAMA_LIB)/ggml/src/ggml-metal/libggml-metal.a \
+	  $(LLAMA_LIB)/ggml/src/ggml-blas/libggml-blas.a $(LLAMA_LIB)/ggml/src/libggml-base.a -framework Metal -framework Foundation -framework Accelerate \
+	  -framework MetalKit -o build-metal/gbnf-validator
+	cd server && STRATA_GBNF_VALIDATOR=$(CURDIR)/build-metal/gbnf-validator cargo test --release --lib the_tool_grammar
+
 server:
 	$(CARGO) build --release --manifest-path server/Cargo.toml
 	@# rm first: a new file (macOS kills a program whose binary was rewritten in place)

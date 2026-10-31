@@ -186,7 +186,7 @@ pub const NUDGE: &str = "(Strata) You said what you would do, but called no tool
 
 /// The check after an answer that changed something (outcome, not the model's word: NVIDIA's agent evaluation scores
 /// the end state against the goal).
-pub const CHECK: &str = "(Strata check) Before you finish, check your work against my request. Read back what you changed with the tools (sheets_read, browser_read, ...): do not trust memory. Then list each part of my request as DONE or NOT DONE, with what you saw. If something is NOT DONE or wrong (a value in the wrong column, a row missing, a file with the wrong name), fix it with the tools now and say what you fixed. Do not create new files the request did not ask for.";
+pub const CHECK: &str = "(Strata check) Before you finish, check your work against my request. Read back what you changed with the tools (sheets_read, browser_read, ...): do not trust memory. Then list each part of my request as DONE or NOT DONE, with what you saw. Check each item you added against every condition of my request (the place, the kind, the price ...): an item that does not meet one is wrong (a studio outside the area asked for was added once). If something is NOT DONE or wrong (a value in the wrong column, a row missing, a file with the wrong name), fix it with the tools now and say what you fixed. Do not create new files the request did not ask for.";
 
 /// A tool that changes something (its own name, after the server's prefix): the answer is checked after it.
 pub fn changes(tool: &str) -> bool {

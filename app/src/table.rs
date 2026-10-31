@@ -191,9 +191,17 @@ pub fn tombstones(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path.with_extension("csv.deleted")).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
-/// The Google Sheet a table is synced to (`<file>.sheet`: its address, written by table_sync).
-pub fn set_sheet(path: &Path, sheet_base: &str) -> Result<(), String> {
-    std::fs::write(path.with_extension("csv.sheet"), format!("{sheet_base}\n")).map_err(|e| format!("{}: {e}", path.display()))
+/// The Google Sheet a table is synced to (`<file>.sheet`, written by table_sync): its address (`base#gid=G`), then
+/// the person's columns of that sync, tab-separated (the app's own syncs take them again).
+pub fn set_sheet(path: &Path, sheet: &str, mine: &[String]) -> Result<(), String> {
+    std::fs::write(path.with_extension("csv.sheet"), format!("{sheet}\n{}\n", mine.join("\t"))).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The person's columns saved with a table's sheet (None: none saved).
+pub fn mine_of(dir: &Path, name: &str) -> Option<Vec<String>> {
+    let s = std::fs::read_to_string(path_of(dir, name).ok()?.with_extension("csv.sheet")).ok()?;
+    let line = s.lines().nth(1)?;
+    Some(line.split('\t').filter(|c| !c.trim().is_empty()).map(|c| c.trim().to_string()).collect())
 }
 
 /// The table whose sheet this is (by the sheet's base address), if one was synced to it.
@@ -201,8 +209,18 @@ pub fn table_for_sheet(dir: &Path, sheet_base: &str) -> Option<String> {
     std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
         let p = e.path();
         let name = p.file_name()?.to_str()?.strip_suffix(".csv.sheet")?.to_string();
-        (std::fs::read_to_string(&p).ok()?.trim() == sheet_base).then_some(name)
+        (std::fs::read_to_string(&p).ok()?.lines().next()?.trim().split('#').next() == Some(sheet_base)).then_some(name)
     })
+}
+
+/// The address of the sheet (and tab) a table was synced to, if any.
+pub fn sheet_of(dir: &Path, name: &str) -> Option<String> {
+    let p = path_of(dir, name).ok()?.with_extension("csv.sheet");
+    let s = std::fs::read_to_string(p).ok()?.lines().next()?.trim().to_string();
+    match s.split_once('#') {
+        Some((base, tab)) => Some(format!("{base}/edit#{tab}")),
+        None => (!s.is_empty()).then(|| format!("{s}/edit")),
+    }
 }
 
 /// The tables there are (their names), for an answer that names them.
@@ -407,6 +425,15 @@ mod tests {
         assert_eq!(t.len(), 3, "an empty tick-box row is no row");
         assert!(merge(&mut t, "Name\tPrice\nx\t1", "Link", &mine, &[]).unwrap_err().contains("has no \"Link\""));
         assert_eq!(merge(&mut t, "", "Link", &mine, &[]).unwrap(), (0, 0), "an empty sheet takes nothing");
+        // the sync the app runs after a table_upsert: merge, then the upsert's rows again (main.rs): the value the
+        // model just set wins in its row; the person's edit in another row stays
+        let mut u = t.clone();
+        let rows = [json!({"Link": "https://a", "Confirmation": "emailed"})];
+        upsert(&mut u, &rows, "Link", None).unwrap();
+        merge(&mut u, "Checkbox\tAddress\tLink\tConfirmation\nTRUE\tx\thttps://a\tcalled Mon\nTRUE\t9 Z St\thttps://z\tsigned", "Link", &mine, &[]).unwrap();
+        upsert(&mut u, &rows, "Link", None).unwrap();
+        assert_eq!(u[1][3], "emailed");
+        assert_eq!((u[2][0].as_str(), u[2][3].as_str()), ("TRUE", "signed"));
     }
 
     #[test]
@@ -427,8 +454,17 @@ mod tests {
         let base = "https://docs.google.com/spreadsheets/d/abcdefghijk";
         assert_eq!(table_for_sheet(&dir, base), None);
         save(&dir.join("studios.csv"), &vec![vec!["Link".into()]]).unwrap();
-        set_sheet(&dir.join("studios.csv"), base).unwrap();
+        set_sheet(&dir.join("studios.csv"), base, &[]).unwrap();
         assert_eq!(table_for_sheet(&dir, base).as_deref(), Some("studios"));
+        assert_eq!(sheet_of(&dir, "studios"), Some(format!("{base}/edit")));
+        assert_eq!(sheet_of(&dir, "other"), None);
+        // linked to a tab: the sync goes to that tab; the sheet is still found by its base address
+        set_sheet(&dir.join("studios.csv"), &format!("{base}#gid=77"), &["Notes".into(), "Checkbox".into()]).unwrap();
+        assert_eq!(sheet_of(&dir, "studios"), Some(format!("{base}/edit#gid=77")));
+        assert_eq!(table_for_sheet(&dir, base).as_deref(), Some("studios"));
+        assert_eq!(mine_of(&dir, "studios"), Some(vec!["Notes".to_string(), "Checkbox".to_string()]), "the person's columns of that sync");
+        set_sheet(&dir.join("studios.csv"), base, &[]).unwrap();
+        assert_eq!(mine_of(&dir, "studios"), Some(vec![]));
         assert_eq!(table_for_sheet(&dir, "https://docs.google.com/spreadsheets/d/other"), None);
         assert_eq!(names(&dir), ["studios"]);
         let r = redirect("sheets_append", "studios");

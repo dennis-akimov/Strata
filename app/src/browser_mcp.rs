@@ -912,6 +912,7 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         ];
         let pulled: Value = serde_json::from_str(tool(&mut b, "table_sync", json!({})).unwrap().as_str()).unwrap();
         assert_eq!(pulled["rows"], 4);
+        assert_eq!(pulled["gid"], "0", "the tab it read: the one saved with the link");
         // the sheet still has "gone", a row table_delete removed from the file: not taken back
         crate::table::merge(&mut file, pulled["pulled"].as_str().unwrap(), "Link", &["Checkbox".into(), "Confirmation".into()], &["https://gone".into()]).unwrap();
         assert_eq!(file[1], ["TRUE", "1 A St", "https://a", "called"], "their tick and note, the file's address");
@@ -937,15 +938,31 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
 
         // no url, an address with ?gid=9 (no #fragment): that tab, not tab 0
         b.page_http_at(FAKE_SHEET, "/spreadsheets/d/fake/edit?gid=9");
+        let pulled: Value = serde_json::from_str(tool(&mut b, "table_sync", json!({})).unwrap().as_str()).unwrap();
+        assert_eq!(pulled["gid"], "9", "a sync with a bare address: the tab open, which is then saved");
+        // the tab is pinned when the sheet is ready: another tab chosen during the call does not move it
+        let pinned = b.run(&format!("(async () => {{ let GID = null; {} await ready(); location.hash = 'gid=5'; return tabOf(); }})()", crate::google::PRELUDE)).unwrap();
+        assert_eq!(pinned, "9");
+        // ... and one chosen during go()'s wait (the same range selected there): refused before a cell is touched
+        let e = b.run(&format!("(async () => {{ let GID = null; {} await ready(); setTimeout(() => {{ location.hash = 'gid=5&range=B2'; }}, 20); await go('B2'); clip('paste', 'x'); }})()", crate::google::PRELUDE)).unwrap_err();
+        assert!(e.starts_with("another tab (gid 5) was chosen during the call, not tab 9"), "{e}");
+        b.eval("history.replaceState(null, '', location.pathname + location.search)");
         b.eval("tabs.length = 0");
         tool(&mut b, "sheets_read", json!({})).unwrap();
         assert!(b.eval("tabs.length > 0 && tabs.every((g) => g === '9')") == true, "{}", b.eval("JSON.stringify(tabs)"));
 
         // maps_import_sheet on another map than the one asked for (the pane went elsewhere while it loaded): nothing
-        b.page_http_at(r#"<html><body><div>Add layer</div><div>Import</div></body></html>"#, "/maps/d/edit?mid=OTHER");
+        // (its title is the sheet's name: a map title, not a layer, so it gets as far as the map check)
+        b.page_http_at(r#"<html><body><h1>s</h1><div>Add layer</div><div>Import</div></body></html>"#, "/maps/d/edit?mid=OTHER");
         let js = crate::google::maps_js("maps_import_sheet", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=WANT", "sheet_title": "s", "location_column": "Address", "title_column": "Name"}), "t").unwrap();
         let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
         assert_eq!(e, "the browser is at another map (OTHER), not WANT: nothing imported");
+
+        // the sheet is a layer of the map already: a second import would put each place there twice, so none is made
+        b.page_http_at(r#"<html><body><h1>s</h1><div>Add layer</div><div>Import</div><div>s</div><div>Individual styles</div></body></html>"#, "/maps/d/edit?mid=WANT");
+        let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
+        assert!(e.starts_with("not imported: s is already a layer of this map"), "{e}");
+        assert!(e.contains("sheets_create a sheet named \"s (new)\""), "{e}");
     }
 
     #[test]

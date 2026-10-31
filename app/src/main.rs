@@ -1672,7 +1672,31 @@ fn main() {
                     // a table on this Mac (table.rs): no browser
                     t if t.starts_with("table_") && t != "table_sync" => {
                         let dir = st.lock().unwrap().root.join("../Strata-data/sheets");
-                        let _ = job.reply.send(table::local_tool(&dir, t, &job.args));
+                        let done = table::local_tool(&dir, t, &job.args);
+                        // a change to a table with a sheet goes on to the sheet: a model added a row and imported the
+                        // stale sheet into the map, table_sync never called (an error there leaves the file changed:
+                        // the upsert again by Link changes nothing)
+                        let name = job.args["name"].as_str().unwrap_or("").to_string();
+                        match (&done, table::sheet_of(&dir, &name)) {
+                            (Ok(said), Some(sheet)) if matches!(t, "table_upsert" | "table_delete") => {
+                                let mut job = job;
+                                job.tool = "table_sync".into();
+                                let mut args = json!({"name": name, "url": sheet, "__note": format!("{said}\nThen synced to its sheet: ")});
+                                if let Some(k) = job.args.get("key").filter(|k| k.is_string()) {
+                                    args["key"] = k.clone();
+                                }
+                                if t == "table_upsert" {
+                                    args["__rows"] = job.args["rows"].clone();
+                                }
+                                // the person's columns of the last sync (an empty list too: none of theirs)
+                                if let Some(m) = table::mine_of(&dir, &name) {
+                                    args["mine"] = json!(m);
+                                }
+                                job.args = args;
+                                let _ = proxy.send_event(Ev::Tool(job));
+                            }
+                            _ => { let _ = job.reply.send(done); }
+                        }
                     }
                     // Google Sheets / My Maps (google.rs): in their page, loaded first when the pane is elsewhere
                     t if google::is_google(t) => {
@@ -1969,6 +1993,11 @@ fn main() {
                         let step = table::load(&path).and_then(|mut t| {
                             if t.is_empty() { return Err(format!("no table {} yet: table_upsert with columns makes it", path.display())); }
                             let (took, added) = table::merge(&mut t, pulled["pulled"].as_str().unwrap_or(""), &key, &mine, &table::tombstones(&path))?;
+                            // after a table_upsert (the app synced for it): what it set wins over the sheet's old
+                            // value in those rows and columns, the person's edits elsewhere are kept
+                            if let Some(rows) = job.args["__rows"].as_array() {
+                                table::upsert(&mut t, rows, &key, None)?;
+                            }
                             table::save(&path, &t)?;
                             Ok((t, took, added))
                         });
@@ -1976,6 +2005,12 @@ fn main() {
                             Err(e) => { let _ = job.reply.send(Err(format!("table_sync: {e}"))); }
                             Ok((t, took, added)) => {
                                 job.args["__push"] = json!(table::sync_push_js(&t, pulled["rows"].as_u64().unwrap_or(0) as usize));
+                                // the tab it read is the tab it writes and the one saved with the link (a bare address
+                                // took whichever tab was open: a later sync could write another)
+                                let url = job.args["url"].as_str().unwrap_or("").to_string();
+                                if let (None, Some(g), Some(b)) = (google::gid_of(&url), pulled["gid"].as_str(), google::sheet_base(&url)) {
+                                    job.args["url"] = json!(format!("{b}/edit#gid={g}"));
+                                }
                                 job.args["__took"] = json!(format!("{took} of your cells and {added} rows you added came from the sheet into the file; "));
                                 job.args["__phase"] = json!(2);
                                 let _ = p.send_event(Ev::Tool(job));
@@ -1994,9 +2029,13 @@ fn main() {
                     } else if job.tool == "table_sync" {
                         // the table knows its sheet now: changes to the sheet are sent to the table from here on
                         let path = std::path::PathBuf::from(job.args["__table"].as_str().unwrap_or(""));
-                        let linked = google::sheet_base(job.args["url"].as_str().unwrap_or("")).map(|b| table::set_sheet(&path, &b));
+                        let url = job.args["url"].as_str().unwrap_or("");
+                        // the tab too: a sync for the table goes to that tab, not to the one open
+                        let mine: Vec<String> = job.args["mine"].as_array().map(|m| m.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .unwrap_or_else(|| vec!["Checkbox".into(), "Confirmation".into()]);
+                        let linked = google::sheet_base(url).map(|b| table::set_sheet(&path, &format!("{b}{}", google::gid_of(url).map(|g| format!("#gid={g}")).unwrap_or_default()), &mine));
                         let note = if let Some(Err(e)) = linked { format!(" (the link to the sheet was not saved: {e})") } else { String::new() };
-                        let _ = job.reply.send(Ok(format!("{}{}{note}", job.args["__took"].as_str().unwrap_or(""), v["ok"].as_str().unwrap_or(""))));
+                        let _ = job.reply.send(Ok(format!("{}{}{}{note}", job.args["__note"].as_str().unwrap_or(""), job.args["__took"].as_str().unwrap_or(""), v["ok"].as_str().unwrap_or(""))));
                     } else {
                         let _ = job.reply.send(Ok(format!("{}{}", job.args["__note"].as_str().unwrap_or(""), google::answer(&job.tool, &job.args, &v["ok"]))));
                     }

@@ -183,12 +183,16 @@ pub const PRELUDE: &str = r#"
 // window.__strataPace: tests run the same waits shorter (a fake sheet answers at once)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms * (window.__strataPace || 1)));
 const editor = () => document.querySelector('#waffle-rich-text-editor');
-const ready = async () => { for (let i = 0; i < 40 && !editor(); i++) await sleep(250); if (!editor()) throw new Error('the spreadsheet did not open (signed in to Google in the browser?)'); };
+// the tab is pinned when the sheet is ready: a switch to another tab during the call does not move it (it read A and
+// would have written B)
+const ready = async () => { for (let i = 0; i < 40 && !editor(); i++) await sleep(250); if (!editor()) throw new Error('the spreadsheet did not open (signed in to Google in the browser?)'); if (typeof GID !== 'undefined' && !GID) GID = tabOf(); };
 // the app stopped this script (it ran past its time): nothing more is changed (window.__strataStop[__ID])
 const live = () => { if (typeof __ID !== 'undefined' && (window.__strataStop || {})[__ID]) throw new Error('stopped: it ran past its time; nothing more was changed'); };
+// the tab a call acts on: the one its address named (GID), else the one open
+const tabOf = () => (typeof GID === 'string' && GID) || new URLSearchParams(location.hash.slice(1)).get('gid') || new URLSearchParams(location.search).get('gid') || '0';
 const go = async (range) => { live();
   // the tab the address named (GID, set before this prelude), else the one open: a call for tab B once could act on A
-  const gid = (typeof GID === 'string' && GID) || new URLSearchParams(location.hash.slice(1)).get('gid') || new URLSearchParams(location.search).get('gid') || '0';
+  const gid = tabOf();
   location.hash = 'gid=' + gid + '&range=' + range; await sleep(800); editor().focus(); await sleep(100);
   // a range past the sheet's last row or column is ignored without a word (the selection stays where it was: an
   // append once counted the rows of A1 alone and wrote over row 2): the Name Box says what is selected
@@ -201,6 +205,9 @@ const go = async (range) => { live();
     if (i === 4) { location.hash = 'gid=' + gid; await sleep(300); location.hash = 'gid=' + gid + '&range=' + range; }
     await sleep(500); }
   if (nb && nb.value !== shown) throw new Error('range ' + range + ' is not in the sheet (it has fewer rows or columns); selected: ' + nb.value);
+  // another tab chosen during the wait (Sheets puts it in the address): the same range there is not this one
+  const now = new URLSearchParams(location.hash.slice(1)).get('gid');
+  if (now && now !== gid) throw new Error('another tab (gid ' + now + ') was chosen during the call, not tab ' + gid + ': nothing more was changed');
 };
 const clip = (type, text) => { if (type !== 'copy') live(); const dt = new DataTransfer(); if (text !== undefined) dt.setData('text/plain', text);
   editor().dispatchEvent(new ClipboardEvent(type, {clipboardData: dt, bubbles: true, cancelable: true})); return dt.getData('text/plain'); };
@@ -355,17 +362,17 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
         "table_sync" if args["__phase"] == 2 => args["__push"].as_str().ok_or("no table to put")?.to_string(),
         "table_sync" => r#"await ready();
   let h = []; try { h = await header(); } catch (e) {}
-  if (!h.length) return JSON.stringify({pulled: '', rows: 0});
+  if (!h.length) return JSON.stringify({pulled: '', rows: 0, gid: tabOf()});
   await go('A:' + letter(Math.max(h.length, 26) - 1));
   const t = clip('copy'); let last = 0;
   t.split('\n').forEach((l, i) => { if (l.split('\t').some((c, j) => filled(c, j))) last = i + 1; });
   await go('A1');
-  return JSON.stringify({pulled: t, rows: last});"#.to_string(),
+  return JSON.stringify({pulled: t, rows: last, gid: tabOf()});"#.to_string(),
         "sheets_trash" => r#"await ready(); const w = where(); await menu('#docs-file-menu', 'Move to trash'); await sleep(1500); return 'moved to the trash: ' + w;"#.to_string(),
         other => return Err(format!("no tool {other}")),
     };
     let gid = serde_json::to_string(&gid_of(args["url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into());
-    Ok(format!("const GID = {gid};\n{PRELUDE}\n{body}"))
+    Ok(format!("let GID = {gid};\n{PRELUDE}\n{body}"))
 }
 
 /// My Maps' helpers, before each body.
@@ -503,8 +510,14 @@ if (!location.pathname.startsWith('/maps/d/edit')) {{
   throw new Error((/Trash/.test(said) ? 'that map is in the trash (gone: use another)' : 'that map did not open (' + (said || location.href) + ')') + '; the maps in My Maps: ' + (maps.join('; ') || 'none') + '. maps_create with a title gives the address of the map with that title');
 }}
 // layers already named after this sheet (an earlier import): done is one more of them, not an old one
-const layersNamed = () => [...document.querySelectorAll('*')].filter((e) => e.offsetParent && e.textContent.trim() === sheet && ![...e.children].some((c) => c.textContent.trim() === sheet)).length;
+// a layer's header is followed by its style line ("Individual styles", "Uniform style", ...); the map's own title is
+// not, and a map and its sheet often share a name (a first import into such a map was refused)
+const layersNamed = () => {{ const l = document.body.innerText.split('\n').map((s) => s.trim()).filter(Boolean);
+  return l.filter((s, i) => s === sheet && /^(Uniform style|Individual styles|Sequence of numbers|Style by|Group(s|ed) by)/i.test(l[i + 1] || '')).length; }};
 const layersBefore = layersNamed();
+// that sheet is a layer already: a second import puts every place on the map twice (a model re-imported the whole
+// 28-row sheet to add one row); an import is not idempotent, so it is refused (RFC 9110 9.2.2)
+if (layersBefore > 0) throw new Error('not imported: ' + sheet + ' is already a layer of this map (importing it again puts each of its places on the map twice). To add only new rows: sheets_create a sheet named "' + sheet + ' (new)", sheets_append just the new rows to it, then maps_import_sheet that one');
 // an export just after an import got the map without the new layer: the import waits for My Maps to save it (below)
 const saved = () => savedPlaces(MID), savedBefore = await saved();
 // the map asked for, not another one the pane went to while it loaded (found by a codex review)
@@ -661,7 +674,7 @@ mod tests {
         assert!(arrived("sheets_append", base, "https://docs.google.com/spreadsheets/d/abcdefghijk/edit#gid=0"));
         assert!(!arrived("sheets_append", base, "https://docs.google.com/spreadsheets/d/zzzzzzzzzzz/edit"), "another sheet after the load");
         assert!(arrived("sheets_create", "\u{0}", "https://docs.google.com/spreadsheets/d/new/edit") && !arrived("sheets_create", "\u{0}", "https://accounts.google.com/"));
-        assert!(sheets_js("sheets_read", &json!({"url": "https://docs.google.com/spreadsheets/d/abcdefghijklmn/edit#gid=77"})).unwrap().starts_with("const GID = \"77\";"));
+        assert!(sheets_js("sheets_read", &json!({"url": "https://docs.google.com/spreadsheets/d/abcdefghijklmn/edit#gid=77"})).unwrap().starts_with("let GID = \"77\";"));
         assert!(page_for("sheets_read", &json!({"url": "https://docs.google.com/spreadsheets/d/abcdefghijklmn/edit#gid=77"}), "").unwrap().0.ends_with("/edit#gid=77"));
         assert!(async_collect_js(7).contains("gone: location.href"));
     }

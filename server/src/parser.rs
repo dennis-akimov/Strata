@@ -1311,7 +1311,11 @@ fn gbnf_lit(s: &str) -> String {
 /// their own names, each with its own argument names, the values Python literals as PyLit reads them.  A small model
 /// made names up (browser__sheets_upsert) and argument names (url for map_url): with this the sampler cannot.  One
 /// way to read each text (whitespace only after `,` `:` `[` `{` and before `]` `}`): an ambiguous grammar multiplies
-/// llama.cpp's parse stacks (issue #4218).  None without tools.
+/// llama.cpp's parse stacks (issue #4218).  Nothing PyLit cannot read: its numbers are JSON's (no `1e+3`, no `01`), a
+/// `\u` four hex digits and not a surrogate half (char::from_u32).  None
+/// without tools.
+/// ponytail: lazy from the start token the engine generates; a call already open in the prompt (a forced opening, a
+/// continued generation) is not constrained, as before this grammar: `closest` and `check_args` still answer it.
 pub fn lfm_call_grammar(tools: &[Value], start: u32, end: u32) -> Option<String> {
     let mut calls = vec![];
     let mut rules = vec![];
@@ -1332,8 +1336,10 @@ call ::= {}
 {}
 v ::= str | num | lit | list | dict
 lit ::= "True" | "False" | "None" | "true" | "false" | "null"
-str ::= "\"" ( [^"\\] | "\\" . )* "\"" | "'" ( [^'\\] | "\\" . )* "'"
-num ::= "-"? [0-9]+ ( "." [0-9]+ )? ( [eE] [-+]? [0-9]+ )?
+str ::= "\"" ( [^"\\] | esc )* "\"" | "'" ( [^'\\] | esc )* "'"
+esc ::= "\\" ( [^u] | "u" ( [0-9a-cA-CeEfF] hex hex hex | [dD] [0-7] hex hex ) )
+hex ::= [0-9a-fA-F]
+num ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] "-"? [0-9]+ )?
 list ::= "[" ws ( v ws ( "," ws v ws )* ( "," ws )? )? "]"
 dict ::= "{{" ws ( pair ws ( "," ws pair ws )* ( "," ws )? )? "}}"
 pair ::= v ws ":" ws v
@@ -1434,7 +1440,9 @@ impl<'a> PyLit<'a> {
                     "True" | "true" => Some(Value::Bool(true)),
                     "False" | "false" => Some(Value::Bool(false)),
                     "None" | "null" => Some(Value::Null),
-                    _ => serde_json::from_str::<Value>(&w).ok().filter(Value::is_number),
+                    // a number past f64 (1e999: the grammar lets it through) is kept as its text, not the call lost
+                    _ => serde_json::from_str::<Value>(&w).ok().filter(Value::is_number)
+                        .or_else(|| (w.parse::<f64>().is_ok_and(f64::is_infinite)).then(|| Value::String(w.clone()))),
                 }
             }
         }
@@ -1595,6 +1603,74 @@ mod lfm_tests {
             assert_eq!(calls[0].arguments["city"], "Paris");
             let shown: String = ev.iter().filter(|e| e.call.is_none()).map(|e| e.text.as_str()).collect();
             assert!(!shown.contains("tool_call"), "cut {cut}: {shown:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod grammar_corpus {
+    use serde_json::json;
+
+    /// What a model writes (from chat logs) and must get through, and what it must not.
+    const GOOD: &[&str] = &[
+        r#"[browser__table_upsert(name="studios", rows=[{"Link": "https://z.com/a/", "Price": "$2,082–$2,291 total"}, {'Link': 'https://b', "Description": "it's \"ok\"\nyes"}])]"#,
+        r#"[browser__maps_import_sheet(map_url="https://www.google.com/maps/d/edit?mid=1", sheet_title="s (7 more)", location_column="Address", title_column="Description"), browser__table_sync(name="t", url="u")]"#,
+        r#"[browser__sheets_read(url="u", range="A1:Z100"),browser__browser_back(),browser__browser_click(element=3)]"#,
+        r#"[browser__table_upsert(name="t", rows=[{"a": 1,}], key=None)]"#,
+        "[browser__table_upsert(name=\"t\", rows=[\n  {\"a\": -1.5e5, \"b\": True, \"c\": null},\n  {\"d\": [1, 2, ]}\n])]",
+        r#"[browser__sheets_write(url="u", row=2, values={"Price": "日本 ✓", "n": 0, "m": -0.5, "e": "caf\u00e9"})]"#,
+        r#"[browser__sheets_write(url="u", row=1e999)]"#,
+    ];
+    /// Calls the parser cannot read: the grammar must not let them through either (they would be lost as text).
+    const UNREAD: &[&str] = &[
+        r#"[browser__table_upsert(name="t", rows=[{"a": 1e+3}])]"#,
+        r#"[browser__sheets_write(url="u", row=01)]"#,
+        r#"[browser__sheets_write(url="u", row=-01)]"#,
+        r#"[browser__sheets_read(url="\uZZZZ")]"#,
+        r#"[browser__sheets_read(url="\ud800")]"#,
+    ];
+    const BAD: &[&str] = &[
+        r#"[browser__sheets_upsert(url="u", rows=[])]"#,
+        r#"[browser__maps_import_sheet(url="u")]"#,
+        r#"[browser__browser_click(index=3)]"#,
+        r#"[browser__sheets_read(url="u")"#,
+    ];
+
+    fn tools() -> Vec<serde_json::Value> {
+        let t = |n: &str, p: &[&str]| json!({"name": n, "parameters": {"properties": p.iter().map(|k| (k.to_string(), json!({}))).collect::<serde_json::Map<_, _>>()}});
+        vec![t("browser__table_upsert", &["name", "rows", "columns", "key"]), t("browser__table_sync", &["name", "url", "mine", "key"]),
+             t("browser__maps_import_sheet", &["map_url", "sheet_title", "location_column", "title_column"]), t("browser__sheets_read", &["url", "range"]),
+             t("browser__sheets_write", &["url", "row", "values"]), t("browser__browser_click", &["element"]), t("browser__browser_back", &[])]
+    }
+
+    #[test]
+    fn the_tool_grammar_takes_what_the_parser_reads() {
+        // every call the grammar must let through is one the parser reads (the grammar never passes what is then lost)
+        for g in GOOD {
+            assert!(super::PyLit::new(g).calls().is_some(), "PyLit does not read {g}");
+        }
+        assert_eq!(super::PyLit::new("[f(x=1e999)]").calls().unwrap()[0].1["x"], "1e999", "too big for f64: kept as text");
+        for u in UNREAD {
+            assert!(super::PyLit::new(u).calls().is_none(), "PyLit reads {u}: move it to GOOD");
+        }
+        // and llama.cpp's own validator (tests/test-gbnf-validator.cpp of the engine's llama.cpp, built by hand):
+        // STRATA_GBNF_VALIDATOR=/path/to/gbnf-validator cargo test --lib the_tool_grammar
+        let Ok(validator) = std::env::var("STRATA_GBNF_VALIDATOR") else { return };
+        let g = super::lfm_call_grammar(&tools(), 1, 2).unwrap();
+        let text = g.replacen("<[1]> ", "", 1).replacen(" <[2]>", "", 1);     // the validator reads text, not tokens
+        let dir = std::env::temp_dir().join(format!("strata-gbnf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("g.gbnf"), &text).unwrap();
+        let valid = |s: &str| {
+            std::fs::write(dir.join("in.txt"), s).unwrap();
+            let o = std::process::Command::new(&validator).arg(dir.join("g.gbnf")).arg(dir.join("in.txt")).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).contains("is valid according to the grammar")
+        };
+        for s in GOOD {
+            assert!(valid(s), "the grammar blocks a call the parser reads: {s}");
+        }
+        for s in BAD.iter().chain(UNREAD) {
+            assert!(!valid(s), "the grammar lets through {s}");
         }
     }
 }
