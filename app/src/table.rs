@@ -178,6 +178,38 @@ pub fn tombstones(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path.with_extension("csv.deleted")).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
+/// The Google Sheet a table is synced to (`<file>.sheet`: its address, written by table_sync).
+pub fn set_sheet(path: &Path, sheet_base: &str) -> Result<(), String> {
+    std::fs::write(path.with_extension("csv.sheet"), format!("{sheet_base}\n")).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The table whose sheet this is (by the sheet's base address), if one was synced to it.
+pub fn table_for_sheet(dir: &Path, sheet_base: &str) -> Option<String> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let p = e.path();
+        let name = p.file_name()?.to_str()?.strip_suffix(".csv.sheet")?.to_string();
+        (std::fs::read_to_string(&p).ok()?.trim() == sheet_base).then_some(name)
+    })
+}
+
+/// The tables there are (their names), for an answer that names them.
+pub fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir).into_iter().flatten().flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".csv").map(String::from)).collect();
+    v.sort();
+    v
+}
+
+/// A change to a sheet that has a local table: not made in the sheet (the file is the master copy, and the next sync
+/// would undo it), but said with the call to make instead, as a 308 answer names the new address (RFC 9110 15.4.9).
+pub fn redirect(tool: &str, table: &str) -> String {
+    let instead = match tool {
+        "sheets_delete_rows" | "sheets_clear" => format!("table_delete with name \"{table}\" and the rows' Link values"),
+        _ => format!("table_upsert with name \"{table}\" and rows as {{column: value}} with their Link"),
+    };
+    format!("{tool} was not run: this sheet's master copy is the local table \"{table}\" (a change made only in the sheet is overwritten by the next sync). Instead: {instead}, then table_sync with name \"{table}\" and this sheet's url.")
+}
+
 /// Read a table's file (missing: empty).
 pub fn load(path: &Path) -> Result<Table, String> {
     match std::fs::read_to_string(path) {
@@ -205,7 +237,7 @@ pub fn local_tool(dir: &Path, tool: &str, args: &Value) -> Result<String, String
     match tool {
         "table_read" => {
             if table.is_empty() {
-                return Err(format!("no table {name:?} yet: table_upsert with columns makes it"));
+                return Err(format!("no table {name:?} yet (tables: {}): table_upsert with columns makes one", names(dir).join(", ")));
             }
             Ok(format!("{} ({} rows, key {key})\n\n{}", path.display(), table.len() - 1, crate::google::numbered(&tsv(&table), 1)))
         }
@@ -237,7 +269,7 @@ pub fn local_tool(dir: &Path, tool: &str, args: &Value) -> Result<String, String
 pub fn tools() -> Value {
     let name = json!({"type": "string", "description": "the table's name (its file in Strata-data/sheets/, e.g. studios-sandiego-downtown-2026)"});
     json!([
-        {"name": "table_read", "description": "Read a table kept as a CSV file on this Mac (the master copy of a Google Sheet): its rows numbered, row 1 the header.",
+        {"name": "table_read", "description": "Read a table kept as a CSV file on this Mac (the master copy of a Google Sheet): its rows numbered, row 1 the header. Use the table tools, not sheets_append / sheets_write, for a sheet that has a table: change rows with table_upsert / table_delete, then table_sync.",
          "inputSchema": {"type": "object", "required": ["name"], "properties": {"name": name}}},
         {"name": "table_upsert", "description": "Add or change rows of a local table by its key column (default Link): a row with a key already there changes only the columns given; a new key is a new row. A new table needs columns (its header). Fast: no browser. Then table_sync to put it in the Google Sheet.",
          "inputSchema": {"type": "object", "required": ["name", "rows"], "properties": {"name": name,
@@ -349,6 +381,25 @@ mod tests {
         assert!(js.contains("clip('paste', \"Checkbox\\tLink\\nFALSE\\thttps://a b\")"));
         assert!(js.contains("'Rows 3 - 5'") && js.contains("go(letter(0) + '2:' + letter(0) + '2')"), "{js}");
         assert!(!sync_push_js(&t, 2).contains("Delete"), "nothing to remove");
+    }
+
+    #[test]
+    fn a_sheet_with_a_table_sends_changes_to_the_table() {
+        let dir = std::env::temp_dir().join(format!("strata-sheetlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = "https://docs.google.com/spreadsheets/d/abcdefghijk";
+        assert_eq!(table_for_sheet(&dir, base), None);
+        save(&dir.join("studios.csv"), &vec![vec!["Link".into()]]).unwrap();
+        set_sheet(&dir.join("studios.csv"), base).unwrap();
+        assert_eq!(table_for_sheet(&dir, base).as_deref(), Some("studios"));
+        assert_eq!(table_for_sheet(&dir, "https://docs.google.com/spreadsheets/d/other"), None);
+        assert_eq!(names(&dir), ["studios"]);
+        let r = redirect("sheets_append", "studios");
+        assert!(r.starts_with("sheets_append was not run: this sheet's master copy is the local table \"studios\"") && r.contains("table_upsert with name \"studios\"") && r.contains("then table_sync"), "{r}");
+        assert!(redirect("sheets_delete_rows", "studios").contains("table_delete"));
+        assert!(local_tool(&dir, "table_read", &json!({"name": "nope"})).unwrap_err().contains("(tables: studios)"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

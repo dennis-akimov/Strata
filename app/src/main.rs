@@ -1690,6 +1690,19 @@ fn main() {
                                 (Err(e), _) | (_, Err(e)) => { let _ = job.reply.send(Err(e)); return; }
                             }
                         }
+                        // a sheet with a local table (table_sync wrote the link): a change goes to the table, not the
+                        // sheet (the next sync would undo it); a read says which table it is
+                        if t.starts_with("sheets_") && t != "sheets_create" {
+                            let dir = st.lock().unwrap().root.join("../Strata-data/sheets");
+                            let url = job.args["url"].as_str().filter(|u| !u.is_empty()).unwrap_or(&here).to_string();
+                            if let Some(name) = google::sheet_base(&url).and_then(|b| table::table_for_sheet(&dir, &b)) {
+                                if matches!(t, "sheets_append" | "sheets_write" | "sheets_delete_rows" | "sheets_clear") {
+                                    let _ = job.reply.send(Err(table::redirect(t, &name)));
+                                    return;
+                                }
+                                job.args["__note"] = json!(format!("[This sheet's master copy is the local table \"{name}\": to change rows use table_upsert / table_delete, then table_sync.]\n"));
+                            }
+                        }
                         // table_sync: its file, set by the app (a caller's __ keys are removed)
                         if t == "table_sync" && job.args.get("__table").is_none() {
                             let dir = st.lock().unwrap().root.join("../Strata-data/sheets");
@@ -1981,9 +1994,13 @@ fn main() {
                         let got: Value = serde_json::from_str(v["ok"].as_str().unwrap_or("")).unwrap_or_default();
                         let _ = job.reply.send(save_map_export(&job.args, got["kml"].as_str().unwrap_or(""), got["title"].as_str().unwrap_or(""), &got["places"]));
                     } else if job.tool == "table_sync" {
-                        let _ = job.reply.send(Ok(format!("{}{}", job.args["__took"].as_str().unwrap_or(""), v["ok"].as_str().unwrap_or(""))));
+                        // the table knows its sheet now: changes to the sheet are sent to the table from here on
+                        let path = std::path::PathBuf::from(job.args["__table"].as_str().unwrap_or(""));
+                        let linked = google::sheet_base(job.args["url"].as_str().unwrap_or("")).map(|b| table::set_sheet(&path, &b));
+                        let note = if let Some(Err(e)) = linked { format!(" (the link to the sheet was not saved: {e})") } else { String::new() };
+                        let _ = job.reply.send(Ok(format!("{}{}{note}", job.args["__took"].as_str().unwrap_or(""), v["ok"].as_str().unwrap_or(""))));
                     } else {
-                        let _ = job.reply.send(Ok(google::answer(&job.tool, &job.args, &v["ok"])));
+                        let _ = job.reply.send(Ok(format!("{}{}", job.args["__note"].as_str().unwrap_or(""), google::answer(&job.tool, &job.args, &v["ok"]))));
                     }
                 });
             }
