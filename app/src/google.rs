@@ -34,6 +34,8 @@ pub fn tools() -> Value {
          "inputSchema": {"type": "object", "required": ["map_url", "sheet_title", "location_column", "title_column"], "properties": {"map_url": {"type": "string", "description": "the map's address (maps_create answers with it)"}, "sheet_title": {"type": "string"},
              "location_column": {"type": "string", "description": "the column with the addresses: its name in the header row (e.g. Address) or its letter (C)"},
              "title_column": {"type": "string", "description": "the column that names each place: its name (e.g. Description) or its letter"}}}},
+        {"name": "maps_export", "description": "Save a Google My Maps map on this Mac: its KML (each place with its coordinates and columns) as Strata-data/maps/<name>.kml, a GeoJSON copy, and the coordinates into the local table of the same name (table_upsert's) as Lat / Lng columns, matched by Link.",
+         "inputSchema": {"type": "object", "required": ["map_url", "name"], "properties": {"map_url": {"type": "string", "description": "the map's address"}, "name": {"type": "string", "description": "the name to save it under (the table's name, to fill its Lat / Lng)"}, "key": {"type": "string", "description": "the key column (default Link)"}}}},
         {"name": "maps_trash", "description": "Move a Google My Maps map (by its title) to the trash (the user is asked to allow it).",
          "inputSchema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}
     ])
@@ -50,7 +52,7 @@ pub fn page_for(tool: &str, args: &Value, here: &str) -> Result<(String, String)
         "sheets_create" => Ok(("https://sheets.new".into(), "\u{0}".into())),   // always a new one
         "maps_create" if args["__phase"] == 2 => Ok((String::new(), MAPS_EDIT.into())),
         "maps_create" | "maps_trash" => Ok((MAPS_LIST.into(), MAPS_LIST.into())),
-        "maps_import_sheet" => {
+        "maps_import_sheet" | "maps_export" => {
             let url = args["map_url"].as_str().unwrap_or("");
             let mid = map_id(url);
             let mid = mid.ok_or_else(|| format!("map_url {url:?}: a My Maps address with mid= (maps_create answers with it)"))?;
@@ -433,6 +435,16 @@ mouse(await wait(() => [...document.querySelectorAll('[role=menuitem]')].find((e
 mouse(await wait(() => byText('[role=button],button', 'MOVE TO TRASH'), 'no confirmation'));
 await sleep(2000);
 return 'moved the map ' + name + ' to the trash';"#, title = s("title")),
+        "maps_export" => format!(r#"
+// the map asked for, then its KML from My Maps' own export (the page's sign-in; the same site)
+const MID = {mid};
+await wait(() => leaf('Add layer') || !location.pathname.startsWith('/maps/d/edit'), 'the map page did not load');
+if (!location.pathname.startsWith('/maps/d/edit') || new URLSearchParams(location.search).get('mid') !== MID) throw new Error('the map did not open (in the trash, or not yours?): ' + location.href);
+const r = await fetch('/maps/d/kml?mid=' + MID + '&forcekml=1', {{credentials: 'include'}});
+if (!r.ok) throw new Error('My Maps answered ' + r.status + ' for the KML');
+const kml = await r.text();
+if (!/<kml[\s>]/.test(kml.slice(0, 500))) throw new Error('My Maps did not give KML (a sign-in page?): ' + kml.slice(0, 80));
+return JSON.stringify({{kml, title: document.title}});"#, mid = serde_json::to_string(&map_id(args["map_url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into())),
         "maps_import_sheet" => format!(r#"
 // the picker is another origin's frame: its end of the bridge (browser_mcp::frame_bridge_js) acts for these messages
 const TOKEN = '{token}';

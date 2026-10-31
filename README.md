@@ -240,7 +240,10 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   Sheet: first your own columns (Checkbox, Confirmation; `mine` to change them) and rows you added there come into the
   file, then the whole table goes in with one paste, rows it no longer has are removed, and the Checkbox column gets
   tick boxes. Rows removed with `table_delete` are remembered (`<name>.csv.deleted`) so a sync does not bring them
-  back. A paste, not File > Import: an import resets the cells' formats.
+  back. A paste, not File > Import: an import resets the cells' formats. `maps_export` keeps the map on this Mac too: its KML
+  (My Maps' own export: each place with the point Google placed it at and all its columns) as
+  `Strata-data/maps/<name>.kml`, a GeoJSON copy (RFC 7946, longitude first), and the coordinates into the table of
+  the same name as Lat / Lng columns by Link, so the table knows where each place is.
 - **The model finishes what it says and checks it:** every MCP tool call is checked against the tool's input schema
   before it runs (a missing required argument, a wrong type; an unknown name when the schema allows none, or beside
   another error): it is not run, and the model reads what the tool takes ("map_url is missing; it has no url. It

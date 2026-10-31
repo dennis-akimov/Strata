@@ -21,6 +21,7 @@ use wry::{WebView, WebViewBuilder};
 
 mod browser_mcp;
 mod google;
+mod mapfile;
 mod native_input;
 mod table;
 
@@ -1014,6 +1015,32 @@ fn frame_send(web: &WebView, proxy: &EventLoopProxy<Ev>, token: &str, id: u64, j
     });
 }
 
+/// maps_export's files: the KML, a GeoJSON copy, and Lat / Lng into the table of the same name (when there is one).
+fn save_map_export(args: &Value, kml: &str, title: &str) -> Result<String, String> {
+    let kml_path = std::path::PathBuf::from(args["__map"].as_str().unwrap_or(""));
+    let places = mapfile::parse_kml(kml);
+    if places.is_empty() {
+        return Err(format!("maps_export: the map {title} has no places to save"));
+    }
+    if let Some(d) = kml_path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    std::fs::write(&kml_path, kml).map_err(|e| format!("{}: {e}", kml_path.display()))?;
+    let gj = kml_path.with_extension("geojson");
+    std::fs::write(&gj, serde_json::to_string_pretty(&mapfile::geojson(&places)).unwrap_or_default()).map_err(|e| format!("{}: {e}", gj.display()))?;
+    let table_path = std::path::PathBuf::from(args["__table"].as_str().unwrap_or(""));
+    let key = args["key"].as_str().filter(|k| !k.is_empty()).unwrap_or("Link");
+    let mut tbl = table::load(&table_path)?;
+    let filled = if tbl.is_empty() {
+        format!("no local table {} to give coordinates to", table_path.display())
+    } else {
+        let (n, missed) = mapfile::fill_lat_lng(&mut tbl, &places, key)?;
+        table::save(&table_path, &tbl)?;
+        format!("Lat / Lng written for {n} rows of {} by {key}{}", table_path.display(), if missed > 0 { format!(" ({missed} places matched no row)") } else { String::new() })
+    };
+    Ok(format!("saved {} places of {title}: {} and {}; {filled}. table_sync puts the new columns in the sheet.", places.len(), kml_path.display(), gj.display()))
+}
+
 /// The page read `ms` from now as the call's answer (what a click or typing led to).
 fn read_later(reply: std::sync::mpsc::Sender<Result<String, String>>, proxy: &EventLoopProxy<Ev>, ms: u64) {
     let p = Mutex::new(proxy.clone());
@@ -1646,6 +1673,18 @@ fn main() {
                     t if google::is_google(t) => {
                         let mut job = job;
                         let here = web.url().unwrap_or_default();
+                        // maps_export: where its files go, set by the app
+                        if t == "maps_export" && job.args.get("__table").is_none() {
+                            let data = st.lock().unwrap().root.join("../Strata-data");
+                            let name = job.args["name"].as_str().unwrap_or("").to_string();
+                            match (table::path_of(&data.join("maps"), &name), table::path_of(&data.join("sheets"), &name)) {
+                                (Ok(m), Ok(tb)) => {
+                                    job.args["__map"] = json!(m.with_extension("kml").to_string_lossy());
+                                    job.args["__table"] = json!(tb.to_string_lossy());
+                                }
+                                (Err(e), _) | (_, Err(e)) => { let _ = job.reply.send(Err(e)); return; }
+                            }
+                        }
                         // table_sync: its file, set by the app (a caller's __ keys are removed)
                         if t == "table_sync" && job.args.get("__table").is_none() {
                             let dir = st.lock().unwrap().root.join("../Strata-data/sheets");
@@ -1933,6 +1972,9 @@ fn main() {
                         let _ = p.send_event(Ev::Tool(job));
                     } else if let Some(e) = v["error"].as_str() {
                         let _ = job.reply.send(Err(format!("{}: {e}", job.tool)));
+                    } else if job.tool == "maps_export" && v["ok"].is_string() {
+                        let got: Value = serde_json::from_str(v["ok"].as_str().unwrap_or("")).unwrap_or_default();
+                        let _ = job.reply.send(save_map_export(&job.args, got["kml"].as_str().unwrap_or(""), got["title"].as_str().unwrap_or("")));
                     } else if job.tool == "table_sync" {
                         let _ = job.reply.send(Ok(format!("{}{}", job.args["__took"].as_str().unwrap_or(""), v["ok"].as_str().unwrap_or(""))));
                     } else {
