@@ -60,7 +60,8 @@ pub fn page_for(tool: &str, args: &Value, here: &str) -> Result<(String, String)
         _ => {
             let url = args["url"].as_str().filter(|u| !u.is_empty()).map(String::from).unwrap_or_else(|| here.to_string());
             let base = sheet_base(&url).ok_or_else(|| format!("{url} is not a Google Sheets address: give the spreadsheet's url (sheets_create answers with it)"))?;
-            Ok((format!("{base}/edit"), base))
+            let tab = gid_of(&url).map(|g| format!("#gid={g}")).unwrap_or_default();
+            Ok((format!("{base}/edit{tab}"), base))
         }
     }
 }
@@ -70,7 +71,9 @@ pub const MAPS_EDIT: &str = "https://www.google.com/maps/d/edit";
 
 /// Is the pane where page_for's prefix says (My Maps' list is not its editor, which starts the same)?
 pub fn on_page(prefix: &str, here: &str) -> bool {
-    here.starts_with(prefix) && (prefix != MAPS_LIST || !here.starts_with(MAPS_EDIT) && !here.starts_with("https://www.google.com/maps/d/viewer"))
+    // the whole id: a sheet whose id is the start of the open one's is another sheet (found by a codex review)
+    let ends = here.get(prefix.len()..).and_then(|r| r.chars().next()).is_none_or(|c| matches!(c, '/' | '?' | '#'));
+    here.starts_with(prefix) && (!prefix.starts_with("https://docs.google.com/spreadsheets/d/") || ends) && (prefix != MAPS_LIST || !here.starts_with(MAPS_EDIT) && !here.starts_with("https://www.google.com/maps/d/viewer"))
 }
 
 /// The tools that wait for the person's Allow in the browser's strip, and what it asks.
@@ -80,6 +83,13 @@ pub fn ask(tool: &str, args: &Value) -> Option<String> {
         "maps_trash" => Some(format!("The model wants to move the map \u{201c}{}\u{201d} to the trash.", args["title"].as_str().unwrap_or(""))),
         _ => None,
     }
+}
+
+/// The tab a spreadsheet's address names (#gid=123 or ?gid=123), digits only.
+pub fn gid_of(url: &str) -> Option<String> {
+    let i = url.find("gid=")? + 4;
+    let g: String = url[i..].chars().take_while(char::is_ascii_digit).collect();
+    (!g.is_empty()).then_some(g)
 }
 
 /// https://docs.google.com/spreadsheets/d/<id> of a spreadsheet's address.
@@ -152,8 +162,11 @@ pub const PRELUDE: &str = r#"
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms * (window.__strataPace || 1)));
 const editor = () => document.querySelector('#waffle-rich-text-editor');
 const ready = async () => { for (let i = 0; i < 40 && !editor(); i++) await sleep(250); if (!editor()) throw new Error('the spreadsheet did not open (signed in to Google in the browser?)'); };
-const go = async (range) => {
-  const gid = new URLSearchParams(location.hash.slice(1)).get('gid') || '0';
+// the app stopped this script (it ran past its time): nothing more is changed (window.__strataStop[__ID])
+const live = () => { if (typeof __ID !== 'undefined' && (window.__strataStop || {})[__ID]) throw new Error('stopped: it ran past its time; nothing more was changed'); };
+const go = async (range) => { live();
+  // the tab the address named (GID, set before this prelude), else the one open: a call for tab B once could act on A
+  const gid = (typeof GID === 'string' && GID) || new URLSearchParams(location.hash.slice(1)).get('gid') || '0';
   location.hash = 'gid=' + gid + '&range=' + range; await sleep(800); editor().focus(); await sleep(100);
   // a range past the sheet's last row or column is ignored without a word (the selection stays where it was: an
   // append once counted the rows of A1 alone and wrote over row 2): the Name Box says what is selected
@@ -161,12 +174,12 @@ const go = async (range) => {
   const shown = b === a ? a : range;     // the Name Box says A4 for A4:A4
   if (nb && nb.value !== shown) throw new Error('range ' + range + ' is not in the sheet (it has fewer rows or columns); selected: ' + nb.value);
 };
-const clip = (type, text) => { const dt = new DataTransfer(); if (text !== undefined) dt.setData('text/plain', text);
+const clip = (type, text) => { if (type !== 'copy') live(); const dt = new DataTransfer(); if (text !== undefined) dt.setData('text/plain', text);
   editor().dispatchEvent(new ClipboardEvent(type, {clipboardData: dt, bubbles: true, cancelable: true})); return dt.getData('text/plain'); };
-const del = () => editor().dispatchEvent(new KeyboardEvent('keydown', {key: 'Delete', code: 'Delete', keyCode: 46, which: 46, bubbles: true, cancelable: true}));
+const del = () => live() || editor().dispatchEvent(new KeyboardEvent('keydown', {key: 'Delete', code: 'Delete', keyCode: 46, which: 46, bubbles: true, cancelable: true}));
 const mouse = (el) => { const r = el.getBoundingClientRect();
   for (const t of ['mouseover', 'mousedown', 'mouseup', 'click']) el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0})); };
-const menu = async (id, item) => { const m = document.querySelector(id); if (!m) throw new Error('no menu ' + id);
+const menu = async (id, item) => { live(); const m = document.querySelector(id); if (!m) throw new Error('no menu ' + id);
   mouse(m); await sleep(400);
   const it = [...document.querySelectorAll('.goog-menu .goog-menuitem')].find((e) => e.offsetParent && e.innerText.trim().split('\n')[0].trim().startsWith(item));
   if (!it) { mouse(m); throw new Error('no menu item ' + item); } mouse(it); await sleep(600); };
@@ -229,7 +242,7 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
         "sheets_append" => {
             let rows = serde_json::to_string(&args["rows"]).unwrap_or_default();
             format!(r#"await ready(); const h = await header(); const rows = place(h, {rows}), n = rows.length;
-  await go('A:Z');
+  await go('A:' + letter(Math.max(h.length, 26) - 1));   // every column with data, past Z when the header is
   const have = clip('copy').split('\n'); let last = 0;
   have.forEach((l, i) => {{ if (l.split('\t').some(filled)) last = i + 1; }});
   await go('A' + (last + 1)); clip('paste', rows.map((r) => r.join('\t')).join('\n')); await sleep(800);
@@ -247,13 +260,18 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
                 return Err("row: the row's number, 2 or more (row 1 is the header; sheets_read shows the numbers)".into());
             }
             let values = serde_json::to_string(&args["values"]).unwrap_or_default();
-            format!(r#"await ready(); const h = await header(); const end = letter(h.length - 1);
-  const [want] = place(h, [{values}]);
-  await go('A{row}:' + end + '{row}');
-  const now = clip('copy').split('\n')[0].split('\t');
-  const merged = h.map((c, i) => (want[i] !== '' || Object.keys({values}).some((k) => k.trim().toLowerCase() === c.toLowerCase())) ? want[i] : (now[i] || '').trim());
-  await go('A{row}'); clip('paste', merged.join('\t')); await sleep(800); await go('A1');
-  return 'updated row {row} of ' + where() + ': ' + Object.keys({values}).join(', ');"#)
+            // only the given cells, each where its column is: pasting the whole row back turned the other cells'
+            // formulas into their values (found by a codex review)
+            format!(r#"await ready(); const h = await header();
+  const given = {values}, [want] = place(h, [given]);
+  for (const k of Object.keys(given)) {{
+    const i = h.findIndex((c) => c.toLowerCase() === k.trim().toLowerCase());
+    await go(letter(i) + '{row}');
+    if (want[i] === '') del(); else clip('paste', want[i]);
+    await sleep(300);
+  }}
+  await go('A1');
+  return 'updated row {row} of ' + where() + ': ' + Object.keys(given).join(', ');"#)
         }
         "sheets_delete_rows" => {
             let (from, to) = (args["from"].as_u64().unwrap_or(0), args["to"].as_u64().or(args["from"].as_u64()).unwrap_or(0));
@@ -274,14 +292,16 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
         "sheets_trash" => r#"await ready(); const w = where(); await menu('#docs-file-menu', 'Move to trash'); await sleep(1500); return 'moved to the trash: ' + w;"#.to_string(),
         other => return Err(format!("no tool {other}")),
     };
-    Ok(format!("{PRELUDE}\n{body}"))
+    let gid = serde_json::to_string(&gid_of(args["url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into());
+    Ok(format!("const GID = {gid};\n{PRELUDE}\n{body}"))
 }
 
 /// My Maps' helpers, before each body.
 pub const MAPS_PRELUDE: &str = r#"
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const byText = (sel, t) => [...document.querySelectorAll(sel)].find((e) => e.offsetParent && (e.innerText || e.textContent || '').trim() === t);
-const mouse = (el) => { const r = el.getBoundingClientRect();
+const live = () => { if (typeof __ID !== 'undefined' && (window.__strataStop || {})[__ID]) throw new Error('stopped: it ran past its time; nothing more was changed'); };
+const mouse = (el) => { live(); const r = el.getBoundingClientRect();
   for (const t of ['mousedown', 'mouseup', 'click']) el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0})); };
 const set = (el, v) => { const p = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   el.focus(); Object.getOwnPropertyDescriptor(p, 'value').set.call(el, v); el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); };
@@ -293,6 +313,9 @@ const pickColumn = (names, want) => { const w = String(want || '').trim(), i = n
   if (i >= 0) return i;
   if (/^[A-Za-z]{1,2}$/.test(w)) { const k = [...w.toUpperCase()].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1; if (k < names.length) return k; }
   return -1; };
+// My Maps' list: the maps' cards (data-mid with data-name; menus carry data-mid too, and a hidden template card is
+// "Untitled map" with the id "dummyId")
+const mapCards = () => [...document.querySelectorAll('[data-mid][data-name]')].filter((c) => !/dummy/i.test(c.getAttribute('data-mid')));
 const leaf = (t) => [...document.querySelectorAll('*')].find((e) => e.offsetParent && e.textContent.trim() === t && ![...e.children].some((c) => c.textContent.trim() === t));
 "#;
 
@@ -316,14 +339,15 @@ return 'created the map ' + document.title + ' (' + location.href.split('&')[0] 
         // clicking the card instead took the page away before the answer was read
         "maps_create" => format!(r#"
 await wait(() => byText('button,[role=button]', 'add_to_drive'), 'no Create button in My Maps (signed in to Google?)');
-const name = {title}, have = leaf(name);
-if (have) {{
-  // its card: data-mid with data-name (menus carry data-mid too, one a "dummyId")
-  const card = have.closest('[data-mid][data-name]'), mid = card && card.getAttribute('data-mid');
-  if (mid) return 'a map titled ' + name + ' already exists, so none was made: https://www.google.com/maps/d/edit?mid=' + mid + '. To put places on it: maps_import_sheet (each import adds a layer).';
-}}
+const name = {title};
+const card = mapCards().find((c) => c.getAttribute('data-name') === name);
+if (card) return 'a map titled ' + name + ' already exists, so none was made: https://www.google.com/maps/d/edit?mid=' + card.getAttribute('data-mid') + '. To put places on it: maps_import_sheet (each import adds a layer).';
+// the title seen on the page, but not on a card: no second map with it (a duplicate was made so, from the trash page)
+if (leaf(name)) throw new Error('a map titled ' + name + ' seems to exist, but its address was not found: open My Maps (browser_open https://www.google.com/maps/d/) and use it, or give another title');
 mouse(byText('button,[role=button]', 'add_to_drive'));
-mouse(await wait(() => byText('button,[role=button],div', 'CREATE'), 'no CREATE in the dialog'));
+const create = await wait(() => byText('button,[role=button],div', 'CREATE'), 'no CREATE in the dialog');
+// the answer first, the click a moment later: the click takes the page away, and with it an answer not yet read
+setTimeout(() => mouse(create), 2500);
 return '__next';"#, title = s("title")),
         "maps_trash" => format!(r#"
 const name = {title};
@@ -357,10 +381,12 @@ const sheet = {sheet}, loc = {loc}, ttl = {ttl};
 await wait(() => leaf('Add layer') || leaf('Import') || !location.pathname.startsWith('/maps/d/edit'), 'the map page did not load');
 if (!location.pathname.startsWith('/maps/d/edit')) {{
   const said = (document.body.innerText.match(/[^\n]*(Trash|exist|permission|access)[^\n]*/) || [''])[0].trim().slice(0, 160);
-  // the cards (data-mid with data-name): the share and map menus carry data-mid too, one with a "dummyId"
-  const maps = [...new Set([...document.querySelectorAll('[data-mid][data-name]')].map((c) => c.getAttribute('data-name') + ' (https://www.google.com/maps/d/edit?mid=' + c.getAttribute('data-mid') + ')'))];
+  const maps = [...new Set(mapCards().map((c) => c.getAttribute('data-name') + ' (https://www.google.com/maps/d/edit?mid=' + c.getAttribute('data-mid') + ')'))];
   throw new Error((/Trash/.test(said) ? 'that map is in the trash (gone: use another)' : 'that map did not open (' + (said || location.href) + ')') + '; the maps in My Maps: ' + (maps.join('; ') || 'none') + '. maps_create with a title gives the address of the map with that title');
 }}
+// layers already named after this sheet (an earlier import): done is one more of them, not an old one
+const layersNamed = () => [...document.querySelectorAll('*')].filter((e) => e.offsetParent && e.textContent.trim() === sheet && ![...e.children].some((c) => c.textContent.trim() === sheet)).length;
+const layersBefore = layersNamed();
 let imp = leaf('Import');
 if (!imp) {{ mouse(await wait(() => leaf('Add layer'), 'no Add layer')); imp = await wait(() => leaf('Import'), 'no Import on the new layer'); }}
 mouse(imp);
@@ -390,7 +416,7 @@ const radio = await wait(() => [...document.querySelectorAll('[role=radio]')].fi
 mouse(radio);
 mouse(await wait(() => byText('button,[role=button]', 'Finish'), 'no Finish'));
 // done: the new layer (named after the sheet) in the map's list, or My Maps' "trouble finding those locations"
-const done = await wait(() => /trouble finding those locations/.test(document.body.innerText) ? 'fail' : (leaf(sheet) ? 'ok' : ''), 'the import did not finish');
+const done = await wait(() => /trouble finding those locations/.test(document.body.innerText) ? 'fail' : (layersNamed() > layersBefore ? 'ok' : ''), 'the import did not finish');
 if (done === 'fail') throw new Error('My Maps could not place the rows by ' + loc + ' (rows with nothing in that column?)');
 await sleep(2000);
 const t = document.body.innerText, all = t.match(/All items\s*\((\d+)\)/), bad = t.match(/(\d+) rows? couldn.t be shown/);
@@ -406,7 +432,7 @@ return 'imported ' + sheet + ' into ' + document.title + ' as a layer' + (all ? 
 /// The page script for a body that awaits: its value (or error) kept in window.__strataAsync[id], for async_collect_js.
 pub fn async_js(id: u64, body: &str) -> String {
     format!(r#"(() => {{ window.__strataAsync = window.__strataAsync || {{}}; window.__strataAsync[{id}] = null;
-  (async () => {{ {body} }})().then((v) => {{ window.__strataAsync[{id}] = JSON.stringify({{ok: v}}); }},
+  (async () => {{ const __ID = {id}; {body} }})().then((v) => {{ window.__strataAsync[{id}] = JSON.stringify({{ok: v}}); }},
     (e) => {{ window.__strataAsync[{id}] = JSON.stringify({{error: String((e && e.message) || e)}}); }});
   return 'started'; }})()"#)
 }
@@ -418,8 +444,10 @@ pub fn async_collect_js(id: u64) -> String {
 
 /// Is `tool` safe to run again from the start when its page was replaced under it (it had changed nothing yet)?  A
 /// trashed map's address loads, then My Maps sends it home: the import's script went with the first page.
-pub fn rerun_safe(tool: &str) -> bool {
-    matches!(tool, "sheets_read" | "maps_import_sheet")
+pub fn rerun_safe(tool: &str, now: &str) -> bool {
+    // an import that ended on a map's editor may have finished (a reload after Finish): never again blindly; one
+    // sent away from the editor (a trashed map goes home) had not begun (found by a codex review)
+    tool == "sheets_read" || (tool == "maps_import_sheet" && !now.starts_with(MAPS_EDIT))
 }
 
 /// The tool's answer from the script's value.
@@ -448,7 +476,7 @@ mod tests {
         assert_eq!(sheet_base("https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft/edit?gid=0#gid=0").as_deref(), Some("https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft"));
         assert_eq!(sheet_base("https://evil.test/spreadsheets/d/1xsvX_nD7BEB6Xft"), None);
         assert!(page_for("sheets_read", &json!({}), "https://example.com/").is_err());
-        assert_eq!(page_for("sheets_read", &json!({}), "https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft/edit#gid=0").unwrap().0, "https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft/edit");
+        assert_eq!(page_for("sheets_read", &json!({}), "https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft/edit#gid=0").unwrap().0, "https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft/edit#gid=0");
     }
 
     #[test]
@@ -473,9 +501,12 @@ mod tests {
         assert!(on_page(MAPS_LIST, "https://www.google.com/maps/d/"));
         assert!(!on_page(MAPS_LIST, "https://www.google.com/maps/d/edit?mid=1"), "the editor is not the list");
         assert!(on_page(MAPS_EDIT, "https://www.google.com/maps/d/edit?mid=1"));
+        let sheet = "https://docs.google.com/spreadsheets/d/abcdefghijk";
+        assert!(on_page(sheet, "https://docs.google.com/spreadsheets/d/abcdefghijk/edit#gid=0") && on_page(sheet, sheet));
+        assert!(!on_page(sheet, "https://docs.google.com/spreadsheets/d/abcdefghijkLONGER/edit"), "another sheet whose id starts the same");
         assert_eq!(page_for("maps_create", &json!({"__phase": 2}), "").unwrap().1, MAPS_EDIT);
         let create = maps_js("maps_create", &json!({"title": "studios"}), "t").unwrap();
-        assert!(create.contains("return '__next'") && create.contains(r#"const name = "studios", have = leaf(name);"#) && create.contains("already exists, so none was made"));
+        assert!(create.contains("return '__next'") && create.contains(r#"const name = "studios";"#) && create.contains("already exists, so none was made"));
         assert!(maps_js("maps_create", &json!({"__phase": 2, "title": "a\"b"}), "t").unwrap().contains(r#"set(input, "a\"b")"#));
         let (load, prefix) = page_for("maps_import_sheet", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=1JYY-x_q&ll=1"}), "").unwrap();
         assert_eq!(load, "https://www.google.com/maps/d/edit?mid=1JYY-x_q");
@@ -484,15 +515,21 @@ mod tests {
         assert!(maps_js("maps_import_sheet", &json!({"sheet_title": "s", "location_column": "Address", "title_column": "Description"}), "tok1").unwrap().contains("const TOKEN = 'tok1'"));
         assert!(ask("maps_trash", &json!({"title": "x"})).unwrap().contains("\u{201c}x\u{201d}"));
         assert_eq!(ask("sheets_read", &json!({})), None);
-        assert!(rerun_safe("maps_import_sheet") && rerun_safe("sheets_read"));
-        assert!(!rerun_safe("sheets_append") && !rerun_safe("maps_create"), "a create or append is never run twice");
+        assert!(rerun_safe("maps_import_sheet", "https://www.google.com/maps/d/home") && rerun_safe("sheets_read", "x"));
+        assert!(!rerun_safe("maps_import_sheet", "https://www.google.com/maps/d/edit?mid=1"), "back on the editor: it may have finished");
+        assert!(!rerun_safe("sheets_append", "x") && !rerun_safe("maps_create", "x"), "a create or append is never run twice");
+        assert_eq!(gid_of("https://docs.google.com/spreadsheets/d/x/edit#gid=1234&range=A1").as_deref(), Some("1234"));
+        assert_eq!(gid_of("https://docs.google.com/spreadsheets/d/x/edit?gid=0"), Some("0".into()));
+        assert_eq!(gid_of("https://docs.google.com/spreadsheets/d/x/edit"), None);
+        assert!(sheets_js("sheets_read", &json!({"url": "https://docs.google.com/spreadsheets/d/abcdefghijklmn/edit#gid=77"})).unwrap().starts_with("const GID = \"77\";"));
+        assert!(page_for("sheets_read", &json!({"url": "https://docs.google.com/spreadsheets/d/abcdefghijklmn/edit#gid=77"}), "").unwrap().0.ends_with("/edit#gid=77"));
         assert!(async_collect_js(7).contains("gone: location.href"));
     }
 
     #[test]
     fn rows_by_number_and_name() {
         assert!(sheets_js("sheets_write", &json!({"row": 1, "values": {"A": "x"}})).is_err(), "the header stays");
-        assert!(sheets_js("sheets_write", &json!({"row": 5, "values": {"Price": "$1"}})).unwrap().contains("go('A5:' + end + '5')"));
+        assert!(sheets_js("sheets_write", &json!({"row": 5, "values": {"Price": "$1"}})).unwrap().contains("await go(letter(i) + '5')"));
         assert!(sheets_js("sheets_delete_rows", &json!({"from": 1})).is_err(), "the header stays");
         assert!(sheets_js("sheets_delete_rows", &json!({"from": 5, "to": 7})).unwrap().contains("Rows 5 - 7"));
         assert!(sheets_js("sheets_delete_rows", &json!({"from": 5})).unwrap().contains("'Row 5'"));

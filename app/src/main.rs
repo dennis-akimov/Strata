@@ -57,6 +57,8 @@ enum Ev {
     AsyncCollect(browser_mcp::Job, u64, u32),
     /// a click or typing done with the mouse and keyboard (native_input): the element found by a script first
     Native(browser_mcp::Job, &'static str, String),
+    /// a Google tool's script past its time: told to change nothing more
+    StopScript(u64),
     Quit,
 }
 
@@ -1666,9 +1668,13 @@ fn main() {
                                         // whatever happens to the page, the call is answered (a lost answer hung it 150 s)
                                         let late = job.reply.clone();
                                         let tool = t.to_string();
+                                        let stop = Mutex::new(proxy.clone());
                                         std::thread::spawn(move || {
                                             std::thread::sleep(Duration::from_secs(75));
-                                            let _ = late.send(Err(format!("{tool} did not answer in 75 s: browser_read the page to see where it is")));
+                                            // the script is told to stop before its next change, and the answer says
+                                            // it may have done part (a timed-out import once finished after it)
+                                            let _ = stop.lock().unwrap().send_event(Ev::StopScript(id));
+                                            let _ = late.send(Err(format!("{tool} did not answer in 75 s and was stopped; it may have done part of it: read the sheet or map before trying again")));
                                         });
                                         let p = Mutex::new(proxy.clone());
                                         std::thread::spawn(move || {
@@ -1774,6 +1780,9 @@ fn main() {
                     let _ = proxy.send_event(Ev::Tool(job));
                 }
             }
+            Event::UserEvent(Ev::StopScript(id)) => {
+                let _ = web.evaluate_script(&format!("(window.__strataStop = window.__strataStop || {{}})[{id}] = true"));
+            }
             Event::UserEvent(Ev::Native(job, what, r)) => {
                 let v = js_value(&r);
                 let n = job.args["element"].as_i64().unwrap_or(0);
@@ -1797,7 +1806,12 @@ fn main() {
                 } else {
                     let text = job.args["text"].as_str().unwrap_or("").to_string();
                     let submit = job.args["submit"] == true;
-                    let typed = native_input::paste(&web, &text).and_then(|_| if submit { native_input::press(&web, "enter", &[]) } else { Ok(()) });
+                    // only into the field that took the focus (else the text went where the focus was before)
+                    let typed = if v["focused"] != true {
+                        Err(format!("field [{n}] did not take the focus (disabled or covered?): browser_read the page again"))
+                    } else {
+                        native_input::type_text(&web, &text).and_then(|_| if submit { native_input::press(&web, "enter", &[]) } else { Ok(()) })
+                    };
                     match typed {
                         Err(e) => { let _ = job.reply.send(Err(e)); }
                         Ok(()) if submit => {
@@ -1818,7 +1832,11 @@ fn main() {
                         // the page was replaced under the script: once more from the start where it went, when that
                         // is safe; else said (a create or an append is never repeated blindly)
                         let mut job = job;
-                        if google::rerun_safe(&job.tool) && job.args.get("__rerun").is_none() {
+                        if job.tool == "maps_create" && job.args["__phase"] != 2 {
+                            // phase 1's Create took the page before its answer was read: the new map's editor next
+                            job.args["__phase"] = json!(2);
+                            let _ = p.send_event(Ev::Tool(job));
+                        } else if google::rerun_safe(&job.tool, to) && job.args.get("__rerun").is_none() {
                             job.args["__rerun"] = json!(true);
                             std::thread::spawn(move || {
                                 std::thread::sleep(Duration::from_millis(1500));
@@ -1829,7 +1847,9 @@ fn main() {
                         }
                     } else if v.is_null() {
                         if tries >= 120 {
-                            let _ = job.reply.send(Err(format!("{} did not finish in 60 s: browser_read the page to see where it is", job.tool)));
+                            // stopped as it is said to have failed (the 75 s watchdog came later, and the work went on)
+                            let _ = p.send_event(Ev::StopScript(id));
+                            let _ = job.reply.send(Err(format!("{} did not finish in 60 s and was stopped; it may have done part of it: read the sheet or map before trying again", job.tool)));
                         } else {
                             std::thread::spawn(move || {
                                 std::thread::sleep(Duration::from_millis(500));

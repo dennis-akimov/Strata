@@ -64,31 +64,14 @@ pub fn press(web: &WebView, name: &str, mods: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Put `text` where the page's focus is, as Edit > Paste does (the selection, if any, is replaced).  The person's
-/// clipboard text is put back a moment later.
-pub fn paste(web: &WebView, text: &str) -> Result<(), String> {
-    let ty = NSString::from_str("public.utf8-plain-text");
-    let pb: Retained<AnyObject> = unsafe { msg_send![class!(NSPasteboard), generalPasteboard] };
-    let before: Option<Retained<NSString>> = unsafe { msg_send![&*pb, stringForType: &*ty] };
-    unsafe {
-        let _: isize = msg_send![&*pb, clearContents];
-        let _: bool = msg_send![&*pb, setString: &*NSString::from_str(text), forType: &*ty];
-    }
+/// Type `text` where the page's focus is, as the keyboard's text input does (insertText: the trusted input and
+/// beforeinput events a typed word gives; the selection is replaced).  No clipboard: a paste through it lost what the
+/// person had copied (an image, a file; found by a codex review).
+pub fn type_text(web: &WebView, text: &str) -> Result<(), String> {
     let _ = window_of(web);
     let wv = web.webview();
-    let _: () = unsafe { msg_send![&*wv, paste: std::ptr::null::<AnyObject>()] };
-    let back = before.map(|b| b.to_string());
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        if let Some(b) = back {
-            unsafe {
-                let pb: Retained<AnyObject> = msg_send![class!(NSPasteboard), generalPasteboard];
-                let ty = NSString::from_str("public.utf8-plain-text");
-                let _: isize = msg_send![&*pb, clearContents];
-                let _: bool = msg_send![&*pb, setString: &*NSString::from_str(&b), forType: &*ty];
-            }
-        }
-    });
+    let s = NSString::from_str(text);
+    let _: () = unsafe { msg_send![&*wv, insertText: &*s] };
     Ok(())
 }
 

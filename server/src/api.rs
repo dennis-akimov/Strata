@@ -197,6 +197,7 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
     // each tool's last error and how many calls in a row gave it: the second says retrying will not help, a third is
     // not run (a model called maps_import_sheet into a trashed map 8 times with the same error: arXiv 2607.01641's
     // "infinite agentic loop", stopped only by the round limit)
+    // keyed by the tool and its arguments: a corrected call (another column, another map) always runs
     let mut fails: HashMap<String, (String, u32)> = HashMap::new();
     let (mut total, mut rounds) = (0i64, 0i64);
     let mut messages = m.messages;
@@ -254,7 +255,8 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             last = true;
             // the tools stay in the prompt: its start is unchanged, so the engine's cache holds (dropping them re-read
             // all 10K tokens, 50 s on the M1); a call in this round is not run
-            let (i2, t2, m2) = svc.prepare(&messages, tools.as_deref(), &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
+            // compacted as every round is: at the limit the context is fullest (found by a codex review)
+            let (i2, t2, m2) = prepare_fit(svc, &mut messages, tools.as_deref(), &m.kw, m.max_req, emit)?;
             ids = i2;
             thinking = t2;
             max_new = m2;
@@ -268,7 +270,7 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
                     emit(Item::Mcp(json!({"event": "result", "id": c.id, "ok": false, "skipped": true, "text": "not run", "chars": 0, "truncated": false, "ms": 0})))?;
                 }
                 tools = None;
-                let (mut i2, t2, m2) = svc.prepare(&messages, None, &m.kw, Some(m.max_req), None, None).map_err(Stop::Err)?;
+                let (mut i2, t2, m2) = prepare_fit(svc, &mut messages, None, &m.kw, m.max_req, emit)?;
                 // its thinking closed for it: a template that always opens one (LFM's) let it think "let me try another
                 // page" to the end, with no answer; after </think> what comes is the answer
                 let close = t2 && !svc.harmony;
@@ -315,7 +317,8 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
         let routes = hub.routes();
         for c in &calls {
             let (server, tool) = routes.get(&c.name).map(|(s, t)| (json!(s.name), t.clone())).unwrap_or((Value::Null, c.name.clone()));
-            if let Some((err, k)) = fails.get(&c.name).filter(|(_, k)| *k >= 2) {
+            let key = format!("{} {}", c.name, Value::Object(c.arguments.clone()));
+            if let Some((err, k)) = fails.get(&key).filter(|(_, k)| *k >= 2) {
                 let text = repeat_refusal(&c.name, err, *k);
                 say(&format!("tool {}: not run, {k} same errors in a row", c.name));
                 emit(Item::Mcp(json!({"event": "result", "id": c.id, "ok": false, "skipped": true, "text": text, "chars": text.len(), "truncated": false, "ms": 0})))?;
@@ -345,9 +348,9 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             }
             let mut text = r["text"].as_str().unwrap_or("").to_string();
             if truthy(&r["ok"]) {
-                fails.remove(&c.name);
+                fails.retain(|k, _| !k.starts_with(&format!("{} ", c.name)));
             } else {
-                let e = fails.entry(c.name.clone()).or_insert_with(|| (String::new(), 0));
+                let e = fails.entry(key).or_insert_with(|| (String::new(), 0));
                 if e.0 == text { e.1 += 1 } else { *e = (text.clone(), 1) }
                 if e.1 == 2 {
                     text.push_str(REPEATED);
@@ -1038,6 +1041,12 @@ mod loop_tests {
         assert!(ByteTokenizer.decode(&prompts[2]).contains("[The same error as the last call: repeating it will not help."));
         assert!(!ByteTokenizer.decode(&prompts[1]).contains("The same error"), "not under the first error");
         assert!(text.contains("could not be filled"), "{text:?}");
+        // a corrected call (other arguments) runs, even after two same errors
+        let fixed = "</think>\n\n<tool_call>\n<function=web__read>\n<parameter=url>\nhttps://p.test/x\n</parameter>\n</function>\n</tool_call>";
+        let (mcp, _, _) = run_with("web", "read", |_| "ERR no column A".into(), &[CALL, CALL, fixed, "</think>\n\nDone."], 6);
+        let results: Vec<&Value> = mcp.iter().filter(|v| v["event"] == "result").collect();
+        assert_eq!(results.len(), 3);
+        assert!(results[2]["skipped"].is_null(), "the corrected call ran: {:?}", results[2]);
         // a different error, or a success, starts the count again
         let (mcp, _, _) = run_with("web", "read", |n| if n == 2 { "Page 2\nhttps://p.test/2\n\nok".into() } else { "ERR busy".into() }, &[CALL, CALL, CALL, CALL, "</think>\n\nDone."], 6);
         let results: Vec<&Value> = mcp.iter().filter(|v| v["event"] == "result").collect();

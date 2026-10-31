@@ -242,7 +242,11 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   check: **Checking the work…** under it, where the model reads back what it changed and marks each part of the
   request DONE or NOT DONE, fixing what is not (at most two checks, 4 more tool rounds). The log's `tool …` lines
   show each call's arguments. Tried on the M1 with LFM2.5-24B: a sheet created, two rows added, read back, all DONE,
-  105 s.
+  105 s. A tool that gives the same error twice in a row says so under the second ("repeating it will not
+  help"), and a third such call is not run: a model once imported into a trashed map 8 times. My Maps' tools say
+  when a map is in the trash, and list the maps there are with their addresses; a Google tool always answers (75 s at
+  most), and one whose page was replaced under it runs again only when it had changed nothing (reading, the start of
+  an import).
 - **Google Sheets and My Maps (Strata.app):** through the same browser pane, signed in to Google as you (no Google
   API, no Cloud project): `sheets_create` (title and header row), `sheets_read` (rows numbered as in the sheet),
   `sheets_append` (under the last filled row, each value by its column's name, `{"Address": …}`: a name that is no

@@ -19,6 +19,15 @@ pub struct Job {
     pub reply: mpsc::Sender<Result<String, String>>,
 }
 
+/// A caller's arguments without the app's own job flags (__allowed, __loaded, __phase, __frame, ...): only the app
+/// sets those (a call with "__allowed" of its own skipped the trash's Allow: found by a codex review).
+pub fn caller_args(args: &Value) -> Value {
+    match args.as_object() {
+        Some(m) => Value::Object(m.iter().filter(|(k, _)| !k.starts_with("__")).map(|(k, v)| (k.clone(), v.clone())).collect()),
+        None => json!({}),
+    }
+}
+
 /// The tools, as tools/list gives them.
 pub fn tools() -> Value {
     let mut t = json!([
@@ -333,7 +342,7 @@ fn handle(mut s: TcpStream, key: &str, stopped: &AtomicBool, to_loop: &dyn Fn(Jo
                 Err("the user stopped the model's browsing (the browser's Stop): ask them, do not retry".to_string())
             } else {
                 let (tx, rx) = mpsc::channel();
-                to_loop(Job { tool: m["params"]["name"].as_str().unwrap_or("").to_string(), args: m["params"]["arguments"].clone(), reply: tx });
+                to_loop(Job { tool: m["params"]["name"].as_str().unwrap_or("").to_string(), args: caller_args(&m["params"]["arguments"]), reply: tx });
                 // a typed text waits for the person's Allow: up to 2 minutes
                 rx.recv_timeout(Duration::from_secs(150)).unwrap_or_else(|_| Err("the browser did not answer in time".into()))
             };
@@ -379,6 +388,8 @@ mod tests {
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_read","arguments":{}}}"#);
         assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["result"]["content"][0]["text"], "ran browser_read");
         assert!(post("Bearer k1", r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).0.contains("202"));
+        assert_eq!(caller_args(&json!({"url": "u", "__allowed": true, "__phase": 2})), json!({"url": "u"}), "the app's own flags never come from a caller");
+        assert_eq!(caller_args(&Value::Null), json!({}));
         stopped.store(true, Ordering::SeqCst);                 // the browser's Stop: every call refused
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_read","arguments":{}}}"#);
         assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["result"]["isError"], true);
@@ -628,12 +639,13 @@ const parse = (range) => {
   return s && e && e.r < rows && e.c < COLS && s.r <= e.r ? {r1: s.r, c1: s.c, r2: e.r, c2: e.c} : null;
 };
 addEventListener('hashchange', () => {
-  const r = new URLSearchParams(location.hash.slice(1)).get('range') || 'A1', p = parse(r);
+  const q = new URLSearchParams(location.hash.slice(1)), r = q.get('range') || 'A1', p = parse(r); tabs.push(q.get('gid'));
   if (!p) return;                                  // past the sheet: ignored, without a word
   sel = p; const [a, b] = r.split(':'); document.querySelector('#t-name-box').value = b === a ? a : r;
 });
 const ed = document.querySelector('#waffle-rich-text-editor');
-ed.addEventListener('paste', (e) => { e.preventDefault();
+window.pastes = []; window.tabs = [];
+ed.addEventListener('paste', (e) => { e.preventDefault(); pastes.push(e.clipboardData.getData('text/plain'));
   e.clipboardData.getData('text/plain').split('\n').forEach((line, i) => line.split('\t').forEach((v, j) => {
     if (sel.r1 + i < rows && sel.c1 + j < COLS) grid[sel.r1 + i][sel.c1 + j] = v; })); });
 ed.addEventListener('copy', (e) => { e.preventDefault(); const out = [];
@@ -690,8 +702,11 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         assert!(tool(&mut b, "sheets_append", json!({"rows": [{"Name": "The Artisan"}]})).unwrap_err().starts_with("no column \"Name\""));
         assert_eq!(grid(&mut b, 5), before);
 
-        // an update changes the named cells only
+        // an update changes the named cells only, each pasted alone (the whole row pasted back turned formulas
+        // into values)
+        b.eval("pastes.length = 0");
         let out = tool(&mut b, "sheets_write", json!({"row": 3, "values": {"Price": "$2,101", "Rating": "4.3"}})).unwrap();
+        assert_eq!(b.eval("JSON.stringify(pastes)"), r#"["$2,101","4.3"]"#);
         assert!(out.starts_with("updated row 3 of studios"), "{out}");
         assert_eq!(grid(&mut b, 3)[2][..4], ["FALSE", "4.3", "801 A St", "$2,101"]);
         assert_eq!(grid(&mut b, 3)[2][7], "The Rey: a tower");
@@ -717,6 +732,22 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         let out = tool(&mut b, "sheets_append", json!({"rows": [{"Address": "9 B St"}]})).unwrap();
         assert!(out.contains("at rows 4-4") && !out.contains("tick boxes"), "{out}");
         assert_eq!(b.eval("boxes.size"), boxes);
+
+        // the tab the address names is the one selected (a call for tab B once acted on the open tab A)
+        b.eval("tabs.length = 0");
+        tool(&mut b, "sheets_read", json!({"url": "https://docs.google.com/spreadsheets/d/fakefakefake1/edit#gid=55"})).unwrap();
+        assert!(b.eval("tabs.every((g) => g === '55') && tabs.length > 0") == true, "{}", b.eval("JSON.stringify(tabs)"));
+        // a script the app stopped (past its time) changes nothing more
+        let before = grid(&mut b, 6);
+        let js = crate::google::sheets_js("sheets_append", &json!({"rows": [{"Address": "1 Stop St"}]})).unwrap();
+        let e = b.run(&format!("(async () => {{ window.__strataPace = 0.02; const __ID = 9; window.__strataStop = {{9: true}}; {js} }})()")).unwrap_err();
+        assert!(e.starts_with("stopped: it ran past its time"), "{e}");
+        assert_eq!(grid(&mut b, 6), before);
+        // a stop that comes after the selection, before the paste: the paste does not happen
+        let r = b.eval(&format!("(() => {{ const __ID = 3; {} ; window.__strataStop = {{3: true}}; try {{ clip('paste', 'late'); return 'pasted'; }} catch (e) {{ return e.message; }} }})()", crate::google::PRELUDE));
+        assert!(r.as_str().unwrap().starts_with("stopped:"), "{r}");
+        assert!(!b.eval("pastes.includes('late')").as_bool().unwrap());
+        b.eval("window.__strataStop = {}");
 
         tool(&mut b, "sheets_clear", json!({"range": "D2:D2"})).unwrap();
         assert_eq!(grid(&mut b, 2)[1][3], "");
@@ -840,17 +871,22 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
 
         // maps_create with a title the list already has: that map's address (its card's data-mid), no second map
         b.page(r#"<html><body><div role="button" onclick="window.created = true">add_to_drive</div>
-<div data-mid="dummyId">Share via Facebook</div>
+<div data-mid="dummyId">Share via Facebook</div><div data-mid="dummyId" data-name="studios-sandiego-downtown-2026">a template</div>
 <div class="card" data-mid="1JYYmapid" data-name="studios-sandiego-downtown-2026"><div class="t">studios-sandiego-downtown-2026</div><div aria-label="Open the map menu" data-mid="dummyId">⋮</div></div></body></html>"#);
         let js = crate::google::maps_js("maps_create", &json!({"title": "studios-sandiego-downtown-2026"}), "t").unwrap();
         let out = b.run(&format!("(async () => {{ {js} }})()")).unwrap();
         assert_eq!(out, "a map titled studios-sandiego-downtown-2026 already exists, so none was made: https://www.google.com/maps/d/edit?mid=1JYYmapid. To put places on it: maps_import_sheet (each import adds a layer).");
         assert_eq!(b.eval("window.created === undefined"), true, "Create was not pressed");
+        // the title on the page but on no card (a tooltip, the trash page): an error, never a second map
+        b.page(r#"<html><body><div role="button" onclick="window.created = true">add_to_drive</div><div>studios-sandiego-downtown-2026</div></body></html>"#);
+        let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
+        assert!(e.starts_with("a map titled studios-sandiego-downtown-2026 seems to exist, but its address was not found"), "{e}");
+        assert_eq!(b.eval("window.created === undefined"), true, "Create was not pressed");
 
         // maps_import_sheet into a trashed map: My Maps sends it home with "in your Trash"; said so, with the maps there are
         b.page(r#"<html><body><div>The map you tried to access is in your Trash. To open this map, take it out of your Trash.</div>
 <div data-mid="1JYYmapid" data-name="studios-sandiego-downtown-2026"><div>studios-sandiego-downtown-2026</div><div>Oct 30, 2026</div>
-<div data-mid="dummyId">Share via Facebook</div></div></body></html>"#);
+<div data-mid="dummyId">Share via Facebook</div></div><div data-mid="dummyId" data-name="Untitled map" style="display:none">template</div></body></html>"#);
         let js = crate::google::maps_js("maps_import_sheet", &json!({"sheet_title": "s", "location_column": "Address", "title_column": "Description"}), "t").unwrap();
         let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
         assert_eq!(e, "that map is in the trash (gone: use another); the maps in My Maps: studios-sandiego-downtown-2026 (https://www.google.com/maps/d/edit?mid=1JYYmapid). maps_create with a title gives the address of the map with that title");
