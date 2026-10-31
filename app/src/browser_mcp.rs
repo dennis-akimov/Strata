@@ -388,7 +388,7 @@ mod tests {
         let names: Vec<String> = serde_json::from_str::<Value>(&b).unwrap()["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().into()).collect();
         assert_eq!(names, ["browser_search", "browser_open", "browser_read", "browser_click", "browser_type", "browser_scroll", "browser_back",
                            "sheets_create", "sheets_read", "sheets_append", "sheets_write", "sheets_delete_rows", "sheets_clear", "sheets_trash",
-                           "maps_create", "maps_import_sheet", "maps_export", "maps_trash", "table_read", "table_upsert", "table_delete", "table_sync"]);
+                           "maps_create", "maps_import_sheet", "maps_export", "maps_delete_layer", "maps_trash", "table_read", "table_upsert", "table_delete", "table_sync"]);
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_read","arguments":{}}}"#);
         assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["result"]["content"][0]["text"], "ran browser_read");
         assert!(post("Bearer k1", r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).0.contains("202"));
@@ -994,6 +994,20 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         let js = crate::google::maps_js("maps_import_sheet", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=WANT", "sheet_title": "s", "location_column": "Address", "title_column": "Name"}), "t").unwrap();
         let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
         assert_eq!(e, "the browser is at another map (OTHER), not WANT: nothing imported");
+
+        // maps_delete_layer: two layers share the map's name; the one with 28 places goes, the map title and the
+        // other layer stay
+        let layer = |n: usize| format!(r#"<div class="layer"><div>Studios A</div><div>Uniform style</div><div>All items({n})</div><div aria-label="Layer options" onclick="window.menuFor = this.closest('.layer'); document.getElementById('menu').style.display = 'block'">⋮</div></div>"#);
+        let page = format!(r#"<html><body><h1>Studios A</h1><div>42 views</div><div>Add layer</div>{}{}
+<div id="menu" style="display:none"><div role="menuitem" onclick="this.parentElement.style.display = 'none'; document.getElementById('ok').style.display = 'block'">Delete this layer</div></div>
+<div id="ok" style="display:none"><button onclick="window.menuFor.remove(); this.parentElement.style.display = 'none'">Delete</button></div></body></html>"#, layer(18), layer(28));
+        b.page_http_at(Box::leak(page.into_boxed_str()), "/maps/d/edit?mid=M");
+        let del = |n: i64| crate::google::maps_js("maps_delete_layer", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=M", "layer": "Studios A", "items": n}), "t").unwrap();
+        let e = b.run(&format!("(async () => {{ {} }})()", del(5))).unwrap_err();
+        assert_eq!(e, "no layer named Studios A with 5 places: nothing deleted; its layers named so have 18, 28 places");
+        let out = b.run(&format!("(async () => {{ {} }})()", del(28))).unwrap();
+        assert_eq!(out, "deleted the layer Studios A (28 places); the map has 1 layer(s) named so left");
+        assert!(b.eval("document.body.innerText").as_str().unwrap().contains("All items(18)"));
 
         // the sheet is a layer of the map already: a second import would put each place there twice, so none is made
         b.page_http_at(r#"<html><body><h1>s</h1><div>Add layer</div><div>Import</div><div>s</div><div>Individual styles</div></body></html>"#, "/maps/d/edit?mid=WANT");

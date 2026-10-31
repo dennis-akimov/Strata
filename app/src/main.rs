@@ -1119,6 +1119,9 @@ fn open(args: &[&str]) {
     let _ = Command::new("open").args(args).spawn();
 }
 
+/// How long an Allow is good for: less than browser_mcp's 150 s wait for an answer.
+const ALLOW_WITHIN_S: u64 = 140;
+
 fn main() {
     let root = root();
     let settings = load_settings();
@@ -1162,7 +1165,9 @@ fn main() {
         }
     }
     let load_waiters: std::cell::RefCell<Vec<std::sync::mpsc::Sender<Result<String, String>>>> = Default::default();
-    let approvals: std::cell::RefCell<HashMap<u64, browser_mcp::Job>> = Default::default();
+    // each with when it was asked: an Allow after the caller stopped waiting (150 s) runs nothing (it would act with no
+    // one to hear the answer)
+    let approvals: std::cell::RefCell<HashMap<u64, (std::time::Instant, browser_mcp::Job)>> = Default::default();
     let search_waiters: std::cell::RefCell<Vec<std::sync::mpsc::Sender<Result<String, String>>>> = Default::default();
     // the addresses the model's reads showed (all links of the pages it read), and whether it searched: after a
     // search, browser_open takes only those (LFM2.5 guessed addresses and got 404s, round after round)
@@ -1519,14 +1524,15 @@ fn main() {
                 "web_reload" => { nav_epoch.set(nav_epoch.get() + 1); let _ = web.evaluate_script("location.reload()"); }
                 "web_allow" => {
                     // the person's answer to browser_type's question
-                    if let Some(job) = approvals.borrow_mut().remove(&v["id"].as_u64().unwrap_or(0)) {
+                    let asked = approvals.borrow_mut().remove(&v["id"].as_u64().unwrap_or(0));
+                    if let Some((_, job)) = asked.filter(|(at, _)| at.elapsed() < Duration::from_secs(ALLOW_WITHIN_S)) {
                         if google::ask(&job.tool, &job.args).is_some() {
                             let mut job = job;
                             if v["yes"] == true {
                                 job.args["__allowed"] = json!(true);
                                 let _ = proxy.send_event(Ev::Tool(job));
                             } else {
-                                let _ = job.reply.send(Err("the user said no to the trash: ask them in the chat".into()));
+                                let _ = job.reply.send(Err("the user said no: ask them in the chat".into()));
                             }
                         } else if v["yes"] == true && job.args["__frame"] == true {
                             let args = json!([job.args["element"].as_i64().unwrap_or(0), job.args["text"].as_str().unwrap_or(""), job.args["submit"] == true]);
@@ -1550,7 +1556,7 @@ fn main() {
                     let on = v["on"] == true;
                     web_stopped.store(on, std::sync::atomic::Ordering::SeqCst);
                     if on {
-                        for (_, job) in approvals.borrow_mut().drain() {
+                        for (_, (_, job)) in approvals.borrow_mut().drain() {
                             let _ = job.reply.send(Err("the user stopped the model's browsing".into()));
                         }
                     }
@@ -1743,7 +1749,7 @@ fn main() {
                             Ok(_) if google::ask(t, &job.args).is_some() && job.args["__allowed"] != true => {
                                 next_ask.set(next_ask.get() + 1);
                                 js_call(&web_bar, "ask", &json!({"id": next_ask.get(), "say": google::ask(t, &job.args)}));
-                                approvals.borrow_mut().insert(next_ask.get(), job);
+                                approvals.borrow_mut().insert(next_ask.get(), (std::time::Instant::now(), job));
                             }
                             // a page that comes by itself (the new map's editor, after Create): looked for each second
                             Ok((load, prefix)) if load.is_empty() && !google::on_page(&prefix, &here) => {
@@ -2079,7 +2085,7 @@ fn main() {
                     // asked in the browser's strip; the answer comes back as "web_allow"
                     next_ask.set(next_ask.get() + 1);
                     js_call(&web_bar, "ask", &json!({"id": next_ask.get(), "text": job.args["text"], "field": v["field"], "host": v["host"], "submit": job.args["submit"] == true}));
-                    approvals.borrow_mut().insert(next_ask.get(), job);
+                    approvals.borrow_mut().insert(next_ask.get(), (std::time::Instant::now(), job));
                 }
             }
             Event::UserEvent(Ev::WebText(r)) => {

@@ -36,6 +36,9 @@ pub fn tools() -> Value {
              "title_column": {"type": "string", "description": "the column that names each place: its name (e.g. Description) or its letter"}}}},
         {"name": "maps_export", "description": "Save a Google My Maps map on this Mac: its KML (each place with its coordinates and columns) as Strata-data/maps/<name>.kml, a GeoJSON copy, and the coordinates into the local table of the same name (table_upsert's) as Lat / Lng columns, matched by Link.",
          "inputSchema": {"type": "object", "required": ["map_url", "name"], "properties": {"map_url": {"type": "string", "description": "the map's address"}, "name": {"type": "string", "description": "the name to save it under (the table's name, to fill its Lat / Lng)"}, "key": {"type": "string", "description": "the key column (default Link)"}}}},
+        {"name": "maps_delete_layer", "description": "Delete one layer of a Google My Maps map: the layer with this name and this many places (two layers can share a name; the user is asked to allow it).",
+         "inputSchema": {"type": "object", "required": ["map_url", "layer", "items"], "properties": {"map_url": {"type": "string", "description": "the map's address"},
+             "layer": {"type": "string", "description": "the layer's name"}, "items": {"type": "integer", "description": "how many places the layer has (as the map shows: All items (N))"}}}},
         {"name": "maps_trash", "description": "Move a Google My Maps map (by its title) to the trash (the user is asked to allow it).",
          "inputSchema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}
     ])
@@ -52,7 +55,7 @@ pub fn page_for(tool: &str, args: &Value, here: &str) -> Result<(String, String)
         "sheets_create" => Ok(("https://sheets.new".into(), "\u{0}".into())),   // always a new one
         "maps_create" if args["__phase"] == 2 => Ok((String::new(), MAPS_EDIT.into())),
         "maps_create" | "maps_trash" => Ok((MAPS_LIST.into(), MAPS_LIST.into())),
-        "maps_import_sheet" | "maps_export" => {
+        "maps_import_sheet" | "maps_export" | "maps_delete_layer" => {
             let url = args["map_url"].as_str().unwrap_or("");
             let mid = map_id(url);
             let mid = mid.ok_or_else(|| format!("map_url {url:?}: a My Maps address with mid= (maps_create answers with it)"))?;
@@ -89,6 +92,7 @@ pub fn ask(tool: &str, args: &Value) -> Option<String> {
     match tool {
         "sheets_trash" => Some(format!("The model wants to move {} to the trash.", args["url"].as_str().unwrap_or("the spreadsheet open in the browser"))),
         "maps_trash" => Some(format!("The model wants to move the map \u{201c}{}\u{201d} to the trash.", args["title"].as_str().unwrap_or(""))),
+        "maps_delete_layer" => Some(format!("The model wants to delete the layer \u{201c}{}\u{201d} ({} places) from the map.", args["layer"].as_str().unwrap_or(""), args["items"])),
         _ => None,
     }
 }
@@ -460,6 +464,31 @@ const create = await wait(() => byText('button,[role=button],div', 'CREATE'), 'n
 // the answer first, the click a moment later: the click takes the page away, and with it an answer not yet read
 setTimeout(() => mouse(create), 2500);
 return '__next';"#, title = s("title")),
+        "maps_delete_layer" => format!(r#"
+// one layer, by its name and its number of places (a re-import made a second layer with the first one's name)
+const MID = {mid}, name = {layer}, items = {items};
+await wait(() => leaf('Add layer') || !location.pathname.startsWith('/maps/d/edit'), 'the map page did not load');
+if (!location.pathname.startsWith('/maps/d/edit') || new URLSearchParams(location.search).get('mid') !== MID) throw new Error('the map did not open (in the trash, or not yours?): ' + location.href);
+// a layer: its name, then its style line; its block is the largest ancestor with only that one layer name in it
+const layers = () => [...document.querySelectorAll('*')].filter((e) => e.offsetParent && e.textContent.trim() === name && ![...e.children].some((c) => c.textContent.trim() === name))
+  .map((h) => {{ let box = h;
+    while (box.parentElement && [...box.parentElement.querySelectorAll('*')].filter((e) => e.textContent.trim() === name && ![...e.children].some((c) => c.textContent.trim() === name)).length === 1) box = box.parentElement;
+    const lines = box.innerText.split('\n').map((x) => x.trim()).filter(Boolean), at = lines.indexOf(name);
+    return {{h, box, n: /^(Uniform style|Individual styles|Sequence of numbers|Style by|Group(s|ed) by)/i.test(lines[at + 1] || '') ? layerCount(box.innerText, name) : null}}; }})
+  .filter((l) => l.n !== null);
+const all = layers(), hit = all.filter((l) => l.n === items);
+if (hit.length !== 1) throw new Error((hit.length ? 'more than one layer' : 'no layer') + ' named ' + name + ' with ' + items + ' places: nothing deleted; its layers named so have ' + (all.map((l) => l.n).join(', ') || 'none') + ' places');
+const L = hit[0];
+mouse(L.h);                                        // its menu shows on hover
+await sleep(400);
+const opts = [...L.box.querySelectorAll('[aria-label],[data-tooltip]')].find((e) => /layer options/i.test(e.getAttribute('aria-label') || e.getAttribute('data-tooltip') || ''));
+if (!opts) throw new Error('no Layer options button in that layer (labels there: ' + [...new Set([...L.box.querySelectorAll('[aria-label],[data-tooltip]')].map((e) => e.getAttribute('aria-label') || e.getAttribute('data-tooltip')))].join(' | ').slice(0, 400) + '): nothing deleted');
+mouse(opts);
+mouse(await wait(() => [...document.querySelectorAll('[role=menuitem]')].find((e) => e.offsetParent && /^Delete this layer$/i.test(e.innerText.trim())), 'no Delete this layer in its menu: nothing deleted'));
+mouse(await wait(() => byText('[role=button],button', 'Delete'), 'no Delete in the confirmation'));
+await wait(() => layers().filter((l) => l.n === items).length === 0, 'the layer is still there');
+return 'deleted the layer ' + name + ' (' + items + ' places); the map has ' + layers().length + ' layer(s) named so left';"#,
+                    mid = serde_json::to_string(&map_id(args["map_url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into()), layer = s("layer"), items = args["items"].as_i64().unwrap_or(-1)),
         "maps_trash" => format!(r#"
 const name = {title};
 const t = await wait(() => leaf(name), 'no map titled ' + name + ' in My Maps');
