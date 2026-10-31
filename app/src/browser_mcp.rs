@@ -950,6 +950,12 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
         assert_eq!(e, "that map is in the trash (gone: use another); the maps in My Maps: studios-sandiego-downtown-2026 (https://www.google.com/maps/d/edit?mid=1JYYmapid). maps_create with a title gives the address of the map with that title");
 
+        // the new layer's own count, not the first layer's "All items(18)"
+        let count = |b: &mut Browser, text: &str, name: &str| b.eval(&format!("(() => {{ {} ; return layerCount({}, {}); }})()", crate::google::MAPS_PRELUDE, serde_json::to_string(text).unwrap(), serde_json::to_string(name).unwrap()));
+        let page = "studios\n9 views\nAdd layer\nstudios\nUniform style\nAll items(18)\nstudios (3 more)\nIndividual styles\nThe Artisan\nArrive Broadway Lofts\nCity Villas\nBase map\nView in Google Earth";
+        assert_eq!(count(&mut b, page, "studios (3 more)"), json!(3));
+        assert_eq!(count(&mut b, "studios\nAdd layer\nstudios\nUniform style\nAll items(18)\nBase map", "studios"), json!(18));
+
         // a form: what a field is (for the Allow), a password refused, typing fires input, submit sends the form
         b.page(FORM);
         b.json(&read_js(1));

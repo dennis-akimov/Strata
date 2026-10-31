@@ -370,6 +370,15 @@ const pickColumn = (names, want) => { const w = String(want || '').trim(), i = n
 // My Maps' list: the maps' cards (data-mid with data-name; menus carry data-mid too, and a hidden template card is
 // "Untitled map" with the id "dummyId")
 const mapCards = () => [...document.querySelectorAll('[data-mid][data-name]')].filter((c) => !/dummy/i.test(c.getAttribute('data-mid')));
+// how many places a layer has: its own part of the page (after its last mention, before the next layer or "Base
+// map"): "All items(N)" for a big layer, else one line per place (a 3-place import was once reported as the 18 of the
+// first layer)
+const layerCount = (text, name) => {
+  const i = text.lastIndexOf(name); if (i < 0) return null;
+  const end = text.indexOf('Base map', i), sec = text.slice(i + name.length, end > 0 ? end : undefined);
+  const m = sec.match(/All items\s*\((\d+)\)/);
+  return m ? +m[1] : sec.split('\n').map((s) => s.trim()).filter((s) => s && !/^(Uniform|Individual) styles?$/i.test(s) && !/couldn.t be shown|Open data table|Dismiss/.test(s)).length;
+};
 const leaf = (t) => [...document.querySelectorAll('*')].find((e) => e.offsetParent && e.textContent.trim() === t && ![...e.children].some((c) => c.textContent.trim() === t));
 "#;
 
@@ -476,8 +485,8 @@ mouse(await wait(() => byText('button,[role=button]', 'Finish'), 'no Finish'));
 const done = await wait(() => /trouble finding those locations/.test(document.body.innerText) ? 'fail' : (layersNamed() > layersBefore ? 'ok' : ''), 'the import did not finish');
 if (done === 'fail') throw new Error('My Maps could not place the rows by ' + loc + ' (rows with nothing in that column?)');
 await sleep(2000);
-const t = document.body.innerText, all = t.match(/All items\s*\((\d+)\)/), bad = t.match(/(\d+) rows? couldn.t be shown/);
-return 'imported ' + sheet + ' into ' + document.title + ' as a layer' + (all ? ' of ' + all[1] + ' places' : '') + ', placed by ' + names[li] + ', titled by ' + names[ti]
+const t = document.body.innerText, placed = layerCount(t, sheet), bad = t.match(/(\d+) rows? couldn.t be shown/);
+return 'imported ' + sheet + ' into ' + document.title + ' as a layer' + (placed !== null ? ' of ' + placed + ' places' : '') + ', placed by ' + names[li] + ', titled by ' + names[ti]
   + (bad ? '; ' + bad[1] + ' row(s) could not be placed (My Maps found no place for their ' + loc + ': fix them in the sheet, then import again)' : '')
   + ' (' + location.href.split('&')[0] + ')';"#,
                     sheet = s("sheet_title"), loc = s("location_column"), ttl = s("title_column"),
