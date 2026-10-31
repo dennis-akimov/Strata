@@ -623,9 +623,12 @@ fn defaults() -> Map<String, Value> {
 /// The tools whose names share the most words with a made-up one (browser__sheets_import_sheet ->
 /// browser__maps_import_sheet), at most two.
 pub fn closest(name: &str, names: &[String]) -> Vec<String> {
-    let words = |s: &str| -> HashSet<String> { s.split(['_', '-']).filter(|w| !w.is_empty()).map(str::to_lowercase).collect() };
+    // the words after the server's prefix ("browser__" is shared by all); "sheet" is "sheets"
+    let words = |s: &str| -> HashSet<String> {
+        s.rsplit("__").next().unwrap_or(s).split(['_', '-']).filter(|w| !w.is_empty()).map(|w| w.to_lowercase().trim_end_matches('s').to_string()).collect()
+    };
     let want = words(name);
-    let mut scored: Vec<(usize, &String)> = names.iter().map(|n| (words(n).intersection(&want).count(), n)).filter(|(k, _)| *k > 1).collect();
+    let mut scored: Vec<(usize, &String)> = names.iter().map(|n| (words(n).intersection(&want).count(), n)).filter(|(k, _)| *k > 0).collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
     let best = scored.first().map_or(0, |s| s.0);
     scored.into_iter().filter(|(k, _)| *k == best).take(2).map(|(_, n)| n.clone()).collect()
@@ -787,7 +790,10 @@ impl McpHub {
     /// Run one tool -> {"server", "tool", "ok", "text", "chars", "truncated", "ms"}; only a cancel is an Err.
     pub fn call(&self, name: &str, arguments: &Value, cancel: Option<&Event>) -> Result<Map<String, Value>, McpErr> {
         let t0 = Instant::now();
-        let route = self.routes_cache.lock().unwrap().get(name).cloned().or_else(|| self.routes().get(name).cloned());
+        // the cache's lock released before routes() takes it again (held through or_else, a name not in the cache
+        // deadlocked here: no call reached this with an unknown name until made-up names were answered here)
+        let cached = self.routes_cache.lock().unwrap().get(name).cloned();
+        let route = cached.or_else(|| self.routes().get(name).cloned());
         let mut out = Map::new();
         out.insert("server".into(), route.as_ref().map(|(s, _)| json!(s.name)).unwrap_or(Value::Null));
         out.insert("tool".into(), json!(route.as_ref().map(|(_, t)| t.clone()).unwrap_or_else(|| name.to_string())));
