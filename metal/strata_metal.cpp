@@ -594,8 +594,13 @@ struct Engine {
         return true;
     }
 
-    common_sampler* sampler(const std::string& line_keys) {
+    // grammar=<hex of GBNF> and grammar_trigger=<token id>: a lazy grammar, applied from that token on (the server's
+    // tool-call grammar: only the tools' own names and arguments; thinking and text stay free).  A grammar that does
+    // not parse is an error, here or in common_sampler_init (it throws): `err` says it, the sampler is null.
+    common_sampler* sampler(const std::string& line_keys, std::string* err = nullptr) {
         common_params_sampling s = params.sampling;
+        std::string grammar;
+        long long trigger = -1;
         s.temp = 0.0f;                        // absent keys: greedy, as the CUDA engine
         s.top_k = 20;
         s.top_p = 1.0f;
@@ -620,9 +625,34 @@ struct Engine {
             else if (k == "penalty_present") s.penalty_present = std::strtof(v, nullptr);
             else if (k == "penalty_last_n") s.penalty_last_n = std::atoi(v);
             else if (k == "seed") s.seed = (uint32_t) std::strtoull(v, nullptr, 10);
+            else if (k == "grammar_trigger") trigger = std::strtoll(v, nullptr, 10);
+            else if (k == "grammar") {
+                const std::string h(v);
+                if (h.size() % 2 || h.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+                    if (err) *err = "grammar: not hex";
+                    return nullptr;
+                }
+                for (size_t q = 0; q < h.size(); q += 2) grammar += (char) std::stoi(h.substr(q, 2), nullptr, 16);
+            }
         }
         if (s.top_k <= 0) s.top_k = 64;
-        return common_sampler_init(model, s);
+        if (!grammar.empty()) {
+            if (trigger >= llama_vocab_n_tokens(vocab)) {
+                if (err) *err = "grammar_trigger " + std::to_string(trigger) + " is outside the vocabulary";
+                return nullptr;
+            }
+            s.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, grammar);
+            s.grammar_lazy = trigger >= 0;
+            if (trigger >= 0) s.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN, "", (llama_token) trigger});
+        }
+        try {
+            common_sampler* smpl = common_sampler_init(model, s);
+            if (!smpl && err) *err = "the sampler did not start (grammar?)";
+            return smpl;
+        } catch (const std::exception& e) {
+            if (err) *err = std::string("grammar: ") + e.what();
+            return nullptr;
+        }
     }
 
     bool decoding() const {
@@ -660,6 +690,12 @@ struct Engine {
             }
             keys_txt = rest;
             if (file.empty()) return refuse("expected: GENI <max_new> <file> <id,id,...>");
+        }
+        {                                             // a grammar that does not parse: refused before the prompt is read
+            std::string gerr;
+            common_sampler* probe = keys_txt.find(" grammar=") != std::string::npos ? sampler(keys_txt, &gerr) : nullptr;
+            if (probe) common_sampler_free(probe);
+            if (!gerr.empty()) return refuse(gerr);
         }
         const size_t n = P.ids.size();
         if ((int64_t) n >= o.max_context)
@@ -948,7 +984,7 @@ int main(int argc, char** argv) {
     const char* backend = "vulkan";
 #endif
     out("INFO engine=" STRATA_VERSION "-metal backend=%s llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
-        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu\n", backend,
+        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu grammar=1\n", backend,
         (long long) e.o.max_context, e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0,
         e.spec ? e.o.spec : 0, gpu_used, gpu_total);
     out("READY %lld stop\n", (long long) e.o.max_context);

@@ -106,6 +106,19 @@ impl Service {
         t
     }
 
+    /// The tool-call grammar as hex and the token it starts at: an LFM model with tools, on an engine whose INFO says
+    /// grammar=1, the call's start and end one token each.
+    pub fn tool_grammar(&self, tools: Option<&[Value]>) -> Option<(String, u32)> {
+        let tools = tools.filter(|t| !t.is_empty())?;
+        if !self.lfm || self.engine.strata()?.info.lock().unwrap().get("grammar").and_then(Value::as_i64) != Some(1) {
+            return None;
+        }
+        let one = |s: &str| match self.tok.encode(s, true)[..] { [t] => Some(t), _ => None };
+        let (start, end) = (one(crate::parser::LFM_CALL_START)?, one(crate::parser::LFM_CALL_END)?);
+        let g = crate::parser::lfm_call_grammar(tools, start, end)?;
+        Some((g.bytes().map(|b| format!("{b:02x}")).collect(), start))
+    }
+
     /// The request's events, then Item::Done({"finish", "completion_tokens", ...}).
     #[allow(clippy::too_many_arguments)]
     pub fn run(&self, ids: &[u32], thinking: bool, tools: Option<&[Value]>, max_new: i64, sampling: &Map<String, Value>, cancel: &Arc<Flag>, force: Option<String>, emit: Emit) -> Result<(), Stop<Fail>> {
@@ -123,6 +136,14 @@ impl Service {
                 }
             }
             sampling = merged;
+        }
+        // LFM's tool calls by grammar, on an engine that has it (INFO grammar=1): from <|tool_call_start|> on it samples
+        // only the tools' own names and argument names (never a client's: the keys are Strata's)
+        sampling.remove("strata_tool_grammar");
+        sampling.remove("strata_tool_grammar_from");
+        if let Some((g, from)) = self.tool_grammar(tools) {
+            sampling.insert("strata_tool_grammar".into(), json!(g));
+            sampling.insert("strata_tool_grammar_from".into(), json!(from));
         }
         let samp_v = Value::Object(sampling.clone());
         let mut budget = if thinking { self.reasoning_budget(&samp_v).map_err(Stop::Err)? } else { None };

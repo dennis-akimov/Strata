@@ -1302,6 +1302,46 @@ pub fn lfm_call_to_qwen(call: &str) -> String {
     }).collect()
 }
 
+/// A GBNF literal: `"..."` with `"` and `\` escaped.
+fn gbnf_lit(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The GBNF grammar of an LFM tool-call list for these tools (llama.cpp's lazy grammar, from the `start` token): only
+/// their own names, each with its own argument names, the values Python literals as PyLit reads them.  A small model
+/// made names up (browser__sheets_upsert) and argument names (url for map_url): with this the sampler cannot.  One
+/// way to read each text (whitespace only after `,` `:` `[` `{` and before `]` `}`): an ambiguous grammar multiplies
+/// llama.cpp's parse stacks (issue #4218).  None without tools.
+pub fn lfm_call_grammar(tools: &[Value], start: u32, end: u32) -> Option<String> {
+    let mut calls = vec![];
+    let mut rules = vec![];
+    for (i, t) in tools.iter().enumerate() {
+        let name = py::get(t, "name").as_str().filter(|n| !n.is_empty())?;
+        let props: Vec<String> = py::get(py::get(t, "parameters"), "properties").as_object().map(|o| o.keys().map(|k| gbnf_lit(k)).collect()).unwrap_or_default();
+        // a schema open to other names (JSON Schema's default with no properties, or additionalProperties set) takes any
+        let open = props.is_empty() || py::truthy(py::get(py::get(t, "parameters"), "additionalProperties"));
+        let key = if props.is_empty() { "ident".to_string() } else if open { format!("( {} | ident )", props.join(" | ")) } else { format!("( {} )", props.join(" | ")) };
+        rules.push(format!("t{i} ::= {} ( a{i} ( \",\" \" \"? a{i} )* )? \")\"\na{i} ::= {key} \"=\" v", gbnf_lit(&format!("{name}("))));
+        calls.push(format!("t{i}"));
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    Some(format!(r#"root ::= <[{start}]> "[" call ( "," " "? call )* "]" <[{end}]>
+call ::= {}
+{}
+v ::= str | num | lit | list | dict
+lit ::= "True" | "False" | "None" | "true" | "false" | "null"
+str ::= "\"" ( [^"\\] | "\\" . )* "\"" | "'" ( [^'\\] | "\\" . )* "'"
+num ::= "-"? [0-9]+ ( "." [0-9]+ )? ( [eE] [-+]? [0-9]+ )?
+list ::= "[" ws ( v ws ( "," ws v ws )* ( "," ws )? )? "]"
+dict ::= "{{" ws ( pair ws ( "," ws pair ws )* ( "," ws )? )? "}}"
+pair ::= v ws ":" ws v
+ident ::= [a-zA-Z_] [a-zA-Z0-9_]*
+ws ::= [ \t\n]*
+"#, calls.join(" | "), rules.join("\n")))
+}
+
 /// The calls of an LFM tool-call list: `[f(a=1), g(b='x')]`, the values Python literals (and JSON's true/false/null).
 pub struct PyLit<'a> {
     s: &'a [u8],
@@ -1514,6 +1554,17 @@ mod lfm_tests {
 
     #[test]
     fn lfm_calls_become_outputparser_calls() {
+        // the grammar: each tool by its own name and argument names
+        use serde_json::json;
+        let tools = vec![json!({"name": "browser__maps_export", "parameters": {"properties": {"map_url": {}, "name": {}}}}), json!({"name": "noargs"})];
+        let g = lfm_call_grammar(&tools, 7, 8).unwrap();
+        assert!(g.starts_with("root ::= <[7]> \"[\" call ( \",\" \" \"? call )* \"]\" <[8]>\ncall ::= t0 | t1\n"), "{g}");
+        assert!(g.contains("t0 ::= \"browser__maps_export(\" ( a0 ( \",\" \" \"? a0 )* )? \")\"\na0 ::= ( \"map_url\" | \"name\" ) \"=\" v"), "{g}");
+        assert!(g.contains("a1 ::= ident \"=\" v"), "no properties: any name");
+        let open = lfm_call_grammar(&[json!({"name": "f", "parameters": {"properties": {"a": {}}, "additionalProperties": true}})], 7, 8).unwrap();
+        assert!(open.contains("a0 ::= ( \"a\" | ident ) \"=\" v"), "{open}");
+        assert_eq!(lfm_call_grammar(&[], 7, 8), None);
+        assert_eq!(gbnf_lit(r#"a"b\c"#), r#""a\"b\\c""#);
         let q = lfm_call_to_qwen(r#"<|tool_call_start|>[get_weather(city="Paris", days=3), note(text='it\'s "ok"\nyes', tags=["a", 'b'], opts={"x": True, 'y': None}, t=-1.5)]<|tool_call_end|>"#);
         assert_eq!(q.matches(CALL_START).count(), 2);
         assert!(q.contains("<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>"), "{q}");
@@ -1545,5 +1596,17 @@ mod lfm_tests {
             let shown: String = ev.iter().filter(|e| e.call.is_none()).map(|e| e.text.as_str()).collect();
             assert!(!shown.contains("tool_call"), "cut {cut}: {shown:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod grammar_dump {
+    /// STRATA_TOOLS_JSON=tools.json cargo test --lib dump_tool_grammar -- --ignored --nocapture: the grammar for those
+    /// tools (start/end as tokens 1 and 2), to check with llama.cpp's test-gbnf-validator
+    #[test]
+    #[ignore]
+    fn dump_tool_grammar() {
+        let tools: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(std::env::var("STRATA_TOOLS_JSON").unwrap()).unwrap()).unwrap();
+        println!("{}", super::lfm_call_grammar(&tools, 1, 2).unwrap());
     }
 }

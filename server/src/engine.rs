@@ -166,6 +166,12 @@ pub fn sampling_keys(s: &Map<String, Value>) -> String {
     if s.get("strata_checkpoint") == Some(&Value::Bool(false)) {
         keys += " ckpt=0";
     }
+    // the tool-call grammar (run.rs sets it; GBNF as hex: the line is split at spaces) and the token it starts at
+    if let (Some(Value::String(g)), Some(t)) = (s.get("strata_tool_grammar"), int("strata_tool_grammar_from")) {
+        if !g.is_empty() && g.bytes().all(|b| b.is_ascii_hexdigit()) && t >= 0 {
+            keys += &format!(" grammar={g} grammar_trigger={t}");
+        }
+    }
     if let Some(Value::Number(pn)) = s.get("strata_prefix").and_then(|p| p.get("tokens")) {
         if let Some(pn) = pn.as_i64().filter(|n| *n > 0) {
             keys += &format!(" pin={pn}");
@@ -2300,5 +2306,20 @@ mod afm_tests {
     fn a_streamed_piece_is_one_token() {
         let (a, b) = (chunk_id("Can".into()), chunk_id("berra é".into()));
         assert_eq!(ByteTokenizer.decode(&[a, b, 257]), "Canberra é<|im_end|>");
+    }
+}
+
+#[cfg(test)]
+mod grammar_key_tests {
+    use super::*;
+
+    #[test]
+    fn the_tool_grammar_goes_on_the_gen_line_as_hex() {
+        let keys = |v: Value| sampling_keys(v.as_object().unwrap());
+        assert_eq!(keys(json!({"strata_tool_grammar": "726f6f74", "strata_tool_grammar_from": 7})), " grammar=726f6f74 grammar_trigger=7");
+        // GBNF itself (spaces) would split the line: not hex, not sent; nor without its token
+        assert_eq!(keys(json!({"strata_tool_grammar": "root ::= x", "strata_tool_grammar_from": 7})), "");
+        assert_eq!(keys(json!({"strata_tool_grammar": "726f6f74"})), "");
+        assert_eq!(keys(json!({"grammar": "root ::= x"})), "", "a client's grammar field is not Strata's");
     }
 }
