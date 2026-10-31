@@ -50,6 +50,10 @@ pub fn tools() -> Value {
     if let (Some(all), Some(g)) = (t.as_array_mut(), crate::google::tools().as_array()) {
         all.extend(g.iter().cloned());
     }
+    // tables kept on this Mac and synced to a sheet (table.rs)
+    if let (Some(all), Some(g)) = (t.as_array_mut(), crate::table::tools().as_array()) {
+        all.extend(g.iter().cloned());
+    }
     t
 }
 
@@ -384,7 +388,7 @@ mod tests {
         let names: Vec<String> = serde_json::from_str::<Value>(&b).unwrap()["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().into()).collect();
         assert_eq!(names, ["browser_search", "browser_open", "browser_read", "browser_click", "browser_type", "browser_scroll", "browser_back",
                            "sheets_create", "sheets_read", "sheets_append", "sheets_write", "sheets_delete_rows", "sheets_clear", "sheets_trash",
-                           "maps_create", "maps_import_sheet", "maps_trash"]);
+                           "maps_create", "maps_import_sheet", "maps_trash", "table_read", "table_upsert", "table_delete", "table_sync"]);
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_read","arguments":{}}}"#);
         assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["result"]["content"][0]["text"], "ran browser_read");
         assert!(post("Bearer k1", r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).0.contains("202"));
@@ -800,6 +804,30 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         assert_eq!(grid(&mut b, 2)[1][3], "");
         assert!(tool(&mut b, "sheets_trash", json!({})).unwrap().starts_with("moved to the trash: studios"));
         assert_eq!(b.eval("trashed"), true);
+
+        // table_sync: the person's tick in the sheet goes into the file; the file's table goes into the sheet in one
+        // paste; rows the table no longer has are removed
+        b.page_http(FAKE_SHEET);
+        b.eval("[['Checkbox','Address','Link','Confirmation'],['TRUE','old 1 A St','https://a','called'],['FALSE','2 B St','https://b',''],['FALSE','gone','https://gone','']].forEach((r, i) => r.forEach((v, j) => grid[i][j] = v)); pastes.length = 0");
+        let mut file: crate::table::Table = vec![
+            vec!["Checkbox".into(), "Address".into(), "Link".into(), "Confirmation".into()],
+            vec!["FALSE".into(), "1 A St".into(), "https://a".into(), "".into()],
+            vec!["FALSE".into(), "2 B St".into(), "https://b".into(), "".into()],
+        ];
+        let pulled: Value = serde_json::from_str(tool(&mut b, "table_sync", json!({})).unwrap().as_str()).unwrap();
+        assert_eq!(pulled["rows"], 4);
+        // the sheet still has "gone", a row table_delete removed from the file: not taken back
+        crate::table::merge(&mut file, pulled["pulled"].as_str().unwrap(), "Link", &["Checkbox".into(), "Confirmation".into()], &["https://gone".into()]).unwrap();
+        assert_eq!(file[1], ["TRUE", "1 A St", "https://a", "called"], "their tick and note, the file's address");
+        assert_eq!(file.len(), 3, "the deleted row did not come back");
+        let push = crate::table::sync_push_js(&file, 4);
+        let out = tool(&mut b, "table_sync", json!({"__phase": 2, "__push": push})).unwrap();
+        assert!(out.contains("put 2 rows") && out.contains("rows 4-4 that the table no longer has removed"), "{out}");
+        let g = grid(&mut b, 4);
+        assert_eq!(&g[1][..4], ["TRUE", "1 A St", "https://a", "called"]);
+        assert_eq!(&g[2][..3], ["FALSE", "2 B St", "https://b"]);
+        assert_eq!(g[3][2], "", "the dropped row is gone");
+        assert_eq!(b.eval("pastes.length"), 1, "one paste for the whole table");
 
         // no url, an address with ?gid=9 (no #fragment): that tab, not tab 0
         b.page_http_at(FAKE_SHEET, "/spreadsheets/d/fake/edit?gid=9");

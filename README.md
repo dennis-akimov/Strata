@@ -234,6 +234,13 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   selected, then Enter. A page that asks to prove a person is there (a press-and-hold, a captcha, "unusual traffic")
   is said as such: the model asks you to do it in the pane, and never tries to pass it. The model is told to get
   around a site by its own search field and links rather than made-up addresses.
+- **Tables on this Mac, synced to a Google Sheet:** `table_upsert` / `table_read` / `table_delete` keep a table as a
+  CSV file in `Strata-data/sheets/<name>.csv` (RFC 4180: quoted fields with commas, quotes and line breaks), rows by a
+  key column (Link by default): instant, no browser, a file to diff and back up. `table_sync` puts it in its Google
+  Sheet: first your own columns (Checkbox, Confirmation; `mine` to change them) and rows you added there come into the
+  file, then the whole table goes in with one paste, rows it no longer has are removed, and the Checkbox column gets
+  tick boxes. Rows removed with `table_delete` are remembered (`<name>.csv.deleted`) so a sync does not bring them
+  back. A paste, not File > Import: an import resets the cells' formats.
 - **The model finishes what it says and checks it:** every MCP tool call is checked against the tool's input schema
   before it runs (a missing required argument, a wrong type; an unknown name when the schema allows none, or beside
   another error): it is not run, and the model reads what the tool takes ("map_url is missing; it has no url. It

@@ -22,6 +22,7 @@ use wry::{WebView, WebViewBuilder};
 mod browser_mcp;
 mod google;
 mod native_input;
+mod table;
 
 const PANEL: &str = include_str!("panel.html");
 const LOG_KEEP: usize = 2000;
@@ -1636,10 +1637,23 @@ fn main() {
                 let tool = job.tool.clone();
                 let in_picker = job.args.get("__top").is_none() && web.url().map(|u| browser_mcp::picker_host(&u)).unwrap_or(false);
                 match tool.as_str() {
+                    // a table on this Mac (table.rs): no browser
+                    t if t.starts_with("table_") && t != "table_sync" => {
+                        let dir = st.lock().unwrap().root.join("../Strata-data/sheets");
+                        let _ = job.reply.send(table::local_tool(&dir, t, &job.args));
+                    }
                     // Google Sheets / My Maps (google.rs): in their page, loaded first when the pane is elsewhere
                     t if google::is_google(t) => {
                         let mut job = job;
                         let here = web.url().unwrap_or_default();
+                        // table_sync: its file, set by the app (a caller's __ keys are removed)
+                        if t == "table_sync" && job.args.get("__table").is_none() {
+                            let dir = st.lock().unwrap().root.join("../Strata-data/sheets");
+                            match table::path_of(&dir, job.args["name"].as_str().unwrap_or("")) {
+                                Ok(p) => job.args["__table"] = json!(p.to_string_lossy()),
+                                Err(e) => { let _ = job.reply.send(Err(e)); return; }
+                            }
+                        }
                         // no url: the open sheet's own address (its ?gid= tab with it), not tab 0 by default
                         if t.starts_with("sheets_") && t != "sheets_create" && job.args["url"].as_str().is_none_or(str::is_empty) && google::sheet_base(&here).is_some() {
                             job.args["url"] = json!(here.clone());
@@ -1889,6 +1903,29 @@ fn main() {
                                 let _ = p.send_event(Ev::AsyncCollect(job, id, tries + 1));
                             });
                         }
+                    } else if job.tool == "table_sync" && job.args["__phase"] != 2 && v["ok"].is_string() {
+                        // step 1 read the sheet: the person's columns into the file, then step 2 puts the file in it
+                        let mut job = job;
+                        let pulled: Value = serde_json::from_str(v["ok"].as_str().unwrap_or("")).unwrap_or_default();
+                        let path = std::path::PathBuf::from(job.args["__table"].as_str().unwrap_or(""));
+                        let key = job.args["key"].as_str().filter(|k| !k.is_empty()).unwrap_or("Link").to_string();
+                        let mine: Vec<String> = job.args["mine"].as_array().map(|m| m.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .unwrap_or_else(|| vec!["Checkbox".into(), "Confirmation".into()]);
+                        let step = table::load(&path).and_then(|mut t| {
+                            if t.is_empty() { return Err(format!("no table {} yet: table_upsert with columns makes it", path.display())); }
+                            let (took, added) = table::merge(&mut t, pulled["pulled"].as_str().unwrap_or(""), &key, &mine, &table::tombstones(&path))?;
+                            table::save(&path, &t)?;
+                            Ok((t, took, added))
+                        });
+                        match step {
+                            Err(e) => { let _ = job.reply.send(Err(format!("table_sync: {e}"))); }
+                            Ok((t, took, added)) => {
+                                job.args["__push"] = json!(table::sync_push_js(&t, pulled["rows"].as_u64().unwrap_or(0) as usize));
+                                job.args["__took"] = json!(format!("{took} of your cells and {added} rows you added came from the sheet into the file; "));
+                                job.args["__phase"] = json!(2);
+                                let _ = p.send_event(Ev::Tool(job));
+                            }
+                        }
                     } else if v["ok"] == "__next" {
                         // the script's click took the page away: the next phase where the page goes
                         let mut job = job;
@@ -1896,6 +1933,8 @@ fn main() {
                         let _ = p.send_event(Ev::Tool(job));
                     } else if let Some(e) = v["error"].as_str() {
                         let _ = job.reply.send(Err(format!("{}: {e}", job.tool)));
+                    } else if job.tool == "table_sync" {
+                        let _ = job.reply.send(Ok(format!("{}{}", job.args["__took"].as_str().unwrap_or(""), v["ok"].as_str().unwrap_or(""))));
                     } else {
                         let _ = job.reply.send(Ok(google::answer(&job.tool, &job.args, &v["ok"])));
                     }

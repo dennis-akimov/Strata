@@ -41,7 +41,7 @@ pub fn tools() -> Value {
 
 /// Is `tool` one of these?
 pub fn is_google(tool: &str) -> bool {
-    tool.starts_with("sheets_") || tool.starts_with("maps_")
+    tool.starts_with("sheets_") || tool.starts_with("maps_") || tool == "table_sync"
 }
 
 /// The page `tool` works in: (the address to load when the pane is elsewhere, the prefix that says it is there).
@@ -343,6 +343,16 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
             let r = range("range", "")?;
             format!(r#"await ready(); await go('{r}'); del(); await sleep(600); await go('A1'); return 'cleared {r} in ' + where();"#)
         }
+        // table_sync step 1: the sheet as it is (the person's edits); step 2: the app's paste of the merged table
+        "table_sync" if args["__phase"] == 2 => args["__push"].as_str().ok_or("no table to put")?.to_string(),
+        "table_sync" => r#"await ready();
+  let h = []; try { h = await header(); } catch (e) {}
+  if (!h.length) return JSON.stringify({pulled: '', rows: 0});
+  await go('A:' + letter(Math.max(h.length, 26) - 1));
+  const t = clip('copy'); let last = 0;
+  t.split('\n').forEach((l, i) => { if (l.split('\t').some((c, j) => filled(c, j))) last = i + 1; });
+  await go('A1');
+  return JSON.stringify({pulled: t, rows: last});"#.to_string(),
         "sheets_trash" => r#"await ready(); const w = where(); await menu('#docs-file-menu', 'Move to trash'); await sleep(1500); return 'moved to the trash: ' + w;"#.to_string(),
         other => return Err(format!("no tool {other}")),
     };
