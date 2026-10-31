@@ -194,6 +194,12 @@ const go = async (range) => { live();
   // append once counted the rows of A1 alone and wrote over row 2): the Name Box says what is selected
   const nb = document.querySelector('#t-name-box'), [a, b] = range.split(':');
   const shown = b === a ? a : range;     // the Name Box says A4 for A4:A4
+  // a sheet just opened takes the hash late (the first read after a start said "not in the sheet; selected A1:Z1"):
+  // wait for it, and set the hash once more (the same hash again fires nothing: the tab alone first), before calling
+  // the range missing
+  for (let i = 0; nb && nb.value !== shown && i < 10; i++) {
+    if (i === 4) { location.hash = 'gid=' + gid; await sleep(300); location.hash = 'gid=' + gid + '&range=' + range; }
+    await sleep(500); }
   if (nb && nb.value !== shown) throw new Error('range ' + range + ' is not in the sheet (it has fewer rows or columns); selected: ' + nb.value);
 };
 const clip = (type, text) => { if (type !== 'copy') live(); const dt = new DataTransfer(); if (text !== undefined) dt.setData('text/plain', text);

@@ -672,6 +672,7 @@ const parse = (range) => {
 };
 addEventListener('hashchange', () => {
   const q = new URLSearchParams(location.hash.slice(1)), r = q.get('range') || 'A1', p = parse(r); tabs.push(q.get('gid'));
+  if (window.coldHashes > 0) { coldHashes--; return; }   // a sheet just opened: the first hash is not taken yet
   if (!p) return;                                  // past the sheet: ignored, without a word
   sel = p; const [a, b] = r.split(':'); document.querySelector('#t-name-box').value = b === a ? a : r;
 });
@@ -886,6 +887,9 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         assert_eq!(b.eval("document.querySelector('#menu').children.length"), 0, "the menu did not open");
         b.eval("window.__strataStop = {}");
 
+        // a sheet just opened takes the first hash late: the read waits for it (it said "not in the sheet")
+        b.eval("window.coldHashes = 1");
+        assert!(tool(&mut b, "sheets_read", json!({"range": "A1:B2"})).unwrap().as_str().contains("row 1:"));
         tool(&mut b, "sheets_clear", json!({"range": "D2:D2"})).unwrap();
         assert_eq!(grid(&mut b, 2)[1][3], "");
         assert!(tool(&mut b, "sheets_trash", json!({})).unwrap().starts_with("moved to the trash: studios"));
