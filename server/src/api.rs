@@ -162,12 +162,17 @@ pub fn repeat_refusal(name: &str, err: &str, k: u32) -> String {
             err.trim_start_matches("error: ").chars().take(240).collect::<String>())
 }
 
+/// A tool name with the prefix of one of these MCP tools' servers ("browser__" ...).
+pub fn ours(names: &HashSet<String>, name: &str) -> bool {
+    name.split_once("__").is_some_and(|(server, _)| names.iter().any(|n| n.starts_with(&format!("{server}__"))))
+}
+
 /// What Strata says to a model that only said what it would do.
 pub const NUDGE: &str = "(Strata) You said what you would do, but called no tool, so nothing was done. Do it now with the tools; if you cannot, say plainly why.";
 
 /// The check after an answer that changed something (outcome, not the model's word: NVIDIA's agent evaluation scores
 /// the end state against the goal).
-pub const CHECK: &str = "(Strata check) Before you finish, check your work against my request. Read back what you changed with the tools (sheets_read, browser_read, ...): do not trust memory. Then list each part of my request as DONE or NOT DONE, with what you saw. If something is NOT DONE or wrong (a value in the wrong column, a row missing, a file with the wrong name), fix it with the tools now and say what you fixed.";
+pub const CHECK: &str = "(Strata check) Before you finish, check your work against my request. Read back what you changed with the tools (sheets_read, browser_read, ...): do not trust memory. Then list each part of my request as DONE or NOT DONE, with what you saw. If something is NOT DONE or wrong (a value in the wrong column, a row missing, a file with the wrong name), fix it with the tools now and say what you fixed. Do not create new files the request did not ask for.";
 
 /// A tool that changes something (its own name, after the server's prefix): the answer is checked after it.
 pub fn changes(tool: &str) -> bool {
@@ -219,7 +224,9 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
                 Ok(())
             }
             Item::Event(ev) => {
-                if let Some(c) = ev.call.as_ref().filter(|c| m.names.contains(&c.name)) {
+                // an MCP tool, or a made-up name with an MCP server's prefix (browser__sheets_import_sheet): ours to
+                // answer, not the API client's (passed on, it ended the answer with nothing run)
+                if let Some(c) = ev.call.as_ref().filter(|c| m.names.contains(&c.name) || ours(&m.names, &c.name)) {
                     if ev.kind == Kind::ToolStart {
                         return emit(Item::Mcp(json!({"event": "start", "id": c.id, "name": c.name})));
                     }
@@ -1052,5 +1059,18 @@ mod loop_tests {
         let results: Vec<&Value> = mcp.iter().filter(|v| v["event"] == "result").collect();
         assert_eq!(results.len(), 4);
         assert!(results.iter().all(|v| v["skipped"].is_null()), "error, success, error, error: all four run (the success started the count again); {mcp:?}");
+    }
+
+    #[test]
+    fn a_made_up_tool_name_is_answered_here_not_passed_on() {
+        let names: HashSet<String> = ["browser__maps_import_sheet".to_string()].into();
+        assert!(ours(&names, "browser__sheets_import_sheet") && !ours(&names, "get_weather") && !ours(&names, "other__x"));
+        // in the loop: the call is answered with an error and the answer goes on
+        let typo = "</think>\n\n<tool_call>\n<function=web__raed>\n</function>\n</tool_call>";
+        let (mcp, text, _) = run(&[typo, CALL, "</think>\n\nRead it."]);
+        let results: Vec<&Value> = mcp.iter().filter(|v| v["event"] == "result").collect();
+        assert_eq!(results[0]["text"], "error: there is no tool named 'web__raed'", "no near name for one shared word: {:?}", results[0]);
+        assert_eq!(results.len(), 2, "{mcp:?}");
+        assert!(text.contains("Read it."), "{text:?}");
     }
 }

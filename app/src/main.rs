@@ -1232,6 +1232,9 @@ fn main() {
     let next_frame_op = std::cell::Cell::new(0u64);
     // Google tools waiting for their page to load (re-run once it has)
     let job_waiters: std::cell::RefCell<Vec<browser_mcp::Job>> = Default::default();
+    // navigations the app knows of besides a tool's own load (the strip's address, back, forward, reload; a chat
+    // link): a sheets_create whose load overlapped one is not sure the sheet it landed on is the one it made
+    let nav_epoch = std::cell::Cell::new(0u64);
     let web = {
         let (p, p2) = (proxy.clone(), proxy.clone());
         WebViewBuilder::new()
@@ -1464,6 +1467,7 @@ fn main() {
                     js_call(&page, "strataWeb", &json!(web_open.get()));
                 }
                 "web_open" => {
+                    nav_epoch.set(nav_epoch.get() + 1);
                     if !web_open.get() {
                         web_open.set(true);
                         layout(full.get());
@@ -1473,11 +1477,12 @@ fn main() {
                     let _ = web.load_url(v["url"].as_str().unwrap_or("about:blank"));
                 }
                 "web_go" => {
+                    nav_epoch.set(nav_epoch.get() + 1);
                     let _ = web.load_url(&web_url(v["url"].as_str().unwrap_or("")));
                 }
-                "web_back" => { let _ = web.evaluate_script("history.back()"); }
-                "web_fwd" => { let _ = web.evaluate_script("history.forward()"); }
-                "web_reload" => { let _ = web.evaluate_script("location.reload()"); }
+                "web_back" => { nav_epoch.set(nav_epoch.get() + 1); let _ = web.evaluate_script("history.back()"); }
+                "web_fwd" => { nav_epoch.set(nav_epoch.get() + 1); let _ = web.evaluate_script("history.forward()"); }
+                "web_reload" => { nav_epoch.set(nav_epoch.get() + 1); let _ = web.evaluate_script("location.reload()"); }
                 "web_allow" => {
                     // the person's answer to browser_type's question
                     if let Some(job) = approvals.borrow_mut().remove(&v["id"].as_u64().unwrap_or(0)) {
@@ -1580,7 +1585,10 @@ fn main() {
                         }
                     }
                 }
-                for j in job_waiters.borrow_mut().drain(..) {
+                for mut j in job_waiters.borrow_mut().drain(..) {
+                    // where its own load landed: the tool acts there or not at all (a navigation in between is not it)
+                    // ... unless another navigation the app knows of came between (then it lands nowhere sure)
+                    j.args["__landed"] = if j.args["__epoch"].as_u64() == Some(nav_epoch.get()) { json!(url.clone()) } else { Value::Null };
                     let p = Mutex::new(proxy.clone());
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(1500));
@@ -1631,9 +1639,14 @@ fn main() {
                     t if google::is_google(t) => {
                         let mut job = job;
                         let here = web.url().unwrap_or_default();
+                        // no url: the open sheet's own address (its ?gid= tab with it), not tab 0 by default
+                        if t.starts_with("sheets_") && t != "sheets_create" && job.args["url"].as_str().is_none_or(str::is_empty) && google::sheet_base(&here).is_some() {
+                            job.args["url"] = json!(here.clone());
+                        }
                         match google::page_for(t, &job.args, &here) {
                             Err(e) => { let _ = job.reply.send(Err(e)); }
-                            Ok(_) if google::ask(t, &job.args).is_some() && job.args.get("__allowed").is_none() => {
+                            // exactly true, set by the Allow below (callers' __ keys are removed: browser_mcp::caller_args)
+                            Ok(_) if google::ask(t, &job.args).is_some() && job.args["__allowed"] != true => {
                                 next_ask.set(next_ask.get() + 1);
                                 js_call(&web_bar, "ask", &json!({"id": next_ask.get(), "say": google::ask(t, &job.args)}));
                                 approvals.borrow_mut().insert(next_ask.get(), job);
@@ -1654,8 +1667,14 @@ fn main() {
                             }
                             Ok((load, prefix)) if job.args.get("__loaded").is_none() && !google::on_page(&prefix, &here) => {
                                 job.args["__loaded"] = json!(true);
+                                job.args["__epoch"] = json!(nav_epoch.get());
+                                // the document open before: a "new" sheet that is this one is not new
+                                job.args["__before"] = json!(here.split('/').nth(5).unwrap_or(""));
                                 let _ = web.load_url(&load);
                                 job_waiters.borrow_mut().push(job);
+                            }
+                            Ok((_, prefix)) if !google::arrived(t, &prefix, &here) => {
+                                let _ = job.reply.send(Err(format!("{t} was not run: the browser is at {here}, not the spreadsheet it was for (a sign-in, or another page while it loaded); browser_read it")));
                             }
                             Ok(_) => {
                                 let js = if t.starts_with("maps_") { google::maps_js(t, &job.args, &frame_token) } else { google::sheets_js(t, &job.args) };
@@ -1664,18 +1683,24 @@ fn main() {
                                     Ok(body) => {
                                         next_frame_op.set(next_frame_op.get() + 1);
                                         let id = next_frame_op.get();
-                                        let _ = web.evaluate_script(&google::async_js(id, &body));
-                                        // whatever happens to the page, the call is answered (a lost answer hung it 150 s)
-                                        let late = job.reply.clone();
-                                        let tool = t.to_string();
-                                        let stop = Mutex::new(proxy.clone());
-                                        std::thread::spawn(move || {
-                                            std::thread::sleep(Duration::from_secs(75));
-                                            // the script is told to stop before its next change, and the answer says
-                                            // it may have done part (a timed-out import once finished after it)
-                                            let _ = stop.lock().unwrap().send_event(Ev::StopScript(id));
-                                            let _ = late.send(Err(format!("{tool} did not answer in 75 s and was stopped; it may have done part of it: read the sheet or map before trying again")));
-                                        });
+                                        // one stop key and one watchdog per call, through all its phases and pages (a
+                                        // second phase once outlived the first phase's watchdog: found by a codex review)
+                                        let key = match job.args["__job"].as_u64() {
+                                            Some(k) => k,
+                                            None => {
+                                                job.args["__job"] = json!(id);
+                                                // whatever happens to the page, the call is answered (a lost answer
+                                                // hung it 150 s); the script is told to stop before its next change
+                                                let (late, tool, stop) = (job.reply.clone(), t.to_string(), Mutex::new(proxy.clone()));
+                                                std::thread::spawn(move || {
+                                                    std::thread::sleep(Duration::from_secs(75));
+                                                    let _ = stop.lock().unwrap().send_event(Ev::StopScript(id));
+                                                    let _ = late.send(Err(format!("{tool} did not answer in 75 s and was stopped; it may have done part of it: read the sheet or map before trying again")));
+                                                });
+                                                id
+                                            }
+                                        };
+                                        let _ = web.evaluate_script(&google::async_js(id, key, &body));
                                         let p = Mutex::new(proxy.clone());
                                         std::thread::spawn(move || {
                                             std::thread::sleep(Duration::from_millis(1000));
@@ -1848,7 +1873,7 @@ fn main() {
                     } else if v.is_null() {
                         if tries >= 120 {
                             // stopped as it is said to have failed (the 75 s watchdog came later, and the work went on)
-                            let _ = p.send_event(Ev::StopScript(id));
+                            let _ = p.send_event(Ev::StopScript(job.args["__job"].as_u64().unwrap_or(id)));
                             let _ = job.reply.send(Err(format!("{} did not finish in 60 s and was stopped; it may have done part of it: read the sheet or map before trying again", job.tool)));
                         } else {
                             std::thread::spawn(move || {

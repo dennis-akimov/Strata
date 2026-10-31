@@ -9,7 +9,7 @@ use crate::say;
 use crate::sync::Event;
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
@@ -620,6 +620,17 @@ fn defaults() -> Map<String, Value> {
     json!({"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0}).as_object().cloned().unwrap()
 }
 
+/// The tools whose names share the most words with a made-up one (browser__sheets_import_sheet ->
+/// browser__maps_import_sheet), at most two.
+pub fn closest(name: &str, names: &[String]) -> Vec<String> {
+    let words = |s: &str| -> HashSet<String> { s.split(['_', '-']).filter(|w| !w.is_empty()).map(str::to_lowercase).collect() };
+    let want = words(name);
+    let mut scored: Vec<(usize, &String)> = names.iter().map(|n| (words(n).intersection(&want).count(), n)).filter(|(k, _)| *k > 1).collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    let best = scored.first().map_or(0, |s| s.0);
+    scored.into_iter().filter(|(k, _)| *k == best).take(2).map(|(_, n)| n.clone()).collect()
+}
+
 /// A call's arguments against the tool's inputSchema (JSON Schema): the required ones there, no names it does not
 /// have, and the simple types right.  None when they fit; else what is wrong and what the tool takes, for the model.
 /// (MCP servers check this before running a tool since 2026; a server that does not leaves it to its handler.)
@@ -781,7 +792,12 @@ impl McpHub {
         out.insert("server".into(), route.as_ref().map(|(s, _)| json!(s.name)).unwrap_or(Value::Null));
         out.insert("tool".into(), json!(route.as_ref().map(|(_, t)| t.clone()).unwrap_or_else(|| name.to_string())));
         let (text, ok) = match &route {
-            None => (format!("error: there is no tool named {}", py::py_repr(&json!(name))), false),
+            None => {
+                let names: Vec<String> = self.routes().keys().cloned().collect();
+                let near = closest(name, &names);
+                (format!("error: there is no tool named {}{}", py::py_repr(&json!(name)),
+                         if near.is_empty() { String::new() } else { format!("; did you mean {}?", near.join(" or ")) }), false)
+            }
             Some((s, tool)) => {
                 let args = if arguments.is_object() { arguments.clone() } else { json!({}) };
                 let (url, jailed) = (get(&s.cfg, "url").as_str().unwrap_or("").to_string(), s.kind != "http" && get(&s.cfg, "network") != &json!(true));
@@ -1011,6 +1027,14 @@ pub fn hub_from_config(cfg: &Value, mcp_config_path: Option<&str>, extra: &Map<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_made_up_tool_name_gets_the_closest() {
+        let names: Vec<String> = ["browser__maps_import_sheet", "browser__sheets_append", "browser__sheets_read", "browser__maps_create"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(closest("browser__sheets_import_sheet", &names), ["browser__maps_import_sheet"]);
+        assert_eq!(closest("browser__sheet_read", &names), ["browser__sheets_read"]);
+        assert!(closest("weather", &names).is_empty());
+    }
 
     #[test]
     fn arguments_checked_against_the_schema() {

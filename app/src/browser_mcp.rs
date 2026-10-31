@@ -535,6 +535,10 @@ mod in_a_browser {
         /// page never does: the fake sheet's selection did not move).  One page, any path; framed by Content-Length
         /// and Connection: close (RFC 9112), so Chrome never waits for more.
         fn page_http(&mut self, html: &'static str) {
+            self.page_http_at(html, "/spreadsheets/d/fake/edit");
+        }
+
+        fn page_http_at(&mut self, html: &'static str, path: &str) {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = l.local_addr().unwrap().port();
             std::thread::spawn(move || {
@@ -547,7 +551,7 @@ mod in_a_browser {
                     let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
                 }
             });
-            self.go(&format!("http://127.0.0.1:{port}/spreadsheets/d/fake/edit"));
+            self.go(&format!("http://127.0.0.1:{port}{path}"));
         }
 
         fn page(&mut self, html: &str) {
@@ -680,7 +684,27 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         let Some(mut b) = Browser::start() else { return };
         b.page_http(FAKE_SHEET);
         let cols = ["Checkbox", "Rating", "Address", "Price", "Sq feet", "Time", "Link", "Description", "Availability", "Confirmation"];
-        let out = tool(&mut b, "sheets_create", json!({"title": "studios", "columns": cols})).unwrap();
+        // not a new sheet (something in it already): sheets_create changes nothing
+        b.eval("grid[3][2] = 'someone else'");
+        let e = tool(&mut b, "sheets_create", json!({"title": "studios", "columns": cols, "__landed": "http://127.0.0.1/spreadsheets/d/fake/edit"})).unwrap_err();
+        assert!(e.starts_with("the browser is on a spreadsheet that is not new"), "{e}");
+        assert_eq!(b.eval("document.title"), "Untitled spreadsheet - Google Sheets", "not renamed");
+        b.eval("grid[3][2] = ''");
+        // the document open before the load (the pane never left it), or one with two tabs: not new either
+        assert!(tool(&mut b, "sheets_create", json!({"title": "studios", "columns": cols, "__before": "fake", "__landed": "http://127.0.0.1/spreadsheets/d/fake/edit"})).unwrap_err().starts_with("the browser is on a spreadsheet that is not new"));
+        // the pane went to another sheet after the load landed: not that one
+        assert!(tool(&mut b, "sheets_create", json!({"title": "studios", "columns": cols, "__landed": "http://127.0.0.1/spreadsheets/d/other/edit"})).unwrap_err().starts_with("the browser is on a spreadsheet that is not new"));
+        // a title that only begins like the default: not new
+        b.eval("document.querySelector('.docs-title-input').value = 'Untitled spreadsheet archive'");
+        assert!(tool(&mut b, "sheets_create", json!({"title": "studios", "columns": cols, "__landed": "http://127.0.0.1/spreadsheets/d/fake/edit"})).unwrap_err().starts_with("the browser is on a spreadsheet that is not new"));
+        b.eval("document.querySelector('.docs-title-input').value = 'Untitled spreadsheet'");
+        b.eval("for (let i = 0; i < 2; i++) { const t = document.createElement('div'); t.className = 'docs-sheet-tab'; document.body.appendChild(t); }");
+        assert!(tool(&mut b, "sheets_create", json!({"title": "studios", "columns": cols, "__landed": "http://127.0.0.1/spreadsheets/d/fake/edit"})).unwrap_err().starts_with("the browser is on a spreadsheet that is not new"));
+        b.eval("document.querySelectorAll('.docs-sheet-tab').forEach((t) => t.remove())");
+        assert_eq!(b.eval("document.title"), "Untitled spreadsheet - Google Sheets", "not renamed");
+        // sheets.new's load landed here (the app records the address it landed on)
+        let landed = json!("http://127.0.0.1/spreadsheets/d/fake/edit");
+        let out = tool(&mut b, "sheets_create", json!({"title": "studios", "columns": cols, "__landed": landed})).unwrap();
         assert!(out.starts_with("created studios (") && out.contains("10 columns"), "{out}");
         assert_eq!(b.eval("document.title"), "studios - Google Sheets");
         assert_eq!(grid(&mut b, 1)[0], cols);
@@ -706,10 +730,18 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         // into values)
         b.eval("pastes.length = 0");
         let out = tool(&mut b, "sheets_write", json!({"row": 3, "values": {"Price": "$2,101", "Rating": "4.3"}})).unwrap();
-        assert_eq!(b.eval("JSON.stringify(pastes)"), r#"["$2,101","4.3"]"#);
+        assert_eq!(b.eval("JSON.stringify(pastes)"), r#"["4.3","$2,101"]"#, "two pastes, in column order (not adjacent)");
         assert!(out.starts_with("updated row 3 of studios"), "{out}");
         assert_eq!(grid(&mut b, 3)[2][..4], ["FALSE", "4.3", "801 A St", "$2,101"]);
         assert_eq!(grid(&mut b, 3)[2][7], "The Rey: a tower");
+        // an "update" of a row past the data is refused, with the way to add rows
+        let e = tool(&mut b, "sheets_write", json!({"row": 9, "values": {"Address": "new"}})).unwrap_err();
+        assert!(e.starts_with("row 9 is past the last row with data (3): to add rows use sheets_append"), "{e}");
+        // adjacent columns in one paste; the cells beside them stay
+        b.eval("pastes.length = 0; grid[2][5] = 'keep'");
+        tool(&mut b, "sheets_write", json!({"row": 3, "values": {"Address": "801 A St", "Price": "$2,101", "Sq feet": "470"}})).unwrap();
+        assert_eq!(b.eval("JSON.stringify(pastes)"), r#"["801 A St\t$2,101\t470"]"#);
+        assert_eq!(grid(&mut b, 3)[2][5], "keep");
         // a value set to "" clears that cell, the rest stay
         tool(&mut b, "sheets_write", json!({"row": 3, "values": {"Rating": ""}})).unwrap();
         assert_eq!(grid(&mut b, 3)[2][..4], ["FALSE", "", "801 A St", "$2,101"]);
@@ -733,6 +765,17 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         assert!(out.contains("at rows 4-4") && !out.contains("tick boxes"), "{out}");
         assert_eq!(b.eval("boxes.size"), boxes);
 
+        // a value TRUE outside column A is data: the next append goes under it, not over it
+        tool(&mut b, "sheets_append", json!({"rows": [{"Availability": "TRUE"}]})).unwrap();
+        let out = tool(&mut b, "sheets_append", json!({"rows": [{"Address": "5 After St"}]})).unwrap();
+        let rows: Vec<Vec<String>> = grid(&mut b, 8);
+        let at = rows.iter().position(|r| r[8] == "TRUE").unwrap();
+        assert_eq!(rows[at + 1][2], "5 After St", "{out}");
+        // a column name that two columns share (any case) is refused, not the first taken
+        b.eval("grid[0][9] = 'availability'");
+        assert!(tool(&mut b, "sheets_write", json!({"row": 2, "values": {"Availability": "x"}})).unwrap_err().contains("names 2 columns (I, J)"));
+        b.eval("grid[0][9] = 'Confirmation'");
+
         // the tab the address names is the one selected (a call for tab B once acted on the open tab A)
         b.eval("tabs.length = 0");
         tool(&mut b, "sheets_read", json!({"url": "https://docs.google.com/spreadsheets/d/fakefakefake1/edit#gid=55"})).unwrap();
@@ -747,12 +790,28 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         let r = b.eval(&format!("(() => {{ const __ID = 3; {} ; window.__strataStop = {{3: true}}; try {{ clip('paste', 'late'); return 'pasted'; }} catch (e) {{ return e.message; }} }})()", crate::google::PRELUDE));
         assert!(r.as_str().unwrap().starts_with("stopped:"), "{r}");
         assert!(!b.eval("pastes.includes('late')").as_bool().unwrap());
+        // nor a menu click (File > Move to trash is one)
+        let r = b.eval(&format!("(() => {{ const __ID = 4; {} ; window.__strataStop = {{4: true}}; try {{ mouse(document.querySelector('#docs-file-menu')); return 'clicked'; }} catch (e) {{ return e.message; }} }})()", crate::google::PRELUDE));
+        assert!(r.as_str().unwrap().starts_with("stopped:"), "{r}");
+        assert_eq!(b.eval("document.querySelector('#menu').children.length"), 0, "the menu did not open");
         b.eval("window.__strataStop = {}");
 
         tool(&mut b, "sheets_clear", json!({"range": "D2:D2"})).unwrap();
         assert_eq!(grid(&mut b, 2)[1][3], "");
         assert!(tool(&mut b, "sheets_trash", json!({})).unwrap().starts_with("moved to the trash: studios"));
         assert_eq!(b.eval("trashed"), true);
+
+        // no url, an address with ?gid=9 (no #fragment): that tab, not tab 0
+        b.page_http_at(FAKE_SHEET, "/spreadsheets/d/fake/edit?gid=9");
+        b.eval("tabs.length = 0");
+        tool(&mut b, "sheets_read", json!({})).unwrap();
+        assert!(b.eval("tabs.length > 0 && tabs.every((g) => g === '9')") == true, "{}", b.eval("JSON.stringify(tabs)"));
+
+        // maps_import_sheet on another map than the one asked for (the pane went elsewhere while it loaded): nothing
+        b.page_http_at(r#"<html><body><div>Add layer</div><div>Import</div></body></html>"#, "/maps/d/edit?mid=OTHER");
+        let js = crate::google::maps_js("maps_import_sheet", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=WANT", "sheet_title": "s", "location_column": "Address", "title_column": "Name"}), "t").unwrap();
+        let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
+        assert_eq!(e, "the browser is at another map (OTHER), not WANT: nothing imported");
     }
 
     #[test]
