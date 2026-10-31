@@ -627,8 +627,11 @@ pub fn closest(name: &str, names: &[String]) -> Vec<String> {
     let words = |s: &str| -> HashSet<String> {
         s.rsplit("__").next().unwrap_or(s).split(['_', '-']).filter(|w| !w.is_empty()).map(|w| w.to_lowercase().trim_end_matches('s').to_string()).collect()
     };
+    // the action (the last word: upsert, append, read) counts twice: browser__sheets_upsert is table_upsert, not
+    // maps_import_sheet, which shares only "sheet" (a model fused sheets_ with table_upsert and was told the wrong two)
+    let verb = |s: &str| s.rsplit("__").next().unwrap_or(s).rsplit(['_', '-']).next().unwrap_or("").to_lowercase().trim_end_matches('s').to_string();
     let want = words(name);
-    let mut scored: Vec<(usize, &String)> = names.iter().map(|n| (words(n).intersection(&want).count(), n)).filter(|(k, _)| *k > 0).collect();
+    let mut scored: Vec<(usize, &String)> = names.iter().map(|n| (words(n).intersection(&want).count() + usize::from(!verb(n).is_empty() && verb(n) == verb(name)), n)).filter(|(k, _)| *k > 0).collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
     let best = scored.first().map_or(0, |s| s.0);
     scored.into_iter().filter(|(k, _)| *k == best).take(2).map(|(_, n)| n.clone()).collect()
@@ -1040,6 +1043,8 @@ mod tests {
         assert_eq!(closest("browser__sheets_import_sheet", &names), ["browser__maps_import_sheet"]);
         assert_eq!(closest("browser__sheet_read", &names), ["browser__sheets_read"]);
         assert!(closest("weather", &names).is_empty());
+        let names: Vec<String> = ["browser__maps_import_sheet", "browser__sheets_append", "browser__table_upsert", "browser__table_sync"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(closest("browser__sheets_upsert", &names), ["browser__table_upsert"]);
     }
 
     #[test]

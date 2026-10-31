@@ -78,6 +78,11 @@ fn col(header: &[String], name: &str) -> Option<usize> {
 
 /// Add or change rows by the key column: a row whose key is in the table updates the columns given (the others stay),
 /// a new key is a new row.  A table that does not exist yet takes `columns` as its header.  (changed, added)
+/// A value that says nothing ("-", "N/A", "unknown"): it never overwrites a filled cell (an empty string clears one).
+fn placeholder(v: &str) -> bool {
+    matches!(v.trim().to_lowercase().as_str(), "-" | "–" | "—" | "?" | "n/a" | "na" | "none" | "unknown" | "tbd" | "not listed" | "not available")
+}
+
 pub fn upsert(table: &mut Table, rows: &[Value], key: &str, columns: Option<&[String]>) -> Result<(usize, usize), String> {
     if table.is_empty() {
         let cols = columns.filter(|c| !c.is_empty()).ok_or("a new table needs columns (its header)")?;
@@ -91,23 +96,31 @@ pub fn upsert(table: &mut Table, rows: &[Value], key: &str, columns: Option<&[St
         let mut vals = vec![];
         for (name, v) in obj {
             let i = col(&header, name).ok_or_else(|| format!("no column {name:?}; the columns are: {}", header.join(", ")))?;
+            // "Link" and "link" are one column: two values for it (a valid key and "NA") would replace the key checked
+            if vals.iter().any(|(j, _)| *j == i) {
+                return Err(format!("column {:?} given twice in one row", header[i]));
+            }
             vals.push((i, match v { Value::String(s) => s.trim().to_string(), Value::Null => String::new(), o => o.to_string() }));
         }
-        let kv = vals.iter().find(|(i, _)| *i == k).map(|(_, v)| v.clone()).filter(|v| !v.is_empty())
+        let kv = vals.iter().find(|(i, _)| *i == k).map(|(_, v)| v.clone()).filter(|v| !v.is_empty() && !placeholder(v))
             .ok_or_else(|| format!("each row needs its {key:?} (the key)"))?;
         match table.iter().skip(1).position(|row| row.get(k).is_some_and(|x| x.trim() == kv)) {
             Some(p) => {
                 let row = &mut table[p + 1];
                 row.resize(header.len(), String::new());
                 for (i, v) in vals {
-                    row[i] = v;
+                    // a model re-sending a known row fills what it did not find with "-" ("Sq feet": "-" for a row that
+                    // had 582): a filled cell keeps its value
+                    if !(placeholder(&v) && !row[i].trim().is_empty()) {
+                        row[i] = if placeholder(&v) { String::new() } else { v };
+                    }
                 }
                 changed += 1;
             }
             None => {
                 let mut row = vec![String::new(); header.len()];
                 for (i, v) in vals {
-                    row[i] = v;
+                    row[i] = if placeholder(&v) { String::new() } else { v };
                 }
                 table.push(row);
                 added += 1;
@@ -281,7 +294,7 @@ pub fn tools() -> Value {
     json!([
         {"name": "table_read", "description": "Read a table kept as a CSV file on this Mac (the master copy of a Google Sheet): its rows numbered, row 1 the header. Use the table tools, not sheets_append / sheets_write, for a sheet that has a table: change rows with table_upsert / table_delete, then table_sync.",
          "inputSchema": {"type": "object", "required": ["name"], "properties": {"name": name}}},
-        {"name": "table_upsert", "description": "Add or change rows of a local table by its key column (default Link): a row with a key already there changes only the columns given; a new key is a new row. A new table needs columns (its header). Fast: no browser. Then table_sync to put it in the Google Sheet.",
+        {"name": "table_upsert", "description": "Add or change rows of a local table by its key column (default Link): a row with a key already there changes only the columns given (leave out what you do not know: \"-\" or \"N/A\" never overwrite a value; \"\" clears one); a new key is a new row. A new table needs columns (its header). Fast: no browser. Then table_sync to put it in the Google Sheet.",
          "inputSchema": {"type": "object", "required": ["name", "rows"], "properties": {"name": name,
              "rows": {"type": "array", "items": {"type": "object", "additionalProperties": {"type": "string"}}, "description": "one {column: value} per row, each with its key"},
              "columns": {"type": "array", "items": {"type": "string"}, "description": "the header, for a new table"},
@@ -358,6 +371,19 @@ mod tests {
         assert_eq!(upsert(&mut t, &[json!({"link": "https://a", "Price": "$2,100"}), json!({"Link": "https://b", "Address": "2 B St"})], "Link", None).unwrap(), (1, 1));
         assert_eq!(t[1], ["FALSE", "1 A St", "$2,100", "https://a"]);
         assert_eq!(t[2], ["", "2 B St", "", "https://b"]);
+        // a known row sent again with "-" for what the model did not find: the filled cells stay, the empty one stays empty
+        upsert(&mut t, &[json!({"Link": "https://a", "Price": "-", "Address": "N/A", "Checkbox": "TRUE"}), json!({"Link": "https://b", "Price": "unknown"})], "Link", None).unwrap();
+        assert_eq!(t[1], ["TRUE", "1 A St", "$2,100", "https://a"]);
+        assert_eq!(t[2][2], "");
+        upsert(&mut t, &[json!({"Link": "https://c", "Price": "-"})], "Link", None).unwrap();
+        assert_eq!(t[3][2], "", "a new row stores no placeholder");
+        t.pop();
+        // an empty string clears on purpose; a placeholder key is no key (stored empty, it could never be found again)
+        upsert(&mut t, &[json!({"Link": "https://a", "Price": ""})], "Link", None).unwrap();
+        assert_eq!(t[1][2], "");
+        assert!(upsert(&mut t, &[json!({"Link": "NA", "Address": "x"})], "Link", None).unwrap_err().contains("needs its \"Link\""));
+        assert!(upsert(&mut t, &[json!({"Link": "https://z", "link": "NA"})], "Link", None).unwrap_err().contains("given twice"));
+        assert_eq!(t.len(), 3, "nothing added");
         assert!(upsert(&mut t, &[json!({"Address": "no key"})], "Link", None).unwrap_err().contains("needs its \"Link\""));
         assert!(upsert(&mut t, &[json!({"Link": "x", "Name": "y"})], "Link", None).unwrap_err().starts_with("no column \"Name\""));
         assert!(upsert(&mut vec![], &[json!({"Link": "x"})], "Link", None).unwrap_err().contains("needs columns"));

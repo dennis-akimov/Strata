@@ -136,10 +136,24 @@ pub fn compact_one(messages: &mut [Value]) -> Option<(usize, usize)> {
     Some((newest, n))
 }
 
+/// The room a round should have to think and answer in (tokens): less, and old tool results are shortened.
+const REPLY_ROOM: i64 = 4096;
+
 /// The prompt for the next round, the conversation shortened to fit when it has outgrown the context.
 fn prepare_fit(svc: &Service, messages: &mut [Value], tools: Option<&[Value]>, kw: &Map<String, Value>, max_req: i64, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(Vec<u32>, bool, i64), Stop<Fail>> {
     loop {
         match svc.prepare(messages, tools, kw, Some(max_req), None, None) {
+            // fit_max_tokens shortens the reply to the room left: a prompt that just fits left 946 tokens, all spent
+            // thinking, and the answer was cut ("length").  Old results give way first while the room is short (a
+            // size trigger, as Pydantic's harness has; masking old observations matches summarizing them: JetBrains,
+            // "The Complexity Trap", arXiv 2508.21433)
+            Ok(r) if r.2 < max_req.min(REPLY_ROOM) => match compact_one(messages) {
+                Some((i, chars)) => {
+                    say(&format!("auto-compact: an earlier tool result ({} characters) shortened to leave room to answer", crate::mcp::thousands(chars as i64)));
+                    emit(Item::Mcp(json!({"event": "compacted", "message": i, "chars": chars})))?;
+                }
+                None => return Ok(r),
+            },
             Ok(r) => return Ok(r),
             Err(Fail::Value(e)) if e.contains("exceeds the context window") => {
                 // auto-compact: tool results fill the context (a browsing session: a page per round); the oldest
@@ -905,6 +919,28 @@ mod loop_tests {
         assert_eq!(prompts.len(), 4);
         // the last round's prompt extends the round before it: the engine's cache holds (the tools were not dropped)
         assert!(prompts[3].starts_with(&prompts[2]), "the final round re-reads the prompt from the start");
+    }
+
+    #[test]
+    fn a_nearly_full_context_still_leaves_room_to_answer() {
+        let tok = Arc::new(ByteTokenizer);
+        let mock = Arc::new(MockEngine::new(&*tok, &[], 7000, 0.0));
+        let tpl = crate::template::ChatTemplate::load(&crate::root().join("server/chat_template.jinja")).unwrap();
+        let mut svc = Service::new(Engine::Mock(mock), tok, tpl, "m".into(), None, Default::default());
+        svc.set.fit_max_tokens = true;
+        let mut m = vec![json!({"role": "user", "content": "q"}), json!({"role": "assistant", "content": "a"}), json!({"role": "tool", "content": "x".repeat(3000)}),
+                         json!({"role": "assistant", "content": "b"}), json!({"role": "tool", "content": "y".repeat(1500)})];
+        let mut events = vec![];
+        let (_, _, room) = prepare_fit(&svc, &mut m, None, &Map::new(), 8000, &mut |i| { if let Item::Mcp(v) = i { events.push(v) } Ok(()) }).map_err(|_| "prepare").unwrap();
+        // it fit (5,000 tokens of 7,000) but left too little to answer: the older page gave way, the newest is whole
+        assert!(m[2]["content"].as_str().unwrap().starts_with("[compacted"), "{}", &m[2]["content"].as_str().unwrap()[..40]);
+        assert_eq!(m[4]["content"].as_str().unwrap().len(), 1500);
+        assert_eq!(events.len(), 1);
+        assert!(room > 3000, "room to answer: {room}");
+        // room enough: nothing is touched
+        let mut m2 = vec![json!({"role": "user", "content": "q"}), json!({"role": "tool", "content": "z".repeat(500)}), json!({"role": "tool", "content": "w".repeat(500)})];
+        prepare_fit(&svc, &mut m2, None, &Map::new(), 2000, &mut |_| Ok(())).map_err(|_| "prepare").unwrap();
+        assert_eq!(m2[1]["content"].as_str().unwrap().len(), 500);
     }
 
     #[test]
