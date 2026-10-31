@@ -136,11 +136,68 @@ pub fn compact_one(messages: &mut [Value]) -> Option<(usize, usize)> {
     Some((newest, n))
 }
 
+/// The prompt for the next round, the conversation shortened to fit when it has outgrown the context.
+fn prepare_fit(svc: &Service, messages: &mut [Value], tools: Option<&[Value]>, kw: &Map<String, Value>, max_req: i64, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(Vec<u32>, bool, i64), Stop<Fail>> {
+    loop {
+        match svc.prepare(messages, tools, kw, Some(max_req), None, None) {
+            Ok(r) => return Ok(r),
+            Err(Fail::Value(e)) if e.contains("exceeds the context window") => {
+                // auto-compact: tool results fill the context (a browsing session: a page per round); the oldest
+                // one still whole gives way to a note, the newest (the one the model reads now) last, only halved
+                let Some((i, chars)) = compact_one(messages) else { return Err(Stop::Err(Fail::Value(e))) };
+                say(&format!("auto-compact: an earlier tool result ({} characters) shortened to fit the context", crate::mcp::thousands(chars as i64)));
+                emit(Item::Mcp(json!({"event": "compacted", "message": i, "chars": chars})))?;
+            }
+            Err(e) => return Err(Stop::Err(e)),
+        }
+    }
+}
+
+/// Under an error a tool gave twice in a row.
+pub const REPEATED: &str = "\n\n[The same error as the last call: repeating it will not help. Change what you send, use another tool, or tell the user what blocks this.]";
+
+/// The answer for a call not run: its tool gave the same error `k` times in a row.
+pub fn repeat_refusal(name: &str, err: &str, k: u32) -> String {
+    format!("error: not run: {name} failed {k} times in a row with the same error ({}). Calling it again will not help: change what you give it, use another tool, or tell the user what blocks this.",
+            err.trim_start_matches("error: ").chars().take(240).collect::<String>())
+}
+
+/// What Strata says to a model that only said what it would do.
+pub const NUDGE: &str = "(Strata) You said what you would do, but called no tool, so nothing was done. Do it now with the tools; if you cannot, say plainly why.";
+
+/// The check after an answer that changed something (outcome, not the model's word: NVIDIA's agent evaluation scores
+/// the end state against the goal).
+pub const CHECK: &str = "(Strata check) Before you finish, check your work against my request. Read back what you changed with the tools (sheets_read, browser_read, ...): do not trust memory. Then list each part of my request as DONE or NOT DONE, with what you saw. If something is NOT DONE or wrong (a value in the wrong column, a row missing, a file with the wrong name), fix it with the tools now and say what you fixed.";
+
+/// A tool that changes something (its own name, after the server's prefix): the answer is checked after it.
+pub fn changes(tool: &str) -> bool {
+    let t = tool.rsplit("__").next().unwrap_or(tool).to_ascii_lowercase();
+    !t.contains("read") && !t.contains("list") && !t.contains("search")
+        && ["create", "append", "write", "delete", "clear", "trash", "import", "add", "complete", "update", "remove", "move", "send", "type"].iter().any(|w| t.contains(w))
+}
+
+/// Does the answer end by announcing what it will do (not asking the user)?
+pub fn announces(text: &str) -> bool {
+    let t = crate::py::strip(text);
+    if t.is_empty() || t.ends_with('?') {
+        return false;
+    }
+    let tail: String = t.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect::<String>().to_lowercase();
+    ["let me ", "i'll ", "i will ", "i'm going to", "i am going to", "now i ", "next, i", "next i ", "let's ", "i need to "].iter().any(|p| tail.contains(p))
+}
+
 /// Service::run with the MCP tools executed here, up to max_rounds; one Done at the very end.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: bool, tools: Option<Vec<Value>>, mut max_new: i64, sampling: &Map<String, Value>, cancel: &Arc<Flag>, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(), Stop<Fail>> {
     let hub = svc.mcp.clone().expect("hub");
-    let max_rounds = hub.settings["max_rounds"].as_i64().unwrap_or(8);
+    let mut max_rounds = hub.settings["max_rounds"].as_i64().unwrap_or(8);
+    // an answer that said what it would do and did nothing is told once to do it; one that changed something checks
+    // its work (up to twice: a fix is checked too)
+    let (mut nudged, mut checks, mut changed) = (false, 0, false);
+    // each tool's last error and how many calls in a row gave it: the second says retrying will not help, a third is
+    // not run (a model called maps_import_sheet into a trashed map 8 times with the same error: arXiv 2607.01641's
+    // "infinite agentic loop", stopped only by the round limit)
+    let mut fails: HashMap<String, (String, u32)> = HashMap::new();
     let (mut total, mut rounds) = (0i64, 0i64);
     let mut messages = m.messages;
     // the round after the limit answers from what it has: its calls are not run
@@ -226,13 +283,45 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             for c in &calls {
                 emit(Item::Mcp(json!({"event": "result", "id": c.id, "ok": false, "skipped": true, "text": "not run", "chars": 0, "truncated": false, "ms": 0})))?;
             }
-            break;
+            // an answer with no call: is it the end?
+            let quiet = calls.is_empty() && own_calls == 0 && !last && !cancel.is_set() && tools.is_some() && done.get("finish").and_then(Value::as_str) == Some("stop");
+            let follow = if !quiet {
+                None
+            } else if !nudged && announces(&text) {
+                // it wrote "I'll add all 17 listings starting from row 2" and stopped: 4,092 tokens, nothing done
+                nudged = true;
+                say("the answer said what it would do and called no tool: told once to do it");
+                Some(NUDGE)
+            } else if changed && checks < 2 {
+                // the check: the state, not the model's word (what was asked, what is there now, read back)
+                checks += 1;
+                changed = false;
+                max_rounds = max_rounds.max(rounds + 4);
+                say("checking the work: the answer changed something, so it reads it back against the request");
+                emit(Item::Event(crate::parser::Event::text(Kind::Content, "\n\n**Checking the work…**\n\n")))?;
+                answer_text.push_str("\n\n");
+                Some(CHECK)
+            } else {
+                None
+            };
+            let Some(follow) = follow else { break };
+            messages.push(json!({"role": "assistant", "content": crate::py::strip(&text)}));
+            messages.push(json!({"role": "user", "content": follow}));
+            (ids, thinking, max_new) = prepare_fit(svc, &mut messages, tools.as_deref(), &m.kw, m.max_req, emit)?;
+            continue;
         }
         rounds += 1;
         let mut results = vec![];
         let routes = hub.routes();
         for c in &calls {
             let (server, tool) = routes.get(&c.name).map(|(s, t)| (json!(s.name), t.clone())).unwrap_or((Value::Null, c.name.clone()));
+            if let Some((err, k)) = fails.get(&c.name).filter(|(_, k)| *k >= 2) {
+                let text = repeat_refusal(&c.name, err, *k);
+                say(&format!("tool {}: not run, {k} same errors in a row", c.name));
+                emit(Item::Mcp(json!({"event": "result", "id": c.id, "ok": false, "skipped": true, "text": text, "chars": text.len(), "truncated": false, "ms": 0})))?;
+                results.push(text);
+                continue;
+            }
             emit(Item::Mcp(json!({"event": "call", "id": c.id, "name": c.name, "server": server, "tool": tool, "arguments": Value::Object(c.arguments.clone()), "round": rounds})))?;
             // the call runs on a thread while keep-alives go out (how a client that left is noticed during a slow tool)
             let (h, name, args, cn) = (hub.clone(), c.name.clone(), Value::Object(c.arguments.clone()), cancel.clone());
@@ -254,7 +343,20 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
             if !truthy(&r["ok"]) {
                 say(&format!("tool {} said: {}", c.name, r["text"].as_str().unwrap_or("").chars().take(300).collect::<String>()));
             }
-            results.push(r["text"].as_str().unwrap_or("").to_string());
+            let mut text = r["text"].as_str().unwrap_or("").to_string();
+            if truthy(&r["ok"]) {
+                fails.remove(&c.name);
+            } else {
+                let e = fails.entry(c.name.clone()).or_insert_with(|| (String::new(), 0));
+                if e.0 == text { e.1 += 1 } else { *e = (text.clone(), 1) }
+                if e.1 == 2 {
+                    text.push_str(REPEATED);
+                }
+            }
+            results.push(text);
+            if truthy(&r["ok"]) && changes(&tool) {
+                changed = true;
+            }
             if server == json!("browser") && truthy(&r["ok"]) && matches!(tool.as_str(), "browser_read" | "browser_search" | "browser_open" | "browser_back") {
                 let text = r["text"].as_str().unwrap_or("");
                 if let Some((title, url)) = page_source(text) {
@@ -287,22 +389,7 @@ pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: b
                                 if left <= 2 { ". Answer from what you have unless one more page is essential" } else { "" }));
         }
         messages.extend(results.into_iter().map(|r| json!({"role": "tool", "content": r})));
-        let (i2, t2, m2) = loop {
-            match svc.prepare(&messages, tools.as_deref(), &m.kw, Some(m.max_req), None, None) {
-                Ok(r) => break r,
-                Err(Fail::Value(e)) if e.contains("exceeds the context window") => {
-                    // auto-compact: tool results fill the context (a browsing session: a page per round); the oldest
-                    // one still whole gives way to a note, the newest (the one the model reads now) last, only halved
-                    let Some((i, chars)) = compact_one(&mut messages) else { return Err(Stop::Err(Fail::Value(e))) };
-                    say(&format!("auto-compact: an earlier tool result ({} characters) shortened to fit the context", crate::mcp::thousands(chars as i64)));
-                    emit(Item::Mcp(json!({"event": "compacted", "message": i, "chars": chars})))?;
-                }
-                Err(e) => return Err(Stop::Err(e)),
-            }
-        };
-        ids = i2;
-        thinking = t2;
-        max_new = m2;
+        (ids, thinking, max_new) = prepare_fit(svc, &mut messages, tools.as_deref(), &m.kw, m.max_req, emit)?;
     }
     if crate::py::strip(&answer_text).is_empty() && !sources.is_empty() && !cancel.is_set() {
         // still no answer: said, with what was read, instead of an empty reply
@@ -723,10 +810,15 @@ mod loop_tests {
                 let req: Value = serde_json::from_slice(&body).unwrap_or_default();
                 let result = match req["method"].as_str().unwrap_or("") {
                     "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}),
-                    "tools/list" => json!({"tools": [{"name": tool, "description": "read the page", "inputSchema": {"type": "object", "properties": {}}}]}),
+                    "tools/list" => json!({"tools": [{"name": tool, "description": "read the page", "inputSchema": if tool == "browser_open" {
+                        json!({"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}})
+                    } else {
+                        json!({"type": "object", "properties": {"url": {"type": "string"}}})
+                    }}]}),
                     "tools/call" => {
                         n += 1;
-                        json!({"content": [{"type": "text", "text": reply(n)}]})
+                        let t = reply(n);
+                        json!({"content": [{"type": "text", "text": t}], "isError": t.starts_with("ERR")})
                     }
                     _ => Value::Null,                        // a notification: 202, no body (RFC 9110 15.3.3)
                 };
@@ -753,12 +845,16 @@ mod loop_tests {
     }
 
     fn run_on(server: &str, tool: &'static str, reply: fn(usize) -> String, scripts: &[&str]) -> (Vec<Value>, String, Vec<Vec<u32>>) {
+        run_with(server, tool, reply, scripts, 2)
+    }
+
+    fn run_with(server: &str, tool: &'static str, reply: fn(usize) -> String, scripts: &[&str], max_rounds: i64) -> (Vec<Value>, String, Vec<Vec<u32>>) {
         let tok = Arc::new(ByteTokenizer);
         let mock = Arc::new(MockEngine::new(&*tok, &scripts.iter().map(|s| s.to_string()).collect::<Vec<_>>(), 32768, 0.0));
         let tpl = crate::template::ChatTemplate::load(&crate::root().join("server/chat_template.jinja")).unwrap();
         let mut svc = Service::new(Engine::Mock(mock.clone()), tok, tpl, "m".into(), None, Default::default());
         let servers = indexmap::IndexMap::from([(server.to_string(), json!({"url": format!("http://127.0.0.1:{}/mcp", fake_mcp(tool, reply))}))]);
-        let hub = Arc::new(crate::mcp::McpHub::new(servers, json!({"max_rounds": 2}).as_object().cloned().unwrap(), &[]));
+        let hub = Arc::new(crate::mcp::McpHub::new(servers, json!({"max_rounds": max_rounds}).as_object().cloned().unwrap(), &[]));
         hub.start();
         hub.wait(Some(10.0));
         let tools = hub.template_tools(&[]);
@@ -875,5 +971,77 @@ mod loop_tests {
         // nothing read: no note (the reply is the model's, as it is)
         let (_, text, _) = run(&[CALL, CALL, CALL, CALL, ""]);
         assert!(!text.contains("ran out of steps"), "{text:?}");
+    }
+
+    #[test]
+    fn what_changes_and_what_announces() {
+        for t in ["browser__sheets_append", "browser__sheets_write", "browser__maps_import_sheet", "reminders__reminders_add", "browser__sheets_trash"] {
+            assert!(changes(t), "{t}");
+        }
+        for t in ["browser__sheets_read", "browser__browser_search", "reminders__reminders_list", "browser__browser_open"] {
+            assert!(!changes(t), "{t}");
+        }
+        assert!(announces("The spreadsheet has 10 columns.\n\nLet me write the rows. I'll add all 17 listings starting from row 2."));
+        assert!(!announces("Done: 18 rows are in the sheet."));
+        assert!(!announces("Should I add them now?"), "a question to the user is not an announcement");
+        assert!(!announces(""));
+    }
+
+    const APPEND: &str = "</think>\n\n<tool_call>\n<function=web__sheets_append>\n</function>\n</tool_call>";
+
+    #[test]
+    fn an_answer_that_only_announces_is_told_to_act() {
+        use crate::tokenizer::Tokenize;
+        let (mcp, text, prompts) = run_on("web", "sheets_append", page, &["</think>\n\nI'll add the rows now.", APPEND, "</think>\n\nAdded.", "</think>\n\nDONE: the rows are there."]);
+        assert_eq!(mcp.iter().filter(|v| v["event"] == "call").count(), 1, "the nudge got the call made");
+        assert!(ByteTokenizer.decode(&prompts[1]).contains("called no tool, so nothing was done"));
+        assert!(text.contains("Added.") && text.contains("**Checking the work…**") && text.ends_with("DONE: the rows are there."), "{text:?}");
+    }
+
+    #[test]
+    fn a_change_is_checked_and_a_read_is_not() {
+        use crate::tokenizer::Tokenize;
+        let (_, text, prompts) = run_on("web", "sheets_append", page, &[APPEND, "</think>\n\nAdded 3 rows.", "</think>\n\nDONE: 3 rows read back."]);
+        assert_eq!(prompts.len(), 3);
+        assert!(ByteTokenizer.decode(&prompts[2]).contains("(Strata check) Before you finish"));
+        assert!(text.contains("Added 3 rows.\n\n**Checking the work…**") && text.contains("DONE: 3 rows read back."), "{text:?}");
+        // only reading: no check, one answer
+        let (_, text, prompts) = run(&[CALL, "</think>\n\nTwo pages read."]);
+        assert_eq!(prompts.len(), 2);
+        assert!(!text.contains("Checking"), "{text:?}");
+        // the check runs at most twice even if the model keeps changing things
+        let (_, text, _) = run_on("web", "sheets_append", page, &[APPEND, "</think>\n\nA.", APPEND, "</think>\n\nB.", APPEND, "</think>\n\nC.", "</think>\n\nD."]);
+        assert_eq!(text.matches("**Checking the work…**").count(), 2, "{text:?}");
+    }
+
+    #[test]
+    fn a_call_with_wrong_argument_names_is_not_run_and_says_what_it_takes() {
+        let wrong = "</think>\n\n<tool_call>\n<function=browser__browser_open>\n<parameter=link>\nhttps://p.test/1\n</parameter>\n</function>\n</tool_call>";
+        let (mcp, _, _) = run_on("browser", "browser_open", page, &[wrong, OPEN, "</think>\n\nThe Soto Six jazz quartet plays tonight."]);
+        let results: Vec<&Value> = mcp.iter().filter(|v| v["event"] == "result").collect();
+        assert_eq!(results[0]["ok"], false);
+        assert_eq!(results[0]["text"], "error: browser__browser_open was not run: url is missing; it has no link. It takes: url (string, required)");
+        // the server never got the bad call: the good one is its first
+        assert!(results[1]["text"].as_str().unwrap().contains("Page 1\nhttps://p.test/1"), "{:?}", results[1]);
+    }
+
+    #[test]
+    fn the_same_error_twice_says_so_and_a_third_call_is_not_run() {
+        use crate::tokenizer::Tokenize;
+        // the tool fails the same way every time (a trashed map): it runs twice, then is not run
+        let (mcp, text, prompts) = run_with("web", "read", |_| "ERR no Add layer".into(), &[CALL, CALL, CALL, CALL, "</think>\n\nThe map could not be filled."], 6);
+        let results: Vec<&Value> = mcp.iter().filter(|v| v["event"] == "result").collect();
+        assert_eq!(results.len(), 4, "{mcp:?}");
+        assert_eq!((results[0]["skipped"].is_null(), results[1]["skipped"].is_null()), (true, true), "the first two ran");
+        assert_eq!(results[2]["skipped"], true);
+        assert!(results[2]["text"].as_str().unwrap().starts_with("error: not run: web__read failed 2 times in a row with the same error (ERR no Add layer)."), "{:?}", results[2]);
+        assert!(ByteTokenizer.decode(&prompts[2]).contains("[The same error as the last call: repeating it will not help."));
+        assert!(!ByteTokenizer.decode(&prompts[1]).contains("The same error"), "not under the first error");
+        assert!(text.contains("could not be filled"), "{text:?}");
+        // a different error, or a success, starts the count again
+        let (mcp, _, _) = run_with("web", "read", |n| if n == 2 { "Page 2\nhttps://p.test/2\n\nok".into() } else { "ERR busy".into() }, &[CALL, CALL, CALL, CALL, "</think>\n\nDone."], 6);
+        let results: Vec<&Value> = mcp.iter().filter(|v| v["event"] == "result").collect();
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|v| v["skipped"].is_null()), "error, success, error, error: all four run (the success started the count again); {mcp:?}");
     }
 }

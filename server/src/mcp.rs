@@ -620,6 +620,51 @@ fn defaults() -> Map<String, Value> {
     json!({"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0}).as_object().cloned().unwrap()
 }
 
+/// A call's arguments against the tool's inputSchema (JSON Schema): the required ones there, no names it does not
+/// have, and the simple types right.  None when they fit; else what is wrong and what the tool takes, for the model.
+/// (MCP servers check this before running a tool since 2026; a server that does not leaves it to its handler.)
+pub fn check_args(schema: &Value, args: &Value) -> Option<String> {
+    let props = schema.get("properties").and_then(Value::as_object)?;
+    let given = args.as_object().cloned().unwrap_or_default();
+    let mut wrong = vec![];
+    for r in schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        if given.get(r).map_or(true, Value::is_null) {
+            wrong.push(format!("{r} is missing"));
+        }
+    }
+    // JSON Schema takes other names unless additionalProperties is false: an unknown name alone passes, but it is
+    // named beside a real error (url given, map_url missing: the likely mix-up)
+    let closed = schema.get("additionalProperties") == Some(&Value::Bool(false));
+    let mut unknown = vec![];
+    for (k, v) in &given {
+        match props.get(k) {
+            None if !schema.get("additionalProperties").is_some_and(Value::is_object) => unknown.push(format!("it has no {k}")),
+            None => {}
+            Some(p) => {
+                let fits = match p.get("type").and_then(Value::as_str) {
+                    Some("string") => v.is_string(),
+                    Some("integer") => v.is_i64() || v.is_u64() || v.as_str().is_some_and(|s| s.trim().parse::<i64>().is_ok()),
+                    Some("number") => v.is_number(),
+                    Some("boolean") => v.is_boolean(),
+                    Some("array") => v.is_array(),
+                    Some("object") => v.is_object(),
+                    _ => true,
+                };
+                if !fits {
+                    wrong.push(format!("{k} must be {}", p["type"].as_str().unwrap_or("?")));
+                }
+            }
+        }
+    }
+    if wrong.is_empty() && !(closed && !unknown.is_empty()) {
+        return None;
+    }
+    wrong.extend(unknown);
+    let required: Vec<&str> = schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    let takes: Vec<String> = props.iter().map(|(k, p)| format!("{k} ({}{})", p.get("type").and_then(Value::as_str).unwrap_or("any"), if required.contains(&k.as_str()) { ", required" } else { "" })).collect();
+    Some(format!("{}. It takes: {}", wrong.join("; "), takes.join(", ")))
+}
+
 /// Every configured server, and the merged, namespaced tool list the model sees.
 pub struct McpHub {
     pub settings: Map<String, Value>,
@@ -740,7 +785,12 @@ impl McpHub {
             Some((s, tool)) => {
                 let args = if arguments.is_object() { arguments.clone() } else { json!({}) };
                 let (url, jailed) = (get(&s.cfg, "url").as_str().unwrap_or("").to_string(), s.kind != "http" && get(&s.cfg, "network") != &json!(true));
-                if let Some(why) = crate::firewall::refuse(tool, &args) {
+                let schema = s.st.lock().unwrap().tools.iter().find(|t| get(t, "name") == &json!(tool)).map(|t| get(t, "inputSchema").clone()).unwrap_or(Value::Null);
+                if let Some(why) = check_args(&schema, &args) {
+                    // said as the tool's error, so the model calls again with the right names (it gave `url` for
+                    // `map_url` three times and got only "a My Maps address with mid=")
+                    (format!("error: {name} was not run: {why}"), false)
+                } else if let Some(why) = crate::firewall::refuse(tool, &args) {
                     crate::firewall::tool_run(&s.name, tool, &url, jailed, &args, "blocked");
                     (format!("error: Strata's firewall refused this call ({why})"), false)
                 } else {
@@ -961,6 +1011,26 @@ pub fn hub_from_config(cfg: &Value, mcp_config_path: Option<&str>, extra: &Map<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arguments_checked_against_the_schema() {
+        let schema = json!({"type": "object", "required": ["map_url", "sheet_title"], "properties": {
+            "map_url": {"type": "string"}, "sheet_title": {"type": "string"}, "row": {"type": "integer"}}});
+        // what the model sent: url for map_url
+        let why = check_args(&schema, &json!({"url": "https://www.google.com/maps/d/edit?mid=1", "sheet_title": "s"})).unwrap();
+        assert_eq!(why, "map_url is missing; it has no url. It takes: map_url (string, required), sheet_title (string, required), row (integer)");
+        assert_eq!(check_args(&schema, &json!({"map_url": "m", "sheet_title": "s", "row": 5})), None);
+        assert_eq!(check_args(&schema, &json!({"map_url": "m", "sheet_title": "s", "row": "5"})), None, "a number as text is fine");
+        assert!(check_args(&schema, &json!({"map_url": 3, "sheet_title": "s"})).unwrap().starts_with("map_url must be string"));
+        assert!(check_args(&schema, &json!({"map_url": null, "sheet_title": "s"})).unwrap().starts_with("map_url is missing"));
+        // other names pass (JSON Schema's default) unless the schema closes the object
+        assert_eq!(check_args(&schema, &json!({"map_url": "m", "sheet_title": "s", "extra": 1})), None);
+        let closed = json!({"properties": {"a": {"type": "string"}}, "additionalProperties": false});
+        assert_eq!(check_args(&closed, &json!({"a": "x", "b": 1})).unwrap(), "it has no b. It takes: a (string)");
+        let open = json!({"properties": {"a": {"type": "string"}}, "additionalProperties": {"type": "string"}});
+        assert_eq!(check_args(&open, &json!({"a": "x", "Price": "$1"})), None);
+        assert_eq!(check_args(&Value::Null, &json!({"x": 1})), None);
+    }
 
     #[test]
     fn result_text_and_page_entries() {

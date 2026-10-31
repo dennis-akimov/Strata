@@ -21,6 +21,7 @@ use wry::{WebView, WebViewBuilder};
 
 mod browser_mcp;
 mod google;
+mod native_input;
 
 const PANEL: &str = include_str!("panel.html");
 const LOG_KEEP: usize = 2000;
@@ -54,6 +55,8 @@ enum Ev {
     FrameCollect(browser_mcp::Job, String, u64, u32),
     /// a Google tool's script (google.rs) looked for its value (id, the u32-th time)
     AsyncCollect(browser_mcp::Job, u64, u32),
+    /// a click or typing done with the mouse and keyboard (native_input): the element found by a script first
+    Native(browser_mcp::Job, &'static str, String),
     Quit,
 }
 
@@ -1008,6 +1011,19 @@ fn frame_send(web: &WebView, proxy: &EventLoopProxy<Ev>, token: &str, id: u64, j
     });
 }
 
+/// The page read `ms` from now as the call's answer (what a click or typing led to).
+fn read_later(reply: std::sync::mpsc::Sender<Result<String, String>>, proxy: &EventLoopProxy<Ev>, ms: u64) {
+    let p = Mutex::new(proxy.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(ms));
+        let _ = p.lock().unwrap().send_event(Ev::PageRead(reply, false));
+    });
+}
+
+fn say_web(line: &str) {
+    eprintln!("strata-app: {line}");
+}
+
 fn js_call(wv: &WebView, f: &str, v: &Value) {
     let _ = wv.evaluate_script(&format!("{f}({v})"));
 }
@@ -1476,13 +1492,14 @@ fn main() {
                             next_frame_op.set(next_frame_op.get() + 1);
                             frame_send(&web, &proxy, &frame_token, next_frame_op.get(), job, "type", args);
                         } else if v["yes"] == true {
-                            let js = browser_mcp::type_js(job.args["element"].as_i64().unwrap_or(0), job.args["text"].as_str().unwrap_or(""), job.args["submit"] == true);
-                            if job.args["submit"] == true {
-                                load_waiters.borrow_mut().push(job.reply.clone());
-                                act_then_read(&web, &js, job.reply, &proxy, 2500);
-                            } else {
-                                eval_reply(&web, &js, job.reply, |_| Ok("typed (not sent): browser_click the form's button, or browser_type again with submit".into()));
-                            }
+                            // the field focused, its text selected; then typed with the keyboard (Ev::Native)
+                            let (p, slot) = (Mutex::new(proxy.clone()), Mutex::new(Some(job)));
+                            let n = slot.lock().unwrap().as_ref().map_or(0, |j| j.args["element"].as_i64().unwrap_or(0));
+                            let _ = web.evaluate_script_with_callback(&browser_mcp::focus_js(n), move |r| {
+                                if let Some(j) = slot.lock().unwrap().take() {
+                                    let _ = p.lock().unwrap().send_event(Ev::Native(j, "type", r));
+                                }
+                            });
                         } else {
                             let _ = job.reply.send(Err("the user said no to typing that: ask them in the chat".into()));
                         }
@@ -1646,6 +1663,13 @@ fn main() {
                                         next_frame_op.set(next_frame_op.get() + 1);
                                         let id = next_frame_op.get();
                                         let _ = web.evaluate_script(&google::async_js(id, &body));
+                                        // whatever happens to the page, the call is answered (a lost answer hung it 150 s)
+                                        let late = job.reply.clone();
+                                        let tool = t.to_string();
+                                        std::thread::spawn(move || {
+                                            std::thread::sleep(Duration::from_secs(75));
+                                            let _ = late.send(Err(format!("{tool} did not answer in 75 s: browser_read the page to see where it is")));
+                                        });
                                         let p = Mutex::new(proxy.clone());
                                         std::thread::spawn(move || {
                                             std::thread::sleep(Duration::from_millis(1000));
@@ -1711,9 +1735,13 @@ fn main() {
                         search_waiters.borrow_mut().push(job.reply);
                     }
                     "browser_click" => {
-                        // a link loads a page (read when it has); a button that changes this page: read 2 s on
-                        load_waiters.borrow_mut().push(job.reply.clone());
-                        act_then_read(&web, &browser_mcp::click_js(n), job.reply, &proxy, 2000);
+                        // where the element is, then a real click there (Ev::Native)
+                        let (p, slot) = (Mutex::new(proxy.clone()), Mutex::new(Some(job)));
+                        let _ = web.evaluate_script_with_callback(&browser_mcp::target_js(n), move |r| {
+                            if let Some(j) = slot.lock().unwrap().take() {
+                                let _ = p.lock().unwrap().send_event(Ev::Native(j, "click", r));
+                            }
+                        });
                     }
                     "browser_scroll" => {
                         let js = format!("window.scrollBy(0, {}innerHeight * 0.8); JSON.stringify({{y: Math.round(scrollY), height: document.documentElement.scrollHeight}})",
@@ -1746,13 +1774,60 @@ fn main() {
                     let _ = proxy.send_event(Ev::Tool(job));
                 }
             }
+            Event::UserEvent(Ev::Native(job, what, r)) => {
+                let v = js_value(&r);
+                let n = job.args["element"].as_i64().unwrap_or(0);
+                if let Some(e) = v["error"].as_str() {
+                    let _ = job.reply.send(Err(e.to_string()));
+                } else if what == "click" && v["hidden"] == true {
+                    // nowhere a mouse can reach it (no size, off screen): clicked by the page's script instead
+                    load_waiters.borrow_mut().push(job.reply.clone());
+                    act_then_read(&web, &browser_mcp::click_js(n), job.reply, &proxy, 2000);
+                } else if what == "click" {
+                    if let Some(c) = v["cover"].as_str() {
+                        say_web(&format!("[web] the click on [{n}] lands on \"{c}\" (on top of it)"));
+                    }
+                    match native_input::click(&web, v["x"].as_f64().unwrap_or(0.0), v["y"].as_f64().unwrap_or(0.0)) {
+                        Err(e) => { let _ = job.reply.send(Err(e)); }
+                        Ok(()) => {
+                            load_waiters.borrow_mut().push(job.reply.clone());
+                            read_later(job.reply, &proxy, 2000);
+                        }
+                    }
+                } else {
+                    let text = job.args["text"].as_str().unwrap_or("").to_string();
+                    let submit = job.args["submit"] == true;
+                    let typed = native_input::paste(&web, &text).and_then(|_| if submit { native_input::press(&web, "enter", &[]) } else { Ok(()) });
+                    match typed {
+                        Err(e) => { let _ = job.reply.send(Err(e)); }
+                        Ok(()) if submit => {
+                            load_waiters.borrow_mut().push(job.reply.clone());
+                            read_later(job.reply, &proxy, 2500);
+                        }
+                        Ok(()) => read_later(job.reply, &proxy, 600),
+                    }
+                }
+            }
             Event::UserEvent(Ev::AsyncCollect(job, id, tries)) => {
                 let (p, slot) = (Mutex::new(proxy.clone()), Mutex::new(Some(job)));
                 let _ = web.evaluate_script_with_callback(&google::async_collect_js(id), move |r| {
                     let Some(job) = slot.lock().unwrap().take() else { return };
                     let v = js_value(&r);
                     let p = p.lock().unwrap().clone();
-                    if v.is_null() {
+                    if let Some(to) = v["gone"].as_str() {
+                        // the page was replaced under the script: once more from the start where it went, when that
+                        // is safe; else said (a create or an append is never repeated blindly)
+                        let mut job = job;
+                        if google::rerun_safe(&job.tool) && job.args.get("__rerun").is_none() {
+                            job.args["__rerun"] = json!(true);
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(1500));
+                                let _ = p.send_event(Ev::Tool(job));
+                            });
+                        } else {
+                            let _ = job.reply.send(Err(format!("{}: the page changed while it ran (now {to}); browser_read it, and check before doing it again", job.tool)));
+                        }
+                    } else if v.is_null() {
                         if tries >= 120 {
                             let _ = job.reply.send(Err(format!("{} did not finish in 60 s: browser_read the page to see where it is", job.tool)));
                         } else {

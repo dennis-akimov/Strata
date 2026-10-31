@@ -228,19 +228,38 @@ the SSD while they run. The other Qwen sizes (IQ2_XS, the Unsloth ones) were not
   these tools (app/src/browser_mcp.rs: MCP on 127.0.0.1 with a key made at each start) and hands them to the server it
   starts as the MCP server `browser` (not saved; only there while the app runs). Tried on the M1 with LFM2.5-24B:
   opened example.com, read it, clicked "Learn more", read IANA's page. Opening a page, clicking, scrolling and going
-  back answer with the page itself, and each tool result says how many tool calls are left for the answer.
+  back answer with the page itself, and each tool result says how many tool calls are left for the answer. Clicks and
+  typing are the mouse and keyboard's own (AppKit events into the pane: trusted, as sites such as Zillow need): the
+  pointer moves onto the element and presses there, and typing goes in as a paste into the field with its text
+  selected, then Enter. A page that asks to prove a person is there (a press-and-hold, a captcha, "unusual traffic")
+  is said as such: the model asks you to do it in the pane, and never tries to pass it. The model is told to get
+  around a site by its own search field and links rather than made-up addresses.
+- **The model finishes what it says and checks it:** every MCP tool call is checked against the tool's input schema
+  before it runs (a missing required argument, a wrong type; an unknown name when the schema allows none, or beside
+  another error): it is not run, and the model reads what the tool takes ("map_url is missing; it has no url. It
+  takes: …"). An answer that ends by announcing what it will do ("I'll add all 17 listings…") with no tool call is
+  told once to do it. An answer that changed something (create, append, write, delete, trash, import, add…) gets a
+  check: **Checking the work…** under it, where the model reads back what it changed and marks each part of the
+  request DONE or NOT DONE, fixing what is not (at most two checks, 4 more tool rounds). The log's `tool …` lines
+  show each call's arguments. Tried on the M1 with LFM2.5-24B: a sheet created, two rows added, read back, all DONE,
+  105 s.
 - **Google Sheets and My Maps (Strata.app):** through the same browser pane, signed in to Google as you (no Google
   API, no Cloud project): `sheets_create` (title and header row), `sheets_read` (rows numbered as in the sheet),
-  `sheets_append` (under the last filled row; rows whose first cell is FALSE/TRUE get tick boxes), `sheets_write` (from
-  a cell), `sheets_delete_rows`, `sheets_clear`, `sheets_trash`, and `maps_create`, `maps_import_sheet` (a sheet's rows
-  as places: an address column to place them, a column to title them, every column kept in each place) and
+  `sheets_append` (under the last filled row, each value by its column's name, `{"Address": …}`: a name that is no
+  column, or a list of cells shorter than the header, is refused with the columns, never shifted; first cells FALSE/TRUE
+  become tick boxes), `sheets_write` (one row's cells by column name, the rest of the row kept), `sheets_delete_rows`, `sheets_clear`, `sheets_trash`, and `maps_create` (a map with that title already: its address, not a second map), `maps_import_sheet` (a sheet's rows
+  as places: an address column to place them, a column to title them, by name or letter; a wrong one is answered
+  at once with the sheet's columns; the map is loaded fresh for each import; every column kept in each place) and
   `maps_trash`. The trash tools wait for your **Allow** in the browser's strip. They run scripts in Google's pages
   (app/src/google.rs: a cell range by the address's `#range=`, a paste event for writing, a copy event for reading,
   the menus by mouse events). My Maps' Import opens Google's file picker from another origin (docs.google.com); a
   script the browser puts in every frame wakes only there and answers My Maps' page for a token made at each start, so
   `browser_read`/`click`/`type` also work inside the picker. Tried on the M1 (30 Oct 2026): a sheet of 18 downtown San
   Diego studios and a map of them; create 10 s, append 6 s, read 2–3 s, map create 7 s, import 9 s. Google's pages
-  change: when a tool says it found no button or menu item, that is where.
+  change: when a tool says it found no button or menu item, that is where. The log's `tool …` line has the call's
+  arguments (cut at 300 characters) and, for an error, what the tool said. Tests: `cargo test` in app/ runs the tools'
+  scripts in headless Chrome against a small fake Google Sheet (served on 127.0.0.1, the editor, Name Box, `#range=`,
+  paste, copy, Delete and menus as they behaved live), one Chrome at a time.
 - **Scheduled prompts:** the calendar button by the chat's message box. A prompt that runs at
   set times: once, every N minutes (5 or more), hourly, daily, weekdays, weekly, monthly, or a cron expression
   (`minute hour day-of-month month day-of-week`, with `*`, lists, ranges, `*/N`, names; both day fields set: either

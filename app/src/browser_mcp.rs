@@ -28,7 +28,7 @@ pub fn tools() -> Value {
          "inputSchema": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}},
         {"name": "browser_read", "description": "The page in the browser now (when you answer from it, link it: [its title](its address)), compactly: its main text (in parts of 3,500 characters: part 2, 3... for more) and up to 40 links, buttons and fields numbered [n] for browser_click / browser_type.",
          "inputSchema": {"type": "object", "properties": {"part": {"type": "integer", "description": "which part of the text (default 1)"}}}},
-        {"name": "browser_click", "description": "Click element [n] of the last page you read (a link, a button). It answers with the page after the click.",
+        {"name": "browser_click", "description": "Click element [n] of the last page you read (a link, a button), with the mouse as a person would. It answers with the page after the click. On a site, get around by its search field and links (browser_type into its search box with submit, then browser_click a result) rather than by making up addresses.",
          "inputSchema": {"type": "object", "required": ["element"], "properties": {"element": {"type": "integer"}}}},
         {"name": "browser_type", "description": "Type text into field [n] of the last browser_read (the user is asked to allow it; never a password). submit: press Enter / send its form (it then answers with the page that follows).",
          "inputSchema": {"type": "object", "required": ["element", "text"], "properties": {"element": {"type": "integer"}, "text": {"type": "string"}, "submit": {"type": "boolean"}}}},
@@ -132,6 +132,41 @@ pub const CLICK_FN: &str = r#"(n) => { const e = document.querySelector('[data-s
   e.click();
   return JSON.stringify({clicked: (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0, 80)}); }"#;
 
+/// Element [n] brought into view: its centre (CSS pixels from the page's top left), for a real click there; {cover}
+/// when something else is on top (a cookie banner): that is what a mouse would hit.
+pub fn target_js(n: i64) -> String {
+    format!("({TARGET_FN})({n})")
+}
+
+pub const TARGET_FN: &str = r#"(n) => { const e = document.querySelector('[data-strata-id="' + n + '"]');
+  if (!e) return JSON.stringify({error: 'no element [' + n + '] now: browser_read the page again'});
+  e.scrollIntoView({block: 'center', inline: 'center'});
+  const r = e.getBoundingClientRect(), x = r.x + r.width / 2, y = r.y + r.height / 2;
+  if (!(r.width > 0 && r.height > 0) || x < 0 || y < 0 || x > innerWidth || y > innerHeight) return JSON.stringify({hidden: true});
+  const top = document.elementFromPoint(x, y);
+  const cover = top && top !== e && !e.contains(top) && !top.contains(e) ? (top.innerText || top.getAttribute('aria-label') || top.tagName).trim().slice(0, 60) : null;
+  return JSON.stringify({x, y, cover, name: (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0, 80)}); }"#;
+
+/// Field [n] focused with its text selected, for the typing that follows (it replaces what was there).
+pub fn focus_js(n: i64) -> String {
+    format!(r#"(() => {{ const e = document.querySelector('[data-strata-id="{n}"]');
+  if (!e) return JSON.stringify({{error: 'no element [{n}] now: browser_read the page again'}});
+  if (e.type === 'password') return JSON.stringify({{error: 'a password field: the model never types there'}});
+  e.scrollIntoView({{block: 'center'}}); e.focus();
+  if (e.select) e.select(); else if (e.isContentEditable) document.execCommand('selectAll');
+  return JSON.stringify({{focused: document.activeElement === e}}); }})()"#)
+}
+
+/// The words of a site's "prove you are a person" page (PerimeterX's Press & Hold on Zillow, Cloudflare, captchas).
+pub fn person_check(title: &str, text: &str) -> bool {
+    let t = format!("{title}\n{}", text.chars().take(3000).collect::<String>()).to_lowercase();
+    ["press & hold", "press and hold", "verify you are human", "verify you are a human", "verify you're human", "are you a robot",
+     "captcha", "unusual traffic", "access to this page has been denied", "just a moment...", "performing security verification"]
+        .iter().any(|w| t.contains(w))
+}
+
+// the page's own typing, kept for the tests (the app types with the keyboard: native_input; the picker bridge: TYPE_FN)
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn type_js(n: i64, text: &str, submit: bool) -> String {
     format!("({TYPE_FN})({n}, {}, {submit})", serde_json::to_string(text).unwrap_or_default())
 }
@@ -199,11 +234,16 @@ pub fn frame_collect_js(id: u64) -> String {
 
 /// browser_read's JSON -> what the model reads.
 pub fn page_text(v: &Value) -> String {
+    let check = if person_check(v["title"].as_str().unwrap_or(""), v["text"].as_str().unwrap_or("")) {
+        "[The site shows a check that a person is here. Do not try to pass it: ask the user to do it in the browser beside the chat, then browser_read again.]\n"
+    } else {
+        ""
+    };
     let els: Vec<&str> = v["elements"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     let (p, n) = (v["part"].as_i64().unwrap_or(1), v["parts"].as_i64().unwrap_or(1));
     let text = v["text"].as_str().unwrap_or("");
     let text = if text.is_empty() { "(no text on this page: a bot check, or still loading. browser_read it once more, or use another result)" } else { text };
-    format!("{}\n{}\n\n{}{}\n\nElements:\n{}", v["title"].as_str().unwrap_or(""), v["url"].as_str().unwrap_or(""), text,
+    format!("{check}{}\n{}\n\n{}{}\n\nElements:\n{}", v["title"].as_str().unwrap_or(""), v["url"].as_str().unwrap_or(""), text,
             if n > 1 { format!("\n[part {p} of {n}: browser_read with part {} for more]", (p + 1).min(n)) } else { String::new() },
             if els.is_empty() { "(none)".to_string() } else { els.join("\n") })
 }
@@ -353,6 +393,11 @@ mod tests {
         assert!(read_js(2).ends_with("})(2, 3500)"));
         assert!(type_js(3, "a\"b", true).contains(r#""a\"b""#));
         assert!(page_text(&json!({"title": "T", "url": "u", "text": ""})).contains("(no text on this page"));
+        // a "prove you are a person" page is said as such, for the user to answer (never passed by the model)
+        let check = page_text(&json!({"title": "Access to this page has been denied", "url": "https://www.zillow.com/", "text": "Press & Hold to confirm you are a human (and not a bot)."}));
+        assert!(check.starts_with("[The site shows a check that a person is here. Do not try to pass it"), "{check}");
+        assert!(!page_text(&json!({"title": "Studios", "url": "u", "text": "Studio apartments in San Diego"})).starts_with("[The site"));
+        assert!(person_check("Just a moment...", "") && person_check("", "Our systems have detected unusual traffic") && !person_check("Zillow", "3 studios"));
     }
 
     #[test]
@@ -764,6 +809,51 @@ document.querySelector('#docs-file-menu').addEventListener('mousedown', () => op
         assert_eq!(place(&mut b, r#"[{"Name": "The Rey"}]"#)["error"], "no column \"Name\"; the columns are: Checkbox, Rating, Address, Price");
         assert!(place(&mut b, "[]")["error"].as_str().unwrap().starts_with("rows:"));
         assert_eq!(b.json(&format!("(() => {{ {} ; return JSON.stringify([letter(0), letter(9), letter(25), letter(26), letter(27)]); }})()", crate::google::PRELUDE)), json!(["A", "J", "Z", "AA", "AB"]));
+
+        // where a real click goes: the element brought into view, its centre; what covers it; none for the hidden
+        b.page(r#"<html><body style="margin:0"><div style="height:2000px"></div><button id="far" style="width:100px;height:40px">Far</button>
+<button id="under" style="position:absolute;left:0;top:0;width:100px;height:40px">Under</button>
+<div style="position:absolute;left:0;top:0;width:300px;height:60px;background:#fff">Accept cookies</div>
+<button style="display:none">Hidden</button><input id="q" value="old words"></body></html>"#);
+        let els: Vec<String> = b.json(&read_js(1))["elements"].as_array().unwrap().iter().map(|e| e.as_str().unwrap().to_string()).collect();
+        let num = |name: &str| els.iter().find(|e| e.contains(name)).map(|e| e[1..e.find(']').unwrap()].parse::<i64>().unwrap()).unwrap();
+        let t = b.json(&target_js(num("Far")));
+        let (x, y) = (t["x"].as_f64().unwrap(), t["y"].as_f64().unwrap());
+        assert!(x > 0.0 && y > 0.0 && y < b.eval("innerHeight").as_f64().unwrap() && t["cover"].is_null(), "scrolled into view, nothing on top: {t}");
+        assert_eq!(b.eval(&format!("document.elementFromPoint({x}, {y}).id")), "far", "the centre is the element");
+        b.eval("scrollTo(0, 0)");
+        assert_eq!(b.json(&target_js(num("Under")))["cover"], "Accept cookies");
+        b.eval("document.querySelector('[style*=\"display:none\"]').setAttribute('data-strata-id', '99')");
+        assert_eq!(b.json(&target_js(99))["hidden"], true);
+        assert!(b.json(&target_js(77))["error"].as_str().unwrap().contains("no element [77]"));
+        // typing replaces the field's text: it is focused with its text selected
+        assert_eq!(b.json(&focus_js(num("old words")))["focused"], true);
+        assert_eq!(b.eval("[document.activeElement.id, document.activeElement.selectionStart, document.activeElement.selectionEnd].join(' ')"), "q 0 9");
+
+        // My Maps' import: a column by its header name or its letter (the model gave A, C, B, D for Address)
+        let pick = |b: &mut Browser, want: &str| -> i64 {
+            b.eval(&format!("(() => {{ {} ; return pickColumn(['Checkbox', 'Rating', 'Address', 'Price', 'Sq feet', 'Time', 'Link', 'Description'], {}); }})()",
+                            crate::google::MAPS_PRELUDE, serde_json::to_string(want).unwrap())).as_i64().unwrap()
+        };
+        assert_eq!((pick(&mut b, "Address"), pick(&mut b, "address "), pick(&mut b, "C"), pick(&mut b, "h"), pick(&mut b, "Description")), (2, 2, 2, 7, 7));
+        assert_eq!((pick(&mut b, "Z"), pick(&mut b, "Name"), pick(&mut b, ""), pick(&mut b, "AB")), (-1, -1, -1, -1), "no such column: -1, so the error lists them");
+
+        // maps_create with a title the list already has: that map's address (its card's data-mid), no second map
+        b.page(r#"<html><body><div role="button" onclick="window.created = true">add_to_drive</div>
+<div data-mid="dummyId">Share via Facebook</div>
+<div class="card" data-mid="1JYYmapid" data-name="studios-sandiego-downtown-2026"><div class="t">studios-sandiego-downtown-2026</div><div aria-label="Open the map menu" data-mid="dummyId">⋮</div></div></body></html>"#);
+        let js = crate::google::maps_js("maps_create", &json!({"title": "studios-sandiego-downtown-2026"}), "t").unwrap();
+        let out = b.run(&format!("(async () => {{ {js} }})()")).unwrap();
+        assert_eq!(out, "a map titled studios-sandiego-downtown-2026 already exists, so none was made: https://www.google.com/maps/d/edit?mid=1JYYmapid. To put places on it: maps_import_sheet (each import adds a layer).");
+        assert_eq!(b.eval("window.created === undefined"), true, "Create was not pressed");
+
+        // maps_import_sheet into a trashed map: My Maps sends it home with "in your Trash"; said so, with the maps there are
+        b.page(r#"<html><body><div>The map you tried to access is in your Trash. To open this map, take it out of your Trash.</div>
+<div data-mid="1JYYmapid" data-name="studios-sandiego-downtown-2026"><div>studios-sandiego-downtown-2026</div><div>Oct 30, 2026</div>
+<div data-mid="dummyId">Share via Facebook</div></div></body></html>"#);
+        let js = crate::google::maps_js("maps_import_sheet", &json!({"sheet_title": "s", "location_column": "Address", "title_column": "Description"}), "t").unwrap();
+        let e = b.run(&format!("(async () => {{ {js} }})()")).unwrap_err();
+        assert_eq!(e, "that map is in the trash (gone: use another); the maps in My Maps: studios-sandiego-downtown-2026 (https://www.google.com/maps/d/edit?mid=1JYYmapid). maps_create with a title gives the address of the map with that title");
 
         // a form: what a field is (for the Allow), a password refused, typing fires input, submit sends the form
         b.page(FORM);

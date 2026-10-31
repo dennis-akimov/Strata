@@ -31,7 +31,9 @@ pub fn tools() -> Value {
         {"name": "maps_create", "description": "Create a Google My Maps map in the user's Google Drive with this title. Answers with its address. To put places on it: maps_import_sheet.",
          "inputSchema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}, "description": {"type": "string"}}}},
         {"name": "maps_import_sheet", "description": "Put a Google Sheets spreadsheet's rows on a Google My Maps map as places (a new layer named after the sheet): location_column holds the addresses, title_column names each place; every column is kept in each place's details.",
-         "inputSchema": {"type": "object", "required": ["map_url", "sheet_title", "location_column", "title_column"], "properties": {"map_url": {"type": "string", "description": "the map's address (maps_create answers with it)"}, "sheet_title": {"type": "string"}, "location_column": {"type": "string"}, "title_column": {"type": "string"}}}},
+         "inputSchema": {"type": "object", "required": ["map_url", "sheet_title", "location_column", "title_column"], "properties": {"map_url": {"type": "string", "description": "the map's address (maps_create answers with it)"}, "sheet_title": {"type": "string"},
+             "location_column": {"type": "string", "description": "the column with the addresses: its name in the header row (e.g. Address) or its letter (C)"},
+             "title_column": {"type": "string", "description": "the column that names each place: its name (e.g. Description) or its letter"}}}},
         {"name": "maps_trash", "description": "Move a Google My Maps map (by its title) to the trash (the user is asked to allow it).",
          "inputSchema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}
     ])
@@ -52,8 +54,8 @@ pub fn page_for(tool: &str, args: &Value, here: &str) -> Result<(String, String)
             let url = args["map_url"].as_str().unwrap_or("");
             let mid = url.split("mid=").nth(1).map(|m| m.split('&').next().unwrap_or("")).filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
             let mid = mid.ok_or_else(|| format!("map_url {url:?}: a My Maps address with mid= (maps_create answers with it)"))?;
-            let base = format!("{MAPS_EDIT}?mid={mid}");
-            Ok((base.clone(), base))
+            // always loaded fresh: an import after a cancelled one, on the same page, never finished
+            Ok((format!("{MAPS_EDIT}?mid={mid}"), "\u{0}".into()))
         }
         _ => {
             let url = args["url"].as_str().filter(|u| !u.is_empty()).map(String::from).unwrap_or_else(|| here.to_string());
@@ -276,7 +278,7 @@ pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
 }
 
 /// My Maps' helpers, before each body.
-const MAPS_PRELUDE: &str = r#"
+pub const MAPS_PRELUDE: &str = r#"
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const byText = (sel, t) => [...document.querySelectorAll(sel)].find((e) => e.offsetParent && (e.innerText || e.textContent || '').trim() === t);
 const mouse = (el) => { const r = el.getBoundingClientRect();
@@ -285,6 +287,12 @@ const set = (el, v) => { const p = el.tagName === 'TEXTAREA' ? HTMLTextAreaEleme
   el.focus(); Object.getOwnPropertyDescriptor(p, 'value').set.call(el, v); el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); };
 const wait = async (f, what) => { for (let i = 0; i < 60; i++) { const v = f(); if (v) return v; await sleep(250); } throw new Error(what); };
 // the deepest visible element with exactly this text (My Maps' Import is a div around other elements: no leaf)
+// a column by its header name (any case) or its letter (C: the third); -1 when neither.  A model gave A, C and B for
+// Address and Description, three times, and heard only "no column A"
+const pickColumn = (names, want) => { const w = String(want || '').trim(), i = names.findIndex((n) => n.toLowerCase() === w.toLowerCase());
+  if (i >= 0) return i;
+  if (/^[A-Za-z]{1,2}$/.test(w)) { const k = [...w.toUpperCase()].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1; if (k < names.length) return k; }
+  return -1; };
 const leaf = (t) => [...document.querySelectorAll('*')].find((e) => e.offsetParent && e.textContent.trim() === t && ![...e.children].some((c) => c.textContent.trim() === t));
 "#;
 
@@ -303,10 +311,20 @@ if (d && {desc}) set(d, {desc});
 mouse(await wait(() => byText('button', 'Save'), 'no Save'));
 await sleep(1500);
 return 'created the map ' + document.title + ' (' + location.href.split('&')[0] + '). To put places on it: maps_import_sheet.';"#, title = s("title"), desc = s("description")),
-        "maps_create" => r#"
-mouse(await wait(() => byText('button,[role=button]', 'add_to_drive'), 'no Create button in My Maps (signed in to Google?)'));
+        // a map with this title already: its address, not a second map with the same name (a model that lost track
+        // repeats a create: idempotent, as RFC 9110 9.2.2 means it).  The list's card holds the map's id (data-mid);
+        // clicking the card instead took the page away before the answer was read
+        "maps_create" => format!(r#"
+await wait(() => byText('button,[role=button]', 'add_to_drive'), 'no Create button in My Maps (signed in to Google?)');
+const name = {title}, have = leaf(name);
+if (have) {{
+  // its card: data-mid with data-name (menus carry data-mid too, one a "dummyId")
+  const card = have.closest('[data-mid][data-name]'), mid = card && card.getAttribute('data-mid');
+  if (mid) return 'a map titled ' + name + ' already exists, so none was made: https://www.google.com/maps/d/edit?mid=' + mid + '. To put places on it: maps_import_sheet (each import adds a layer).';
+}}
+mouse(byText('button,[role=button]', 'add_to_drive'));
 mouse(await wait(() => byText('button,[role=button],div', 'CREATE'), 'no CREATE in the dialog'));
-return '__next';"#.to_string(),
+return '__next';"#, title = s("title")),
         "maps_trash" => format!(r#"
 const name = {title};
 const t = await wait(() => leaf(name), 'no map titled ' + name + ' in My Maps');
@@ -334,6 +352,15 @@ const picker = (op, args) => new Promise((ok, no) => {{
 const num = (page, kind, name) => {{ const l = (page.elements || []).find((e) => e.startsWith('[') && e.includes('] ' + kind) && e.includes('"' + name + '"'));
   return l ? +l.slice(1, l.indexOf(']')) : 0; }};
 const sheet = {sheet}, loc = {loc}, ttl = {ttl};
+// the map open?  A trashed one sends My Maps home ("The map you tried to access is in your Trash"): said so, with the
+// maps there are (a model kept importing into a trashed map 8 times, hearing only "no Add layer")
+await wait(() => leaf('Add layer') || leaf('Import') || !location.pathname.startsWith('/maps/d/edit'), 'the map page did not load');
+if (!location.pathname.startsWith('/maps/d/edit')) {{
+  const said = (document.body.innerText.match(/[^\n]*(Trash|exist|permission|access)[^\n]*/) || [''])[0].trim().slice(0, 160);
+  // the cards (data-mid with data-name): the share and map menus carry data-mid too, one with a "dummyId"
+  const maps = [...new Set([...document.querySelectorAll('[data-mid][data-name]')].map((c) => c.getAttribute('data-name') + ' (https://www.google.com/maps/d/edit?mid=' + c.getAttribute('data-mid') + ')'))];
+  throw new Error((/Trash/.test(said) ? 'that map is in the trash (gone: use another)' : 'that map did not open (' + (said || location.href) + ')') + '; the maps in My Maps: ' + (maps.join('; ') || 'none') + '. maps_create with a title gives the address of the map with that title');
+}}
 let imp = leaf('Import');
 if (!imp) {{ mouse(await wait(() => leaf('Add layer'), 'no Add layer')); imp = await wait(() => leaf('Import'), 'no Import on the new layer'); }}
 mouse(imp);
@@ -346,11 +373,20 @@ page = (await picker('click', [n])).read;
 const ins = num(page, 'button', 'Insert') || num(page, 'button', 'Select');
 if (!ins) throw new Error('no Insert in the file picker');
 await picker('click', [ins]);
-const label = await wait(() => [...document.querySelectorAll('[id^=upload-checkbox-label-]')].find((e) => e.offsetParent && e.textContent.trim() === loc), 'no column ' + loc + ' to place the markers by');
-const box = document.querySelector('[aria-labelledby="' + label.id + '"]');
+// the column step: as soon as it shows its columns (no waiting out a name that is not there)
+const labels = await wait(() => {{ const l = [...document.querySelectorAll('[id^=upload-checkbox-label-]')].filter((e) => e.offsetParent); return l.length ? l : null; }}, 'My Maps did not ask which column places the markers');
+const names = labels.map((e) => e.textContent.trim());
+const li = pickColumn(names, loc), ti = pickColumn(names, ttl);
+if (li < 0 || ti < 0) {{
+  const c = byText('button,[role=button]', 'Cancel'); if (c) mouse(c);   // the half-done import is not left open
+  throw new Error('no column ' + (li < 0 ? loc : ttl) + ' in ' + sheet + '; its columns are: ' + names.join(', ') + ' (give a name or a letter: C is the third)');
+}}
+const box = document.querySelector('[aria-labelledby="' + labels[li].id + '"]');
+// one location column: any other ticked (My Maps ticks a likely one itself) is unticked
+for (const o of labels) {{ const b = document.querySelector('[aria-labelledby="' + o.id + '"]'); if (b !== box && b.getAttribute('aria-checked') === 'true') mouse(b); }}
 if (box.getAttribute('aria-checked') !== 'true') mouse(box);
 mouse(await wait(() => byText('button,[role=button]', 'Continue'), 'no Continue'));
-const radio = await wait(() => [...document.querySelectorAll('[role=radio]')].find((e) => e.offsetParent && (e.innerText || '').trim() === ttl), 'no column ' + ttl + ' for the titles');
+const radio = await wait(() => [...document.querySelectorAll('[role=radio]')].find((e) => e.offsetParent && (e.innerText || '').trim() === names[ti]), 'no column ' + names[ti] + ' for the titles');
 mouse(radio);
 mouse(await wait(() => byText('button,[role=button]', 'Finish'), 'no Finish'));
 // done: the new layer (named after the sheet) in the map's list, or My Maps' "trouble finding those locations"
@@ -358,7 +394,7 @@ const done = await wait(() => /trouble finding those locations/.test(document.bo
 if (done === 'fail') throw new Error('My Maps could not place the rows by ' + loc + ' (rows with nothing in that column?)');
 await sleep(2000);
 const t = document.body.innerText, all = t.match(/All items\s*\((\d+)\)/), bad = t.match(/(\d+) rows? couldn.t be shown/);
-return 'imported ' + sheet + ' into ' + document.title + ' as a layer' + (all ? ' of ' + all[1] + ' places' : '') + ', placed by ' + loc + ', titled by ' + ttl
+return 'imported ' + sheet + ' into ' + document.title + ' as a layer' + (all ? ' of ' + all[1] + ' places' : '') + ', placed by ' + names[li] + ', titled by ' + names[ti]
   + (bad ? '; ' + bad[1] + ' row(s) could not be placed (My Maps found no place for their ' + loc + ': fix them in the sheet, then import again)' : '')
   + ' (' + location.href.split('&')[0] + ')';"#,
                     sheet = s("sheet_title"), loc = s("location_column"), ttl = s("title_column")),
@@ -375,8 +411,15 @@ pub fn async_js(id: u64, body: &str) -> String {
   return 'started'; }})()"#)
 }
 
+/// The script's value; {gone} when the page it ran in has been replaced (a redirect took it away).
 pub fn async_collect_js(id: u64) -> String {
-    format!("(() => {{ const o = window.__strataAsync && window.__strataAsync[{id}]; return o ? o : 'null'; }})()")
+    format!("(() => {{ if (!window.__strataAsync) return JSON.stringify({{gone: location.href}}); const o = window.__strataAsync[{id}]; return o ? o : 'null'; }})()")
+}
+
+/// Is `tool` safe to run again from the start when its page was replaced under it (it had changed nothing yet)?  A
+/// trashed map's address loads, then My Maps sends it home: the import's script went with the first page.
+pub fn rerun_safe(tool: &str) -> bool {
+    matches!(tool, "sheets_read" | "maps_import_sheet")
 }
 
 /// The tool's answer from the script's value.
@@ -431,14 +474,19 @@ mod tests {
         assert!(!on_page(MAPS_LIST, "https://www.google.com/maps/d/edit?mid=1"), "the editor is not the list");
         assert!(on_page(MAPS_EDIT, "https://www.google.com/maps/d/edit?mid=1"));
         assert_eq!(page_for("maps_create", &json!({"__phase": 2}), "").unwrap().1, MAPS_EDIT);
-        assert!(maps_js("maps_create", &json!({}), "t").unwrap().contains("return '__next'"));
+        let create = maps_js("maps_create", &json!({"title": "studios"}), "t").unwrap();
+        assert!(create.contains("return '__next'") && create.contains(r#"const name = "studios", have = leaf(name);"#) && create.contains("already exists, so none was made"));
         assert!(maps_js("maps_create", &json!({"__phase": 2, "title": "a\"b"}), "t").unwrap().contains(r#"set(input, "a\"b")"#));
         let (load, prefix) = page_for("maps_import_sheet", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=1JYY-x_q&ll=1"}), "").unwrap();
-        assert_eq!((load.as_str(), prefix.as_str()), ("https://www.google.com/maps/d/edit?mid=1JYY-x_q", "https://www.google.com/maps/d/edit?mid=1JYY-x_q"));
+        assert_eq!(load, "https://www.google.com/maps/d/edit?mid=1JYY-x_q");
+        assert!(!on_page(&prefix, &load), "the map is loaded fresh for each import");
         assert!(page_for("maps_import_sheet", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=a');x('"}), "").is_err());
         assert!(maps_js("maps_import_sheet", &json!({"sheet_title": "s", "location_column": "Address", "title_column": "Description"}), "tok1").unwrap().contains("const TOKEN = 'tok1'"));
         assert!(ask("maps_trash", &json!({"title": "x"})).unwrap().contains("\u{201c}x\u{201d}"));
         assert_eq!(ask("sheets_read", &json!({})), None);
+        assert!(rerun_safe("maps_import_sheet") && rerun_safe("sheets_read"));
+        assert!(!rerun_safe("sheets_append") && !rerun_safe("maps_create"), "a create or append is never run twice");
+        assert!(async_collect_js(7).contains("gone: location.href"));
     }
 
     #[test]
