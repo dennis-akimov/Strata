@@ -1336,9 +1336,17 @@ impl StrataEngine {
             };
             return free.iter().copied().min_by_key(|b| (!fills_hole(*b), s.order.iter().position(|x| x == b).unwrap_or(0)));
         }
+        // what the slot's cache gives this prompt: its whole history when the prompt goes on from it, or a common start
+        // of at least half the prompt (llama.cpp's slot similarity, -sps 0.5): a new question after the same document
+        // or tool result, which the engine reads from its nearest checkpoint.  Less (a shared system prompt) counts as
+        // nothing, so a turn does not take over a slot whose conversation may come back for a few tokens.
         let held_prefix = |b: usize| {
             let h = &s.held[b];
-            if !h.is_empty() && h.len() < prompt.len() && prompt[..h.len()] == h[..] { h.len() } else { 0 }
+            if !h.is_empty() && h.len() < prompt.len() && prompt[..h.len()] == h[..] {
+                return h.len();
+            }
+            let common = h.iter().zip(prompt).take_while(|(x, y)| x == y).count();
+            if common * 2 >= prompt.len() { common } else { 0 }
         };
         // max() keeps the last of equals in Rust, the first in Python: pick the first maximum by hand
         let mut best = free[0];
@@ -2321,5 +2329,31 @@ mod grammar_key_tests {
         assert_eq!(keys(json!({"strata_tool_grammar": "root ::= x", "strata_tool_grammar_from": 7})), "");
         assert_eq!(keys(json!({"strata_tool_grammar": "726f6f74"})), "");
         assert_eq!(keys(json!({"grammar": "root ::= x"})), "", "a client's grammar field is not Strata's");
+    }
+}
+
+#[cfg(test)]
+mod slot_pick_tests {
+    use super::*;
+
+    fn slots(held: Vec<Vec<u32>>, used: Vec<f64>) -> Slots {
+        let n = held.len();
+        Slots { busy: vec![false; n], claims: HashSet::new(), releasing: HashSet::new(), orphan_seen: HashMap::new(), held, used,
+                live: vec![None; n], order: (0..n).collect(), group: vec![0; n], groups: 1, gs: 0, waiting: 0, admitting: 0,
+                wait_lens: vec![], next_wait_id: 0, ctl_epoch: 0 }
+    }
+
+    #[test]
+    fn a_new_question_on_the_same_document_goes_to_the_slot_that_read_it() {
+        let sys: Vec<u32> = (1..33).collect();
+        let doc = |d: u32| sys.iter().copied().chain((0..2000).map(|i| d * 10000 + i)).collect::<Vec<u32>>();
+        let with = |mut v: Vec<u32>, tail: std::ops::Range<u32>| { v.extend(tail); v };
+        // slot 0: document B; slot 1: document A, its question 1 and answer; slot 2: empty and the least recently used
+        let s = slots(vec![with(doc(2), 900..960), with(doc(1), 700..800), vec![]], vec![5.0, 6.0, 1.0]);
+        assert_eq!(StrataEngine::pick_slot(&s, &with(doc(1), 300..330)), Some(1));       // question 2 on document A
+        // a turn that only shares the system prompt keeps away from the slots that hold conversations
+        assert_eq!(StrataEngine::pick_slot(&s, &with(sys.clone(), 400..460)), Some(2));
+        // a conversation going on (the slot's whole history, then more) stays in its slot
+        assert_eq!(StrataEngine::pick_slot(&s, &with(with(doc(2), 900..960), 10..20)), Some(0));
     }
 }
