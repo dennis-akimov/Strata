@@ -82,6 +82,19 @@ Q3_K_M of the same model at 12.2 (Qwen3.6-35B's 2-bit UD-IQ2_M, since taken out 
 think before answering) passed the M1's checks (arithmetic, a fact, letter counting, Russian, code, a tool call): the
 server reads their `<|tool_call_start|>[f(a=1)]<|tool_call_end|>` calls and their template's `{% generation %}` tag.
 
+Several agents at once on the M1 (`"parallel": 3`, see [above](#how-fast-is-it)): LFM2.5-8B-A1B (Q8_0) on macOS, 2026-11-01,
+through the OpenAI API, three different chat prompts at a time, each answer its full 512 tokens (the model thinks first):
+
+| Agents at once | Tokens/s together | Tokens/s each | Memory at a 32K context each |
+| ---: | ---: | ---: | ---: |
+| 1 | 30.1 | 30.1 | 10.65 GB |
+| 2 | 34.4 | 17.2 | |
+| 3 | 36.8 | 12.3 | 11.86 GB |
+
+The M1 gains much less from writing several answers at once than the M5 Max (1.22x for three, against 1.74x for
+Qwen3.6-35B there): its 8-core GPU is already busy with one. Three agents fit easily (LFM2.5's hybrid layers keep
+small caches: 1.6 GB for three 32K contexts), so on the M1 they are for working at the same time, not for more output.
+
 On Linux the GPU sets the pace (the engine uses under 10% of the CPU; the GPU's clock is its firmware's, the same top
 1278 MHz as under macOS, with no Linux setting). What was measured on the M1, 2026-10-29:
 
