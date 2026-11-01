@@ -5,7 +5,7 @@
 @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--fg:#f5f5f7;--mute:#98989d;--line:#3a3a3c;--log:#000;--logfg:#d1d1d6}}
 *{box-sizing:border-box}[hidden]{display:none!important}html,body{height:100%}body{margin:0;font:12.5px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
 #bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:nowrap;white-space:nowrap;height:44px;overflow:visible}
-#bar>*{flex-shrink:0}#bar>#cfg,#bar>#ctx{flex-shrink:1;min-width:90px}
+#bar>*{flex-shrink:0}
 @media (max-width:1400px){#url{display:none}}@media (max-width:1150px){#rate,.sep{display:none}#mem{max-width:110px;overflow:hidden;text-overflow:ellipsis}}
 select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
 button{cursor:pointer}button:hover:not(:disabled){border-color:var(--acc)}button:disabled{opacity:.4;cursor:default}
@@ -17,7 +17,10 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
 #menu label{display:block;padding:6px 8px}
 #memwrap{position:relative}#mem{cursor:pointer}#refresh{padding:2px 7px}
 #mempop{display:none;position:absolute;left:0;top:28px;z-index:9;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;width:380px;max-width:90vw;box-shadow:0 6px 24px #0003}
-#mempop.open{display:block}#mempop h3{margin:8px 0 4px;font-size:13px}#mempop h3:first-child{margin-top:0}
+#mempop.open{display:block}
+#mempop{white-space:normal}   /* the bar's nowrap would stretch the table and the note past the popover */
+#popapps{padding-top:8px}#mempop .applist table{table-layout:fixed}#mempop .applist td:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#mempop .applist td.n{width:5.5em}#mempop .applist td.b{width:7em}#mempop h3{margin:8px 0 4px;font-size:13px}#mempop h3:first-child{margin-top:0}
 #mempop .row{display:flex;justify-content:space-between;font-variant-numeric:tabular-nums;padding:1px 0}
 #mempop .meter{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin:4px 0}#mempop .meter span{display:block;height:100%}
 #main{flex:1;display:flex;flex-direction:column;min-height:0}
@@ -151,8 +154,8 @@ function apps(a){
   appsList=a.apps||[];if(a.still)stillRunning=a.still;if(a.sys){sysMem=a.sys;strataMem=a.strata;memsum();}
   const need=mem&&mem.avail!=null&&mem.need>mem.avail?mem.need-mem.avail:0;
   const html=!appsList.length?'':`<h3>${need?`Free ${gb(need)}: quit apps you do not need`:'Apps using the most memory'}</h3>
-    <table>${appsList.map((x,i)=>`<tr><td>${esc(x.name)}</td><td class="n">${gb(x.bytes)}</td><td class="b">`+
-      (!x.app?`<span class="mute" title="${esc(x.bundle)}">background · not quit from here</span>`
+    <table>${appsList.map((x,i)=>`<tr><td title="${esc(x.name)}">${esc(x.name)}</td><td class="n">${gb(x.bytes)}</td><td class="b">`+
+      (!x.app?`<span class="mute" title="${esc(x.bundle)}: a background process, not quit from here">background</span>`
       :x.bundle===stillRunning?`<span class="mute">still open · </span><button class="force" data-i="${i}" data-f="1">Force quit</button>`
                               :`<button data-i="${i}">Quit</button>`)+`</td></tr>`).join('')}</table>
     <div class="mute" style="margin-top:6px">Quit asks the app to close (it may ask to save your work); background services
@@ -167,11 +170,13 @@ document.addEventListener('click',e=>{const b=e.target.closest('.applist button'
 function memsum(){
   const m=mem||{},s=sysMem,row=(a,b)=>`<div class="row"><span>${a}</span><span>${b}</span></div>`;
   let h=`<h3>Strata</h3>`+(m.need!=null?row(`this model at context ${k(m.context||0)}`,gb(m.need))+row('the GPU can use',gb(m.limit)):'')+
-    (strataMem!=null?row('Strata now (app, server, engine)',gb(strataMem)):'');
+    (strataMem!=null?row('Strata\'s processes (its GPU memory is in wired)',gb(strataMem)):'');
+  // the whole Mac in binary GB, as Activity Monitor and macOS's "128 GB" count it
+  const gib=b=>b==null?'–':(b/2**30).toFixed(1)+' GB';
   if(s){const p=s.pressure,c=p==null?'var(--line)':p<50?'#34c759':p<80?'#ff9f0a':'#ff453a';
-    h+=`<h3>This Mac · ${gb(s.total)}</h3>`+(p!=null?row('memory pressure',p+'%')+`<div class="meter"><span style="width:${p}%;background:${c}"></span></div>`:'')+
-      row('apps',gb(s.app))+row('wired (macOS, the GPU)',gb(s.wired))+row('compressed',gb(s.compressed))+row('free or file cache',gb(s.free))+
-      (s.swap_total?row('swap',`${gb(s.swap_used)} of ${gb(s.swap_total)}`):'');}
+    h+=`<h3>This Mac · ${Math.round(s.total/2**30)} GB</h3>`+(p!=null?row('memory pressure',p+'%')+`<div class="meter"><span style="width:${p}%;background:${c}"></span></div>`:'')+
+      row('apps',gib(s.app))+row('wired (macOS, the GPU)',gib(s.wired))+row('compressed',gib(s.compressed))+row('free or file cache',gib(s.free))+
+      (s.swap_total?row('swap',`${gib(s.swap_used)} of ${gib(s.swap_total)}`):'');}
   $('memsum').innerHTML=h;
 }
 // what else would let it fit or run faster: macOS's GPU memory limit, the energy mode (one click each: macOS asks
