@@ -348,9 +348,30 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
+  // "parallel": the top row is all the agents together, then one row per batch slot
+  const slots = live.parallel > 0 && Array.isArray(live.slots) ? live.slots : null;
+  const busy = slots ? slots.filter((s) => s.state !== "idle") : [];
+  if (busy.length) {                       // a request outside the slots (the solo path) keeps the one-request label
+    const tok = busy.reduce((a, s) => a + (s.tok_s || 0), 0), gen = busy.reduce((a, s) => a + (s.generated || 0), 0);
+    label = `${busy.length} of ${slots.length} agents at work`;
+    detail = `${fmt(gen)} tokens · ${fmt(tok, 1)} tok/s together` + (live.waiting ? ` · ${fmt(live.waiting)} waiting` : "");
+    pct = (100 * busy.length) / slots.length;
+  }
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
+  const box = $("state-slots");
+  box.hidden = !slots;
+  if (slots) box.innerHTML = slots.map((s) => {
+    const idle = s.state === "idle", reading = s.state === "reading";
+    const p = idle ? 0 : s.max_tokens ? Math.min(100, (100 * (s.generated || 0)) / s.max_tokens) : 0;
+    const what = idle ? (s.held_tokens ? `idle · ${fmt(s.held_tokens)} tokens kept` : "idle")
+               : reading ? `reading ${fmt(s.prompt_tokens)} tokens`
+               : `${fmt(s.generated)} tokens · ${fmt(s.tok_s, 1)} tok/s`;
+    return `<div class="state-slot${idle ? " state-slot--idle" : ""}"><span>Agent ${s.slot + 1}</span>` +
+           `<div class="st-progress"${reading ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${p}%"></div></div>` +
+           `<span>${esc(what)}</span></div>`;
+  }).join("");
 
   // the eight cards
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;

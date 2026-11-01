@@ -665,11 +665,30 @@ fn set_context(cfg_path: &Path, ctx: u64, batch: Option<u64>) -> Result<(), Stri
             _ => args.extend([json!(flag), json!(val.to_string())]),
         }
     }
+    write_config(cfg_path, &text, &v)
+}
+
+/// How many requests the server runs at once ("parallel": 2..8 batch slots, one engine and one copy of the weights);
+/// 1 takes the key out.  A running server restarts with it.
+fn set_parallel(cfg_path: &Path, n: u64) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let o = v.as_object_mut().ok_or("the config is not a JSON object")?;
+    if n > 1 {
+        o.insert("parallel".into(), json!(n.min(8)));
+    } else {
+        o.remove("parallel");
+    }
+    write_config(cfg_path, &text, &v)
+}
+
+/// The config written back with the indent it had (its other keys as they were).
+fn write_config(cfg_path: &Path, text: &str, v: &Value) -> Result<(), String> {
     let indent = text.lines().nth(1).map(|l| l.len() - l.trim_start().len()).filter(|n| *n > 0).unwrap_or(1);
     let mut out = vec![];
     let fmt = serde_json::ser::PrettyFormatter::with_indent(&b"        "[..indent.min(8)]);
     let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
-    serde::Serialize::serialize(&v, &mut ser).map_err(|e| e.to_string())?;
+    serde::Serialize::serialize(v, &mut ser).map_err(|e| e.to_string())?;
     out.push(b'\n');
     std::fs::write(cfg_path, out).map_err(|e| e.to_string())
 }
@@ -1110,7 +1129,8 @@ fn snapshot(st: &Shared) -> Value {
         .iter()
         .map(|p| {
             let c = read_config(p);
-            json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"], "problem": problem(&c)})
+            json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"], "problem": problem(&c),
+                "parallel": c["parallel"].as_u64().filter(|n| *n > 1).map(|n| n.min(8)).unwrap_or(1)})
         })
         .collect();
     let settings = load_settings();
@@ -1455,6 +1475,29 @@ fn main() {
                         };
                         let _ = p2.send_event(Ev::Log(msg));
                         if start_after {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                        check_memory(&st2, &p2, None);
+                    });
+                }
+                "set_parallel" => {
+                    // requests at once in the config; a running server restarts with it (as a new context does)
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let n = v["n"].as_u64().unwrap_or(1).clamp(1, 8);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let msg = match set_parallel(&cfg, n) {
+                            Ok(()) => format!("── {n} request{} at once in {} ──", if n == 1 { "" } else { "s" }, cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        if running {
                             if let Err(e) = start(&st2, &p2) {
                                 let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
                             }
@@ -2266,6 +2309,23 @@ mod tests {
         }
         assert!(apps.iter().all(|a| !a["bundle"].as_str().unwrap().starts_with("/System/") && a["name"] != "Strata"));
         eprintln!("{}", apps.iter().map(|a| format!("{} {:.1} GB", a["name"].as_str().unwrap(), a["bytes"].as_f64().unwrap() / 1e9)).collect::<Vec<_>>().join(", "));
+    }
+
+    #[test]
+    fn parallel_is_written_into_the_config_and_taken_out_at_one() {
+        let d = std::env::temp_dir().join(format!("strata-par-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("strata-x.json");
+        std::fs::write(&p, "{\n \"args\": [\"--gguf\", \"m\"],\n \"api_key\": \"k\"\n}\n").unwrap();
+        set_parallel(&p, 3).unwrap();
+        assert_eq!(read_config(&p)["parallel"], 3);
+        assert!(std::fs::read_to_string(&p).unwrap().contains("\n \"api_key\": \"k\""));   // the rest and its indent kept
+        set_parallel(&p, 12).unwrap();
+        assert_eq!(read_config(&p)["parallel"], 8);                                  // the engine's most
+        set_parallel(&p, 1).unwrap();
+        assert!(read_config(&p).get("parallel").is_none());                          // one at a time: no key at all
+        assert_eq!(plan_args(&read_config(&p)), ["--gguf", "m"]);
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

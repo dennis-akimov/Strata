@@ -1379,7 +1379,7 @@ impl StrataEngine {
                     let generated = r.get("generated").and_then(Value::as_f64).unwrap_or(0.0);
                     let started = r.get("started").and_then(Value::as_f64).unwrap_or(now);
                     json!({"slot": b, "state": r.get("state").cloned().unwrap_or(Value::Null), "prompt_tokens": r.get("prompt_tokens").cloned().unwrap_or(Value::Null),
-                           "generated": r.get("generated").cloned().unwrap_or(Value::Null), "elapsed_s": round1(now - started),
+                           "generated": r.get("generated").cloned().unwrap_or(Value::Null), "max_tokens": r.get("max_tokens").cloned().unwrap_or(Value::Null), "elapsed_s": round1(now - started),
                            "tok_s": ft.map(|ft| round1(generated / (now - ft).max(1e-6)))})
                 }
             })
@@ -1584,7 +1584,7 @@ impl StrataEngine {
                     };
                     {
                         let mut s = self.slots.lock().unwrap();
-                        s.live[b] = Some(json!({"slot": b, "state": "reading", "prompt_tokens": prompt.len(), "generated": 0, "started": crate::sync::now(), "first_token": null}).as_object().cloned().unwrap());
+                        s.live[b] = Some(json!({"slot": b, "state": "reading", "prompt_tokens": prompt.len(), "generated": 0, "max_tokens": left, "started": crate::sync::now(), "first_token": null}).as_object().cloned().unwrap());
                     }
                     self.send(&format!("{head} {}", ids_line(&prompt))).map_err(Stop::Err)?;
                     self.slots.lock().unwrap().held[b] = vec![];
