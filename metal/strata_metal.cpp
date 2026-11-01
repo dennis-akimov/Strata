@@ -292,6 +292,7 @@ struct Checkpoint {
     size_t n;                                 // cells the state covers: live[0, n)
     llama_pos pos;                            // the position of cell n (the first one cut)
     std::vector<uint8_t> tgt, dft, spec;      // recurrent part of the trunk, the draft context's, the drafter's
+    bool inside = false;                      // inside a message (a chunk's end), not at its first token
 };
 
 // What one sequence of the context holds: seq 0 is the solo path's (GEN, with the MTP drafts), seq b + 1 batch slot b's.
@@ -490,16 +491,20 @@ struct Engine {
         return d;
     }
 
-    void checkpoint(llama_seq_id sq, size_t n, llama_pos pos) {
+    // At a message boundary, or `inside` one at a chunk's end: a new question after the same long message (a document,
+    // a tool's result) goes back there, not to the message's start.  --checkpoints of each kind are kept, counted apart,
+    // so a long message's inside ones never push out the boundary before it.
+    void checkpoint(llama_seq_id sq, size_t n, llama_pos pos, bool inside) {
         if (o.checkpoints == 0) return;
-        Checkpoint c{n, pos, state(ctx, sq), {}, {}};
+        Checkpoint c{n, pos, state(ctx, sq), {}, {}, inside};
         if (c.tgt.empty()) return;
         if (sq == 0 && ctx_dft) c.dft = state(ctx_dft, 0);
         if (sq == 0 && spec) common_speculative_get_state(spec, 0, c.spec);
         auto& ck = seqs[(size_t) sq].ckpts;
         while (!ck.empty() && ck.back().n >= n) ck.pop_back();
         ck.push_back(std::move(c));
-        while ((int) ck.size() > o.checkpoints) ck.pop_front();
+        if (std::count_if(ck.begin(), ck.end(), [&](const Checkpoint& x) { return x.inside == inside; }) > o.checkpoints)
+            ck.erase(std::find_if(ck.begin(), ck.end(), [&](const Checkpoint& x) { return x.inside == inside; }));
     }
 
     void clear(llama_seq_id sq) {
@@ -733,7 +738,8 @@ struct Engine {
         const char* finish = "length";
         bool cancelled = false;
         const bool drafts = spec && sq == 0;
-        // the prompt but its last token, in chunks of n_batch, each also ending at a message boundary (a checkpoint)
+        // the prompt but its last token, in chunks of n_batch, each also ending at a message boundary (a checkpoint at
+        // each chunk's end)
         size_t at = resume;
         while (at + 1 < n) {
             size_t end = std::min(n - 1, at + (size_t) o.n_batch);
@@ -743,7 +749,10 @@ struct Engine {
             if (boundary) end = b;
             if (!feed(sq, P, at, end, false, err, !geni)) { clear(sq); return refuse(err); }
             at = end;
-            if (boundary) checkpoint(sq, at, P.pos[at][0]);
+            // a boundary is the cut's own token (a chunk can end right before an <|im_start|>); inside a message, only
+            // where seq_rm from the cut's position keeps every held cell (an M-RoPE image's rows share one position)
+            if (P.ids[at] == im_start || P.pos[at][0] > P.pos[at - 1][0])
+                checkpoint(sq, at, P.pos[at][0], P.ids[at] != im_start);
             const double ms = ms_since(t0);
             out("PP %zu %zu %.0f %.1f\n", at, n, ms, (at - resume) / std::max(1e-3, ms / 1000.0));
             if (g_stop) { cancelled = true; finish = "cancel"; break; }
