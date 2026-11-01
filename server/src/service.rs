@@ -488,6 +488,8 @@ pub struct Service {
     pub conv_log: Mutex<crate::engine::ConvCacheLog>,
     pub harmony: bool,
     pub glm: bool,
+    /// LFM2 / LFM2.5 (LiquidAI): tool calls as `<|tool_call_start|>[f(a=1)]<|tool_call_end|>`
+    pub lfm: bool,
     pub stop_ids: Vec<u32>,
     pub mcp: Option<Arc<crate::mcp::McpHub>>,
     pub telemetry: Mutex<Option<Arc<crate::telemetry::Telemetry>>>,
@@ -507,6 +509,7 @@ impl Service {
         // GPT-OSS: harmony (its tokenizer has <|channel|>); GLM: <|observation|>
         let harmony = special("<|channel|>") && is_special(&*tok, "<|channel|>");
         let glm = is_special(&*tok, "<|observation|>");
+        let lfm = !glm && is_special(&*tok, crate::parser::LFM_CALL_START);
         let ends: Vec<&str> = if harmony { vec!["<|return|>", "<|call|>", "<|endoftext|>"] } else if glm { vec!["<|endoftext|>", "<|user|>", "<|observation|>"] } else { vec![IM_END, "<|endoftext|>"] };
         let mut stop_ids = vec![];
         for s in ends {
@@ -544,6 +547,7 @@ impl Service {
             conv_log: Mutex::new(crate::engine::ConvCacheLog::default()),
             harmony,
             glm,
+            lfm,
             stop_ids,
             mcp: None,
             telemetry: Mutex::new(None),
@@ -1003,9 +1007,10 @@ impl Service {
         s.shift_remove("x");
         let n = if all_requests { hist.len() } else { 12 };
         let requests: Vec<Value> = hist.iter().rev().take(n).cloned().collect();
+        let hardware = gpu_memory_from_engine(tel["now"].clone(), &engine);
         json!({"engine": engine, "live": live, "requests": requests,
             "conversation_cache": conversation_cache_view(&engine, &hist, &totals, &parked),
-            "requests_kept": hist.len(), "totals": totals, "hardware": tel["now"], "hardware_static": tel["static"],
+            "requests_kept": hist.len(), "totals": totals, "hardware": hardware, "hardware_static": tel["static"],
             "history": tel["history"], "time": t})
     }
 
@@ -1290,7 +1295,8 @@ impl Service {
                 req.insert("strata_prefix".into(), r);
             }
         }
-        Ok((ids, !thinking_off, max_new))
+        // Apple's on-device model does not think: its text is all answer
+        Ok((ids, !thinking_off && !matches!(self.engine, crate::engine::Engine::Afm(_)), max_new))
     }
 
     /// R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix -> {"tokens": N} or {}.
@@ -1427,4 +1433,14 @@ pub fn add_f(m: &mut Map<String, Value>, k: &str, d: f64) {
 /// A number as Python formats it in an f-string (int stays int, float repr).
 pub fn py_num(x: f64) -> String {
     if x == x.trunc() && x.abs() < 1e16 { format!("{}", x as i64) } else { crate::pyjson::float_repr(x) }
+}
+
+/// No GPU counters of the OS (Asahi Linux): the GPU memory the engine measured once the model was in it (its INFO
+/// gpu_used / gpu_total); the OS's own numbers win where there are some (macOS).
+pub fn gpu_memory_from_engine(mut hardware: Value, engine: &Map<String, Value>) -> Value {
+    if hardware["gpu_mem_used"].is_null() && engine.get("gpu_total").and_then(Value::as_f64).unwrap_or(0.0) > 0.0 {
+        hardware["gpu_mem_used"] = engine["gpu_used"].clone();
+        hardware["gpu_mem_total"] = engine["gpu_total"].clone();
+    }
+    hardware
 }

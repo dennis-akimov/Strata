@@ -141,6 +141,118 @@ class TestStrataMetal(unittest.TestCase):
         self.assertEqual(resume0, 0)
         self.assertEqual(out_b, out_fresh)
 
+    def test_a_new_question_after_one_long_message_reads_only_the_question(self):
+        # skill-quiz's shape: one user message "Document: ... Question: q" - the document is no message of its own
+        e = Engine("--prefill-batch", "64")
+        try:
+            doc = self.m1 + message(e.im_start, list(range(1000, 1300)))
+            e.gen(doc + list(range(700, 720)))
+            out_b, resume, _ = e.gen(doc + list(range(900, 930)))
+        finally:
+            e.close()
+        self.assertGreater(resume, len(doc) - 64)                 # a checkpoint inside the message, not its start
+        self.assertLessEqual(resume, len(doc))
+        fresh = Engine()
+        try:
+            out_fresh, _, _ = fresh.gen(doc + list(range(900, 930)))
+        finally:
+            fresh.close()
+        self.assertEqual(out_b, out_fresh)
+
+    def test_checkpoints_inside_a_long_message_keep_the_boundaries(self):
+        # the long message's own checkpoints (many more than --checkpoints) never push out the one before it
+        e = Engine("--prefill-batch", "32", "--checkpoints", "2")
+        try:
+            head = self.m1 + self.m2
+            e.gen(head + message(e.im_start, list(range(1000, 1400))))
+            _, resume, _ = e.gen(head + self.mx)
+        finally:
+            e.close()
+        self.assertEqual(resume, len(head))
+
+    def test_the_latest_inside_checkpoints_are_kept(self):
+        # --checkpoints 2: the long message's last two chunk ends; one early in it went, so the message's start serves
+        e = Engine("--prefill-batch", "32", "--checkpoints", "2")
+        try:
+            a = self.m1 + message(e.im_start, list(range(1000, 1400)))
+            e.gen(a)
+            _, late, _ = e.gen(a[:-5] + self.mx)
+            e.gen(a)
+            _, early, _ = e.gen(a[:len(self.m1) + 100] + self.mx)
+        finally:
+            e.close()
+        self.assertGreater(late, len(a) - 5 - 32)
+        self.assertLessEqual(late, len(a) - 5)
+        self.assertEqual(early, len(self.m1))
+
+    def test_a_boundary_at_a_chunk_end_is_a_boundary(self):
+        # the first message is exactly one chunk: its end is the next message's <|im_start|>, a boundary, not pushed
+        # out by the long message's inside checkpoints
+        e = Engine("--prefill-batch", "32", "--checkpoints", "2")
+        try:
+            head = message(e.im_start, list(range(300, 331)))
+            self.assertEqual(len(head), 32)
+            e.gen(head + message(e.im_start, list(range(1000, 1400))))
+            _, resume, _ = e.gen(head + self.mx)
+        finally:
+            e.close()
+        self.assertEqual(resume, 32)
+
+    def test_a_long_image_across_chunks_comes_back_whole(self):
+        # an image of 128 rows read in chunks of 32, then a new question after it: what is held matches a fresh engine
+        e = Engine("--prefill-batch", "32")
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                one = os.path.join(d, "one.bin")
+                embeddings(one, [(16, 8, 0.01)], e.n_embd)
+                ids = self.m1 + [PAD] * 128
+                e.gen(ids + self.m3, image=one)
+                out, resume, _ = e.gen(ids + self.mx, image=one)
+                fresh = Engine()
+                try:
+                    self.assertEqual(out, fresh.gen(ids + self.mx, image=one)[0])
+                finally:
+                    fresh.close()
+        finally:
+            e.close()
+        self.assertGreater(resume, len(self.m1))
+        self.assertLessEqual(resume, len(ids))
+
+    def test_no_checkpoints_reads_it_all_again(self):
+        e = Engine("--prefill-batch", "64", "--checkpoints", "0")
+        try:
+            doc = self.m1 + message(e.im_start, list(range(1000, 1300)))
+            e.gen(doc + list(range(700, 720)))
+            out, resume, _ = e.gen(doc + list(range(900, 930)))
+        finally:
+            e.close()
+        self.assertEqual(resume, 0)
+        fresh = Engine()
+        try:
+            self.assertEqual(out, fresh.gen(doc + list(range(900, 930)))[0])
+        finally:
+            fresh.close()
+
+    def test_a_batch_slot_reads_only_the_new_question_too(self):
+        b = Engine("--batch", "1", "--prefill-batch", "64")
+        try:
+            doc = self.m1 + message(b.im_start, list(range(1000, 1300)))
+            b.admit(0, doc + list(range(700, 720)), 4)
+            b.admitted = 1
+            b.slots()
+            first, resume, _ = b.admit(0, doc + list(range(900, 930)), 8)
+            b.admitted = 1
+            got = b.slots()
+        finally:
+            b.close()
+        self.assertGreater(resume, len(doc) - 64)
+        self.assertLessEqual(resume, len(doc))
+        fresh = Engine()
+        try:
+            self.assertEqual(first + got[0][0], fresh.gen(doc + list(range(900, 930)), max_new=8)[0])
+        finally:
+            fresh.close()
+
     def test_an_extended_prompt_reads_only_the_new_part(self):
         a = self.m1 + self.m3
         out, _, done = self.e.gen(a)

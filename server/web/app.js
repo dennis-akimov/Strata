@@ -508,6 +508,9 @@ const MCP_STATE = {ready: ["st-badge--generating", "Connected"], starting: ["st-
                    failed: ["st-badge--error", "Failed"], stopped: ["st-badge--queued", "Stopped"], idle: ["", "Waiting"]};
 function renderMcp() {
   const servers = mcpInfo.servers || [];
+  const rem = mcpInfo.reminders || {};
+  $("rem-row").hidden = !rem.available;
+  $("s-rem").setAttribute("aria-checked", rem.on ? "true" : "false");
   $("mcp-card").hidden = !servers.length;
   $("mcp-row").hidden = !servers.length;
   $("mcp-conns").hidden = !mcpLoaded;                // connections can be added here even when there are none yet
@@ -746,7 +749,9 @@ function inline(s) {
   s = esc(s)
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1<em>$2</em>")
-    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    // a bare address is a link too (not one inside a link already made: after href=" or as its text)
+    .replace(/(^|[\s(])(https?:\/\/[^\s<"]*[^\s<".,;:!?)'])/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
 function codeBlock(lang, code) {
@@ -1462,6 +1467,7 @@ async function send() {
   $("input").value = "";
   autosize();
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now(), wait: ""};
+  if (voiceNext) { m.voice = true; voiceNext = false; }   // asked by voice: its answer is read aloud when done
   messages.push(m);
   renderChat();
   const el = $("chat").lastElementChild;
@@ -1594,6 +1600,7 @@ async function send() {
   saveChat();
   scrollDown();
   refreshContext();                               // counted exactly again, with this answer in it
+  if (m.voice) voicePost({say: m.text || (m.error ? `Sorry: ${m.error}` : "")});
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -1817,3 +1824,232 @@ if (startQuestion) history.replaceState(null, "", location.pathname + location.h
 Promise.all([chatsReady, loadHealth()]).then(modelSampling).then(loadMcp).then(() => { refreshContext(); if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
+
+// ------------------------------------------------------------------ voice ("Hey Strata": GET / POST voice)
+// strata-voice listens on this Mac (macOS 26+); the button shows only where the server has it
+let voiceTimer = null, voiceSeen = null, voiceNext = false;
+const voiceQueue = [];
+// a question voice heard while this page checked in (by: "page"): sent through this chat like a typed one, so the
+// chat keeps it (history, context, settings); send() reads the answer back aloud (POST voice {"say"})
+async function voiceRun() {
+  if (!voiceQueue.length) return;
+  if (busy || sending) { setTimeout(voiceRun, 800); return; }
+  const q = voiceQueue.shift();
+  showTab("chat");
+  $("input").value = q;
+  voiceNext = true;
+  await send();
+  voiceNext = false;                              // send() returned early (an image command...): not the next typed one
+  voiceRun();
+}
+async function loadVoice() {
+  let v;
+  // a visible page checks in, and takes the questions (a hidden tab leaves them to the helper)
+  try { v = await (await fetch(document.hidden ? "voice" : "voice?page=1", {headers: headers(), cache: "no-store"})).json(); } catch (e) { return; }
+  const evs = v.events || [], top = evs.length ? evs[evs.length - 1].n : 0;
+  if (voiceSeen === null) voiceSeen = top;        // what happened before this page opened is not replayed
+  for (const e of evs) if (e.n > voiceSeen && e.event === "command" && e.by === "page" && e.text) voiceQueue.push(e.text);
+  voiceSeen = Math.max(voiceSeen, top);
+  voiceRun();
+  $("voice-btn").hidden = $("voice-more").hidden = !v.available;
+  $("voice-btn").setAttribute("aria-pressed", v.on ? "true" : "false");
+  $("voice-on").checked = !!v.on;
+  const ph = v.phrase || "hey strata", quoted = `\u201c${ph.replace(/\b\w/g, (c) => c.toUpperCase())}\u201d`;
+  $("voice-on-label").textContent = quoted;
+  $("voice-btn").title = v.on ? `Voice on: say ${quoted} and your question (click: off)` : `Voice off (click: on, then say ${quoted})`;
+  if (document.activeElement !== $("voice-phrase")) $("voice-phrase").value = ph;
+  $("voice-speak").checked = v.speak !== false;
+  const ev = v.events || [], last = ev[ev.length - 1] || {};
+  const said = {starting: "Starting\u2026", listening: `Listening for ${quoted}.`, wake: `Heard ${quoted}: go on\u2026`,
+                command: "Asking the model\u2026", answer: `Listening for ${quoted}.`, off: "Off.",
+                downloading: "Downloading Apple\u2019s dictation model\u2026", "wake-timeout": `Listening for ${quoted}.`};
+  if (v.on || last.event === "error" || last.event === "permissions") {
+    $("voice-state").textContent = last.event === "error" ? last.text
+      : last.event === "permissions" ? `Microphone: ${last.microphone ? "allowed" : "not allowed (System Settings opened)"}; speech recognition: ${last.speech ? "allowed" : "not allowed"}.`
+      : (said[last.event] || "Listening.");
+  }
+  if (v.on && v.heard) $("voice-state").textContent += ` Last heard: \u201c${v.heard}\u201d`;
+  $("voice-log").innerHTML = ev.filter((e) => ["command", "answer", "error"].includes(e.event)).slice(-12).reverse().map((e) =>
+    `<li class="${e.event === "command" ? "q" : e.event === "error" ? "err" : ""}">${esc(e.text || "")}</li>`).join("");
+  clearTimeout(voiceTimer);
+  voiceTimer = setTimeout(loadVoice, v.on || $("voice-pop").matches(":popover-open") ? 1500 : 10000);
+}
+async function voicePost(body) {
+  try {
+    const r = await fetch("voice", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) {
+      $("voice-state").textContent = (j.error && j.error.message) || `HTTP ${r.status}`;
+      toast("error", "Voice", $("voice-state").textContent, 6000);
+    } else if (body.on === true) {
+      // turned on: a start that fails (the microphone, its permission) is said, not left in the closed panel
+      setTimeout(async () => {
+        try {
+          const v = await (await fetch("voice", {headers: headers(), cache: "no-store"})).json();
+          const last = (v.events || []).slice(-1)[0] || {};
+          if (!v.on && last.event === "error") toast("error", "Voice did not start", last.text + " (the arrow next to the microphone: Allow microphone)", 9000);
+        } catch (e) { /* the next poll says it */ }
+      }, 6000);
+    }
+  } catch (e) { $("voice-state").textContent = String(e); }
+  loadVoice();
+}
+$("voice-on").onchange = (e) => voicePost({on: e.target.checked});
+// the microphone itself: voice on / off (its settings behind the arrow next to it)
+$("voice-btn").onclick = () => voicePost({on: $("voice-btn").getAttribute("aria-pressed") !== "true"});
+$("voice-speak").onchange = (e) => voicePost({speak: e.target.checked});
+$("voice-phrase-form").onsubmit = (e) => { e.preventDefault(); voicePost({phrase: $("voice-phrase").value}); };
+$("voice-allow").onclick = () => { $("voice-state").textContent = "macOS asks now (its window may be behind this one)\u2026"; voicePost({permissions: true}); };
+$("voice-pop").addEventListener("toggle", (e) => {
+  if (e.newState !== "open") return;
+  // above the button, kept on screen: its bottom is anchored, so it grows upward as its contents load (a top
+  // computed at opening put the later rows below the window); taller than the window, it scrolls
+  const b = $("voice-more").getBoundingClientRect(), p = $("voice-pop");
+  p.style.left = `${Math.max(8, Math.min(innerWidth - p.offsetWidth - 8, b.left))}px`;
+  p.style.top = "auto";
+  p.style.bottom = `${Math.max(8, innerHeight - b.top + 10)}px`;
+  p.style.maxHeight = `${Math.max(160, b.top - 18)}px`;
+  loadVoice();
+});
+loadVoice();
+
+// Strata.app's browser pane, "Send page to chat": the page's text into the message box, as an attached file
+window.strataAttach = ([name, text]) => {
+  showTab("chat");
+  attachments.push({kind: "file", name: name || "web page.txt", text: String(text || "")});
+  renderAttachments();
+  $("input").focus();
+};
+
+// macOS Reminders: the settings' switch (POST mcp/reminders); the model then has reminders_* tools (and the chat's
+// MCP switch must be on, as for every MCP server)
+$("s-rem").onclick = async () => {
+  const on = $("s-rem").getAttribute("aria-checked") !== "true";
+  $("s-rem").setAttribute("aria-checked", on ? "true" : "false");
+  try { await mcpSend("POST", "mcp/reminders", {on}); }
+  catch (e) { toast("error", "Reminders", e.message, 6000); $("s-rem").setAttribute("aria-checked", on ? "false" : "true"); }
+};
+
+// Strata.app's browser pane: the globe opens and closes it (only inside the app, which takes the message); the app
+// says when it changes (also when the model's browsing opens it)
+if (window.ipc && window.ipc.postMessage) {
+  $("web-btn").hidden = false;
+  $("web-btn").onclick = () => window.ipc.postMessage(JSON.stringify({cmd: "web"}));
+}
+window.strataWeb = (open) => $("web-btn").setAttribute("aria-pressed", open ? "true" : "false");
+
+// ------------------------------------------------------------------ scheduled prompts (GET / POST / DELETE schedules)
+let schedTimer = null, schedData = {schedules: []};
+const schedWhen = {daily: ["time"], weekdays: ["time"], weekly: ["dow", "time"], monthly: ["dom", "time"], hourly: ["min"],
+                   minutes: ["every"], once: ["at"], cron: ["cron"]};
+function schedShowWhen() {
+  const k = $("sf-kind").value;
+  for (const l of document.querySelectorAll(".sched-when label")) l.hidden = !l.dataset.for.split(" ").includes(k);
+}
+$("sf-kind").onchange = schedShowWhen;
+function openSched(open) {
+  $("sched").dataset.open = String(open);
+  $("sched").setAttribute("aria-hidden", String(!open));
+  $("scrim").hidden = !open;
+  clearTimeout(schedTimer);
+  if (open) loadSched();
+}
+const when = (t) => t ? new Date(t * 1000).toLocaleString([], {weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}) : "";
+async function loadSched() {
+  try { schedData = await (await fetch("schedules", {headers: headers(), cache: "no-store"})).json(); } catch (e) { return; }
+  const l = schedData.schedules || [];
+  $("sched-btn").setAttribute("aria-pressed", l.some((s) => s.enabled) ? "true" : "false");
+  $("sched-list").innerHTML = l.length ? l.map((s) => {
+    const last = (s.history || [])[0];
+    const state = s.running ? "running now\u2026" : s.enabled ? `next: ${when(s.next_run)}` : "paused";
+    return `<div class="sched-item${s.enabled ? "" : " off"}"><div class="sched-item__head"><strong>${esc(s.name)}</strong>` +
+      `<span class="muted small">${esc(s.when_text)}</span></div><span class="muted small">${esc(state)}${s.tools ? " \u00b7 may use tools" : ""}</span>` +
+      (last ? `<div class="muted small">last run ${when(last.at)} \u00b7 ${last.secs} s${last.ok ? "" : " \u00b7 failed"}</div>` +
+              `<div class="sched-run${last.ok ? "" : " err"}">${esc(last.text)}</div>` : "") +
+      `<div class="sched-item__acts"><button class="st-btn st-btn--secondary" data-sr="${esc(s.id)}"${s.running ? " disabled" : ""}>Run now</button>` +
+      `<button class="st-btn st-btn--secondary" data-st="${esc(s.id)}">${s.enabled ? "Pause" : "Resume"}</button>` +
+      `<button class="st-btn st-btn--secondary" data-se="${esc(s.id)}">Edit</button>` +
+      (last && last.ok ? `<button class="st-btn st-btn--secondary" data-so="${esc(s.id)}">Open in chat</button>` : "") +
+      `<button class="st-btn st-btn--secondary" data-sd="${esc(s.id)}">Delete</button></div></div>`;
+  }).join("") : `<div class="muted">Nothing scheduled yet. New: a prompt that runs at set times, like "every weekday at 8:00: my reminders and the weather".</div>`;
+  if ($("sched").dataset.open === "true") schedTimer = setTimeout(loadSched, l.some((s) => s.running) ? 2000 : 15000);
+}
+async function schedPost(method, path, body) {
+  const r = await fetch(path, {method, headers: headers(body !== undefined), body: body !== undefined ? JSON.stringify(body) : undefined});
+  let j = {}; try { j = await r.json(); } catch (e) { /* none */ }
+  if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  return j;
+}
+function schedEdit(s) {
+  $("sched-form").hidden = false;
+  $("sf-id").value = s ? s.id : "";
+  $("sf-name").value = s ? s.name : "";
+  $("sf-prompt").value = s ? s.prompt : "";
+  $("sf-tools").checked = s ? !!s.tools : true;
+  const w = (s && s.when) || {kind: "daily", time: "08:00"};
+  $("sf-kind").value = w.kind;
+  if (w.time) $("sf-time").value = w.time;
+  if (w.day != null) { $("sf-dow").value = String(w.day); $("sf-dom").value = w.day; }
+  if (w.minute != null) $("sf-min").value = w.minute;
+  if (w.every != null) $("sf-every").value = w.every;
+  if (w.at) $("sf-at").value = w.at.replace(" ", "T");
+  if (w.cron) $("sf-cron").value = w.cron;
+  schedShowWhen();
+  $("sf-name").focus();
+}
+$("sched-btn").onclick = () => openSched(true);
+$("sched-close").onclick = () => openSched(false);
+$("sched-new").onclick = () => schedEdit(null);
+$("sf-cancel").onclick = () => { $("sched-form").hidden = true; };
+$("sched-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const k = $("sf-kind").value, w = {kind: k};
+  if (schedWhen[k].includes("time")) w.time = $("sf-time").value;
+  if (k === "weekly") w.day = +$("sf-dow").value;
+  if (k === "monthly") w.day = +$("sf-dom").value;
+  if (k === "hourly") w.minute = +$("sf-min").value;
+  if (k === "minutes") w.every = +$("sf-every").value;
+  if (k === "once") w.at = $("sf-at").value.replace("T", " ");
+  if (k === "cron") w.cron = $("sf-cron").value.trim();
+  try {
+    const old = (schedData.schedules || []).find((x) => x.id === $("sf-id").value);
+    await schedPost("POST", "schedules", {id: $("sf-id").value || undefined, name: $("sf-name").value, prompt: $("sf-prompt").value,
+                                          when: w, tools: $("sf-tools").checked, enabled: old ? old.enabled : true});
+    $("sched-form").hidden = true;
+    loadSched();
+  } catch (err) { toast("error", "Not saved", err.message, 6000); }
+};
+$("sched-list").onclick = async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  const s = (schedData.schedules || []).find((x) => x.id === (b.dataset.sr || b.dataset.st || b.dataset.se || b.dataset.so || b.dataset.sd));
+  if (!s) return;
+  try {
+    if (b.dataset.sr) { await schedPost("POST", "schedules", {run: s.id}); toast("info", "Running", s.name); }
+    if (b.dataset.st) await schedPost("POST", "schedules", {...s, enabled: !s.enabled});
+    if (b.dataset.se) return schedEdit(s);
+    if (b.dataset.sd && confirm(`Delete "${s.name}"?`)) await schedPost("DELETE", `schedules/${encodeURIComponent(s.id)}`);
+    if (b.dataset.so) {
+      // the prompt and its last answer, as a new chat to go on with
+      const last = s.history[0];
+      if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+      saveChat();
+      openChat(newChatId(), [{role: "user", text: s.prompt, time: last.at * 1000}, {role: "assistant", text: last.text, time: last.at * 1000}]);
+      openSched(false);
+      saveChat();
+      return;
+    }
+  } catch (err) { toast("error", s.name, err.message, 6000); }
+  loadSched();
+};
+$("scrim").addEventListener("click", () => { if ($("sched").dataset.open === "true") openSched(false); });
+loadSched();
+
+// Strata.app: a link in the chat opens in the browser pane beside it (its web view opens no new windows, and the
+// chat must not navigate away); elsewhere target=_blank opens a tab as usual
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest("a[href]");
+  if (!a || !window.ipc || !window.ipc.postMessage || !/^https?:/.test(a.href) || a.closest(".st-drawer")) return;
+  if (new URL(a.href).origin === location.origin) return;     // the server's own pages stay as they are
+  e.preventDefault();
+  window.ipc.postMessage(JSON.stringify({cmd: "web_open", url: a.href}));
+});

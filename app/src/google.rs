@@ -1,0 +1,747 @@
+//! Google Sheets and My Maps for the model, through the browser pane signed in as the person (no Google API: their
+//! choice).  Each tool is a script run in the Sheets or My Maps page.  These ways in were tried live on 2026-10-30:
+//! - a cell range is selected by the address's fragment (#gid=0&range=C3);
+//! - Sheets takes a script's paste event on its cell editor (#waffle-rich-text-editor): tab-separated rows become cells;
+//! - its copy event hands back the selection as tab-separated text (empty rows kept, values as shown): the read;
+//! - a Delete key event clears the selection; its menus answer mouse events (Insert > Checkbox, File > Move to trash);
+//! - the title saves on its input's change and blur; My Maps' title saves in its dialog (the title, then Save).
+//! A script returns a Promise; the app keeps its value in window.__strataAsync[id] and looks for it (async_js).
+use serde_json::{json, Value};
+
+/// The tools, as tools/list gives them (after the browser's).
+pub fn tools() -> Value {
+    let rows = json!({"type": "array", "items": {"type": "object", "additionalProperties": {"type": "string"}}, "description": "one object per row, its values by column name (the header row's names, as sheets_read shows them), e.g. [{\"Address\": \"123 Main St\", \"Price\": \"$2,100\"}]; a column left out stays empty"});
+    let url = json!({"type": "string", "description": "the spreadsheet's address (docs.google.com/spreadsheets/d/...); default: the one open in the browser"});
+    json!([
+        {"name": "sheets_create", "description": "Create a Google Sheets spreadsheet in the user's Google Drive (the browser beside the chat, signed in as them): its title and its header row. Answers with its address.",
+         "inputSchema": {"type": "object", "required": ["title", "columns"], "properties": {"title": {"type": "string"}, "columns": {"type": "array", "items": {"type": "string"}}}}},
+        {"name": "sheets_read", "description": "Read a Google Sheets spreadsheet: its rows, numbered as in the sheet (row 1 is the header), cells as shown.",
+         "inputSchema": {"type": "object", "properties": {"url": url, "range": {"type": "string", "description": "e.g. A1:J50 (default: A:Z, the whole sheet up to its last filled row; 300 rows at a time)"}}}},
+        {"name": "sheets_append", "description": "Add rows under the last filled row of a Google Sheets spreadsheet, each value under its column's name (read the sheet first to see them). For a sheet that has a local table (sheets_read says so) use table_upsert and table_sync instead. When every row's first-column value is FALSE or TRUE, those cells become tick boxes.",
+         "inputSchema": {"type": "object", "required": ["rows"], "properties": {"url": url, "rows": rows}}},
+        {"name": "sheets_write", "description": "Change cells of one existing row of a Google Sheets spreadsheet by column name (update): the other cells of the row stay as they are. For a sheet that has a local table (sheets_read says so) use table_upsert and table_sync instead. To add new rows use sheets_append (one call for all of them).",
+         "inputSchema": {"type": "object", "required": ["row", "values"], "properties": {"url": url, "row": {"type": "integer", "description": "the row's number as sheets_read shows it (2 or more)"},
+             "values": {"type": "object", "additionalProperties": {"type": "string"}, "description": "{column name: new value}"}}}},
+        {"name": "sheets_delete_rows", "description": "Delete rows from..to of a Google Sheets spreadsheet (the rows under move up); row 1, the header, stays.",
+         "inputSchema": {"type": "object", "required": ["from"], "properties": {"url": url, "from": {"type": "integer"}, "to": {"type": "integer"}}}},
+        {"name": "sheets_clear", "description": "Empty the cells of a range of a Google Sheets spreadsheet (e.g. A5:J5 for row 5).",
+         "inputSchema": {"type": "object", "required": ["range"], "properties": {"url": url, "range": {"type": "string"}}}},
+        {"name": "sheets_trash", "description": "Move a Google Sheets spreadsheet to the trash (the user is asked to allow it).",
+         "inputSchema": {"type": "object", "properties": {"url": url}}},
+        {"name": "maps_create", "description": "Create a Google My Maps map in the user's Google Drive with this title. Answers with its address. To put places on it: maps_import_sheet.",
+         "inputSchema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}, "description": {"type": "string"}}}},
+        {"name": "maps_import_sheet", "description": "Put a Google Sheets spreadsheet's rows on a Google My Maps map as places (a new layer named after the sheet): location_column holds the addresses, title_column names each place; every column is kept in each place's details.",
+         "inputSchema": {"type": "object", "required": ["map_url", "sheet_title", "location_column", "title_column"], "properties": {"map_url": {"type": "string", "description": "the map's address (maps_create answers with it)"}, "sheet_title": {"type": "string"},
+             "location_column": {"type": "string", "description": "the column with the addresses: its name in the header row (e.g. Address) or its letter (C)"},
+             "title_column": {"type": "string", "description": "the column that names each place: its name (e.g. Description) or its letter"}}}},
+        {"name": "maps_export", "description": "Save a Google My Maps map on this Mac: its KML (each place with its coordinates and columns) as Strata-data/maps/<name>.kml, a GeoJSON copy, and the coordinates into the local table of the same name (table_upsert's) as Lat / Lng columns, matched by Link.",
+         "inputSchema": {"type": "object", "required": ["map_url", "name"], "properties": {"map_url": {"type": "string", "description": "the map's address"}, "name": {"type": "string", "description": "the name to save it under (the table's name, to fill its Lat / Lng)"}, "key": {"type": "string", "description": "the key column (default Link)"}}}},
+        {"name": "maps_delete_layer", "description": "Delete one layer of a Google My Maps map: the layer with this name and this many places (two layers can share a name; the user is asked to allow it).",
+         "inputSchema": {"type": "object", "required": ["map_url", "layer", "items"], "properties": {"map_url": {"type": "string", "description": "the map's address"},
+             "layer": {"type": "string", "description": "the layer's name"}, "items": {"type": "integer", "description": "how many places the layer has (as the map shows: All items (N))"}}}},
+        {"name": "maps_trash", "description": "Move a Google My Maps map (by its title) to the trash (the user is asked to allow it).",
+         "inputSchema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}
+    ])
+}
+
+/// Is `tool` one of these?
+pub fn is_google(tool: &str) -> bool {
+    tool.starts_with("sheets_") || tool.starts_with("maps_") || tool == "table_sync"
+}
+
+/// The page `tool` works in: (the address to load when the pane is elsewhere, the prefix that says it is there).
+pub fn page_for(tool: &str, args: &Value, here: &str) -> Result<(String, String), String> {
+    match tool {
+        "sheets_create" => Ok(("https://sheets.new".into(), "\u{0}".into())),   // always a new one
+        "maps_create" if args["__phase"] == 2 => Ok((String::new(), MAPS_EDIT.into())),
+        "maps_create" | "maps_trash" => Ok((MAPS_LIST.into(), MAPS_LIST.into())),
+        "maps_import_sheet" | "maps_export" | "maps_delete_layer" => {
+            let url = args["map_url"].as_str().unwrap_or("");
+            let mid = map_id(url);
+            let mid = mid.ok_or_else(|| format!("map_url {url:?}: a My Maps address with mid= (maps_create answers with it)"))?;
+            // always loaded fresh: an import after a cancelled one, on the same page, never finished
+            Ok((format!("{MAPS_EDIT}?mid={mid}"), "\u{0}".into()))
+        }
+        _ => {
+            let url = args["url"].as_str().filter(|u| !u.is_empty()).map(String::from).unwrap_or_else(|| here.to_string());
+            let base = sheet_base(&url).ok_or_else(|| format!("{url} is not a Google Sheets address: give the spreadsheet's url (sheets_create answers with it)"))?;
+            let tab = gid_of(&url).map(|g| format!("#gid={g}")).unwrap_or_default();
+            Ok((format!("{base}/edit{tab}"), base))
+        }
+    }
+}
+
+pub const MAPS_LIST: &str = "https://www.google.com/maps/d/";
+pub const MAPS_EDIT: &str = "https://www.google.com/maps/d/edit";
+
+/// Is the pane where page_for's prefix says (My Maps' list is not its editor, which starts the same)?
+pub fn on_page(prefix: &str, here: &str) -> bool {
+    // the whole id: a sheet whose id is the start of the open one's is another sheet (found by a codex review)
+    let ends = here.get(prefix.len()..).and_then(|r| r.chars().next()).is_none_or(|c| matches!(c, '/' | '?' | '#'));
+    here.starts_with(prefix) && (!prefix.starts_with("https://docs.google.com/spreadsheets/d/") || ends) && (prefix != MAPS_LIST || !here.starts_with(MAPS_EDIT) && !here.starts_with("https://www.google.com/maps/d/viewer"))
+}
+
+/// A My Maps address's map id (mid=...), checked characters only.
+pub fn map_id(url: &str) -> Option<String> {
+    url.split("mid=").nth(1).map(|m| m.split(['&', '#']).next().unwrap_or("").to_string())
+        .filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+}
+
+/// The tools that wait for the person's Allow in the browser's strip, and what it asks.
+pub fn ask(tool: &str, args: &Value) -> Option<String> {
+    match tool {
+        "sheets_trash" => Some(format!("The model wants to move {} to the trash.", args["url"].as_str().unwrap_or("the spreadsheet open in the browser"))),
+        "maps_trash" => Some(format!("The model wants to move the map \u{201c}{}\u{201d} to the trash.", args["title"].as_str().unwrap_or(""))),
+        "maps_delete_layer" => Some(format!("The model wants to delete the layer \u{201c}{}\u{201d} ({} places) from the map.", args["layer"].as_str().unwrap_or(""), args["items"])),
+        _ => None,
+    }
+}
+
+/// The tab a spreadsheet's address names (#gid=123 or ?gid=123), digits only.
+/// The fragment's gid first (what Sheets shows), then the query's; exact parameters ("xgid=" is not one): a url
+/// "?gid=0#gid=77" once picked tab 0 (found by a codex review).
+pub fn gid_of(url: &str) -> Option<String> {
+    let (rest, frag) = url.split_once('#').unwrap_or((url, ""));
+    let query = rest.split_once('?').map_or("", |(_, q)| q);
+    [frag, query].iter().find_map(|part| {
+        part.split('&').find_map(|kv| kv.strip_prefix("gid=")).filter(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_digit())).map(String::from)
+    })
+}
+
+/// After its page loaded, is the pane where the tool must act?  (A navigation while it loaded could put a write on
+/// another spreadsheet: found by a codex review.)  My Maps' scripts check their page themselves.
+pub fn arrived(tool: &str, prefix: &str, here: &str) -> bool {
+    match tool {
+        "sheets_create" => here.starts_with("https://docs.google.com/spreadsheets/d/"),
+        _ if prefix == "\u{0}" || tool.starts_with("maps_") => true,
+        _ => on_page(prefix, here),
+    }
+}
+
+/// https://docs.google.com/spreadsheets/d/<id> of a spreadsheet's address.
+pub fn sheet_base(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://docs.google.com/spreadsheets/d/")?;
+    let id: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    (id.len() > 10).then(|| format!("https://docs.google.com/spreadsheets/d/{id}"))
+}
+
+/// A cell address or range the fragment can take (A1, B5, A2:J40): nothing else goes into the script.
+pub fn range_ok(r: &str) -> bool {
+    let parts: Vec<&str> = r.split(':').collect();
+    let cell = |p: &str, whole_column: bool| {
+        let letters = p.chars().take_while(|c| c.is_ascii_uppercase()).count();
+        let digits = &p[letters..];
+        (1..=3).contains(&letters) && digits.len() <= 7 && digits.chars().all(|c| c.is_ascii_digit()) && (whole_column || !digits.is_empty())
+    };
+    // A1, A2:J40, or whole columns A:Z (both ends letters only)
+    let columns = parts.len() == 2 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_uppercase()));
+    !r.is_empty() && parts.len() <= 2 && parts.iter().all(|p| cell(p, columns))
+}
+
+/// Rows as the paste takes them: cells by tabs, rows by newlines (a tab or newline in a cell would split it: a space).
+pub fn tsv(rows: &Value) -> Result<String, String> {
+    let rows = rows.as_array().ok_or("rows: a list of rows, each a list of cells")?;
+    let cell = |v: &Value| -> String {
+        let s = match v { Value::String(s) => s.clone(), Value::Null => String::new(), other => other.to_string() };
+        s.split(['\t', '\r', '\n']).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ")
+    };
+    Ok(rows.iter().map(|r| match r.as_array() {
+        Some(cells) => cells.iter().map(cell).collect::<Vec<_>>().join("\t"),
+        None => cell(r),
+    }).collect::<Vec<_>>().join("\n"))
+}
+
+/// Rows read at once (a model's context holds about this many short rows).
+const MAX_ROWS: usize = 300;
+
+/// A cell with something in it: a tick box alone (TRUE / FALSE) does not fill a row (200 unticked rows are no data).
+fn filled(c: &str, col: usize) -> bool {
+    let c = c.trim();
+    !c.is_empty() && (col > 0 || (c != "FALSE" && c != "TRUE"))
+}
+
+/// What the copy gave (tab-separated) -> rows numbered from `first`, empty rows and columns at the end left out.
+pub fn numbered(text: &str, first: usize) -> String {
+    let rows: Vec<Vec<&str>> = text.split('\n').map(|l| l.trim_end_matches('\r').split('\t').collect()).collect();
+    let width = rows.iter().map(|r| r.iter().rposition(|c| !c.trim().is_empty()).map_or(0, |i| i + 1)).max().unwrap_or(0);
+    let last = rows.iter().rposition(|r| r.iter().enumerate().any(|(j, c)| filled(c, j)));
+    let Some(last) = last else { return "(empty)".into() };
+    let shown = (last + 1).min(MAX_ROWS);
+    let mut out = rows[..shown].iter().enumerate().map(|(i, r)| {
+        let cells: Vec<&str> = (0..width).map(|j| r.get(j).copied().unwrap_or("").trim()).collect();
+        format!("row {}: {}", first + i, cells.join(" | "))
+    }).collect::<Vec<_>>().join("\n");
+    if last + 1 > shown {
+        out.push_str(&format!("\n[{} more rows: sheets_read with range A{}:Z{}]", last + 1 - shown, first + shown, first + shown + MAX_ROWS - 1));
+    }
+    out
+}
+
+/// The first row of a range ("A2:J40" -> 2).
+pub fn first_row(range: &str) -> usize {
+    range.split(':').next().unwrap_or("A1").trim_start_matches(|c: char| c.is_ascii_uppercase()).parse().unwrap_or(1)
+}
+
+/// Sheets' helpers, before each body.
+pub const PRELUDE: &str = r#"
+// window.__strataPace: tests run the same waits shorter (a fake sheet answers at once)
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms * (window.__strataPace || 1)));
+const editor = () => document.querySelector('#waffle-rich-text-editor');
+// the tab is pinned when the sheet is ready: a switch to another tab during the call does not move it (it read A and
+// would have written B)
+const ready = async () => { for (let i = 0; i < 40 && !editor(); i++) await sleep(250); if (!editor()) throw new Error('the spreadsheet did not open (signed in to Google in the browser?)'); if (typeof GID !== 'undefined' && !GID) GID = tabOf(); };
+// the app stopped this script (it ran past its time): nothing more is changed (window.__strataStop[__ID])
+const live = () => { if (typeof __ID !== 'undefined' && (window.__strataStop || {})[__ID]) throw new Error('stopped: it ran past its time; nothing more was changed'); };
+// the tab a call acts on: the one its address named (GID), else the one open
+const tabOf = () => (typeof GID === 'string' && GID) || new URLSearchParams(location.hash.slice(1)).get('gid') || new URLSearchParams(location.search).get('gid') || '0';
+const go = async (range) => { live();
+  // the tab the address named (GID, set before this prelude), else the one open: a call for tab B once could act on A
+  const gid = tabOf();
+  location.hash = 'gid=' + gid + '&range=' + range; await sleep(800); editor().focus(); await sleep(100);
+  // a range past the sheet's last row or column is ignored without a word (the selection stays where it was: an
+  // append once counted the rows of A1 alone and wrote over row 2): the Name Box says what is selected
+  const nb = document.querySelector('#t-name-box'), [a, b] = range.split(':');
+  const shown = b === a ? a : range;     // the Name Box says A4 for A4:A4
+  // a sheet just opened takes the hash late (the first read after a start said "not in the sheet; selected A1:Z1"):
+  // wait for it, and set the hash once more (the same hash again fires nothing: the tab alone first), before calling
+  // the range missing
+  // another tab chosen during the wait (Sheets puts it in the address): the same range there is not this one; checked
+  // before the retry below sets this tab's address again (it would hide the switch)
+  const moved = () => { const now = new URLSearchParams(location.hash.slice(1)).get('gid');
+    if (now && now !== gid) throw new Error('another tab (gid ' + now + ') was chosen during the call, not tab ' + gid + ': nothing more was changed'); };
+  for (let i = 0; nb && nb.value !== shown && i < 10; i++) {
+    moved();
+    if (i === 4) { location.hash = 'gid=' + gid; await sleep(300); moved(); location.hash = 'gid=' + gid + '&range=' + range; }
+    await sleep(500); }
+  moved();
+  if (nb && nb.value !== shown) throw new Error('range ' + range + ' is not in the sheet (it has fewer rows or columns); selected: ' + nb.value);
+};
+const clip = (type, text) => { if (type !== 'copy') live(); const dt = new DataTransfer(); if (text !== undefined) dt.setData('text/plain', text);
+  editor().dispatchEvent(new ClipboardEvent(type, {clipboardData: dt, bubbles: true, cancelable: true})); return dt.getData('text/plain'); };
+const del = () => live() || editor().dispatchEvent(new KeyboardEvent('keydown', {key: 'Delete', code: 'Delete', keyCode: 46, which: 46, bubbles: true, cancelable: true}));
+const mouse = (el) => { live(); const r = el.getBoundingClientRect();
+  for (const t of ['mouseover', 'mousedown', 'mouseup', 'click']) el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0})); };
+const menu = async (id, item) => { live(); const m = document.querySelector(id); if (!m) throw new Error('no menu ' + id);
+  mouse(m); await sleep(400);
+  const it = [...document.querySelectorAll('.goog-menu .goog-menuitem')].find((e) => e.offsetParent && e.innerText.trim().split('\n')[0].trim().startsWith(item));
+  if (!it) { mouse(m); throw new Error('no menu item ' + item); } mouse(it); await sleep(600); };
+// rows by column name -> cells in the header's order.  Positional rows went wrong: a model wrote [name, address, price]
+// from B5, under Rating, Address and Price, and each row then held halves of two buildings.  A row as a list must
+// fill every column; a name that is no column is refused (with the columns), never put somewhere.
+const place = (header, rows) => {
+  const cols = header.map((h) => String(h).trim()), key = (k) => String(k).trim().toLowerCase();
+  const cell = (v) => (v === null || v === undefined ? '' : String(v)).replace(/[\t\r\n]+/g, ' ').trim();
+  const list = cols.join(', ');
+  if (!Array.isArray(rows) || !rows.length) throw new Error('rows: a list of {column: value}; the columns are: ' + list);
+  return rows.map((r) => {
+    if (Array.isArray(r)) {
+      if (r.length !== cols.length) throw new Error('a row of ' + r.length + ' cells for ' + cols.length + ' columns: give each row as {column: value}; the columns are: ' + list);
+      return r.map(cell);
+    }
+    if (!r || typeof r !== 'object') throw new Error('each row: {column: value}; the columns are: ' + list);
+    const out = cols.map(() => '');
+    for (const [k, v] of Object.entries(r)) {
+      const all = cols.map((c, j) => key(c) === key(k) ? j : -1).filter((j) => j >= 0);
+      if (all.length > 1) throw new Error('"' + k + '" names ' + all.length + ' columns (' + all.map((j) => letter(j)).join(', ') + '): rename one in the sheet; nothing written');
+      const i = all.length ? all[0] : -1;
+      if (i < 0) throw new Error('no column "' + k + '"; the columns are: ' + list);
+      out[i] = cell(v);
+    }
+    return out;
+  });
+};
+const letter = (i) => { let s = ''; for (i++; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s; return s; };
+// the header row's names (row 1 up to its last named column)
+const header = async () => { await go('A1:Z1'); const h = clip('copy').split('\n')[0].split('\t').map((c) => c.trim());
+  while (h.length && !h[h.length - 1]) h.pop(); if (!h.length) throw new Error('row 1 has no column names: sheets_create gives a sheet its header'); return h; };
+// a cell with something in it: an unticked (or ticked) box alone does not fill a row
+// a cell with data: column A's FALSE / TRUE alone is a tick box (sheets_append puts them there), elsewhere it is a
+// value (a "TRUE" status once counted as nothing, and the next append wrote over its row: found by a codex review)
+const filled = (c, j) => c.trim() && (j > 0 || (c.trim() !== 'FALSE' && c.trim() !== 'TRUE'));
+const title = () => (document.querySelector('.docs-title-input') || {}).value || document.title;
+const where = () => title() + ' (' + location.href.split('#')[0].replace(/\?.*$/, '') + ')';
+"#;
+
+/// The script for a Sheets tool (run where page_for says, once it has loaded).
+pub fn sheets_js(tool: &str, args: &Value) -> Result<String, String> {
+    let s = |k: &str| serde_json::to_string(args[k].as_str().unwrap_or("")).unwrap_or_default();
+    let range = |k: &str, default: &str| -> Result<String, String> {
+        let r = args[k].as_str().filter(|r| !r.is_empty()).unwrap_or(default).to_ascii_uppercase();
+        if range_ok(&r) { Ok(r) } else { Err(format!("{k} {r:?}: a cell like B5 or a range like A2:J40")) }
+    };
+    let body = match tool {
+        "sheets_create" => {
+            let cols = tsv(&json!([args["columns"].clone()]))?;
+            let n = args["columns"].as_array().map_or(0, |c| c.len());
+            // the tools find columns by name in A1:Z1: a sheet made here keeps to A-Z
+            if n > 26 {
+                return Err(format!("{n} columns: at most 26 (A to Z)"));
+            }
+            let lower: Vec<String> = args["columns"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|c| c.trim().to_lowercase()).collect();
+            if let Some(d) = lower.iter().enumerate().find(|(i, c)| lower[..*i].contains(c)).map(|(_, c)| c) {
+                return Err(format!("two columns named {d:?}: each name once (the tools find columns by name)"));
+            }
+            format!(r#"await ready(); await sleep(1500);
+  // a new sheet: empty.  Anything in A1:Z20 means the pane is on another spreadsheet (a navigation while it loaded):
+  // nothing is renamed or written (found by a codex review)
+  await go('A1:Z20');
+  // a new one: another document than the one open before, its default title, one tab, A1:Z20 empty (found by codex
+  // reviews: emptiness alone took an existing empty-looking sheet)
+  const id = location.pathname.split('/')[3], before = {before}, landed = {landed};
+  const tabs = document.querySelectorAll('.docs-sheet-tab').length;
+  const blank = !clip('copy').split('\n').some((l) => l.split('\t').some((c) => c.trim()));
+  if (id === before || landed !== id || title() !== 'Untitled spreadsheet' || tabs > 1 || !blank) throw new Error('the browser is on a spreadsheet that is not new (' + where() + '): nothing changed; try sheets_create again');
+  live();
+  const t = document.querySelector('.docs-title-input');
+  t.focus(); t.value = {title}; t.dispatchEvent(new Event('input', {{bubbles: true}})); t.dispatchEvent(new Event('change', {{bubbles: true}})); t.blur();
+  await sleep(1000); await go('A1'); clip('paste', {cols}); await sleep(800);
+  await go('A1');
+  return 'created ' + where() + ' with the header row (' + {n} + ' columns). Add rows with sheets_append (url: this address; a first cell FALSE or TRUE makes it a tick box).';"#,
+                    title = s("title"), cols = serde_json::to_string(&cols).unwrap_or_default(),
+                    before = serde_json::to_string(&args["__before"]).unwrap_or_else(|_| "null".into()),
+                    // the document sheets.new's load landed on (the app records it): the one to act on, no other
+                    landed = serde_json::to_string(&args["__landed"].as_str().and_then(|u| u.split('/').nth(5))).unwrap_or_else(|_| "null".into()))
+        }
+        "sheets_read" => {
+            let r = range("range", "A:Z")?;
+            format!(r#"await ready(); await go('{r}'); const t = clip('copy'); await go('A1'); return JSON.stringify({{where: where(), text: t}});"#)
+        }
+        "sheets_append" => {
+            let rows = serde_json::to_string(&args["rows"]).unwrap_or_default();
+            format!(r#"await ready(); const h = await header(); const rows = place(h, {rows}), n = rows.length;
+  await go('A:' + letter(Math.max(h.length, 26) - 1));   // every column with data, past Z when the header is
+  const have = clip('copy').split('\n'); let last = 0;
+  have.forEach((l, i) => {{ if (l.split('\t').some((c, j) => filled(c, j))) last = i + 1; }});
+  await go('A' + (last + 1)); clip('paste', rows.map((r) => r.join('\t')).join('\n')); await sleep(800);
+  // first cells all FALSE / TRUE: tick boxes, in these rows only (pre-filled boxes under the data were rows to
+  // My Maps' import: 181 rows with no address, and "trouble finding those locations")
+  const boxes = rows.every((r) => r[0] === 'FALSE' || r[0] === 'TRUE');
+  if (boxes) {{ await go('A' + (last + 1) + ':A' + (last + n)); await menu('#docs-insert-menu', 'Checkbox'); }}
+  await go('A1');
+  const used = h.filter((c, i) => rows.some((r) => r[i]));
+  return 'added ' + n + ' rows at rows ' + (last + 1) + '-' + (last + n) + ' of ' + where() + ', filling ' + used.join(', ') + (boxes ? ' (' + h[0] + ' as tick boxes)' : '');"#)
+        }
+        "sheets_write" => {
+            let row = args["row"].as_u64().unwrap_or(0);
+            if row < 2 {
+                return Err("row: the row's number, 2 or more (row 1 is the header; sheets_read shows the numbers)".into());
+            }
+            let values = serde_json::to_string(&args["values"]).unwrap_or_default();
+            // only the given cells, each where its column is: pasting the whole row back turned the other cells'
+            // formulas into their values (found by a codex review)
+            format!(r#"await ready(); const h = await header();
+  const given = {values}, [want] = place(h, [given]);
+  // an update is for a row that is there (RFC 9110 9.3.4: content that does not fit the target is an error that
+  // says why): a model "updated" rows 20-22 one cell at a time to add them
+  await go('A:' + letter(Math.max(h.length, 26) - 1));
+  let last = 0; clip('copy').split('\n').forEach((l, i) => {{ if (l.split('\t').some((c, j) => filled(c, j))) last = i + 1; }});
+  if ({row} > last) throw new Error('row {row} is past the last row with data (' + last + '): to add rows use sheets_append (all of them in one call, under row ' + last + ')');
+  const cols = [...new Set(Object.keys(given).map((k) => h.findIndex((c) => c.toLowerCase() === k.trim().toLowerCase())))].sort((a, b) => a - b);
+  // adjacent given columns in one paste (a full row: one, not ten at 1.5 s each); the others are never touched
+  for (let s = 0; s < cols.length;) {{
+    let e = s; while (e + 1 < cols.length && cols[e + 1] === cols[e] + 1) e++;
+    const run = cols.slice(s, e + 1).map((i) => want[i]);
+    await go(letter(cols[s]) + '{row}' + (e > s ? ':' + letter(cols[e]) + '{row}' : ''));
+    if (run.every((v) => v === '')) del(); else clip('paste', run.join('\t'));
+    await sleep(300);
+    s = e + 1;
+  }}
+  await go('A1');
+  return 'updated row {row} of ' + where() + ': ' + Object.keys(given).join(', ');"#)
+        }
+        "sheets_delete_rows" => {
+            let (from, to) = (args["from"].as_u64().unwrap_or(0), args["to"].as_u64().or(args["from"].as_u64()).unwrap_or(0));
+            if from < 2 || to < from {
+                return Err("from / to: row numbers, 2 or more (row 1 is the header), from <= to".into());
+            }
+            let item = if from == to { format!("Row {from}") } else { format!("Rows {from} - {to}") };
+            format!(r#"await ready(); await go('A{from}:A{to}'); await menu('#docs-edit-menu', 'Delete');
+  // the submenu is open now: its item, clicked where it is (the menu's button again would close it)
+  const it = [...document.querySelectorAll('.goog-menu .goog-menuitem')].find((e) => e.offsetParent && e.innerText.trim().startsWith('{item}'));
+  if (!it) throw new Error('no menu item {item}'); mouse(it); await sleep(800);
+  await go('A1'); return 'deleted {item} (the rows under moved up) in ' + where();"#)
+        }
+        "sheets_clear" => {
+            let r = range("range", "")?;
+            format!(r#"await ready(); await go('{r}'); del(); await sleep(600); await go('A1'); return 'cleared {r} in ' + where();"#)
+        }
+        // table_sync step 1: the sheet as it is (the person's edits); step 2: the app's paste of the merged table
+        "table_sync" if args["__phase"] == 2 => args["__push"].as_str().ok_or("no table to put")?.to_string(),
+        "table_sync" => r#"await ready();
+  // an empty row 1 is an empty sheet; any other failure (another tab chosen, stopped) ends the sync before a paste
+  let h = []; try { h = await header(); } catch (e) { if (!/^row 1 has no column names/.test(e.message)) throw e; }
+  // columns past Z are never read, yet the push deletes whole rows: a sheet that has them is not synced (a new sheet
+  // has A to Z; after the header's selection: the sheet takes selections by now)
+  // narrow only on positive evidence: the selection left as it was (Sheets ignores a range it does not have); moved
+  // elsewhere during the probe, it says nothing and nothing is synced
+  // (from A1: the probe's retry selects the tab alone, which puts the selection there)
+  await go('A1');
+  const nbox = document.querySelector('#t-name-box'), before = nbox && nbox.value;
+  // (as patient as every selection: a late answer is waited for, about 5 s on a sheet without AA)
+  let wide = true; try { await go('AA1'); } catch (e) { if (!/^range AA1 is not in the sheet/.test(e.message)) throw e; wide = false; }
+  if (!wide && nbox && nbox.value !== before) throw new Error('the selection changed while table_sync checked the sheet\'s width: nothing was synced (try again)');
+  if (wide) throw new Error('this sheet has columns past Z, which table_sync does not read (it would delete rows with data there): nothing was synced');
+  if (!h.length) {
+    // no header: an empty sheet takes the table; one with data under a blank row 1 is not pasted over
+    await go('A:Z');
+    if (clip('copy').split('\n').some((l) => l.split('\t').some((c, j) => filled(c, j)))) throw new Error('row 1 of this sheet is empty but rows below it have data: nothing was synced (put the column names back in row 1, or use an empty sheet)');
+    return JSON.stringify({pulled: '', rows: 0, gid: tabOf()});
+  }
+  await go('A:' + letter(Math.max(h.length, 26) - 1));
+  const t = clip('copy'); let last = 0;
+  t.split('\n').forEach((l, i) => { if (l.split('\t').some((c, j) => filled(c, j))) last = i + 1; });
+  await go('A1');
+  return JSON.stringify({pulled: t, rows: last, gid: tabOf()});"#.to_string(),
+        "sheets_trash" => r#"await ready(); const w = where(); await menu('#docs-file-menu', 'Move to trash'); await sleep(1500); return 'moved to the trash: ' + w;"#.to_string(),
+        other => return Err(format!("no tool {other}")),
+    };
+    let gid = serde_json::to_string(&gid_of(args["url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into());
+    Ok(format!("let GID = {gid};\n{PRELUDE}\n{body}"))
+}
+
+/// My Maps' helpers, before each body.
+pub const MAPS_PRELUDE: &str = r#"
+// the places My Maps has saved on a map: its KML export's placemarks (-1: not known)
+const savedPlaces = async (mid) => { try { const r = await fetch('/maps/d/kml?mid=' + mid + '&forcekml=1', {credentials: 'include'});
+  const t = r.ok ? await r.text() : ''; return /<kml[\s>]/.test(t.slice(0, 500)) ? (t.match(/<Placemark[\s>]/g) || []).length : -1; } catch (e) { return -1; } };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const byText = (sel, t) => [...document.querySelectorAll(sel)].find((e) => e.offsetParent && (e.innerText || e.textContent || '').trim() === t);
+const live = () => { if (typeof __ID !== 'undefined' && (window.__strataStop || {})[__ID]) throw new Error('stopped: it ran past its time; nothing more was changed'); };
+const mouse = (el) => { live(); const r = el.getBoundingClientRect();
+  for (const t of ['mousedown', 'mouseup', 'click']) el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0})); };
+const set = (el, v) => { const p = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  el.focus(); Object.getOwnPropertyDescriptor(p, 'value').set.call(el, v); el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); };
+const wait = async (f, what) => { for (let i = 0; i < 60; i++) { const v = f(); if (v) return v; await sleep(250); } throw new Error(what); };
+// the deepest visible element with exactly this text (My Maps' Import is a div around other elements: no leaf)
+// a column by its header name (any case) or its letter (C: the third); -1 when neither.  A model gave A, C and B for
+// Address and Description, three times, and heard only "no column A"
+const pickColumn = (names, want) => { const w = String(want || '').trim(), i = names.findIndex((n) => n.toLowerCase() === w.toLowerCase());
+  if (i >= 0) return i;
+  if (/^[A-Za-z]{1,2}$/.test(w)) { const k = [...w.toUpperCase()].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1; if (k < names.length) return k; }
+  return -1; };
+// My Maps' list: the maps' cards (data-mid with data-name; menus carry data-mid too, and a hidden template card is
+// "Untitled map" with the id "dummyId")
+const mapCards = () => [...document.querySelectorAll('[data-mid][data-name]')].filter((c) => !/dummy/i.test(c.getAttribute('data-mid')));
+// how many places a layer has: its own part of the page (after its last mention, before the next layer or "Base
+// map"): "All items(N)" for a big layer, else one line per place (a 3-place import was once reported as the 18 of the
+// first layer)
+const layerCount = (text, name) => {
+  const i = text.lastIndexOf(name); if (i < 0) return null;
+  const end = text.indexOf('Base map', i), sec = text.slice(i + name.length, end > 0 ? end : undefined);
+  const m = sec.match(/All items\s*\((\d+)\)/);
+  return m ? +m[1] : sec.split('\n').map((s) => s.trim()).filter((s) => s && !/^(Uniform|Individual) styles?$/i.test(s) && !/couldn.t be shown|Open data table|Dismiss/.test(s)).length;
+};
+const leaf = (t) => [...document.querySelectorAll('*')].find((e) => e.offsetParent && e.textContent.trim() === t && ![...e.children].some((c) => c.textContent.trim() === t));
+"#;
+
+/// A My Maps tool's script.  maps_create is two pages: the list's Create (phase 1: the page goes), then the new map's
+/// title in its editor (phase 2).  maps_trash: the map's card in the list, its menu, Move to Trash, the dialog's yes.
+pub fn maps_js(tool: &str, args: &Value, token: &str) -> Result<String, String> {
+    let s = |k: &str| serde_json::to_string(args[k].as_str().unwrap_or("")).unwrap_or_default();
+    let body = match tool {
+        "maps_create" if args["__phase"] == 2 => format!(r#"
+const t = await wait(() => leaf('Untitled map'), 'no title on the new map');
+mouse(t);
+const input = await wait(() => [...document.querySelectorAll('input')].find((e) => e.offsetParent && e.placeholder === 'Untitled map'), 'no title dialog');
+set(input, {title});
+const d = [...document.querySelectorAll('textarea')].find((e) => e.offsetParent);
+if (d && {desc}) set(d, {desc});
+mouse(await wait(() => byText('button', 'Save'), 'no Save'));
+await sleep(1500);
+return 'created the map ' + document.title + ' (' + location.href.split('&')[0] + '). To put places on it: maps_import_sheet.';"#, title = s("title"), desc = s("description")),
+        // a map with this title already: its address, not a second map with the same name (a model that lost track
+        // repeats a create: idempotent, as RFC 9110 9.2.2 means it).  The list's card holds the map's id (data-mid);
+        // clicking the card instead took the page away before the answer was read
+        "maps_create" => format!(r#"
+await wait(() => byText('button,[role=button]', 'add_to_drive'), 'no Create button in My Maps (signed in to Google?)');
+const name = {title};
+const card = mapCards().find((c) => c.getAttribute('data-name') === name);
+if (card) return 'a map titled ' + name + ' already exists, so none was made: https://www.google.com/maps/d/edit?mid=' + card.getAttribute('data-mid') + '. To put places on it: maps_import_sheet (each import adds a layer).';
+// the title seen on the page, but not on a card: no second map with it (a duplicate was made so, from the trash page)
+if (leaf(name)) throw new Error('a map titled ' + name + ' seems to exist, but its address was not found: open My Maps (browser_open https://www.google.com/maps/d/) and use it, or give another title');
+mouse(byText('button,[role=button]', 'add_to_drive'));
+const create = await wait(() => byText('button,[role=button],div', 'CREATE'), 'no CREATE in the dialog');
+// the answer first, the click a moment later: the click takes the page away, and with it an answer not yet read
+setTimeout(() => mouse(create), 2500);
+return '__next';"#, title = s("title")),
+        "maps_delete_layer" => format!(r#"
+// one layer, by its name and its number of places (a re-import made a second layer with the first one's name)
+const MID = {mid}, name = {layer}, items = {items};
+await wait(() => leaf('Add layer') || !location.pathname.startsWith('/maps/d/edit'), 'the map page did not load');
+if (!location.pathname.startsWith('/maps/d/edit') || new URLSearchParams(location.search).get('mid') !== MID) throw new Error('the map did not open (in the trash, or not yours?): ' + location.href);
+// a layer: its name, then its style line; its block is the largest ancestor with only that one layer name in it
+const layers = () => [...document.querySelectorAll('*')].filter((e) => e.offsetParent && e.textContent.trim() === name && ![...e.children].some((c) => c.textContent.trim() === name))
+  .map((h) => {{ let box = h;
+    while (box.parentElement && [...box.parentElement.querySelectorAll('*')].filter((e) => e.textContent.trim() === name && ![...e.children].some((c) => c.textContent.trim() === name)).length === 1) box = box.parentElement;
+    const lines = box.innerText.split('\n').map((x) => x.trim()).filter(Boolean), at = lines.indexOf(name);
+    return {{h, box, n: /^(Uniform style|Individual styles|Sequence of numbers|Style by|Group(s|ed) by)/i.test(lines[at + 1] || '') ? layerCount(box.innerText, name) : null}}; }})
+  .filter((l) => l.n !== null);
+const all = layers(), hit = all.filter((l) => l.n === items);
+if (hit.length !== 1) throw new Error((hit.length ? 'more than one layer' : 'no layer') + ' named ' + name + ' with ' + items + ' places: nothing deleted; its layers named so have ' + (all.map((l) => l.n).join(', ') || 'none') + ' places');
+const L = hit[0];
+mouse(L.h);                                        // its menu shows on hover
+await sleep(400);
+const opts = [...L.box.querySelectorAll('[aria-label],[data-tooltip]')].find((e) => /layer options/i.test(e.getAttribute('aria-label') || e.getAttribute('data-tooltip') || ''));
+if (!opts) throw new Error('no Layer options button in that layer (labels there: ' + [...new Set([...L.box.querySelectorAll('[aria-label],[data-tooltip]')].map((e) => e.getAttribute('aria-label') || e.getAttribute('data-tooltip')))].join(' | ').slice(0, 400) + '): nothing deleted');
+mouse(opts);
+mouse(await wait(() => [...document.querySelectorAll('[role=menuitem]')].find((e) => e.offsetParent && /^Delete this layer$/i.test(e.innerText.trim())), 'no Delete this layer in its menu: nothing deleted'));
+mouse(await wait(() => byText('[role=button],button', 'Delete'), 'no Delete in the confirmation'));
+await wait(() => layers().filter((l) => l.n === items).length === 0, 'the layer is still there');
+return 'deleted the layer ' + name + ' (' + items + ' places); the map has ' + layers().length + ' layer(s) named so left';"#,
+                    mid = serde_json::to_string(&map_id(args["map_url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into()), layer = s("layer"), items = args["items"].as_i64().unwrap_or(-1)),
+        "maps_trash" => format!(r#"
+const name = {title};
+const t = await wait(() => leaf(name), 'no map titled ' + name + ' in My Maps');
+let card = t;
+for (let i = 0; i < 12 && card && !card.querySelector('[aria-label="Open the map menu"]'); i++) card = card.parentElement;
+if (!card) throw new Error('no menu for the map ' + name);
+mouse(card.querySelector('[aria-label="Open the map menu"]'));
+mouse(await wait(() => [...document.querySelectorAll('[role=menuitem]')].find((e) => e.offsetParent && e.innerText.trim() === 'Move to Trash'), 'no Move to Trash'));
+mouse(await wait(() => byText('[role=button],button', 'MOVE TO TRASH'), 'no confirmation'));
+await sleep(2000);
+return 'moved the map ' + name + ' to the trash';"#, title = s("title")),
+        "maps_export" => format!(r#"
+// the map asked for, then its KML from My Maps' own export (the page's sign-in; the same site)
+const MID = {mid};
+await wait(() => leaf('Add layer') || !location.pathname.startsWith('/maps/d/edit'), 'the map page did not load');
+if (!location.pathname.startsWith('/maps/d/edit') || new URLSearchParams(location.search).get('mid') !== MID) throw new Error('the map did not open (in the trash, or not yours?): ' + location.href);
+const r = await fetch('/maps/d/kml?mid=' + MID + '&forcekml=1', {{credentials: 'include'}});
+if (!r.ok) throw new Error('My Maps answered ' + r.status + ' for the KML');
+const kml = await r.text();
+if (!/<kml[\s>]/.test(kml.slice(0, 500))) throw new Error('My Maps did not give KML (a sign-in page?): ' + kml.slice(0, 80));
+// the points: the KML has none for places placed by address; the page's _pageData has each one ("geocoded"),
+// beside its columns (names base64 after "str:")
+const src = [...document.scripts].map((x) => x.text).join('\n'), at = src.indexOf('_pageData = {{');
+const places = [];
+if (at >= 0) {{
+  let j = src.indexOf('{{', at), depth = 0, inStr = false, k = j;
+  for (; k < src.length; k++) {{ const ch = src[k];
+    if (inStr) {{ if (ch === '\\') k++; else if (ch === '"') inStr = false; continue; }}
+    if (ch === '"') inStr = true; else if (ch === '{{') depth++; else if (ch === '}}') {{ depth--; if (!depth) break; }} }}
+  const name = (s) => {{ try {{ return decodeURIComponent(escape(atob(s.slice(4)))); }} catch (e) {{ return ''; }} }};
+  const visit = (a) => {{
+    if (!Array.isArray(a)) return;
+    const geo = a.find((f) => Array.isArray(f) && f[4] === 'geocoded' && Array.isArray(f[6]));
+    if (geo) {{
+      let c = geo[6]; while (Array.isArray(c) && Array.isArray(c[0])) c = c[0];
+      const data = {{}};
+      for (const f of a) if (Array.isArray(f) && typeof f[9] === 'string' && f[9].startsWith('str:') && typeof f[4] === 'string') data[name(f[9])] = f[4];
+      if (typeof c[0] === 'number' && typeof c[1] === 'number') places.push({{lat: c[0], lng: c[1], data}});
+      return;
+    }}
+    a.forEach(visit);
+  }};
+  try {{ for (const v of Object.values(JSON.parse(src.slice(j, k + 1)))) if (typeof v === 'string' && v.startsWith('[')) {{ try {{ visit(JSON.parse(v)); }} catch (e) {{}} }} }} catch (e) {{}}
+}}
+return JSON.stringify({{kml, title: document.title, places}});"#, mid = serde_json::to_string(&map_id(args["map_url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into())),
+        "maps_import_sheet" => format!(r#"
+// the picker is another origin's frame: its end of the bridge (browser_mcp::frame_bridge_js) acts for these messages
+const TOKEN = '{token}';
+let seq = 0;
+const picker = (op, args) => new Promise((ok, no) => {{
+  const f = [...document.querySelectorAll('iframe')].find((f) => (f.src || '').startsWith('https://docs.google.com/picker') && f.getBoundingClientRect().width > 0);
+  if (!f) return no(new Error('the file picker is not open'));
+  const id = 'imp' + (++seq) + Math.random();
+  const on = (e) => {{ if (e.origin === 'https://docs.google.com' && e.data && e.data.strataReply === TOKEN && e.data.id === id) {{ removeEventListener('message', on); ok(JSON.parse(e.data.out)); }} }};
+  addEventListener('message', on);
+  f.contentWindow.postMessage({{strata: TOKEN, op, args, id}}, 'https://docs.google.com');
+  setTimeout(() => {{ removeEventListener('message', on); no(new Error('the file picker did not answer')); }}, 10000);
+}});
+const num = (page, kind, name) => {{ const l = (page.elements || []).find((e) => e.startsWith('[') && e.includes('] ' + kind) && e.includes('"' + name + '"'));
+  return l ? +l.slice(1, l.indexOf(']')) : 0; }};
+const sheet = {sheet}, loc = {loc}, ttl = {ttl}, MID = {mid};
+// the map open?  A trashed one sends My Maps home ("The map you tried to access is in your Trash"): said so, with the
+// maps there are (a model kept importing into a trashed map 8 times, hearing only "no Add layer")
+await wait(() => leaf('Add layer') || leaf('Import') || !location.pathname.startsWith('/maps/d/edit'), 'the map page did not load');
+if (!location.pathname.startsWith('/maps/d/edit')) {{
+  const said = (document.body.innerText.match(/[^\n]*(Trash|exist|permission|access)[^\n]*/) || [''])[0].trim().slice(0, 160);
+  const maps = [...new Set(mapCards().map((c) => c.getAttribute('data-name') + ' (https://www.google.com/maps/d/edit?mid=' + c.getAttribute('data-mid') + ')'))];
+  throw new Error((/Trash/.test(said) ? 'that map is in the trash (gone: use another)' : 'that map did not open (' + (said || location.href) + ')') + '; the maps in My Maps: ' + (maps.join('; ') || 'none') + '. maps_create with a title gives the address of the map with that title');
+}}
+// layers already named after this sheet (an earlier import): done is one more of them, not an old one
+// a layer's header is followed by its style line ("Individual styles", "Uniform style", ...); the map's own title is
+// not, and a map and its sheet often share a name (a first import into such a map was refused)
+const layersNamed = () => {{ const l = document.body.innerText.split('\n').map((s) => s.trim()).filter(Boolean);
+  return l.filter((s, i) => s === sheet && /^(Uniform style|Individual styles|Sequence of numbers|Style by|Group(s|ed) by)/i.test(l[i + 1] || '')).length; }};
+const layersBefore = layersNamed();
+// that sheet is a layer already: a second import puts every place on the map twice (a model re-imported the whole
+// 28-row sheet to add one row); an import is not idempotent, so it is refused (RFC 9110 9.2.2)
+if (layersBefore > 0) throw new Error('not imported: ' + sheet + ' is already a layer of this map (importing it again puts each of its places on the map twice). To add only new rows: sheets_create a sheet named "' + sheet + ' (new)", sheets_append just the new rows to it, then maps_import_sheet that one');
+// an export just after an import got the map without the new layer: the import waits for My Maps to save it (below)
+const saved = () => savedPlaces(MID), savedBefore = await saved();
+// the map asked for, not another one the pane went to while it loaded (found by a codex review)
+const here = new URLSearchParams(location.search).get('mid');
+if (here !== MID) throw new Error('the browser is at another map (' + here + '), not ' + MID + ': nothing imported');
+let imp = leaf('Import');
+if (!imp) {{ mouse(await wait(() => leaf('Add layer'), 'no Add layer')); imp = await wait(() => leaf('Import'), 'no Import on the new layer'); }}
+mouse(imp);
+await wait(() => [...document.querySelectorAll('iframe')].some((f) => (f.src || '').startsWith('https://docs.google.com/picker') && f.getBoundingClientRect().width > 0), 'the file picker did not open');
+let page; for (let i = 0; i < 20; i++) {{ await sleep(500); try {{ page = await picker('read', [1, 3500]); if (num(page, 'option', sheet)) break; }} catch (e) {{}} }}
+let n = page ? num(page, 'option', sheet) : 0;
+if (!n && page) {{ const q = num(page, 'field text', 'Search in Drive or paste URL'); if (q) {{ page = ((live(), await picker('type', [q, sheet, true]))).read; await sleep(1500); page = await picker('read', [1, 3500]); n = num(page, 'option', sheet); }} }}
+if (!n) throw new Error('no spreadsheet titled ' + sheet + ' in the file picker');
+live(); page = (await picker('click', [n])).read;
+const ins = num(page, 'button', 'Insert') || num(page, 'button', 'Select');
+if (!ins) throw new Error('no Insert in the file picker');
+live(); await picker('click', [ins]);
+// the column step: as soon as it shows its columns (no waiting out a name that is not there)
+const labels = await wait(() => {{ const l = [...document.querySelectorAll('[id^=upload-checkbox-label-]')].filter((e) => e.offsetParent); return l.length ? l : null; }}, 'My Maps did not ask which column places the markers');
+const names = labels.map((e) => e.textContent.trim());
+const li = pickColumn(names, loc), ti = pickColumn(names, ttl);
+if (li < 0 || ti < 0) {{
+  const c = byText('button,[role=button]', 'Cancel'); if (c) mouse(c);   // the half-done import is not left open
+  throw new Error('no column ' + (li < 0 ? loc : ttl) + ' in ' + sheet + '; its columns are: ' + names.join(', ') + ' (give a name or a letter: C is the third)');
+}}
+const box = document.querySelector('[aria-labelledby="' + labels[li].id + '"]');
+// one location column: any other ticked (My Maps ticks a likely one itself) is unticked
+for (const o of labels) {{ const b = document.querySelector('[aria-labelledby="' + o.id + '"]'); if (b !== box && b.getAttribute('aria-checked') === 'true') mouse(b); }}
+if (box.getAttribute('aria-checked') !== 'true') mouse(box);
+mouse(await wait(() => byText('button,[role=button]', 'Continue'), 'no Continue'));
+const radio = await wait(() => [...document.querySelectorAll('[role=radio]')].find((e) => e.offsetParent && (e.innerText || '').trim() === names[ti]), 'no column ' + names[ti] + ' for the titles');
+mouse(radio);
+mouse(await wait(() => byText('button,[role=button]', 'Finish'), 'no Finish'));
+// done: the new layer (named after the sheet) in the map's list, or My Maps' "trouble finding those locations"
+const done = await wait(() => /trouble finding those locations/.test(document.body.innerText) ? 'fail' : (layersNamed() > layersBefore ? 'ok' : ''), 'the import did not finish');
+if (done === 'fail') throw new Error('My Maps could not place the rows by ' + loc + ' (rows with nothing in that column?)');
+await sleep(2000);
+const t = document.body.innerText, placed = layerCount(t, sheet), bad = t.match(/(\d+) rows? couldn.t be shown/);
+let kept = savedBefore < 0 || placed === null;
+for (let i = 0; !kept && i < 15; i++) {{ live(); kept = (await saved()) >= savedBefore + placed; if (!kept) await sleep(1000); }}
+return 'imported ' + sheet + ' into ' + document.title + ' as a layer' + (placed !== null ? ' of ' + placed + ' places' : '') + ', placed by ' + names[li] + ', titled by ' + names[ti]
+  + (bad ? '; ' + bad[1] + ' row(s) could not be placed (My Maps found no place for their ' + loc + ': fix them in the sheet, then import again)' : '')
+  + (kept ? '' : '; My Maps has not saved the new places yet (maps_export now would miss them: wait, then export)')
+  + ' (' + location.href.split('&')[0] + ')';"#,
+                    sheet = s("sheet_title"), loc = s("location_column"), ttl = s("title_column"),
+                    mid = serde_json::to_string(&map_id(args["map_url"].as_str().unwrap_or(""))).unwrap_or_else(|_| "null".into())),
+        other => return Err(format!("no tool {other}")),
+    };
+    Ok(format!("{MAPS_PRELUDE}\n{body}"))
+}
+
+/// The page script for a body that awaits: its value (or error) kept in window.__strataAsync[id], for async_collect_js.
+/// `stop`: the job's key for window.__strataStop (one per tool call, through all its phases and pages).
+pub fn async_js(id: u64, stop: u64, body: &str) -> String {
+    format!(r#"(() => {{ window.__strataAsync = window.__strataAsync || {{}}; window.__strataAsync[{id}] = null;
+  (async () => {{ const __ID = {stop}; {body} }})().then((v) => {{ window.__strataAsync[{id}] = JSON.stringify({{ok: v}}); }},
+    (e) => {{ window.__strataAsync[{id}] = JSON.stringify({{error: String((e && e.message) || e)}}); }});
+  return 'started'; }})()"#)
+}
+
+/// The script's value; {gone} when the page it ran in has been replaced (a redirect took it away).
+pub fn async_collect_js(id: u64) -> String {
+    format!("(() => {{ if (!window.__strataAsync) return JSON.stringify({{gone: location.href}}); const o = window.__strataAsync[{id}]; return o ? o : 'null'; }})()")
+}
+
+/// Is `tool` safe to run again from the start when its page was replaced under it (it had changed nothing yet)?  A
+/// trashed map's address loads, then My Maps sends it home: the import's script went with the first page.
+pub fn rerun_safe(tool: &str, now: &str) -> bool {
+    // an import that ended on a map's editor may have finished (a reload after Finish): never again blindly; one
+    // sent away from the editor (a trashed map goes home) had not begun (found by a codex review)
+    tool == "sheets_read" || (tool == "maps_import_sheet" && !now.starts_with(MAPS_EDIT))
+}
+
+/// The tool's answer from the script's value.
+pub fn answer(tool: &str, args: &Value, ok: &Value) -> String {
+    let text = ok.as_str().unwrap_or("").to_string();
+    if tool == "sheets_read" {
+        let v: Value = serde_json::from_str(&text).unwrap_or_default();
+        let range = args["range"].as_str().filter(|r| !r.is_empty()).unwrap_or("A:Z").to_ascii_uppercase();
+        return format!("{}\n\n{}", v["where"].as_str().unwrap_or(""), numbered(v["text"].as_str().unwrap_or(""), first_row(&range)));
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges_and_addresses() {
+        for ok in ["A1", "B5", "A2:J40", "AA10:AB12", "A:Z", "B:B"] {
+            assert!(range_ok(ok), "{ok}");
+        }
+        for bad in ["", "5", "A", "a1", "A1:B2:C3", "A1');alert(1);('", "ABCD1", "A:", ":Z", "A1:Z"] {
+            assert!(!range_ok(bad), "{bad}");
+        }
+        assert_eq!(sheet_base("https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft/edit?gid=0#gid=0").as_deref(), Some("https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft"));
+        assert_eq!(sheet_base("https://evil.test/spreadsheets/d/1xsvX_nD7BEB6Xft"), None);
+        assert!(page_for("sheets_read", &json!({}), "https://example.com/").is_err());
+        assert_eq!(page_for("sheets_read", &json!({}), "https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft/edit#gid=0").unwrap().0, "https://docs.google.com/spreadsheets/d/1xsvX_nD7BEB6Xft/edit#gid=0");
+    }
+
+    #[test]
+    fn rows_paste_and_read_back() {
+        assert_eq!(tsv(&json!([["a", "b\tc"], ["x\ny", 4.5, null]])).unwrap(), "a\tb c\nx y\t4.5\t");
+        assert!(tsv(&json!("no")).is_err());
+        let copied = "Checkbox\tRating\tAddress\t\nFALSE\t4.5\t123 Main St\t\n\t\t\t\nFALSE\t\t9 B St\t\n\t\t\t";
+        assert_eq!(numbered(copied, 1), "row 1: Checkbox | Rating | Address\nrow 2: FALSE | 4.5 | 123 Main St\nrow 3:  |  | \nrow 4: FALSE |  | 9 B St");
+        assert_eq!(numbered("\t\n\t", 1), "(empty)");
+        // unticked boxes under the data are not rows
+        assert_eq!(numbered("Checkbox\tName\nFALSE\tA\nFALSE\t\nFALSE\t", 1), "row 1: Checkbox | Name\nrow 2: FALSE | A");
+        // but TRUE in another column is a value: its row is a row
+        assert_eq!(numbered("Name\tPaid\n\tTRUE\n\t", 1), "row 1: Name | Paid\nrow 2:  | TRUE");
+        assert!(sheets_js("sheets_create", &json!({"title": "t", "columns": ["Name", " name"]})).unwrap_err().starts_with("two columns named \"name\""));
+        assert_eq!(first_row("A12:J40"), 12);
+        assert_eq!(first_row("C3"), 3);
+        assert_eq!(first_row("A:Z"), 1);
+        let many: String = (1..=400).map(|i| format!("r{i}\tx")).collect::<Vec<_>>().join("\n");
+        let out = numbered(&many, 1);
+        assert!(out.contains("row 300: r300 | x") && !out.contains("row 301:") && out.ends_with("[100 more rows: sheets_read with range A301:Z600]"), "{}", &out[out.len() - 80..]);
+    }
+
+    #[test]
+    fn my_maps_pages() {
+        assert!(on_page(MAPS_LIST, "https://www.google.com/maps/d/"));
+        assert!(!on_page(MAPS_LIST, "https://www.google.com/maps/d/edit?mid=1"), "the editor is not the list");
+        assert!(on_page(MAPS_EDIT, "https://www.google.com/maps/d/edit?mid=1"));
+        let sheet = "https://docs.google.com/spreadsheets/d/abcdefghijk";
+        assert!(on_page(sheet, "https://docs.google.com/spreadsheets/d/abcdefghijk/edit#gid=0") && on_page(sheet, sheet));
+        assert!(!on_page(sheet, "https://docs.google.com/spreadsheets/d/abcdefghijkLONGER/edit"), "another sheet whose id starts the same");
+        assert_eq!(page_for("maps_create", &json!({"__phase": 2}), "").unwrap().1, MAPS_EDIT);
+        let create = maps_js("maps_create", &json!({"title": "studios"}), "t").unwrap();
+        assert!(create.contains("return '__next'") && create.contains(r#"const name = "studios";"#) && create.contains("already exists, so none was made"));
+        assert!(maps_js("maps_create", &json!({"__phase": 2, "title": "a\"b"}), "t").unwrap().contains(r#"set(input, "a\"b")"#));
+        let (load, prefix) = page_for("maps_import_sheet", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=1JYY-x_q&ll=1"}), "").unwrap();
+        assert_eq!(load, "https://www.google.com/maps/d/edit?mid=1JYY-x_q");
+        assert!(!on_page(&prefix, &load), "the map is loaded fresh for each import");
+        assert!(page_for("maps_import_sheet", &json!({"map_url": "https://www.google.com/maps/d/edit?mid=a');x('"}), "").is_err());
+        assert!(maps_js("maps_import_sheet", &json!({"sheet_title": "s", "location_column": "Address", "title_column": "Description"}), "tok1").unwrap().contains("const TOKEN = 'tok1'"));
+        assert!(ask("maps_trash", &json!({"title": "x"})).unwrap().contains("\u{201c}x\u{201d}"));
+        assert_eq!(ask("sheets_read", &json!({})), None);
+        assert!(rerun_safe("maps_import_sheet", "https://www.google.com/maps/d/home") && rerun_safe("sheets_read", "x"));
+        assert_eq!(map_id("https://www.google.com/maps/d/edit?mid=1JYY-x_q&ll=1").as_deref(), Some("1JYY-x_q"));
+        assert_eq!(map_id("https://www.google.com/maps/d/edit?mid=a');x("), None);
+        assert!(!rerun_safe("maps_import_sheet", "https://www.google.com/maps/d/edit?mid=1"), "back on the editor: it may have finished");
+        assert!(!rerun_safe("sheets_append", "x") && !rerun_safe("maps_create", "x"), "a create or append is never run twice");
+        assert_eq!(gid_of("https://docs.google.com/spreadsheets/d/x/edit#gid=1234&range=A1").as_deref(), Some("1234"));
+        assert_eq!(gid_of("https://docs.google.com/spreadsheets/d/x/edit?gid=0"), Some("0".into()));
+        assert_eq!(gid_of("https://docs.google.com/spreadsheets/d/x/edit"), None);
+        assert_eq!(gid_of("https://docs.google.com/spreadsheets/d/x/edit?gid=0#gid=77").as_deref(), Some("77"), "the fragment's tab");
+        assert_eq!(gid_of("https://docs.google.com/spreadsheets/d/x/edit?xgid=5#range=A1"), None, "xgid is not gid");
+        assert!(sheets_js("sheets_create", &json!({"title": "t", "columns": vec!["c"; 27]})).unwrap_err().contains("at most 26"));
+        let base = "https://docs.google.com/spreadsheets/d/abcdefghijk";
+        assert!(arrived("sheets_append", base, "https://docs.google.com/spreadsheets/d/abcdefghijk/edit#gid=0"));
+        assert!(!arrived("sheets_append", base, "https://docs.google.com/spreadsheets/d/zzzzzzzzzzz/edit"), "another sheet after the load");
+        assert!(arrived("sheets_create", "\u{0}", "https://docs.google.com/spreadsheets/d/new/edit") && !arrived("sheets_create", "\u{0}", "https://accounts.google.com/"));
+        assert!(sheets_js("sheets_read", &json!({"url": "https://docs.google.com/spreadsheets/d/abcdefghijklmn/edit#gid=77"})).unwrap().starts_with("let GID = \"77\";"));
+        assert!(page_for("sheets_read", &json!({"url": "https://docs.google.com/spreadsheets/d/abcdefghijklmn/edit#gid=77"}), "").unwrap().0.ends_with("/edit#gid=77"));
+        assert!(async_collect_js(7).contains("gone: location.href"));
+    }
+
+    #[test]
+    fn rows_by_number_and_name() {
+        assert!(sheets_js("sheets_write", &json!({"row": 1, "values": {"A": "x"}})).is_err(), "the header stays");
+        assert!(sheets_js("sheets_write", &json!({"row": 5, "values": {"Price": "$1"}})).unwrap().contains("await go(letter(cols[s]) + '5'"));
+        assert!(sheets_js("sheets_delete_rows", &json!({"from": 1})).is_err(), "the header stays");
+        assert!(sheets_js("sheets_delete_rows", &json!({"from": 5, "to": 7})).unwrap().contains("Rows 5 - 7"));
+        assert!(sheets_js("sheets_delete_rows", &json!({"from": 5})).unwrap().contains("'Row 5'"));
+    }
+
+    #[test]
+    fn scripts_take_only_checked_ranges() {
+        assert!(sheets_js("sheets_clear", &json!({"range": "A1');x('"})).is_err());
+        let js = sheets_js("sheets_append", &json!({"rows": [{"Name": "it's \"q\""}]})).unwrap();
+        assert!(js.contains(r#"[{"Name":"it's \"q\""}]"#));
+        assert!(!sheets_js("sheets_create", &json!({"title": "t", "columns": ["A", "B"]})).unwrap().contains("Checkbox"), "no tick boxes before there are rows");
+    }
+}

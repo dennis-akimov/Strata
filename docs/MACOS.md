@@ -72,6 +72,52 @@ run the same command again: it continues where it stopped. Q2_0, IQ3_XXS (`make 
 
 If setup stops, it says what is missing and the command that fixes it.
 
+## Linux on an Apple Silicon Mac (Asahi)
+
+The same engine runs under Linux on an M1 or M2 Mac (Asahi Linux, or Debian / Ubuntu with Asahi's kernel): llama.cpp
+on **Vulkan**, through Mesa's Apple GPU driver (Honeykrisp), instead of Metal. Tried on a 16 GB M1 MacBook Pro with
+Debian forky and kernel 7.1.13-asahi.
+
+```sh
+git clone https://github.com/dennis-akimov/Strata.git && cd Strata
+python3 bootstrap.py --onboard      # the first time, when make is not installed yet; later: make setup
+```
+
+It does what `make setup` does on macOS, with Linux's parts:
+
+| Step | On Linux |
+|---|---|
+| Tools | with sudo: `build-essential make pkg-config cmake ninja-build git curl ca-certificates python3-venv python3-pip aria2 lsof libvulkan-dev glslc spirv-headers glslang-tools mesa-vulkan-drivers vulkan-tools`; you in the groups `render` and `video` (the GPU's device files; they apply from your next login, setup itself uses them at once); Rust (rustup) |
+| GPU check | `vulkaninfo --summary` must list `Apple M1 (G13G B1)` / Honeykrisp. Only `llvmpipe` means the GPU is not reachable: the groups above, or the kernel's `asahi` driver |
+| Engine | `build-metal/metal/strata-metal` built with `GGML_VULKAN` (10-20 minutes the first time: Vulkan's shaders compile too) |
+| Memory | Vulkan's GPU memory is one heap that Honeykrisp makes about half the memory (7.65 GiB on a 16 GB M1: too small for gpt-oss-20b's 11 GB of weights); the run config's `"env": {"HK_SYSMEM": "<bytes>"}` raises it to the memory less 3 GB (or 15%), and that is the limit setup sizes the context for |
+| At the end | `make tui`: Strata.app in the terminal (bar with the state and memory, Chat, Monitor, Memory with the context picker, Log; Ctrl+S starts the server, Ctrl+Q quits and stops it). Or `make run PORT=8090` and http://127.0.0.1:8090 |
+
+Measured on the 16 GB M1 (Debian, kernel 7.1.13-asahi, Mesa 26.1.6): gpt-oss-20b at a 32K context answers at
+13.3-13.7 tok/s (Metal on the same Mac under macOS: 19-20).
+
+**Speed on Linux.** The GPU waits for nothing else: the engine uses 1-9% of the CPU, the fan stays off. Measured
+2026-10-29, 200-token answers:
+
+- The GPU's clock is its firmware's (up to 1278 MHz, the same as under macOS); Linux has no setting for it.
+- The CPU's `performance` governor (`p` in the TUI's Monitor) adds about 3% (12.2 -> 12.6); boost does nothing.
+- `GGML_VK_PERF_LOGGER=1` in the run config's `env` prints each GPU step's time into the log. Per answer token, 57% of
+  the GPU's time went to the MXFP4 experts' mat-vec, which read memory at about 25 GB/s (the q8_0 layers: 47-51).
+- `metal/patches/core/0003-honeykrisp-mat-vec.patch` gives Honeykrisp's mat-vec large workgroups and 2 rows per
+  workgroup (the defaults: subgroup-sized, 4): 12.2 -> 13.3-13.7 tok/s. Tried and no faster: `GGML_VK_FORCE_MMVQ`,
+  `GGML_VK_DISABLE_FUSION`, `GGML_VK_DISABLE_GRAPH_OPTIMIZE`, `HK_PERFTEST=batch`, 1 or 8 rows.
+- The rest of the gap to Metal is the driver: Honeykrisp has no integer dot product and no cooperative matrix (Mesa
+  26.3 neither), which llama.cpp's fast paths need.
+- Newer is not faster here (same M1, the 0003 patch in each): llama.cpp b12000 (2026-10-29, 487 commits past the pin)
+  answered at 12.8 tok/s instead of 13.7 and read a 706-token prompt at 60.6 tok/s instead of 59.5; Mesa 26.2.6 at
+  13.7 and 59 (26.1.6: 13.7 and 59.4); Mesa 26.2.6 with the unmerged lighter compute barrier (mesa!44041, 7 -> 4 us
+  per GPU step) at 13.8 and 59.6. A step costs little next to the experts' mat-vec, so that one is where speed is. `python3 bootstrap.py --detect` prints what setup sees (chip, SoC,
+the GPU driver).
+
+`make run` and `make start` start the newest `strata-*.json` (`make run CONFIG=strata-x.json` for another). Not on
+Linux: Strata.app, the kernel sandbox of the Firewall tab (sandbox-exec is macOS's: the engine and MCP programs run
+with the network there, and the tab says so) and Apple's GPU counters in the Monitor.
+
 ## Limits and warnings
 
 - **Memory.** A Mac's CPU and GPU share one memory. Metal sets a limit on how much the GPU may use at once
@@ -117,6 +163,14 @@ If setup stops, it says what is missing and the command that fixes it.
 - **Not on a Mac yet:** contexts past 262,144 tokens (rope scaling), the PC engine's expert cache and CPU experts.
 
 ### If a model does not fit
+
+Strata.app and `make setup` check this for you: the app's memory card lists what the model needs against what the GPU
+may hold and what is free, the apps using the most memory (with Quit), and, when macOS's GPU limit is the wall, a
+**Raise it** button (macOS asks for your password) for the command below; `make setup` offers the same after an
+out-of-memory. On Macs up to 36 GB macOS's default limit is about two thirds of the memory, below what Metal reports:
+a 16 GB M1 ran GPT-OSS 20B (8K context) only after `sudo sysctl iogpu.wired_limit_mb=13312`. They also say when Low
+Power Mode is on, when High Power Mode is available (MacBook Pro with a Max chip, 2024+ Pro/Max, Mac mini with Pro,
+Mac Studio 2026: `pmset -g` shows `powermode`; `sudo pmset -a powermode 2`), and when the Mac is on battery.
 
 Pick a smaller size or a smaller context first. If you know what you are doing, you can raise Metal's limit; the
 setting lasts until the Mac restarts:
@@ -237,6 +291,10 @@ Then a run config as for [GPT-OSS 120B](#gpt-oss-120b) with that file and pack, 
 | Decode, 800-token answers, 3 runs | 139, 128, 130 tok/s | 97, 90, 89 tok/s |
 | GPU clock during those runs (throttled, so a floor) | 1.2-1.3 GHz | 1.2-1.5 GHz |
 | Memory at 131,072 tokens of context (model, cache and work buffers) | 19 GB | 29 GB |
+
+**On a 16 GB Mac** the MXFP4 file (21.7 GB) does not fit. Its 2-bit UD-IQ2_M (11.5 GB) did, but answered at 2.4
+tokens/s on the M1 under Linux (IQ quants are slow on Honeykrisp) and was taken out of `make pull`: use GPT-OSS 20B or
+LFM2.5-8B / LFM2.5-24B there.
 
 Qwen3.6 has fewer active parameters than GPT-OSS 120B but is no faster: 30 of its 40 layers are linear attention (Gated
 DeltaNet), whose small steps for each token take time that fewer parameters do not save. This file has no MTP head.

@@ -6,9 +6,16 @@ rust-version = "1.90"
 
 [dependencies]
 libc = "0.2.191"
+# AppKit events into the browser pane (native_input): the crates wry already builds
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSGeometry"] }
 serde = "1.0.229"
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tao = "0.37.2"
 tray-icon = "0.26.1"
 ureq = "3.5.0"
 wry = "0.57.1"
+
+[dev-dependencies]
+# the page scripts' tests drive headless Chrome over the DevTools protocol (a websocket); skipped without Chrome
+tungstenite = "0.24"

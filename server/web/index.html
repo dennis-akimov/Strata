@@ -71,6 +71,14 @@
             <svg class="st-icon"><use href="web/sprite.svg#i-layers"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
             <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon voice-btn" id="voice-btn" title="Voice on / off" aria-label="Voice on or off" aria-pressed="false" hidden>
+            <svg class="st-icon"><use href="web/sprite.svg#i-mic"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon voice-more" id="voice-more" popovertarget="voice-pop" title="Voice settings" aria-label="Voice settings" hidden>
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chevron"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="sched-btn" title="Scheduled prompts: what runs when, and its answers" aria-label="Scheduled prompts">
+            <svg class="st-icon"><use href="web/sprite.svg#i-calendar"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon web-btn" id="web-btn" title="The browser beside the chat (the model can browse in it too)" aria-label="Browser" aria-pressed="false" hidden>
+            <svg class="st-icon"><use href="web/sprite.svg#i-globe"/></svg></button>
           <span class="spacer"></span>
           <span class="composer-hint" id="composer-hint"></span>
           <button type="button" class="ctx-ring" id="cw-btn" popovertarget="cw-pop" aria-label="Context window" hidden>
@@ -262,6 +270,23 @@
   <div class="ctx-pop__note" id="cw-note"></div>
 </div>
 
+<!-- ============================ Voice ("Hey Strata", the mic by the composer) ============================ -->
+<div popover id="voice-pop" class="ctx-pop voice-pop" role="dialog" aria-label="Voice">
+  <div class="ctx-pop__head"><span class="ctx-pop__title">Voice</span>
+    <label class="voice-switch"><input type="checkbox" id="voice-on"> <span id="voice-on-label">&ldquo;Hey Strata&rdquo;</span></label></div>
+  <form class="voice-phrase" id="voice-phrase-form" autocomplete="off">
+    <label for="voice-phrase">Wake phrase</label>
+    <input class="st-input" id="voice-phrase" maxlength="40" placeholder="hey strata" aria-describedby="voice-phrase-hint">
+    <button class="st-btn st-btn--secondary" type="submit">Save</button>
+    <span class="muted small" id="voice-phrase-hint">1-4 words; the last one wakes it, as the first or second word you say</span>
+  </form>
+  <div class="ctx-pop__note" id="voice-state">Say &ldquo;Hey Strata&rdquo; and your question; the answer is read aloud.
+    Apple&rsquo;s on-device dictation hears it (no Apple Intelligence needed); this model answers.</div>
+  <label class="voice-switch"><input type="checkbox" id="voice-speak" checked> Read answers aloud</label>
+  <button type="button" class="st-btn st-btn--secondary" id="voice-allow">Allow microphone &amp; speech</button>
+  <ol class="voice-log" id="voice-log"></ol>
+</div>
+
 <!-- ============================ Chat history (kept in this browser) ============================ -->
 <aside class="st-drawer" id="history" data-open="false" aria-label="Chat history" aria-hidden="true">
   <div class="st-drawer__head"><span class="card-title">History</span>
@@ -271,6 +296,39 @@
     <input class="st-input" id="history-search" type="search" placeholder="Search chats" aria-label="Search chats">
     <div class="history-list" id="history-list"></div>
     <div class="muted history-note">Chats are kept in this browser only; the server keeps none.</div>
+  </div>
+</aside>
+
+<!-- ============================ Scheduled prompts (the calendar by the composer) ============================ -->
+<aside class="st-drawer sched" id="sched" data-open="false" aria-label="Scheduled prompts" aria-hidden="true">
+  <div class="st-drawer__head"><span class="card-title">Scheduled prompts</span>
+    <span><button class="st-btn st-btn--secondary" id="sched-new" type="button">New</button>
+    <button class="st-btn st-btn--icon" id="sched-close" aria-label="Close"><svg class="st-icon"><use href="web/sprite.svg#i-chevron"/></svg></button></span></div>
+  <div class="st-drawer__body">
+    <form class="sched-form" id="sched-form" hidden autocomplete="off">
+      <input type="hidden" id="sf-id">
+      <label>Name<input class="st-input" id="sf-name" maxlength="80" required placeholder="Morning briefing"></label>
+      <label>Prompt<textarea class="st-input" id="sf-prompt" rows="4" required placeholder="Summarise my open reminders and today's weather in Paris."></textarea></label>
+      <label>When<select class="st-input" id="sf-kind">
+        <option value="daily">Every day</option><option value="weekdays">Weekdays (Mon-Fri)</option><option value="weekly">Every week</option>
+        <option value="monthly">Every month</option><option value="hourly">Every hour</option><option value="minutes">Every N minutes</option>
+        <option value="once">Once</option><option value="cron">Cron expression</option></select></label>
+      <div class="sched-when">
+        <label data-for="daily weekdays weekly monthly">Time<input class="st-input" id="sf-time" type="time" value="08:00"></label>
+        <label data-for="weekly">Day<select class="st-input" id="sf-dow"><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option>
+          <option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option></select></label>
+        <label data-for="monthly">Day of month<input class="st-input" id="sf-dom" type="number" min="1" max="31" value="1"></label>
+        <label data-for="hourly">At minute<input class="st-input" id="sf-min" type="number" min="0" max="59" value="0"></label>
+        <label data-for="minutes">Every (minutes)<input class="st-input" id="sf-every" type="number" min="5" value="30"></label>
+        <label data-for="once">At<input class="st-input" id="sf-at" type="datetime-local"></label>
+        <label data-for="cron">Cron<input class="st-input" id="sf-cron" placeholder="0 8 * * 1-5" spellcheck="false"></label>
+      </div>
+      <label class="sched-check"><input type="checkbox" id="sf-tools" checked> May use tools (Reminders, the browser)</label>
+      <div class="sched-acts"><button class="st-btn st-btn--secondary" type="button" id="sf-cancel">Cancel</button>
+        <button class="st-btn st-btn--primary" type="submit">Save</button></div>
+    </form>
+    <div class="sched-list" id="sched-list"></div>
+    <div class="muted small">They run in this server (while Strata runs; a run missed while it was off runs once when it is back). Each answer also comes as a macOS notification.</div>
   </div>
 </aside>
 
@@ -319,6 +377,9 @@
     <div class="toggle-row" id="mcp-row" hidden><span>Use tools from MCP servers<br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers"></button></div>
+    <div class="toggle-row" id="rem-row" hidden><span>macOS Reminders<br><span class="muted small"
+      id="rem-row-sub">the model may read, add and complete your reminders (macOS asks once)</span></span>
+      <button class="st-toggle" id="s-rem" role="switch" aria-checked="false" aria-label="macOS Reminders"></button></div>
     <div class="mcp-conns" id="mcp-conns" hidden>
       <div class="mcp-conns__list" id="mcp-conns-list"></div>
       <details class="mcp-add" id="mcp-add">

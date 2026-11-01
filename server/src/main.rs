@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use strata_server::engine::{py_g, Engine, MockEngine, Spawn, StrataEngine, ENGINE_SILENCE_S};
+use strata_server::engine::{py_g, AfmEngine, Engine, MockEngine, Spawn, StrataEngine, ENGINE_SILENCE_S};
 use strata_server::py::{self, get, truthy};
 use strata_server::service::{clean_shared_defaults, sampling_defaults_from_config, Service, Settings, REPEAT_STOP_TOKENS};
 use strata_server::tokenizer::{ByteTokenizer, Tokenize, Tokenizer};
@@ -285,6 +285,27 @@ fn stop_server(pid: i32, port: u16) -> bool {
     free()
 }
 
+/// The pids of Strata engines already running (strata-metal: a model in memory), of any user.
+fn other_engines() -> Vec<String> {
+    engines_in(&std::process::Command::new("ps").args(["-axo", "pid=,args="]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default())
+}
+
+/// ps -axo pid=,args= -> the pids whose program is strata-metal (a path, spaces allowed, or a bare name) holding a
+/// model: `--plan` only measures one (no weights read; Strata.app runs it for its memory panel while a server starts).
+fn engines_in(ps: &str) -> Vec<String> {
+    ps.lines()
+        .filter_map(|l| {
+            let (pid, args) = l.trim_start().split_once(' ')?;
+            let args = args.trim();
+            let at = args.match_indices("strata-metal").map(|(i, _)| i + "strata-metal".len()).find(|&e| {
+                let st = e - "strata-metal".len();
+                (st == 0 || args[..st].ends_with('/')) && matches!(args[e..].chars().next(), None | Some(' '))
+            })?;
+            (!args[at..].split_whitespace().any(|a| a == "--plan")).then(|| pid.to_string())
+        })
+        .collect()
+}
+
 fn listen_problem(host: &str, port: u16, e: &std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::AddrInUse => format!("port {port} is already in use - is Strata (or another server) already running? Close it, or start this one with a different --port"),
@@ -344,11 +365,14 @@ fn main() {
         }
         say(&format!("port {} is free", a.port));
     }
+    // "engine": "afm": Apple's on-device model (metal/afm/strata-afm, FoundationModels): text in and out, so bytes for
+    // tokens and the conversation as JSON for a prompt
+    let afm = a.engine == "strata" && get(&cfgv, "engine") == &json!("afm");
     let tpath = PathBuf::from(get(&cfgv, "tokenizer").as_str().map(String::from).or(a.tokenizer.clone()).unwrap_or_else(|| root().join("pack/full/tokenizer").to_string_lossy().into_owned()));
-    if a.engine == "strata" && !tpath.join("vocab.json").exists() {
+    if a.engine == "strata" && !afm && !tpath.join("vocab.json").exists() {
         die(&format!("strata-server: error: the model's tokenizer is missing ({}); run setup again", tpath.join("vocab.json").display()));
     }
-    let tok: Arc<dyn Tokenize> = if tpath.join("vocab.json").exists() {
+    let tok: Arc<dyn Tokenize> = if !afm && tpath.join("vocab.json").exists() {
         match Tokenizer::from_dir(&tpath) {
             Ok(t) => Arc::new(t),
             Err(e) => die(&format!("strata-server: error: the tokenizer in {}: {e}", tpath.display())),
@@ -356,7 +380,17 @@ fn main() {
     } else {
         Arc::new(ByteTokenizer)
     };
-    let hub = match mcp::hub_from_config(&cfgv, a.mcp_config.as_deref()) {
+    // the Strata folder's .env: one more API key and MCP servers, on top of the config (crate::dotenv)
+    let dotenv = strata_server::dotenv::load(&root());
+    let mut env_mcp = strata_server::dotenv::mcp_servers(&dotenv);
+    // Strata.app's browser for the model (app/src/browser_mcp.rs): its endpoint and key, made at each app start
+    if let (Ok(u), Ok(k)) = (std::env::var("STRATA_BROWSER_MCP_URL"), std::env::var("STRATA_BROWSER_MCP_KEY")) {
+        env_mcp.insert("browser".into(), json!({"url": u, "headers": {"Authorization": format!("Bearer {k}")}}));
+    }
+    if !env_mcp.is_empty() {
+        say(&format!("MCP servers from .env or Strata.app (its browser): {}", env_mcp.keys().cloned().collect::<Vec<_>>().join(", ")));
+    }
+    let hub = match mcp::hub_from_config(&cfgv, a.mcp_config.as_deref(), &env_mcp) {
         Ok(Some(h)) => h,
         Ok(None) => mcp::McpHub::new(Default::default(), mcp::settings_from(&cfgv).unwrap_or_else(|e| exit_msg(&e)), &[]),
         Err(e) => exit_msg(&e),
@@ -365,7 +399,13 @@ fn main() {
     let sampling_defaults;
     let engine: Engine;
     let effort_end;
-    if a.engine == "strata" {
+    if afm {
+        effort_end = None;
+        sampling_defaults = sampling_defaults_from_config(&cfgv).unwrap_or_else(|e| exit_msg(&e));
+        let exe = get(&cfgv, "exe").as_str().unwrap_or("").to_string();
+        println!("starting Apple's on-device model ...");
+        engine = Engine::Afm(Arc::new(AfmEngine::new(&exe).unwrap_or_else(|e| exit_msg(&format!("[strata] {e}")))));
+    } else if a.engine == "strata" {
         if cfg.is_empty() {
             die("strata-server: error: --engine strata needs --config");
         }
@@ -389,6 +429,17 @@ fn main() {
                 Ok(v) => vision = Some(Arc::new(v)),
                 Err(e) => exit_msg(&format!("[strata] {e}")),
             }
+        }
+        // two engines need the memory for two models: on a 16 GB Mac the kernel's out-of-memory killer then ends one of
+        // them (and systemd the session it ran in: a TUI was lost that way).  --replace has already stopped this port's.
+        let others = other_engines();
+        if !others.is_empty() && std::env::var("STRATA_ALLOW_SECOND_ENGINE").map(|v| v != "1").unwrap_or(true) {
+            exit_msg(&format!(
+                "[strata] another Strata engine is running (pid {}): two models need the memory of both, and the system ends one when it runs out. \
+                 Stop that one first (Ctrl+S in its make tui, Stop in Strata.app, or make stop), or start this one with --replace on its port. \
+                 To run both anyway: STRATA_ALLOW_SECOND_ENGINE=1",
+                others.join(", ")
+            ));
         }
         println!("{}", if lazy { "model unloaded; the first request loads it ..." } else { "loading the model (the first start takes a minute or two) ..." });
         warn_budget_over_ram(&engine_args(&cfgv));
@@ -416,7 +467,7 @@ fn main() {
         engine = Engine::Mock(Arc::new(MockEngine::new(&*tok, &scripts, 32768, 0.0)));
     }
     let tpl_path = tpath.join("chat_template.jinja");
-    let tpl_path = if tpl_path.exists() { tpl_path } else { root().join("server/chat_template.jinja") };
+    let tpl_path = if afm { root().join("server/afm_template.jinja") } else if tpl_path.exists() { tpl_path } else { root().join("server/chat_template.jinja") };
     let template = strata_server::template::ChatTemplate::load(&tpl_path).unwrap_or_else(|e| exit_msg(&format!("[strata] the chat template {}: {e}", tpl_path.display())));
     // ------------------------------------------------------------------ the settings
     let mut set = Settings { sampling_defaults, fit_max_tokens: a.fit_max_tokens || get(&cfgv, "fit_max_tokens") == &json!(true), ..Default::default() };
@@ -461,7 +512,16 @@ fn main() {
     }
     let key_src = a.api_key.clone().filter(|k| !k.is_empty()).or(env_key).map(Value::from).unwrap_or_else(|| get(&cfgv, "api_key").clone());
     match net::api_key_of(&key_src) {
-        Ok(k) => set.api_key = net::key_list(&k),
+        Ok(k) => {
+            set.api_key = net::key_list(&k);
+            // .env's API_KEY: accepted too, next to the config's / the command line's (never in their place)
+            if let Some(ek) = strata_server::dotenv::get(&dotenv, "API_KEY").map(|k| py::strip(k).to_string()).filter(|k| !k.is_empty()) {
+                if !set.api_key.contains(&ek) {
+                    set.api_key.push(ek);
+                    say("API key: .env's API_KEY is accepted too");
+                }
+            }
+        }
         Err(e) => {
             eprintln!("[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / \"api_key\" out");
             std::process::exit(2);
@@ -587,11 +647,17 @@ fn main() {
     svc.start_idle_unload();
     let here = if ["0.0.0.0", "", "::"].contains(&host.as_str()) { "127.0.0.1".to_string() } else { host.clone() };
     println!("ready: http://{here}:{}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context {} tokens{}{})", a.port, engine.max_context(), if vision.is_some() { ", images on" } else { "" }, if svc.set.api_key.is_empty() { "" } else { ", API key required" });
+    strata_server::voice::autostart(a.port, svc.set.api_key.first().map(String::as_str)); // "Hey ...": on again if it was on
+    strata_server::schedules::start(a.port, svc.set.api_key.first().cloned()); // scheduled prompts (missed ones run once)
     let args = str_args(&cfgv);
     let gguf = args[..args.len().saturating_sub(1)].iter().position(|x| x == "--gguf").map(|i| Path::new(&args[i + 1]).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
     println!("       model: {}{}", svc.model, if gguf.is_empty() { String::new() } else { format!("  ({gguf})") });
     if !svc.set.api_key.is_empty() {
-        println!("       API key: {}", svc.set.api_key.join(", "));
+        // .env's key is not printed (the log is no place for it): only that it is accepted
+        let from_env = strata_server::dotenv::get(&dotenv, "API_KEY").map(|k| py::strip(k).to_string());
+        let shown: Vec<&str> = svc.set.api_key.iter().map(String::as_str).filter(|k| Some(*k) != from_env.as_deref()).collect();
+        let env_note = if from_env.as_deref().is_some_and(|k| svc.set.api_key.iter().any(|x| x == k)) { ".env's API_KEY" } else { "" };
+        println!("       API key: {}", shown.into_iter().chain((!env_note.is_empty()).then_some(env_note)).collect::<Vec<_>>().join(", "));
     }
     println!("       open http://{here}:{}/ in a browser to chat; close this window to stop the model", a.port);
     if !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
@@ -635,4 +701,16 @@ fn main() {
         v.shutdown();
     }
     say("stopped");
+}
+
+#[cfg(test)]
+mod engine_guard_tests {
+    use super::engines_in;
+
+    #[test]
+    fn finds_running_engines_only() {
+        let ps = "    1 /sbin/launchd\n 2148 /home/dadmin/Strata/engine-metal/strata-metal --serve --gguf m.gguf\n 2141 engine-metal/strata-server --engine strata\n  77 strata-metal\n 99 /usr/bin/strata-metal-helper\n 120 /Users/x/My Apps/Strata/engine-metal/strata-metal --serve\n 17790 /Users/x/Strata/engine-metal/strata-metal --plan --gguf m.gguf --max-context 8192\n 300 vim notes-about-strata-metal.txt\n";
+        assert_eq!(engines_in(ps), ["2148", "77", "120"]);
+        assert!(engines_in("  1 /sbin/init\n").is_empty());
+    }
 }

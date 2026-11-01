@@ -525,6 +525,18 @@ fn get_(c: &mut Ctx) {
         }
         return;
     }
+    if path == "/schedules" {
+        if c.authorized() {
+            c.json(200, crate::schedules::list());
+        }
+        return;
+    }
+    if path == "/voice" {
+        if c.authorized() {
+            c.json(200, crate::voice::status_for(c.query_param("page").is_some_and(|v| v == "1")));
+        }
+        return;
+    }
     if path == "/connections" {
         if c.authorized() {
             let all = c.query_param("all").is_some_and(|v| v == "1");
@@ -558,7 +570,10 @@ fn get_(c: &mut Ctx) {
     }
     if path == "/mcp" {
         if c.authorized() {
-            let s = svc.mcp.as_ref().map(|m| m.status()).unwrap_or(json!({"servers": [], "tools": 0}));
+            let mut s = svc.mcp.as_ref().map(|m| m.status()).unwrap_or(json!({"servers": [], "tools": 0}));
+            // macOS Reminders (engine-metal/strata-reminders): the page's switch for it
+            let on = s["servers"].as_array().is_some_and(|a| a.iter().any(|x| x["name"] == "reminders"));
+            s["reminders"] = json!({"available": cfg!(target_os = "macos") && reminders_exe().is_file(), "on": on});
             c.json(200, s);
         }
         return;
@@ -722,6 +737,9 @@ fn delete(c: &mut Ctx) {
         let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy().into_owned();
         return mcp_delete(c, &name);
     }
+    if let Some(id) = path.strip_prefix("/schedules/") {
+        return if crate::schedules::delete(id) { c.json(200, crate::schedules::list()) } else { c.json(404, json!({"error": {"message": "no such schedule"}})) };
+    }
     if path.starts_with("/v1/videos/") && path.matches('/').count() == 3 {
         if let Some(v) = c.svc().video.clone() {
             let jid = path.rsplit('/').next().unwrap_or("").to_string();
@@ -751,6 +769,9 @@ fn post(c: &mut Ctx) {
         "/settings" => return settings(c),
         "/config" => return config_post(c),
         "/mcp/servers" => return mcp_put(c),
+        "/mcp/reminders" => return reminders_post(c),
+        "/schedules" => return schedules_post(c),
+        "/voice" => return voice_post(c),
         _ => {}
     }
     if (path == "/unload" || path == "/load") && c.body.as_ref().map(|b| b.len() > 65536).unwrap_or(false) {
@@ -1010,9 +1031,10 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     if tool_choice_of(get(&rv, "tool_choice")).0 == "none" {
         tools = None;
         let stop = stop_strings(&json!({"stop": get(&rv, "stop")}))?;
-        if stop.len() < 4 && !stop.iter().any(|s| s == CALL_START) {
+        let opener = if svc.lfm { crate::parser::LFM_CALL_START } else { CALL_START };
+        if stop.len() < 4 && !stop.iter().any(|s| s == opener) {
             let mut s = stop.clone();
-            s.push(CALL_START.into());
+            s.push(opener.into());
             req.insert("stop".into(), json!(s));
         }
     }
@@ -1561,6 +1583,101 @@ fn mcp_save(svc: &Service, name: &str, entry: Option<&Value>) -> Result<bool, St
     Ok(true)
 }
 
+/// POST /voice: {"on": bool} starts or stops "Hey Strata"; {"permissions": true} asks macOS for the microphone.
+fn voice_post(c: &mut Ctx) {
+    if !c.own_page("voice can be turned on") {
+        return;
+    }
+    let req: Value = c.body().ok().and_then(|b| serde_json::from_slice(if b.is_empty() { b"{}" } else { &b }).ok()).unwrap_or(Value::Null);
+    if get(&req, "permissions") == &json!(true) {
+        return c.json(200, crate::voice::permissions());
+    }
+    if let Some(t) = get(&req, "say").as_str() {
+        return c.json(200, crate::voice::speak(t, false));
+    }
+    if let Some(on) = get(&req, "speak").as_bool() {
+        if let Err(e) = crate::voice::set_speak(on) {
+            return c.json(500, json!({"error": {"type": "server_error", "message": e}}));
+        }
+        return c.json(200, crate::voice::status());
+    }
+    if get(&req, "hush") == &json!(true) {
+        return c.json(200, crate::voice::speak("", true));
+    }
+    let on = match get(&req, "phrase").as_str() {
+        // a new wake phrase: saved, and listening restarts with it when it was on
+        Some(p) => {
+            if let Err(e) = crate::voice::set_phrase(p) {
+                return c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}}));
+            }
+            if crate::voice::status()["on"] != json!(true) {
+                return c.json(200, crate::voice::status());
+            }
+            true
+        }
+        None => get(&req, "on") == &json!(true),
+    };
+    // the helper asks this server on the port the page reached it on
+    let port = c.header("host").and_then(|h| h.rsplit_once(':').and_then(|(_, p)| p.parse().ok())).unwrap_or(8090);
+    let key = c.svc().set.api_key.first().cloned();
+    match crate::voice::set(on, port, key.as_deref()) {
+        Ok(v) => c.json(200, v),
+        Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
+    }
+}
+
+/// POST /schedules: a new scheduled prompt or a change to one; POST /schedules {"run": id}: run it now (in the
+/// background: the page watches GET /schedules).
+fn schedules_post(c: &mut Ctx) {
+    if !c.own_page("scheduled prompts can be changed") {
+        return;
+    }
+    let req: Value = c.body().ok().and_then(|b| serde_json::from_slice(if b.is_empty() { b"{}" } else { &b }).ok()).unwrap_or(Value::Null);
+    if let Some(id) = get(&req, "run").as_str() {
+        let (id, port) = (id.to_string(), c.header("host").and_then(|h| h.rsplit_once(':').and_then(|(_, p)| p.parse().ok())).unwrap_or(8090));
+        let key = c.svc().set.api_key.first().cloned();
+        std::thread::spawn(move || {
+            let _ = crate::schedules::run(&id, port, key.as_deref());
+        });
+        return c.json(200, crate::schedules::list());
+    }
+    match crate::schedules::put(&req) {
+        Ok(_) => c.json(200, crate::schedules::list()),
+        Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
+    }
+}
+
+fn reminders_exe() -> std::path::PathBuf {
+    crate::root().join("engine-metal/strata-reminders")
+}
+
+/// POST /mcp/reminders {"on": bool}: macOS Reminders as the MCP server "reminders" (metal/reminders), saved in the
+/// run config like the page's other servers; off takes it out of both.  macOS asks for Reminders access at its first
+/// call (for Strata.app).
+fn reminders_post(c: &mut Ctx) {
+    if !c.own_page("Reminders can be turned on") {
+        return;
+    }
+    let svc = c.svc().clone();
+    let Some(hub) = svc.mcp.clone() else { return c.json(404, json!({"error": {"message": "not found"}})) };
+    let req: Value = c.body().ok().and_then(|b| serde_json::from_slice(if b.is_empty() { b"{}" } else { &b }).ok()).unwrap_or(Value::Null);
+    let on = get(&req, "on") == &json!(true);
+    if on && !reminders_exe().is_file() {
+        return c.json(400, json!({"error": {"type": "invalid_request_error", "message": "engine-metal/strata-reminders is missing: make build compiles it (macOS)"}}));
+    }
+    let entry = json!({"command": reminders_exe().to_string_lossy()});
+    if let Err(e) = mcp_save(&svc, "reminders", if on { Some(&entry) } else { None }) {
+        return c.json(500, json!({"error": {"type": "server_error", "message": format!("the run config cannot be written: {e}")}}));
+    }
+    if on {
+        hub.put("reminders", entry);
+    } else {
+        hub.remove("reminders");
+    }
+    say(&format!("the chat page turned macOS Reminders {}", if on { "on" } else { "off" }));
+    c.json(200, hub.status())
+}
+
 fn mcp_put(c: &mut Ctx) {
     if !c.own_page("MCP servers can be changed") {
         return;
@@ -1571,7 +1688,7 @@ fn mcp_put(c: &mut Ctx) {
     let old = get(&req, "name").as_str().and_then(|n| hub.servers.lock().unwrap().get(n).cloned());
     if let Some(o) = &old {
         if !o.editable {
-            return c.json(409, json!({"error": {"type": "invalid_request_error", "message": format!("{} comes from the config file or --mcp-config, not from this page: change it there", py::py_repr(&json!(o.name)))}}));
+            return c.json(409, json!({"error": {"type": "invalid_request_error", "message": format!("{} comes from the config file, --mcp-config or .env, not from this page: change it there", py::py_repr(&json!(o.name)))}}));
         }
     }
     let (name, entry) = match crate::mcp::page_entry(&req, old.as_ref().map(|o| &o.cfg)) {
@@ -1598,7 +1715,7 @@ fn mcp_delete(c: &mut Ctx, name: &str) {
     let s = svc.mcp.as_ref().and_then(|h| h.servers.lock().unwrap().get(name).cloned());
     match s {
         None => return c.json(404, json!({"error": {"type": "invalid_request_error", "message": format!("no MCP server {}", py::py_repr(&json!(name)))}})),
-        Some(s) if !s.editable => return c.json(409, json!({"error": {"type": "invalid_request_error", "message": format!("{} comes from the config file or --mcp-config, not from this page", py::py_repr(&json!(name)))}})),
+        Some(s) if !s.editable => return c.json(409, json!({"error": {"type": "invalid_request_error", "message": format!("{} comes from the config file, --mcp-config or .env, not from this page", py::py_repr(&json!(name)))}})),
         _ => {}
     }
     let saved = match mcp_save(&svc, name, None) {

@@ -16,10 +16,14 @@
 use serde_json::{json, Value};
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, Write};
+#[cfg(target_os = "macos")]
+use std::io::BufRead;
+use std::io::Write;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::sync::{LazyLock, Mutex};
 
 #[derive(Debug, Default, Clone)]
@@ -37,12 +41,38 @@ fn tree() -> Vec<i32> {
     let mut out = vec![std::process::id() as i32];
     let mut i = 0;
     while i < out.len() {
-        let mut kids = vec![0i32; 1024];
-        let n = unsafe { libc::proc_listchildpids(out[i], kids.as_mut_ptr().cast(), (kids.len() * 4) as i32) };
-        out.extend(kids.into_iter().take(n.max(0) as usize).filter(|p| *p > 0));
+        out.extend(children(out[i]));
         i += 1;
     }
     out
+}
+
+#[cfg(target_os = "macos")]
+fn children(pid: i32) -> Vec<i32> {
+    let mut kids = vec![0i32; 1024];
+    let n = unsafe { libc::proc_listchildpids(pid, kids.as_mut_ptr().cast(), (kids.len() * 4) as i32) };
+    kids.into_iter().take(n.max(0) as usize).filter(|p| *p > 0).collect()
+}
+
+/// Linux: every process whose parent (/proc/PID/stat, the field after the command's closing parenthesis) is pid.
+#[cfg(not(target_os = "macos"))]
+fn children(pid: i32) -> Vec<i32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p: i32 = e.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
+            let ppid: i32 = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()?;
+            (ppid == pid).then_some(p)
+        })
+        .collect()
+}
+
+/// lsof: /usr/sbin on macOS, /usr/bin on Linux.
+fn lsof() -> Command {
+    Command::new(if std::path::Path::new("/usr/sbin/lsof").exists() { "/usr/sbin/lsof" } else { "lsof" })
 }
 
 /// lsof -F output: p<pid> c<command>, then per socket f<fd> t<IPv4|IPv6> P<TCP|UDP> n<name> T<ST=STATE> ...
@@ -135,7 +165,7 @@ fn fold(socks: &[Sock]) -> Vec<Value> {
 
 /// GET /connections[?all=1]
 pub fn connections(all: bool) -> Value {
-    let mut cmd = std::process::Command::new("/usr/sbin/lsof");
+    let mut cmd = lsof();
     cmd.args(["-nP", "+c", "0", "-i", "-F", "pcPnT"]);
     if !all {
         cmd.args(["-a", "-p", &tree().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")]);
@@ -343,6 +373,7 @@ pub fn start(cfg: &Value, persist: bool) {
         fw.file = file;
     }
     std::thread::Builder::new().name("firewall-sample".into()).spawn(sample).ok();
+    #[cfg(target_os = "macos")] // the jail and its log are macOS's (sandbox-exec); on Linux the programs run as they are
     std::thread::Builder::new().name("firewall-kernel".into()).spawn(kernel_log).ok();
 }
 
@@ -350,7 +381,7 @@ pub fn start(cfg: &Value, persist: bool) {
 fn sample() {
     let mut before: HashSet<(i32, String, String)> = HashSet::new();
     loop {
-        let out = Command::new("/usr/sbin/lsof").args(["-nP", "+c", "0", "-i", "-F", "pcPnT", "-a", "-p", &tree().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")]).output();
+        let out = lsof().args(["-nP", "+c", "0", "-i", "-F", "pcPnT", "-a", "-p", &tree().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")]).output();
         let socks = out.map(|o| parse(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default();
         let listening: HashSet<(i32, String)> = socks.iter().filter(|s| s.state == "LISTEN").map(|s| (s.pid, split(&s.local).1.to_string())).collect();
         let mut now_set = HashSet::new();
@@ -380,17 +411,37 @@ fn sample() {
     }
 }
 
+/// The child keeps only its stdin, stdout and stderr.  Rust marks a new socket close-on-exec a moment after making it;
+/// this thread starts `log` while main binds port 8090 to see that it is free, and once `log` got that socket: it
+/// outlived the server (its parent gone) and held the port ("port 8090 is already in use" on every start after).
+#[cfg(target_os = "macos")]
+fn only_stdio(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // runs in the child after its stdio is set and before exec: only async-signal-safe calls
+    unsafe {
+        cmd.pre_exec(|| {
+            let max = libc::getdtablesize().clamp(64, 65536);
+            for fd in 3..max {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+}
+
 /// The kernel's own record of every network attempt a jailed process made: "Sandbox: curl(21467) deny(1)
 /// network-outbound /private/var/run/mDNSResponder".  It sees what a 2 s sample misses (a lookup, a ping, a refused
 /// connect lasts microseconds).
+#[cfg(target_os = "macos")]
 fn kernel_log() {
     static LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Sandbox: (.+?)\((\d+)\) deny\(\d+\) (network-[a-z-]+)\s*(.*)").unwrap());
     loop {
-        let child = Command::new("/usr/bin/log")
-            .args(["stream", "--style", "ndjson", "--predicate", r#"sender == "Sandbox" AND eventMessage CONTAINS "deny(1) network""#])
+        let mut cmd = Command::new("/usr/bin/log");
+        cmd.args(["stream", "--style", "ndjson", "--predicate", r#"sender == "Sandbox" AND eventMessage CONTAINS "deny(1) network""#])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        only_stdio(&mut cmd);
+        let child = cmd.spawn();
         let Ok(mut child) = child else { return };
         for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
@@ -411,6 +462,24 @@ fn kernel_log() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_child_gets_no_socket_of_ours() {
+        use std::os::fd::AsRawFd;
+        // a socket made without close-on-exec, as one is for a moment after socket(): the child must not have it
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = l.as_raw_fd();
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", &format!("[ -e /dev/fd/{fd} ] && echo has || echo none")]).stdout(Stdio::piped());
+        only_stdio(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "none");
+        let mut plain = Command::new("/bin/sh");
+        plain.args(["-c", &format!("[ -e /dev/fd/{fd} ] && echo has || echo none")]);
+        assert_eq!(String::from_utf8_lossy(&plain.output().unwrap().stdout).trim(), "has", "the test's socket was inheritable");
+    }
 
     const LSOF: &str = "p10\ncstrata-server\nf18\ntIPv4\nPTCP\nn*:8090\nTST=LISTEN\nTQR=0\n\
 f19\ntIPv4\nPTCP\nn127.0.0.1:8090->127.0.0.1:56200\nTST=ESTABLISHED\n\

@@ -1,0 +1,10 @@
+[package]
+name = "strata-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.191"
+ratatui = "0.30.2"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+ureq = "3.5.0"

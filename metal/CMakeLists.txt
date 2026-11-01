@@ -5,8 +5,14 @@
 set(STRATA_LLAMA_COMMIT "71ad0590f4808b6202f9213d166913858c73b1bc")   # 2026-10-08: few-row MMA mat-mul (#30065), +8% decode with MTP
 set(STRATA_LLAMA_DIR "" CACHE PATH "a llama.cpp checkout at STRATA_LLAMA_COMMIT with metal/patches/core applied (default: fetched)")
 
-set(GGML_METAL ON CACHE BOOL "" FORCE)
-set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # the shaders inside the binary: no Xcode needed to run it
+if(APPLE)
+  set(GGML_METAL ON CACHE BOOL "" FORCE)
+  set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # the shaders inside the binary: no Xcode needed to run it
+else()
+  # Linux on Apple Silicon (Asahi): the GPU through Vulkan (Mesa's Honeykrisp; libvulkan-dev + glslc to build)
+  set(GGML_METAL OFF CACHE BOOL "" FORCE)
+  set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -54,6 +60,15 @@ else()
   string(MD5 _sig "${_sig}")
   string(SUBSTRING "${_sig}" 0 10 _sig)
   set(_src "${FETCHCONTENT_BASE_DIR}/llama_cpp-src-${_sig}")
+  # Vulkan's shader generator is its own CMake project, whose cache names the source folder it was configured from: a
+  # new set of patches (a new folder) would fail it with "does not match the source ... used to generate cache"
+  set(_gen "${FETCHCONTENT_BASE_DIR}/llama_cpp-build/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix")
+  if(EXISTS "${_gen}/src/vulkan-shaders-gen-build/CMakeCache.txt")
+    file(STRINGS "${_gen}/src/vulkan-shaders-gen-build/CMakeCache.txt" _home REGEX "^CMAKE_HOME_DIRECTORY:")
+    if(NOT _home MATCHES "llama_cpp-src-${_sig}/")
+      file(REMOVE_RECURSE "${_gen}")
+    endif()
+  endif()
   FetchContent_Declare(llama_cpp URL https://github.com/ggml-org/llama.cpp/archive/${STRATA_LLAMA_COMMIT}.tar.gz
                        SOURCE_DIR "${_src}" ${_patch})
   FetchContent_MakeAvailable(llama_cpp)

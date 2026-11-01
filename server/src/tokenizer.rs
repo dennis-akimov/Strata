@@ -52,6 +52,7 @@ fn pre_of(pre: &str) -> Option<(&'static str, bool)> {
         "qwen35" => (QWEN35, false),
         "gpt-4o" => (GPT4O, true),
         "glm4" => (GLM4, true),
+        "lfm2" => (GLM4, true), // LiquidAI's LFM2 / LFM2.5: their tokenizer.json's pattern is glm4's
         "hunyuan" => (HUNYUAN, true),
         _ => return None,
     })
@@ -148,7 +149,7 @@ impl Tokenizer {
             let id = ids.get(&merged).copied().unwrap_or(u32::MAX);
             mm.insert((l, r), (i as u32, id));
         }
-        let (pat, ignore_merges) = pre_of(pre).ok_or_else(|| anyhow!("no pre-tokenizer for {pre:?} (known: qwen35, gpt-4o, glm4, hunyuan)"))?;
+        let (pat, ignore_merges) = pre_of(pre).ok_or_else(|| anyhow!("no pre-tokenizer for {pre:?} (known: qwen35, gpt-4o, glm4, lfm2, hunyuan)"))?;
         let re = fancy_regex::Regex::new(pat).context("pre-tokenizer pattern")?;
         let mut special = HashMap::new();
         let mut always = vec![];
@@ -428,7 +429,9 @@ impl Tokenize for ByteTokenizer {
     }
 
     fn token_bytes(&self, id: u32) -> Vec<u8> {
-        if id >= 256 {
+        if id >= crate::engine::CHUNK_BASE {
+            crate::engine::chunk_bytes(id) // a piece of text Apple's model streamed (engine::AfmEngine)
+        } else if id >= 256 {
             BYTE_SPECIALS.get(id as usize - 256).map(|s| s.as_bytes().to_vec()).unwrap_or_default()
         } else {
             vec![id as u8]

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod bias;
+pub mod dotenv;
 pub mod engine;
 pub mod errors;
 pub mod firewall;
@@ -15,6 +16,7 @@ pub mod pyjson;
 pub mod responses;
 pub mod run;
 pub mod runconfig;
+pub mod schedules;
 pub mod service;
 pub mod structured;
 pub mod sync;
@@ -23,6 +25,7 @@ pub mod template;
 pub mod tokenizer;
 pub mod videogen;
 pub mod vision;
+pub mod voice;
 
 /// A "[strata] " line on stdout, with the time (the Python server's Stamped stream).
 pub fn say(msg: &str) {

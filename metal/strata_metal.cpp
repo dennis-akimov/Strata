@@ -292,6 +292,7 @@ struct Checkpoint {
     size_t n;                                 // cells the state covers: live[0, n)
     llama_pos pos;                            // the position of cell n (the first one cut)
     std::vector<uint8_t> tgt, dft, spec;      // recurrent part of the trunk, the draft context's, the drafter's
+    bool inside = false;                      // inside a message (a chunk's end), not at its first token
 };
 
 // What one sequence of the context holds: seq 0 is the solo path's (GEN, with the MTP drafts), seq b + 1 batch slot b's.
@@ -490,16 +491,20 @@ struct Engine {
         return d;
     }
 
-    void checkpoint(llama_seq_id sq, size_t n, llama_pos pos) {
+    // At a message boundary, or `inside` one at a chunk's end: a new question after the same long message (a document,
+    // a tool's result) goes back there, not to the message's start.  --checkpoints of each kind are kept, counted apart,
+    // so a long message's inside ones never push out the boundary before it.
+    void checkpoint(llama_seq_id sq, size_t n, llama_pos pos, bool inside) {
         if (o.checkpoints == 0) return;
-        Checkpoint c{n, pos, state(ctx, sq), {}, {}};
+        Checkpoint c{n, pos, state(ctx, sq), {}, {}, inside};
         if (c.tgt.empty()) return;
         if (sq == 0 && ctx_dft) c.dft = state(ctx_dft, 0);
         if (sq == 0 && spec) common_speculative_get_state(spec, 0, c.spec);
         auto& ck = seqs[(size_t) sq].ckpts;
         while (!ck.empty() && ck.back().n >= n) ck.pop_back();
         ck.push_back(std::move(c));
-        while ((int) ck.size() > o.checkpoints) ck.pop_front();
+        if (std::count_if(ck.begin(), ck.end(), [&](const Checkpoint& x) { return x.inside == inside; }) > o.checkpoints)
+            ck.erase(std::find_if(ck.begin(), ck.end(), [&](const Checkpoint& x) { return x.inside == inside; }));
     }
 
     void clear(llama_seq_id sq) {
@@ -594,8 +599,13 @@ struct Engine {
         return true;
     }
 
-    common_sampler* sampler(const std::string& line_keys) {
+    // grammar=<hex of GBNF> and grammar_trigger=<token id>: a lazy grammar, applied from that token on (the server's
+    // tool-call grammar: only the tools' own names and arguments; thinking and text stay free).  A grammar that does
+    // not parse is an error, here or in common_sampler_init (it throws): `err` says it, the sampler is null.
+    common_sampler* sampler(const std::string& line_keys, std::string* err = nullptr) {
         common_params_sampling s = params.sampling;
+        std::string grammar;
+        long long trigger = -1;
         s.temp = 0.0f;                        // absent keys: greedy, as the CUDA engine
         s.top_k = 20;
         s.top_p = 1.0f;
@@ -620,9 +630,34 @@ struct Engine {
             else if (k == "penalty_present") s.penalty_present = std::strtof(v, nullptr);
             else if (k == "penalty_last_n") s.penalty_last_n = std::atoi(v);
             else if (k == "seed") s.seed = (uint32_t) std::strtoull(v, nullptr, 10);
+            else if (k == "grammar_trigger") trigger = std::strtoll(v, nullptr, 10);
+            else if (k == "grammar") {
+                const std::string h(v);
+                if (h.size() % 2 || h.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+                    if (err) *err = "grammar: not hex";
+                    return nullptr;
+                }
+                for (size_t q = 0; q < h.size(); q += 2) grammar += (char) std::stoi(h.substr(q, 2), nullptr, 16);
+            }
         }
         if (s.top_k <= 0) s.top_k = 64;
-        return common_sampler_init(model, s);
+        if (!grammar.empty()) {
+            if (trigger >= llama_vocab_n_tokens(vocab)) {
+                if (err) *err = "grammar_trigger " + std::to_string(trigger) + " is outside the vocabulary";
+                return nullptr;
+            }
+            s.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, grammar);
+            s.grammar_lazy = trigger >= 0;
+            if (trigger >= 0) s.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN, "", (llama_token) trigger});
+        }
+        try {
+            common_sampler* smpl = common_sampler_init(model, s);
+            if (!smpl && err) *err = "the sampler did not start (grammar?)";
+            return smpl;
+        } catch (const std::exception& e) {
+            if (err) *err = std::string("grammar: ") + e.what();
+            return nullptr;
+        }
     }
 
     bool decoding() const {
@@ -661,6 +696,12 @@ struct Engine {
             keys_txt = rest;
             if (file.empty()) return refuse("expected: GENI <max_new> <file> <id,id,...>");
         }
+        {                                             // a grammar that does not parse: refused before the prompt is read
+            std::string gerr;
+            common_sampler* probe = keys_txt.find(" grammar=") != std::string::npos ? sampler(keys_txt, &gerr) : nullptr;
+            if (probe) common_sampler_free(probe);
+            if (!gerr.empty()) return refuse(gerr);
+        }
         const size_t n = P.ids.size();
         if ((int64_t) n >= o.max_context)
             return refuse("the prompt (" + std::to_string(n) + " tokens) does not fit the context (" +
@@ -697,7 +738,8 @@ struct Engine {
         const char* finish = "length";
         bool cancelled = false;
         const bool drafts = spec && sq == 0;
-        // the prompt but its last token, in chunks of n_batch, each also ending at a message boundary (a checkpoint)
+        // the prompt but its last token, in chunks of n_batch, each also ending at a message boundary (a checkpoint at
+        // each chunk's end)
         size_t at = resume;
         while (at + 1 < n) {
             size_t end = std::min(n - 1, at + (size_t) o.n_batch);
@@ -707,7 +749,12 @@ struct Engine {
             if (boundary) end = b;
             if (!feed(sq, P, at, end, false, err, !geni)) { clear(sq); return refuse(err); }
             at = end;
-            if (boundary) checkpoint(sq, at, P.pos[at][0]);
+            // only where seq_rm from the cut's position keeps every held cell (an M-RoPE image's rows share one
+            // position), and from the cell before it too (rollback's EAGLE3 rule cuts one more); a boundary is the cut's
+            // own token (a chunk can end right before an <|im_start|>)
+            // ponytail: the M-RoPE and EAGLE3 cases have no test model here (LFM2-350M's images are not M-RoPE)
+            if (P.pos[at][0] > P.pos[at - 1][0] && (at < 2 || P.pos[at - 1][0] > P.pos[at - 2][0]))
+                checkpoint(sq, at, P.pos[at][0], P.ids[at] != im_start);
             const double ms = ms_since(t0);
             out("PP %zu %zu %.0f %.1f\n", at, n, ms, (at - resume) / std::max(1e-3, ms / 1000.0));
             if (g_stop) { cancelled = true; finish = "cancel"; break; }
@@ -927,9 +974,30 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (e.o.plan) return 0;
-    out("INFO engine=" STRATA_VERSION "-metal backend=metal llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
-        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d\n", (long long) e.o.max_context,
-        e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0, e.spec ? e.o.spec : 0);
+    // the GPU's memory once the model is in it (Metal: its working set; Vulkan: the heap, Honeykrisp's HK_SYSMEM on
+    // Linux): what the server's Monitor shows where the OS has no GPU counters of its own (Asahi Linux)
+    size_t gpu_free = 0, gpu_total = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        const auto t = ggml_backend_dev_type(d);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            ggml_backend_dev_memory(d, &gpu_free, &gpu_total);
+            break;
+        }
+    }
+    // a Vulkan driver without the memory-budget extension (Honeykrisp) reports the heap's free as its total: the model's
+    // own weights are then the closest measure of what it holds
+    size_t gpu_used = gpu_total - gpu_free;
+    if (gpu_used == 0 && e.model) gpu_used = (size_t) llama_model_size(e.model);
+#ifdef __APPLE__
+    const char* backend = "metal";
+#else
+    const char* backend = "vulkan";
+#endif
+    out("INFO engine=" STRATA_VERSION "-metal backend=%s llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
+        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu grammar=1\n", backend,
+        (long long) e.o.max_context, e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0,
+        e.spec ? e.o.spec : 0, gpu_used, gpu_total);
     out("READY %lld stop\n", (long long) e.o.max_context);
     g_slots = e.o.batch;
     g_bstop.reset(new std::atomic<bool>[(size_t) std::max(1, g_slots)]());

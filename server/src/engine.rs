@@ -166,6 +166,12 @@ pub fn sampling_keys(s: &Map<String, Value>) -> String {
     if s.get("strata_checkpoint") == Some(&Value::Bool(false)) {
         keys += " ckpt=0";
     }
+    // the tool-call grammar (run.rs sets it; GBNF as hex: the line is split at spaces) and the token it starts at
+    if let (Some(Value::String(g)), Some(t)) = (s.get("strata_tool_grammar"), int("strata_tool_grammar_from")) {
+        if !g.is_empty() && g.bytes().all(|b| b.is_ascii_hexdigit()) && t >= 0 {
+            keys += &format!(" grammar={g} grammar_trigger={t}");
+        }
+    }
     if let Some(Value::Number(pn)) = s.get("strata_prefix").and_then(|p| p.get("tokens")) {
         if let Some(pn) = pn.as_i64().filter(|n| *n > 0) {
             keys += &format!(" pin={pn}");
@@ -2047,6 +2053,8 @@ pub struct MockEngine {
     scripts: Vec<Vec<u32>>,
     turns: Mutex<usize>,
     pub last_prompt: Mutex<Vec<u32>>,
+    /// every prompt it got, in order (tests compare the rounds of a tool loop)
+    pub prompts: Mutex<Vec<Vec<u32>>>,
 }
 
 impl MockEngine {
@@ -2058,10 +2066,12 @@ impl MockEngine {
             scripts: scripts.iter().map(|s| tok.encode(s, true).into_iter().chain(end.iter().copied()).collect()).collect(),
             turns: Mutex::new(0),
             last_prompt: Mutex::new(vec![]),
+            prompts: Mutex::new(vec![]),
         }
     }
 
     pub fn generate(&self, ids: Vec<u32>, max_new: i64, cancel: Arc<Event>) -> Generation {
+        self.prompts.lock().unwrap().push(ids.clone());
         *self.last_prompt.lock().unwrap() = ids;
         let script = if self.scripts.len() > 1 {
             let mut t = self.turns.lock().unwrap();
@@ -2089,17 +2099,136 @@ impl MockEngine {
     }
 }
 
+// ------------------------------------------------------------------ Apple's on-device model (FoundationModels)
+/// Token ids from CHUNK_BASE up are pieces of text Apple's model streamed (it has no token ids of its own): the
+/// ByteTokenizer reads them back from this ring, so a piece counts as one token (max_tokens, usage).
+/// ponytail: a ring of 65,536 pieces; each is read right after it is made, so old ones may be overwritten.
+pub const CHUNK_BASE: u32 = 1 << 20;
+const CHUNK_RING: usize = 1 << 16;
+static CHUNKS: std::sync::LazyLock<Mutex<(Vec<String>, usize)>> = std::sync::LazyLock::new(Default::default);
+
+pub fn chunk_id(text: String) -> u32 {
+    let mut g = CHUNKS.lock().unwrap();
+    let i = g.1 % CHUNK_RING;
+    if g.0.len() < CHUNK_RING {
+        g.0.push(text);
+    } else {
+        g.0[i] = text;
+    }
+    g.1 += 1;
+    CHUNK_BASE + i as u32
+}
+
+pub fn chunk_bytes(id: u32) -> Vec<u8> {
+    CHUNKS.lock().unwrap().0.get((id - CHUNK_BASE) as usize).map(|s| s.as_bytes().to_vec()).unwrap_or_default()
+}
+
+/// The prompt the template wrote (server/afm_template.jinja: the conversation as JSON) -> strata-afm's request.
+pub fn afm_request(prompt: &str, max_new: i64, sampling: &Map<String, Value>) -> Value {
+    let conv = prompt.find('{').zip(prompt.rfind('}')).and_then(|(a, b)| serde_json::from_str::<Value>(&prompt[a..=b]).ok())
+        .unwrap_or_else(|| json!({"messages": [{"role": "user", "content": prompt}]}));
+    json!({"conversation": conv, "max_tokens": max_new, "temperature": sampling.get("temperature")})
+}
+
+struct AfmProc {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<std::process::ChildStdout>,
+}
+
+/// `strata-afm` (metal/afm/strata_afm.swift): a JSON line in (the conversation), `{"delta": ...}` lines out, then
+/// `{"done": true}` or `{"error": ...}`.  One request at a time; a cancelled or cut answer ends the helper (the next
+/// request starts a new one), as it would otherwise go on writing that answer.
+pub struct AfmEngine {
+    exe: String,
+    proc: Mutex<Option<AfmProc>>,
+    pub max_context: i64,
+}
+
+impl AfmEngine {
+    pub fn new(exe: &str) -> Result<Self, String> {
+        let (p, ctx) = Self::spawn(exe)?;
+        // the server counts the prompt in bytes: about 4 to Apple's token
+        Ok(AfmEngine { exe: exe.to_string(), proc: Mutex::new(Some(p)), max_context: ctx * 4 })
+    }
+
+    fn spawn(exe: &str) -> Result<(AfmProc, i64), String> {
+        let mut child = std::process::Command::new(exe).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+            .map_err(|e| format!("{exe}: {e} (make build compiles it on macOS 26 and later)"))?;
+        let (input, mut output) = (child.stdin.take().unwrap(), BufReader::new(child.stdout.take().unwrap()));
+        let mut hello = String::new();
+        output.read_line(&mut hello).map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&hello).unwrap_or(json!({"error": "strata-afm said nothing"}));
+        if let Some(e) = v["error"].as_str() {
+            let _ = child.kill();
+            return Err(format!("Apple's on-device model: {e}"));
+        }
+        Ok((AfmProc { child, input, output }, v["context"].as_i64().unwrap_or(4096)))
+    }
+
+    pub fn generate(self: &Arc<Self>, ids: Vec<u32>, max_new: i64, sampling: Map<String, Value>, cancel: Arc<Event>) -> Generation {
+        use crate::tokenizer::Tokenize;
+        let req = afm_request(&crate::tokenizer::ByteTokenizer.decode(&ids), max_new, &sampling);
+        let me = self.clone();
+        let tokens = Gen::new(move |y: &Yielder<Option<u32>, Fail>| {
+            let mut slot = me.proc.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(Self::spawn(&me.exe).map_err(|e| Stop::Err(Fail::Died(e)))?.0);
+            }
+            let end = |slot: &mut Option<AfmProc>| {
+                if let Some(mut p) = slot.take() {
+                    let _ = p.child.kill();
+                    let _ = p.child.wait();
+                }
+            };
+            let p = slot.as_mut().unwrap();
+            if writeln!(p.input, "{req}").and_then(|_| p.input.flush()).is_err() {
+                end(&mut slot);
+                return Err(Stop::Err(Fail::Died("Apple's model helper (strata-afm) stopped".into())));
+            }
+            let mut n = 0;
+            loop {
+                let mut line = String::new();
+                let p = slot.as_mut().unwrap();
+                if cancel.is_set() || p.output.read_line(&mut line).unwrap_or(0) == 0 {
+                    let died = !cancel.is_set();
+                    end(&mut slot);
+                    return if died { Err(Stop::Err(Fail::Died("Apple's model helper (strata-afm) stopped".into()))) } else { Ok(()) };
+                }
+                let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                if let Some(d) = v["delta"].as_str() {
+                    y.yield_(Some(chunk_id(d.to_string())))?;
+                    n += 1;
+                    if max_new > 0 && n >= max_new {
+                        end(&mut slot);
+                        return Ok(());
+                    }
+                } else if v["done"] == true {
+                    y.yield_(Some(257))?; // <|im_end|> (the ByteTokenizer's)
+                    return Ok(());
+                } else if let Some(e) = v["error"].as_str() {
+                    return Err(Stop::Err(Fail::Value(format!("Apple's on-device model: {e}"))));
+                }
+            }
+        });
+        Generation { tokens, stats: Arc::new(Mutex::new(None)) }
+    }
+}
+
 /// The engine the service runs on: the mock (`--engine mock`) or the real one.
 #[derive(Clone)]
 pub enum Engine {
     Mock(Arc<MockEngine>),
     Strata(Arc<StrataEngine>),
+    /// Apple's on-device model (a config with "engine": "afm")
+    Afm(Arc<AfmEngine>),
 }
 
 impl Engine {
     pub fn generate(&self, ids: Vec<u32>, max_new: i64, sampling: Map<String, Value>, cancel: Arc<Event>, embeddings: Option<String>) -> Generation {
         match self {
             Engine::Mock(m) => m.generate(ids, max_new, cancel),
+            Engine::Afm(a) => a.generate(ids, max_new, sampling, cancel),
             Engine::Strata(s) => s.generate(ids, max_new, sampling, cancel, embeddings),
         }
     }
@@ -2116,6 +2245,7 @@ impl Engine {
     pub fn max_context(&self) -> i64 {
         match self {
             Engine::Mock(m) => m.max_context,
+            Engine::Afm(a) => a.max_context,
             Engine::Strata(s) => s.max_context.load(SeqCst),
         }
     }
@@ -2148,5 +2278,48 @@ mod engine_err_tests {
         let e = engine_err("ERR llama_process failed (-3)", 8192);
         assert!(matches!(&e, Fail::GpuBusy(m) if m.contains("ran out of memory") && m.contains("8192") && m.contains("--prefill-batch")), "{e:?}");
         assert_eq!(engine_err("ERR unknown command: X", 8192), Fail::Value("unknown command: X".into()));
+    }
+}
+
+#[cfg(test)]
+mod afm_tests {
+    use super::*;
+    use crate::tokenizer::{ByteTokenizer, Tokenize};
+
+    #[test]
+    fn the_template_s_json_becomes_the_request() {
+        let t = crate::template::ChatTemplate::load(&crate::root().join("server/afm_template.jinja")).unwrap();
+        let msgs = [json!({"role": "system", "content": "Be brief."}), json!({"role": "user", "content": "Hi \"there\" é"})];
+        let prompt = t.render(&msgs, None, true, &Map::new()).unwrap();
+        let ids = ByteTokenizer.encode(&prompt, false);
+        let mut s = Map::new();
+        s.insert("temperature".into(), json!(0.2));
+        let r = afm_request(&ByteTokenizer.decode(&ids), 64, &s);
+        assert_eq!(r["conversation"]["messages"][1]["content"], "Hi \"there\" é");
+        assert_eq!(r["conversation"]["tools"], Value::Null);
+        assert_eq!((r["max_tokens"].as_i64(), r["temperature"].as_f64()), (Some(64), Some(0.2)));
+        // not JSON: the text is the user's message
+        assert_eq!(afm_request("hello", 8, &Map::new())["conversation"]["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn a_streamed_piece_is_one_token() {
+        let (a, b) = (chunk_id("Can".into()), chunk_id("berra é".into()));
+        assert_eq!(ByteTokenizer.decode(&[a, b, 257]), "Canberra é<|im_end|>");
+    }
+}
+
+#[cfg(test)]
+mod grammar_key_tests {
+    use super::*;
+
+    #[test]
+    fn the_tool_grammar_goes_on_the_gen_line_as_hex() {
+        let keys = |v: Value| sampling_keys(v.as_object().unwrap());
+        assert_eq!(keys(json!({"strata_tool_grammar": "726f6f74", "strata_tool_grammar_from": 7})), " grammar=726f6f74 grammar_trigger=7");
+        // GBNF itself (spaces) would split the line: not hex, not sent; nor without its token
+        assert_eq!(keys(json!({"strata_tool_grammar": "root ::= x", "strata_tool_grammar_from": 7})), "");
+        assert_eq!(keys(json!({"strata_tool_grammar": "726f6f74"})), "");
+        assert_eq!(keys(json!({"grammar": "root ::= x"})), "", "a client's grammar field is not Strata's");
     }
 }

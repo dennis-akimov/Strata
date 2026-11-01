@@ -28,6 +28,65 @@ VENV_PY = os.path.join(ROOT, ".venv", "bin", "python")
 MAC = platform.system() == "Darwin"
 
 
+# Apple's SoC names (the device tree's compatible, "apple,t8103") -> the chip.  Asahi's GPU driver covers M1 and M2
+CHIPS = {"t8103": "Apple M1", "t6000": "Apple M1 Pro", "t6001": "Apple M1 Max", "t6002": "Apple M1 Ultra",
+         "t8112": "Apple M2", "t6020": "Apple M2 Pro", "t6021": "Apple M2 Max", "t6022": "Apple M2 Ultra",
+         "t8122": "Apple M3", "t6030": "Apple M3 Pro", "t6031": "Apple M3 Max", "t6034": "Apple M3 Max",
+         "t8132": "Apple M4", "t6040": "Apple M4 Pro", "t6041": "Apple M4 Max"}
+
+
+def _read(path, binary=False):
+    try:
+        with open(path, "rb" if binary else "r") as f:
+            return f.read()
+    except OSError:
+        return b"" if binary else ""
+
+
+def _sysctl(name):
+    try:
+        return subprocess.run(["sysctl", "-n", name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True).stdout.strip()
+    except OSError:
+        return ""
+
+
+def apple_silicon():
+    """Is this an Apple Silicon Mac, and can Strata reach its GPU?  Each signal is read on the fly:
+
+    - macOS: sysctl hw.optional.arm64 = 1 (true under Rosetta too; sysctl.proc_translated = 1 says this process is an
+      Intel one translated, so a native Terminal / Python is needed); the chip from machdep.cpu.brand_string; GPU: Metal
+    - Linux: the device tree's compatible ("apple,j293 apple,t8103 ...": a 13" MacBook Pro with the M1), else the
+      CPU's implementer in /proc/cpuinfo (0x61 = Apple; a Linux VM on a Mac has it too, but no Apple GPU); GPU: the
+      kernel's asahi driver bound to "apple,agx-..." (/sys/class/drm/*/device/uevent), reached through Vulkan
+
+    {"apple", "os", "chip", "soc", "gpu" ("metal" | "asahi" | None), "rosetta", "how"}"""
+    if MAC:
+        arm = _sysctl("hw.optional.arm64") == "1"
+        return {"apple": arm, "os": "macos", "chip": _sysctl("machdep.cpu.brand_string") or None, "soc": None,
+                "gpu": "metal" if arm else None, "rosetta": _sysctl("sysctl.proc_translated") == "1",
+                "how": "sysctl hw.optional.arm64"}
+    info = {"apple": False, "os": platform.system().lower(), "chip": None, "soc": None, "gpu": None, "rosetta": False, "how": ""}
+    if platform.system() != "Linux":
+        return info
+    compat = [c.decode(errors="replace") for c in _read("/proc/device-tree/compatible", True).split(b"\0") if c]
+    soc = next((c.split(",", 1)[1] for c in compat if c.startswith("apple,") and c.split(",", 1)[1] in CHIPS), None)
+    if any(c.startswith("apple,") for c in compat):
+        info.update(apple=True, soc=soc, chip=CHIPS.get(soc or "", "Apple Silicon"), how="device tree " + " ".join(compat))
+    elif any(l.split(":")[-1].strip() == "0x61" for l in _read("/proc/cpuinfo").splitlines() if l.startswith("CPU implementer")):
+        info.update(apple=True, chip="Apple Silicon (no device tree: a VM?)", how="/proc/cpuinfo CPU implementer 0x61")
+    try:
+        cards = os.listdir("/sys/class/drm")
+    except OSError:
+        cards = []
+    for c in cards:
+        ev = _read("/sys/class/drm/%s/device/uevent" % c)
+        if "DRIVER=asahi" in ev and "apple,agx" in ev:
+            info["gpu"] = "asahi"
+            break
+    return info
+
+
 def say(msg):
     print(msg, flush=True)
 
@@ -132,6 +191,10 @@ def make_venv():
 
 def main():
     os.chdir(ROOT)
+    if sys.argv[1:2] == ["--detect"]:          # what this machine is, as setup sees it
+        import json
+        print(json.dumps(apple_silicon(), indent=1))
+        return
     if MAC:
         command_line_tools()
         brew_on_path()
