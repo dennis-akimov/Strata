@@ -193,6 +193,18 @@ fn mtime(p: &Path) -> std::time::SystemTime {
     std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH)
 }
 
+/// The config's engine arguments for --plan, with "parallel": N as --batch N the way the server adds it (at most 8):
+/// each batch slot holds a whole context's cache, so three agents need three caches.
+fn plan_args(c: &Value) -> Vec<String> {
+    let mut args: Vec<String> = c["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).filter(|a| *a != "--serve").map(String::from).collect()).unwrap_or_default();
+    if let Some(n) = c["parallel"].as_i64().filter(|n| *n > 1) {
+        if !args.iter().any(|a| a == "--batch" || a == "--slots") {
+            args.extend(["--batch".into(), n.min(8).to_string()]);
+        }
+    }
+    args
+}
+
 /// The engine's own measure of what this config needs (`<exe> --plan <args>`: llama.cpp lays the model and its
 /// buffers out without reading the weights, < 1 s), cached per config and engine file.
 fn plan(cfg_path: &Path) -> Result<Value, String> {
@@ -210,9 +222,8 @@ fn plan(cfg_path: &Path) -> Result<Value, String> {
     if !plans(&exe) {
         return Err("this engine is older than its memory check (--plan): run make build".into());
     }
-    let args: Vec<String> = c["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).filter(|a| *a != "--serve").map(String::from).collect()).unwrap_or_default();
     let mut cmd = Command::new(&exe);
-    cmd.arg("--plan").args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.arg("--plan").args(plan_args(&c)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     if let Some(cwd) = c["cwd"].as_str().filter(|d| Path::new(d).is_dir()) {
         cmd.current_dir(cwd);
     }
@@ -2255,6 +2266,17 @@ mod tests {
         }
         assert!(apps.iter().all(|a| !a["bundle"].as_str().unwrap().starts_with("/System/") && a["name"] != "Strata"));
         eprintln!("{}", apps.iter().map(|a| format!("{} {:.1} GB", a["name"].as_str().unwrap(), a["bytes"].as_f64().unwrap() / 1e9)).collect::<Vec<_>>().join(", "));
+    }
+
+    #[test]
+    fn the_memory_check_counts_parallel_slots() {
+        let c = |v: Value| plan_args(&v);
+        assert_eq!(c(json!({"args": ["--serve", "--gguf", "m"], "parallel": 3})), ["--gguf", "m", "--batch", "3"]);
+        assert_eq!(c(json!({"args": ["--gguf", "m"], "parallel": 20}))[3], "8");                 // the engine's most
+        assert_eq!(c(json!({"args": ["--gguf", "m", "--batch", "2"], "parallel": 3})), ["--gguf", "m", "--batch", "2"]);
+        for p in [json!(1), json!(false), Value::Null, json!("3")] {                                // one request at a time
+            assert_eq!(c(json!({"args": ["--gguf", "m"], "parallel": p})), ["--gguf", "m"]);
+        }
     }
 
     #[test]
