@@ -135,6 +135,7 @@ struct Options {
     std::vector<llama_token> eos = {248044, 248046};   // <|endoftext|>, <|im_end|>: the CUDA engine's --eos-ids
     int n_batch = 2048;
     int checkpoints = 8;
+    int checkpoint_tail = 0;                           // --checkpoint-tail N: the prompt's last N tokens in small chunks
     int threads = 0;
     int spec = 3;                                      // drafted tokens per pass with --mtp, --eagle3 or --dflash
     int batch = 0;                                     // --batch N: batch slots (the server's "parallel")
@@ -180,6 +181,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--kv") o.kv = val("--kv");
         else if (a == "--prefill-batch") o.n_batch = std::atoi(val("--prefill-batch"));
         else if (a == "--checkpoints") o.checkpoints = std::max(0, std::atoi(val("--checkpoints")));
+        else if (a == "--checkpoint-tail") o.checkpoint_tail = std::max(0, std::atoi(val("--checkpoint-tail")));
         else if (a == "--threads") o.threads = std::atoi(val("--threads"));
         else if (a == "--poll") o.poll = std::max(0, std::min(100, std::atoi(val("--poll"))));
         else if (a == "--image-pad-id") g_image_pad = (llama_token) std::atoi(val("--image-pad-id"));
@@ -758,6 +760,14 @@ struct Engine {
         size_t at = resume;
         while (at + 1 < n) {
             size_t end = std::min(n - 1, at + (size_t) o.n_batch);
+            // --checkpoint-tail: the bulk in whole batches, the last N tokens in chunks of 256, each ending at a checkpoint:
+            // a new question after the same document resumes within 256 tokens of where it differs (measured on Qwen3.6, a
+            // 3,042-token prompt: 0.83 s to read a new question at batch 2048, 0.32 s at 256), and only the tail reads slower
+            // ponytail: a fixed 256; a knob when another model wants other chunks
+            if (o.checkpoint_tail > 0) {
+                const size_t tail0 = n - 1 > (size_t) o.checkpoint_tail ? n - 1 - (size_t) o.checkpoint_tail : 0;
+                end = at < tail0 ? std::min(end, tail0) : std::min(end, at + 256);
+            }
             size_t b = at + 1;
             while (b < end && P.ids[b] != im_start) ++b;
             const bool boundary = b < end;

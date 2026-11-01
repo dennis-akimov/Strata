@@ -170,6 +170,26 @@ class TestStrataMetal(unittest.TestCase):
             e.close()
         self.assertEqual(resume, len(head))
 
+    def test_checkpoint_tail_reads_the_end_in_small_chunks(self):
+        # the default batch (2048) reads this whole prompt in one chunk: no checkpoint inside the long message, unless
+        # --checkpoint-tail cuts its last tokens into chunks of 256
+        doc = self.m1 + message(self.e.im_start, list(range(1000, 1700)))
+        resumes = {}
+        for extra in ((), ("--checkpoint-tail", "512")):
+            e = Engine(*extra)
+            try:
+                e.gen(doc + list(range(700, 720)))
+                out, resumes[extra], _ = e.gen(doc + list(range(900, 930)))
+            finally:
+                e.close()
+        self.assertEqual(resumes[()], len(self.m1))                              # back to the message's start
+        self.assertGreater(resumes[("--checkpoint-tail", "512")], len(doc) - 256)  # within one small chunk
+        fresh = Engine()
+        try:
+            self.assertEqual(out, fresh.gen(doc + list(range(900, 930)))[0])
+        finally:
+            fresh.close()
+
     def test_the_latest_inside_checkpoints_are_kept(self):
         # --checkpoints 2: the long message's last two chunk ends; one early in it went, so the message's start serves
         e = Engine("--prefill-batch", "32", "--checkpoints", "2")
