@@ -240,6 +240,8 @@ afm:
 	.venv/bin/python metal/onboard_mac.py --config-only AFM
 
 app: server
+	@# the app runs engine-metal/strata-metal, which only make build refreshes: say so when its source is newer
+	@[ ! -f engine-metal/strata-metal ] || [ engine-metal/strata-metal -nt metal/strata_metal.cpp ] || echo "warning: engine-metal/strata-metal is older than metal/strata_metal.cpp: run make build too (the app keeps using the old engine)"
 	$(CARGO) build --release --manifest-path app/Cargo.toml
 	rm -rf Strata.app && mkdir -p Strata.app/Contents/MacOS
 	cp app/target/release/strata-app Strata.app/Contents/MacOS/Strata

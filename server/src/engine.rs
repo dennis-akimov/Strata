@@ -1322,6 +1322,20 @@ impl StrataEngine {
         self.slots.lock().unwrap().wait_lens.iter().any(|(_, n)| n * 2 <= plen)
     }
 
+    /// STRATA_TRACE=1: which slot a request got and why, in the server's log (the engine traces its own reuse).
+    fn trace_pick(s: &Slots, b: usize, prompt: &[u32]) {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("STRATA_TRACE").is_ok_and(|v| !v.is_empty() && v != "0"));
+        if !*ON {
+            return;
+        }
+        let h = &s.held[b];
+        let common = h.iter().zip(prompt).take_while(|(x, y)| x == y).count();
+        let why = if !h.is_empty() && h.len() < prompt.len() && common == h.len() { "its whole history goes on" }
+                  else if common * 2 >= prompt.len() { "the same start for half the prompt or more" }
+                  else { "least recently used (no slot holds half of this prompt)" };
+        crate::say(&format!("trace slot {b} for a {}-token prompt: it holds {} tokens, {common} of them the prompt's start: {why}", prompt.len(), h.len()));
+    }
+
     /// A free slot for `prompt` (the caller holds the slot lock), None when every slot is busy.
     fn pick_slot(s: &Slots, prompt: &[u32]) -> Option<usize> {
         let free: Vec<usize> = s.order.iter().copied().filter(|b| !s.busy[*b]).collect();
@@ -1479,6 +1493,7 @@ impl StrataEngine {
                         if reserved.is_none() && !emb && yields < YIELDS_MAX && me2.shorter_waiting(prompt.len()) {
                             let mut s = me2.slots.lock().unwrap();
                             if let Some(r) = Self::pick_slot(&s, &prompt) {
+                                Self::trace_pick(&s, r, &prompt);
                                 s.busy[r] = true;
                                 s.claims.insert(r);
                                 reserved = Some(r);
@@ -1519,6 +1534,7 @@ impl StrataEngine {
                             {
                                 let mut s = self.slots.lock().unwrap();
                                 if let Some(b) = Self::pick_slot(&s, &prompt) {
+                                    Self::trace_pick(&s, b, &prompt);
                                     s.busy[b] = true;
                                     s.claims.insert(b);
                                     if admit_wait {

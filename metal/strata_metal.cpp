@@ -79,6 +79,11 @@ void out(const char* fmt, ...) {
 // STOP has to reach a running request, so stdin is read on its own thread.  A GEN line clears the stop flag before
 // it is queued: a STOP the server sent for an earlier request (after that one's DONE) cannot cancel the next.
 std::atomic<bool> g_stop{false};
+// STRATA_TRACE=1: why a prompt is read again or not (each checkpoint taken or skipped, each rollback) on stderr, the
+// run config's log.  Off by default: debug-level lines (RFC 5424 severity 7); llama.cpp hides its own "full prompt
+// re-processing" line the same way, at trace verbosity.
+static const bool g_trace = [] { const char* v = std::getenv("STRATA_TRACE"); return v && *v && std::strcmp(v, "0") != 0; }();
+#define TRACE(...) do { if (g_trace) { std::fprintf(stderr, "strata-metal: trace " __VA_ARGS__); std::fputc('\n', stderr); } } while (0)
 std::unique_ptr<std::atomic<bool>[]> g_bstop;   // BSTOP <slot>: that slot ends at its next window
 int g_slots = 0;
 std::mutex g_mu;
@@ -497,7 +502,11 @@ struct Engine {
     void checkpoint(llama_seq_id sq, size_t n, llama_pos pos, bool inside) {
         if (o.checkpoints == 0) return;
         Checkpoint c{n, pos, state(ctx, sq), {}, {}, inside};
-        if (c.tgt.empty()) return;
+        if (c.tgt.empty()) {
+            TRACE("seq %d: no checkpoint at %zu: the model keeps no partial state to save", sq, n);
+            return;
+        }
+        TRACE("seq %d: checkpoint at %zu (pos %d, %s, %zu bytes)", sq, n, (int) pos, inside ? "inside a message" : "boundary", c.tgt.size());
         if (sq == 0 && ctx_dft) c.dft = state(ctx_dft, 0);
         if (sq == 0 && spec) common_speculative_get_state(spec, 0, c.spec);
         auto& ck = seqs[(size_t) sq].ckpts;
@@ -517,6 +526,7 @@ struct Engine {
     void rollback(llama_seq_id sq, size_t p) {
         Seq& S = seqs[(size_t) sq];
         while (!S.ckpts.empty() && S.ckpts.back().n > p) S.ckpts.pop_back();
+        if (S.ckpts.empty()) TRACE("seq %d: back to %zu of %zu held: no checkpoint at or below it, reading the prompt again", sq, p, S.live.size());
         if (!S.ckpts.empty()) {
             const Checkpoint& c = S.ckpts.back();
             bool ok = llama_state_seq_set_data_ext(ctx, c.tgt.data(), c.tgt.size(), sq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
@@ -537,6 +547,7 @@ struct Engine {
                 --n;
             }
             if (ok) {
+                TRACE("seq %d: back to %zu of %zu held: restored the checkpoint at %zu", sq, p, S.live.size(), n);
                 S.live.resize(n);
                 S.keys.resize(n);
                 return;
@@ -726,8 +737,12 @@ struct Engine {
             const bool busy = other > 0 && slots[other - 1].active;
             if ((llama_seq_id) other == sq || busy) continue;
             const size_t q = prefix(seqs[other]);
-            if (q > p + 16 && copy_seq((llama_seq_id) other, sq)) p = q;
+            if (q > p + 16 && copy_seq((llama_seq_id) other, sq)) {
+                TRACE("seq %d: copied idle seq %zu, which holds %zu of the prompt's start (this one %zu)", sq, other, q, p);
+                p = q;
+            }
         }
+        TRACE("seq %d: prompt %zu, the same start %zu of %zu held, %zu checkpoints", sq, n, p, S.live.size(), S.ckpts.size());
         p = std::min(p, n - 1);
         if (p < S.live.size()) rollback(sq, p);
         const size_t resume = S.live.size();
@@ -755,6 +770,8 @@ struct Engine {
             // ponytail: the M-RoPE and EAGLE3 cases have no test model here (LFM2-350M's images are not M-RoPE)
             if (P.pos[at][0] > P.pos[at - 1][0] && (at < 2 || P.pos[at - 1][0] > P.pos[at - 2][0]))
                 checkpoint(sq, at, P.pos[at][0], P.ids[at] != im_start);
+            else
+                TRACE("seq %d: no checkpoint at %zu: an image's rows share its position", sq, at);
             const double ms = ms_since(t0);
             out("PP %zu %zu %.0f %.1f\n", at, n, ms, (at - resume) / std::max(1e-3, ms / 1000.0));
             if (g_stop) { cancelled = true; finish = "cancel"; break; }

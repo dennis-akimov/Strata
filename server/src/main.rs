@@ -350,6 +350,13 @@ fn main() {
         cfg.insert("gpu".into(), g.trim().parse::<i64>().map(Value::from).unwrap_or(json!(g)));
     }
     let cfgv = Value::Object(cfg.clone());
+    // "trace": true - STRATA_TRACE=1 for this server and its engine (Strata.app starts the server, so no shell sets it):
+    // which slot each request gets and why, and why the engine reads a prompt again or not
+    if get(&cfgv, "trace") == &json!(true) && std::env::var_os("STRATA_TRACE").is_none() {
+        // SAFETY: still one thread here - the runtime, the engine and the firewall sampler start below
+        unsafe { std::env::set_var("STRATA_TRACE", "1") };
+        say("trace on (\"trace\": true): slot choices here, the engine's reuse in this config's log");
+    }
     strata_server::firewall::start(get(&cfgv, "firewall"), a.engine == "strata"); // history, connection sampler, the kernel's sandbox log
     let host = a.host.clone().or_else(|| get(&cfgv, "host").as_str().filter(|h| !h.is_empty()).map(String::from)).unwrap_or_else(|| "127.0.0.1".into());
     // before the minutes of loading: is the port free?
