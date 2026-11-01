@@ -55,6 +55,7 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   <span class="dot" id="dot"></span><span id="phase">stopped</span>
   <select id="cfg" title="run config (strata-*.json in the Strata folder; port from the config)"></select>
   <select id="ctx" title="the context window: the longest conversation the model keeps (more needs more memory)"></select>
+  <select id="cache" title="conversation cache: RAM that keeps conversations another one displaced, so they come back without being read again (RAM, not the GPU's share; a running server restarts)"></select>
   <select id="par" title="agents: requests answered at once by one engine and one copy of the weights, each with its own context (more needs more memory; a running server restarts)"></select>
   <button id="refresh" title="look for models again (a new run config, a download that finished)">↻</button>
   <span id="memwrap"><span id="mem" class="chip" title="what this model needs at this context, against what this Mac has">memory …</span>
@@ -99,16 +100,20 @@ function init(s){
   $('cfg').innerHTML=s.configs.map(c=>{const l=name(c)+(c.problem?' (not ready)':''),sh=c.name.replace(/^strata-|\.json$/g,'');
     return `<option value="${esc(c.path)}"${c.problem?' disabled':''} data-s="${esc(sh)}" data-l="${esc(l)}">${esc(l)}</option>`;}).join('')||'<option>no run config yet: make setup</option>';
   const cur=s.configs.find(c=>c.path===s.config),pn=cur?cur.parallel||1:1;
+  const cm=cur?cur.cache_mib||0:0,cachev=[0,2048,4096,8192,16384,32768].concat([0,2048,4096,8192,16384,32768].includes(cm)?[]:[cm]).sort((a,b)=>a-b);
+  $('cache').innerHTML=cachev.map(v=>{const g=Math.round(v/1024*10)/10;return `<option value="${v}"${v===cm?' selected':''} data-s="${v?'cache '+g+' GB':'no cache'}" data-l="${v?`conversation cache ${g} GB of RAM: displaced conversations come back without reading them again`:'no conversation cache: a displaced conversation is read again'}"></option>`;}).join('');
   $('par').innerHTML=[1,2,3,4,5,6,7,8].map(n=>`<option value="${n}"${n===pn?' selected':''} data-s="${n===1?'1 agent':n+' agents'}" data-l="${n===1?'1 agent: one request at a time':n+' agents at once, each with its own context'}"></option>`).join('');
   const bad=s.configs.filter(c=>c.problem);
   $('notready').innerHTML=bad.length?'<b>Not ready yet:</b>'+bad.map(c=>`<div>${esc(name(c))}: ${esc(c.problem)}</div>`).join(''):'';
-  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;shorten($('cfg'));shorten($('par'));
+  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;shorten($('cfg'));shorten($('par'));shorten($('cache'));
   base=`http://127.0.0.1:${s.port}`;$('url').textContent=`127.0.0.1:${s.port}`;
   $('log').textContent='';(s.log||[]).forEach(log);
   $('where').textContent=s.server?`${s.root}`:'engine-metal/strata-server is missing: run `make server` in '+s.root;
   status({...s.status,phase:s.phase,running:s.running});
 }
+let cacheStat=null;
 function status(s){
+  if(s.conversation_cache!==undefined){cacheStat=s.conversation_cache;if($('mempop').classList.contains('open'))memsum();}
   const ph=s.phase||'stopped';const was=running;running=!!s.running;if(was!==running)send('memory');
   $('phase').textContent=ph;$('dot').style.background=COLORS[ph]||COLORS.stopped;
   $('start').disabled=running;$('start2').hidden=running;$('stop').disabled=!running||ph==='stopping';$('restart').disabled=!running;
@@ -170,7 +175,8 @@ document.addEventListener('click',e=>{const b=e.target.closest('.applist button'
 function memsum(){
   const m=mem||{},s=sysMem,row=(a,b)=>`<div class="row"><span>${a}</span><span>${b}</span></div>`;
   let h=`<h3>Strata</h3>`+(m.need!=null?row(`this model at context ${k(m.context||0)}`,gb(m.need))+row('the GPU can use',gb(m.limit)):'')+
-    (strataMem!=null?row('Strata\'s processes (its GPU memory is in wired)',gb(strataMem)):'');
+    (strataMem!=null?row('Strata\'s processes (its GPU memory is in wired)',gb(strataMem)):'')+
+    (cacheStat&&cacheStat.enabled?row('conversation cache (RAM)',`${gb(cacheStat.bytes||0).replace(' GB','')} / ${Math.round(cacheStat.budget_mib/1024)} GB · ${cacheStat.parked||0} kept · ${cacheStat.restores||0} back`):'');
   // the whole Mac in binary GB, as Activity Monitor and macOS's "128 GB" count it
   const gib=b=>b==null?'–':(b/2**30).toFixed(1)+' GB';
   if(s){const p=s.pressure,c=p==null?'var(--line)':p<50?'#34c759':p<80?'#ff9f0a':'#ff453a';
@@ -268,12 +274,14 @@ function note(m){$('note').textContent=m;if(up&&!$('log').classList.contains('op
 $('cfg').onchange=()=>send('select',{config:$('cfg').value});
 $('refresh').onclick=()=>send('init');
 // the popover needs the whole window: the bar's own view is only the bar's height while the chat shows below it
-$('mem').onclick=()=>{if($('mempop').classList.toggle('open'))send('apps');layout();};
+$('mem').onclick=()=>{const p=$('mempop');if(p.classList.toggle('open')){memsum();send('apps');
+  p.style.left='0px';const r=p.getBoundingClientRect();if(r.right>innerWidth-8)p.style.left=Math.min(0,innerWidth-8-r.right)+'px';}layout();};   // kept inside the window
 $('par').onchange=()=>{send('set_parallel',{n:+$('par').value});$('mem').textContent='memory …';};
+$('cache').onchange=()=>send('set_cache',{mib:+$('cache').value});
 // a picker shows the short name when closed and the whole line in its list (its width held while the list is open)
 function shorten(sel){sel.style.width='';for(const o of sel.options)if(o.dataset.s!=null)o.textContent=o.dataset.s;}
 function lengthen(sel){if(sel.style.width)return;sel.style.width=sel.offsetWidth+'px';for(const o of sel.options)if(o.dataset.l!=null)o.textContent=o.dataset.l;}
-for(const id of ['cfg','ctx','par']){const sel=$(id);sel.addEventListener('mousedown',()=>lengthen(sel));sel.addEventListener('keydown',()=>lengthen(sel));
+for(const id of ['cfg','ctx','par','cache']){const sel=$(id);sel.addEventListener('mousedown',()=>lengthen(sel));sel.addEventListener('keydown',()=>lengthen(sel));
   sel.addEventListener('change',()=>shorten(sel));sel.addEventListener('blur',()=>shorten(sel));}
 $('ctx').onchange=()=>{const o=mem&&mem.options.find(o=>o.ctx===+$('ctx').value);if(o)setCtx(o);};
 $('autostart').onchange=e=>send('autostart',{on:e.target.checked});
