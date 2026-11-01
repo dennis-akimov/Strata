@@ -40,6 +40,26 @@ Measured on one MacBook Pro with an M5 Max (40-core GPU, 128 GB), macOS 26.4, in
 
 ‡ Measured 2026-10-13 on 300-token answers, against 91-99 tokens/s without the draft in the same runs: the draft helps math, not chat.
 
+**Several agents at once.** One model can answer several requests at the same time: `"parallel": N` in the run config
+(2-8), or the *agents* menu in Strata.app. It is one engine on one port with one copy of the weights; each agent gets
+its own conversation cache, and the engine writes all of their answers in the same passes. Qwen3.6-35B-A3B (MXFP4_MOE)
+on the M5 Max, 2026-11-01, 256-token answers to four different 590-token chat prompts, thinking off, the engine driven
+directly:
+
+| Agents at once | Tokens/s together | Tokens/s each | Memory at a 128K context |
+| ---: | ---: | ---: | ---: |
+| 1 | 98.6 | 98.6 | 26.5 GB |
+| 2 | 148.7 | 74.4 | |
+| 3 | 171.6 | 57.2 | 34.8 GB |
+| 4 | 190.5 | 47.6 | 37.5 GB |
+
+- Four agents write 1.9x what one does, each at about half the speed. Three copies of the model instead would hold
+  the 22 GB of weights three times and share the same GPU.
+- An agent's new prompt is read before the others go on: an 18,605-token one took 11 s (about 1,700 tokens/s), and
+  the two agents already answering wrote 3 tokens meanwhile. A follow-up message reads only what is new, so these
+  pauses are usually short.
+- Each agent's context gets its own cache (here 128K each); the memory column is the engine's own measure (`--plan`).
+
 On a 16 GB Mac: a 13-inch MacBook Pro with the M1 (2020), 2026-10-29/30, short answers, on macOS and on Linux on the
 same Mac:
 
