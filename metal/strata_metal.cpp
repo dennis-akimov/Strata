@@ -749,9 +749,11 @@ struct Engine {
             if (boundary) end = b;
             if (!feed(sq, P, at, end, false, err, !geni)) { clear(sq); return refuse(err); }
             at = end;
-            // a boundary is the cut's own token (a chunk can end right before an <|im_start|>); inside a message, only
-            // where seq_rm from the cut's position keeps every held cell (an M-RoPE image's rows share one position)
-            if (P.ids[at] == im_start || P.pos[at][0] > P.pos[at - 1][0])
+            // only where seq_rm from the cut's position keeps every held cell (an M-RoPE image's rows share one
+            // position), and from the cell before it too (rollback's EAGLE3 rule cuts one more); a boundary is the cut's
+            // own token (a chunk can end right before an <|im_start|>)
+            // ponytail: the M-RoPE and EAGLE3 cases have no test model here (LFM2-350M's images are not M-RoPE)
+            if (P.pos[at][0] > P.pos[at - 1][0] && (at < 2 || P.pos[at - 1][0] > P.pos[at - 2][0]))
                 checkpoint(sq, at, P.pos[at][0], P.ids[at] != im_start);
             const double ms = ms_since(t0);
             out("PP %zu %zu %.0f %.1f\n", at, n, ms, (at - resume) / std::max(1e-3, ms / 1000.0));
