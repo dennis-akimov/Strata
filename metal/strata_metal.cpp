@@ -136,6 +136,9 @@ struct Options {
     int n_batch = 2048;
     int checkpoints = 8;
     int checkpoint_tail = 0;                           // --checkpoint-tail N: the prompt's last N tokens in small chunks
+    int64_t cache_mib = 0;                             // --conversation-cache-mib N: displaced conversations kept in RAM
+    int cache_slots = 16;                              // --conversation-cache-slots K: at most K of them
+    int64_t cache_min_tokens = 0;                      // --conversation-cache-min-tokens N: none shorter than N
     int threads = 0;
     int spec = 3;                                      // drafted tokens per pass with --mtp, --eagle3 or --dflash
     int batch = 0;                                     // --batch N: batch slots (the server's "parallel")
@@ -182,6 +185,9 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--prefill-batch") o.n_batch = std::atoi(val("--prefill-batch"));
         else if (a == "--checkpoints") o.checkpoints = std::max(0, std::atoi(val("--checkpoints")));
         else if (a == "--checkpoint-tail") o.checkpoint_tail = std::max(0, std::atoi(val("--checkpoint-tail")));
+        else if (a == "--conversation-cache-mib") o.cache_mib = std::max(0LL, std::atoll(val("--conversation-cache-mib")));
+        else if (a == "--conversation-cache-slots") o.cache_slots = std::max(1, std::atoi(val("--conversation-cache-slots")));
+        else if (a == "--conversation-cache-min-tokens") o.cache_min_tokens = std::max(0LL, std::atoll(val("--conversation-cache-min-tokens")));
         else if (a == "--threads") o.threads = std::atoi(val("--threads"));
         else if (a == "--poll") o.poll = std::max(0, std::min(100, std::atoi(val("--poll"))));
         else if (a == "--image-pad-id") g_image_pad = (llama_token) std::atoi(val("--image-pad-id"));
@@ -309,6 +315,16 @@ struct Seq {
     std::deque<Checkpoint> ckpts;             // ascending n
 };
 
+// The conversation cache (--conversation-cache-mib): a sequence's whole state (its K/V, the recurrent part and its
+// checkpoints) kept in RAM when another conversation takes the sequence, given back when a prompt starts with it
+// again.  The same exact content keys as the live sequences decide a match, so nothing unrelated is ever restored.
+struct Parked {
+    Seq seq;
+    std::vector<uint8_t> state;               // llama_state_seq_get_data: the sequence as it was
+    size_t bytes = 0;                         // the state, the checkpoints and the keys
+    uint64_t used = 0;                        // the park clock when it was parked (the oldest goes first)
+};
+
 // A batch slot decoding between requests (after its BGEN admission): one token a window, its own sampler.
 struct Slot {
     bool active = false;
@@ -333,6 +349,9 @@ struct Engine {
     int n_embd = 0;
     std::vector<Seq> seqs;
     std::vector<Slot> slots;
+    std::vector<Parked> parked;
+    uint64_t park_clock = 0;
+    long evictions = 0;
 
     llama_memory_t mem() const { return llama_get_memory(ctx); }
 
@@ -559,9 +578,92 @@ struct Engine {
         clear(sq);
     }
 
+    size_t parked_bytes() const {
+        size_t b = 0;
+        for (const auto& x : parked) b += x.bytes;
+        return b;
+    }
+
+    static size_t prefix_of(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+        size_t q = 0;
+        while (q < a.size() && q < b.size() && a[q] == b[q]) ++q;
+        return q;
+    }
+
+    // Before `sq` loses what it holds to another conversation (keeping `keep` cells of it): into the RAM cache, the
+    // oldest parked ones evicted to make room.  Only when at least half of it goes - a new question after the same
+    // document keeps most of it live and parks nothing.
+    void park(llama_seq_id sq, size_t keep) {
+        Seq& S = seqs[(size_t) sq];
+        const size_t n = S.live.size();
+        if (o.cache_mib == 0 || n == 0 || keep * 2 >= n) return;
+        const size_t budget = (size_t) o.cache_mib << 20;
+        if ((int64_t) n < o.cache_min_tokens) {
+            out_cache("skipped", n, "below the minimum");
+            return;
+        }
+        for (auto& x : parked)                // already there with as much or more of it
+            if (prefix_of(x.seq.keys, S.keys) == n) { x.used = ++park_clock; return; }
+        const size_t before = parked.size();  // and what this one supersedes goes
+        parked.erase(std::remove_if(parked.begin(), parked.end(), [&](const Parked& x) { return prefix_of(x.seq.keys, S.keys) == x.seq.keys.size(); }), parked.end());
+        if (parked.size() != before) TRACE("conversation cache: dropped %zu superseded by seq %d", before - parked.size(), sq);
+        Parked e;
+        e.state.resize(llama_state_seq_get_size(ctx, sq));
+        if (e.state.empty() || llama_state_seq_get_data(ctx, e.state.data(), e.state.size(), sq) == 0) return;
+        e.seq = S;                            // a copy: the caller decides what the sequence holds next
+        for (auto& c : e.seq.ckpts) { c.dft.clear(); c.spec.clear(); }   // the drafter starts from new tokens anyway
+        e.bytes = e.state.size() + e.seq.keys.size() * (sizeof(uint64_t) + sizeof(llama_token));
+        for (const auto& c : e.seq.ckpts) e.bytes += c.tgt.size();
+        if (e.bytes > budget) {
+            out_cache("skipped", n, "larger than the budget");
+            return;
+        }
+        while (!parked.empty() && ((int) parked.size() >= o.cache_slots || parked_bytes() + e.bytes > budget)) {
+            parked.erase(std::min_element(parked.begin(), parked.end(), [](const Parked& a, const Parked& b) { return a.used < b.used; }));
+            ++evictions;
+        }
+        e.used = ++park_clock;
+        parked.push_back(std::move(e));
+        out_cache("parked", n, sq);
+    }
+
+    // The parked conversation that starts this prompt furthest, when it gives more than `p` cells: moved into `sq`
+    // (what `sq` held is parked first).  The cells it gives, or `p` when none does.
+    size_t restore(llama_seq_id sq, const std::vector<uint64_t>& keys, size_t p) {
+        size_t best = parked.size(), q = p;
+        for (size_t i = 0; i < parked.size(); ++i) {
+            const size_t m = prefix_of(parked[i].seq.keys, keys);
+            if (m > q + 16) { q = m; best = i; }
+        }
+        if (best == parked.size()) return p;
+        Parked e = std::move(parked[best]);
+        parked.erase(parked.begin() + (long) best);
+        park(sq, p);
+        llama_memory_seq_rm(mem(), sq, -1, -1);
+        if (llama_state_seq_set_data(ctx, e.state.data(), e.state.size(), sq) == 0) {
+            clear(sq);
+            std::fprintf(stderr, "strata-metal: conversation cache: could not restore %zu tokens; reading the prompt again\n", e.seq.live.size());
+            return 0;
+        }
+        seqs[(size_t) sq] = std::move(e.seq);
+        if (sq == 0 && ctx_dft) llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+        out_cache("restored", seqs[(size_t) sq].live.size(), sq);
+        return q;
+    }
+
+    // the CUDA engine's log line, which the server reads into /metrics ("conversation_cache")
+    void out_cache(const char* what, size_t n, llama_seq_id sq) {
+        std::fprintf(stderr, "strata-metal: conversation cache: %s %zu tokens (seq %d) parked=%zu bytes=%zu evictions=%ld\n", what, n, sq,
+                     parked.size(), parked_bytes(), evictions);
+    }
+    void out_cache(const char* what, size_t n, const char* why) {
+        std::fprintf(stderr, "strata-metal: conversation cache: %s %zu tokens (%s) parked=%zu bytes=%zu\n", what, n, why, parked.size(), parked_bytes());
+    }
+
     // Another sequence's whole state into `dst` (the solo request that a second request turned into a batch slot, and
     // back): the prompt it already read is not read again.  false: dst is left empty.
     bool copy_seq(llama_seq_id src, llama_seq_id dst) {
+        park(dst, prefix_of(seqs[(size_t) dst].keys, seqs[(size_t) src].keys));
         clear(dst);
         std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, src));
         if (buf.empty() || llama_state_seq_get_data(ctx, buf.data(), buf.size(), src) == 0 ||
@@ -744,9 +846,13 @@ struct Engine {
                 p = q;
             }
         }
+        if (o.cache_mib > 0) p = restore(sq, P.keys, p);
         TRACE("seq %d: prompt %zu, the same start %zu of %zu held, %zu checkpoints", sq, n, p, S.live.size(), S.ckpts.size());
         p = std::min(p, n - 1);
-        if (p < S.live.size()) rollback(sq, p);
+        if (p < S.live.size()) {
+            park(sq, p);
+            rollback(sq, p);
+        }
         const size_t resume = S.live.size();
         out("RESUME %zu\n", resume);
 
@@ -1022,9 +1128,10 @@ int main(int argc, char** argv) {
     const char* backend = "vulkan";
 #endif
     out("INFO engine=" STRATA_VERSION "-metal backend=%s llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
-        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu grammar=1\n", backend,
+        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu grammar=1 "
+        "conversation_cache_mib=%lld conversation_cache_slots=%d\n", backend,
         (long long) e.o.max_context, e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0,
-        e.spec ? e.o.spec : 0, gpu_used, gpu_total);
+        e.spec ? e.o.spec : 0, gpu_used, gpu_total, (long long) e.o.cache_mib, e.o.cache_mib > 0 ? e.o.cache_slots : 0);
     out("READY %lld stop\n", (long long) e.o.max_context);
     g_slots = e.o.batch;
     g_bstop.reset(new std::atomic<bool>[(size_t) std::max(1, g_slots)]());

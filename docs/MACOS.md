@@ -202,6 +202,8 @@ thumb: 8-16 GB): set too high, the whole Mac can slow down or stop responding un
 | DFlash draft model (`--dflash`) | opt-in, for GPT-OSS 120B: faster on math, slower on chat ([below](#gpt-oss-120b-with-a-dflash-draft)) |
 | EAGLE3 draft model (`--eagle3`) | opt-in engine flag, off: slower than no draft on GPT-OSS ([below](#eagle3-draft-model---eagle3)) |
 | Several requests at once (`"parallel"`) | opt-in, the same as on a PC |
+| Conversation cache in RAM (`--conversation-cache-mib N`, `--conversation-cache-slots K`, `--conversation-cache-min-tokens N` in `args`) | opt-in: a conversation another one displaced comes back from RAM instead of being read again (Qwen3.6-35B, a 3,042-token document: 2.55 s -> 0.33 s; about 0.46 GB per such entry) |
+| `--checkpoint-tail N` in `args` | opt-in: the prompt's last N tokens read in chunks of 256, each a checkpoint, so a new question after the same document resumes within 256 tokens (0.81 s -> 0.38 s on that document; its first read 0.5 s slower) |
 | Monitor tab | GPU load, memory and power, the chip's temperature (its die sensors), CPU, RAM; PCIe shows "n/a" (an integrated GPU has no PCIe link) |
 | Expert cache, CPU experts, rope scaling, Intel Macs | no |
 

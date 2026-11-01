@@ -170,6 +170,46 @@ class TestStrataMetal(unittest.TestCase):
             e.close()
         self.assertEqual(resume, len(head))
 
+    def test_a_displaced_conversation_comes_back_from_the_ram_cache(self):
+        # document A, then document B in the same sequence (A's cells are gone), then a new question on A: the RAM
+        # cache gives A back instead of reading it again, and the answer is the one a fresh engine gives
+        s = self.e.im_start
+        doc_a = self.m1 + message(s, list(range(1000, 1300)))
+        doc_b = self.m1 + message(s, list(range(2000, 2300)))
+        resumes = {}
+        for extra in ((), ("--conversation-cache-mib", "512")):
+            e = Engine("--prefill-batch", "64", *extra)
+            try:
+                if extra:
+                    self.assertEqual(e.info.get("conversation_cache_mib"), "512")
+                e.gen(doc_a + list(range(700, 720)))
+                e.gen(doc_b + list(range(700, 720)))
+                out, resumes[extra], _ = e.gen(doc_a + list(range(900, 930)))
+            finally:
+                e.close()
+        self.assertEqual(resumes[()], len(self.m1))                       # without it: back to the shared start
+        self.assertGreater(resumes[("--conversation-cache-mib", "512")], len(doc_a) - 64)
+        fresh = Engine()
+        try:
+            self.assertEqual(out, fresh.gen(doc_a + list(range(900, 930)))[0])
+        finally:
+            fresh.close()
+
+    def test_the_ram_cache_evicts_the_oldest_conversation(self):
+        # two cache slots, four documents: A and B are parked, then C evicts A (the oldest); B comes back, A does not
+        s = self.e.im_start
+        docs = [self.m1 + message(s, list(range(b, b + 300))) for b in (1000, 2000, 3000, 4000)]
+        e = Engine("--prefill-batch", "64", "--conversation-cache-mib", "512", "--conversation-cache-slots", "2")
+        try:
+            for d in docs:
+                e.gen(d + list(range(700, 720)))
+            _, back_b, _ = e.gen(docs[1] + list(range(900, 930)))
+            _, back_a, _ = e.gen(docs[0] + list(range(900, 930)))
+        finally:
+            e.close()
+        self.assertGreater(back_b, len(docs[1]) - 64)
+        self.assertEqual(back_a, len(self.m1))
+
     def test_checkpoint_tail_reads_the_end_in_small_chunks(self):
         # the default batch (2048) reads this whole prompt in one chunk: no checkpoint inside the long message, unless
         # --checkpoint-tail cuts its last tokens into chunks of 256
