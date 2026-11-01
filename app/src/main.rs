@@ -228,8 +228,9 @@ fn plan(cfg_path: &Path) -> Result<Value, String> {
 
 /// The apps using the most memory now, the ones a person can quit to give the model room: each app's processes added
 /// up (Chrome's helpers count as Chrome), from top's MEM (it counts compressed memory, unlike ps's RSS) and ps's paths.
-/// macOS's own (/System) and Strata are left out.  [{name, bundle, pid, bytes}], largest first, 150 MB or more.
-fn memory_apps() -> Vec<Value> {
+/// macOS's own (/System) and Strata are left out.  ([{name, bundle, pid, bytes}], largest first, 150 MB or more;
+/// Strata's own processes added up: this app, its server and engine).
+fn memory_apps() -> (Vec<Value>, u64) {
     let me = unsafe { libc::getuid() }.to_string();
     let ps = Command::new("/bin/ps").args(["-axo", "pid=,uid=,comm="]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let top = Command::new("/usr/bin/top").args(["-l", "1", "-stats", "pid,mem"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
@@ -244,6 +245,7 @@ fn memory_apps() -> Vec<Value> {
         Some((f.next()?.parse().ok()?, unit(f.next()?)))
     }).collect();
     let mut apps: HashMap<String, (u64, u32)> = HashMap::new();
+    let mut strata = 0;
     for l in ps.lines() {
         // "  296   501 /Applications/X.app/Contents/MacOS/X": columns padded with spaces, the path may hold spaces too
         let Some((pid, rest)) = l.trim_start().split_once(' ') else { continue };
@@ -261,6 +263,7 @@ fn memory_apps() -> Vec<Value> {
         };
         let name = Path::new(bundle).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if bundle.ends_with("/Strata.app") || name.starts_with("strata-") || pid == std::process::id() {
+            strata += mem.get(&pid).copied().unwrap_or(0);
             continue;
         }
         let e = apps.entry(bundle.to_string()).or_insert((0, 0));
@@ -275,11 +278,38 @@ fn memory_apps() -> Vec<Value> {
         .map(|(k, (b, p))| (k, b, p))
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
-    v.into_iter().take(8).map(|(bundle, bytes, pid)| {
+    let list = v.into_iter().take(8).map(|(bundle, bytes, pid)| {
         let app = bundle.ends_with(".app");
         let name = Path::new(&bundle).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         json!({"name": name, "bundle": bundle, "pid": pid, "bytes": bytes, "app": app})
-    }).collect()
+    }).collect();
+    (list, strata)
+}
+
+/// The whole Mac's memory as Activity Monitor counts it: app (anonymous pages less purgeable), wired, compressed (the
+/// compressor's own pages), the rest free or file cache; pressure is 100 - kern.memorystatus_level; swap in use.
+fn sys_memory() -> Value {
+    let vm = Command::new("/usr/bin/vm_stat").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let sc = Command::new("/usr/sbin/sysctl").args(["-n", "kern.memorystatus_level", "hw.memsize", "vm.swapusage"]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    sys_memory_of(&vm, &sc)
+}
+
+fn sys_memory_of(vm: &str, sc: &str) -> Value {
+    let page = vm.split("page size of ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(16384);
+    let pages = |name: &str| vm.lines().find(|l| l.starts_with(name)).and_then(|l| l.rsplit(':').next()).and_then(|n| n.trim().trim_end_matches('.').parse::<u64>().ok()).unwrap_or(0);
+    let mut l = sc.lines();
+    let level: Option<u64> = l.next().and_then(|x| x.trim().parse().ok());
+    let total: u64 = l.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+    // "total = 17408.00M  used = 15980.56M  free = 1427.44M  (encrypted)"
+    let swap = |k: &str| l.clone().next().and_then(|x| x.split(k).nth(1)).and_then(|r| r.trim_start().split('M').next())
+        .and_then(|n| n.trim().parse::<f64>().ok()).map(|m| (m * 1048576.0) as u64).unwrap_or(0);
+    let app = pages("Anonymous pages").saturating_sub(pages("Pages purgeable")) * page;
+    let wired = pages("Pages wired down") * page;
+    let compressed = pages("Pages occupied by compressor") * page;
+    json!({"total": total, "app": app, "wired": wired, "compressed": compressed,
+        "free": total.saturating_sub(app + wired + compressed), "pressure": level.map(|v| 100u64.saturating_sub(v)),
+        "swap_used": swap("used ="), "swap_total": swap("total =")})
 }
 
 /// Quit an app the way the Dock does (it may ask to save); `force`: SIGKILL its processes (unsaved work is lost).
@@ -1383,7 +1413,8 @@ fn main() {
                 "apps" => {
                     let p = proxy.clone();
                     std::thread::spawn(move || {
-                        let _ = p.send_event(Ev::Apps(json!({"apps": memory_apps()})));
+                        let (apps, strata) = memory_apps();
+                        let _ = p.send_event(Ev::Apps(json!({"apps": apps, "strata": strata, "sys": sys_memory()})));
                     });
                 }
                 "quit_app" => {
@@ -1391,7 +1422,8 @@ fn main() {
                     let (bundle, pid, force) = (v["bundle"].as_str().unwrap_or("").to_string(), v["pid"].as_u64().unwrap_or(0) as u32, v["force"] == true);
                     std::thread::spawn(move || {
                         let still = !bundle.is_empty() && pid > 0 && quit_app(&bundle, pid, force);
-                        let _ = p.send_event(Ev::Apps(json!({"apps": memory_apps(), "still": if still { json!(bundle) } else { Value::Null }})));
+                        let (apps, strata) = memory_apps();
+                        let _ = p.send_event(Ev::Apps(json!({"apps": apps, "strata": strata, "sys": sys_memory(), "still": if still { json!(bundle) } else { Value::Null }})));
                         check_memory(&st2, &p, None);
                     });
                 }
@@ -2217,12 +2249,32 @@ mod tests {
 
     #[test]
     fn lists_the_apps_using_memory() {
-        let apps = memory_apps();
+        let (apps, _) = memory_apps();
         for w in apps.windows(2) {
             assert!(w[0]["bytes"].as_u64() >= w[1]["bytes"].as_u64());
         }
         assert!(apps.iter().all(|a| !a["bundle"].as_str().unwrap().starts_with("/System/") && a["name"] != "Strata"));
         eprintln!("{}", apps.iter().map(|a| format!("{} {:.1} GB", a["name"].as_str().unwrap(), a["bytes"].as_f64().unwrap() / 1e9)).collect::<Vec<_>>().join(", "));
+    }
+
+    #[test]
+    fn reads_the_mac_memory_like_activity_monitor() {
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:     1460547.\nPages wired down:   534861.\n\
+                  Pages purgeable:   17820.\nFile-backed pages:  2135266.\nAnonymous pages:  2898072.\n\
+                  Pages stored in compressor:  4012441.\nPages occupied by compressor:  1274808.\n";
+        let m = sys_memory_of(vm, "77\n137438953472\ntotal = 17408.00M  used = 15980.56M  free = 1427.44M  (encrypted)\n");
+        assert_eq!(m["app"], (2898072u64 - 17820) * 16384);              // anonymous less purgeable, not "stored in"
+        assert_eq!(m["wired"], 534861u64 * 16384);
+        assert_eq!(m["compressed"], 1274808u64 * 16384);                // the compressor's own pages
+        assert_eq!(m["pressure"], 23);
+        assert_eq!(m["free"], 137438953472u64 - (2898072 - 17820 + 534861 + 1274808) * 16384);
+        assert_eq!(m["swap_used"], (15980.56f64 * 1048576.0) as u64);
+        assert_eq!(m["swap_total"], 17408u64 * 1048576);
+        let none = sys_memory_of("", "");                               // sysctl or vm_stat missing: nothing made up
+        assert_eq!(none["pressure"], Value::Null);
+        assert_eq!(none["free"], 0);
+        let live = sys_memory();
+        assert!(live["total"].as_u64().unwrap() > 0 && live["pressure"].as_u64().unwrap() <= 100, "{live}");
     }
 
     #[test]

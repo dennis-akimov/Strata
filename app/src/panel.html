@@ -15,6 +15,11 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
 #more{position:relative}#menu{display:none;position:absolute;right:0;top:28px;z-index:9;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px;min-width:220px;box-shadow:0 6px 24px #0003}
 #menu.open{display:block}#menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:6px 8px}#menu button:hover{background:var(--bg)}
 #menu label{display:block;padding:6px 8px}
+#memwrap{position:relative}#mem{cursor:pointer}#refresh{padding:2px 7px}
+#mempop{display:none;position:absolute;left:0;top:28px;z-index:9;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;width:380px;max-width:90vw;box-shadow:0 6px 24px #0003}
+#mempop.open{display:block}#mempop h3{margin:8px 0 4px;font-size:13px}#mempop h3:first-child{margin-top:0}
+#mempop .row{display:flex;justify-content:space-between;font-variant-numeric:tabular-nums;padding:1px 0}
+#mempop .meter{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin:4px 0}#mempop .meter span{display:block;height:100%}
 #main{flex:1;display:flex;flex-direction:column;min-height:0}
 #idle{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:16px;text-align:center}
 #idle h2{margin:0;font-size:20px}#note{color:#ff453a;min-height:1em}
@@ -47,7 +52,9 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   <span class="dot" id="dot"></span><span id="phase">stopped</span>
   <select id="cfg" title="run config (strata-*.json in the Strata folder; port from the config)"></select>
   <select id="ctx" title="the context window: the longest conversation the model keeps (more needs more memory)"></select>
-  <span id="mem" class="chip" title="what this model needs at this context, against what this Mac has">memory …</span>
+  <button id="refresh" title="look for models again (a new run config, a download that finished)">↻</button>
+  <span id="memwrap"><span id="mem" class="chip" title="what this model needs at this context, against what this Mac has">memory …</span>
+    <div id="mempop"><div id="memsum"></div><div class="applist" id="popapps"></div></div></span>
   <button class="main" id="start">Start</button><button id="stop">Stop</button><button id="restart">Restart</button>
   <span class="mute sep">|</span><button id="load">Load model</button><button id="unload">Unload</button>
   <span id="rate" class="mute"></span><span style="flex:1"></span>
@@ -118,8 +125,9 @@ function memory(m){
   if(m.error){chip.className='chip red';chip.textContent='memory ?';chip.title=m.error;$('ctx').innerHTML='';$('memcard').hidden=false;
     $('memcard').innerHTML=`<h3>Memory</h3><div class="verdict red">${esc(m.error)}</div>`;return;}
   chip.className='chip '+m.state;   // what it needs next to what this Mac has: the GPU's share, and what is free right now
-  chip.textContent=`needs ${gb(m.need)} · GPU has ${gb(m.limit)}`+(m.avail!=null?` · ${gb(m.avail)} free`:'')+(m.state==='green'?'':m.state==='amber'?' · tight':' · too big');
-  chip.title=m.advice;
+  chip.textContent=`${gb(m.need).replace(' GB','')} / ${gb(m.limit)}`+(m.state==='green'?'':' ⚠');   // needs / the GPU's share
+  chip.title=`needs ${gb(m.need)} · GPU has ${gb(m.limit)}`+(m.avail!=null?` · ${gb(m.avail)} free`:'')+` · ${m.advice} (click for this Mac's memory)`;
+  memsum();
   $('ctx').innerHTML=m.options.map(o=>`<option value="${o.ctx}" data-b="${o.batch512?1:0}"${o.ctx===m.context?' selected':''}>context ${k(o.ctx)} · ${gb(o.need)}${o.recommended?' · recommended':o.fits?'':' · too big'}${o.batch512?' (batch 512)':''}</option>`).join('');
   const tot=Math.max(m.need,m.limit),pct=b=>(100*b/tot).toFixed(1)+'%';
   $('memcard').hidden=false;
@@ -131,12 +139,12 @@ function memory(m){
     ${m.recommended&&m.recommended.ctx!==m.context?`<div class="acts" style="margin-top:8px"><button id="userec">Use context ${k(m.recommended.ctx)}${m.recommended.batch512?' with batch 512':''} (${gb(m.recommended.need)})</button></div>`:''}`;
   $('memcard').insertAdjacentHTML('beforeend',tips(m));
   if($('userec'))$('userec').onclick=()=>setCtx(m.recommended);
-  if(m.state!=='green'||m.avail!=null&&m.need>m.avail*0.9)send('apps');else for(const el of document.querySelectorAll('.applist'))el.hidden=true;
+  if(m.state!=='green'||m.avail!=null&&m.need>m.avail*0.9)send('apps');else for(const el of document.querySelectorAll('.applist:not(#popapps)'))el.hidden=true;
 }
 // the apps using the most memory: Quit asks the app (it may ask to save), Force quit ends it (unsaved work is lost)
-let appsList=[],stillRunning=null;
+let appsList=[],stillRunning=null,sysMem=null,strataMem=null;
 function apps(a){
-  appsList=a.apps||[];if(a.still)stillRunning=a.still;
+  appsList=a.apps||[];if(a.still)stillRunning=a.still;if(a.sys){sysMem=a.sys;strataMem=a.strata;memsum();}
   const need=mem&&mem.avail!=null&&mem.need>mem.avail?mem.need-mem.avail:0;
   const html=!appsList.length?'':`<h3>${need?`Free ${gb(need)}: quit apps you do not need`:'Apps using the most memory'}</h3>
     <table>${appsList.map((x,i)=>`<tr><td>${esc(x.name)}</td><td class="n">${gb(x.bytes)}</td><td class="b">`+
@@ -151,6 +159,17 @@ document.addEventListener('click',e=>{const b=e.target.closest('.applist button'
   if(b.dataset.f&&!confirm(`Force quit ${x.name}? Unsaved work in it is lost.`))return;
   b.disabled=true;b.textContent=b.dataset.f?'Ending…':'Quitting…';if(b.dataset.f)stillRunning=null;
   send('quit_app',{bundle:x.bundle,pid:x.pid,force:!!b.dataset.f});});
+// the chip's popover: this model against the GPU, Strata's processes now, and the whole Mac as Activity Monitor shows it
+function memsum(){
+  const m=mem||{},s=sysMem,row=(a,b)=>`<div class="row"><span>${a}</span><span>${b}</span></div>`;
+  let h=`<h3>Strata</h3>`+(m.need!=null?row(`this model at context ${k(m.context||0)}`,gb(m.need))+row('the GPU can use',gb(m.limit)):'')+
+    (strataMem!=null?row('Strata now (app, server, engine)',gb(strataMem)):'');
+  if(s){const p=s.pressure,c=p==null?'var(--line)':p<50?'#34c759':p<80?'#ff9f0a':'#ff453a';
+    h+=`<h3>This Mac · ${gb(s.total)}</h3>`+(p!=null?row('memory pressure',p+'%')+`<div class="meter"><span style="width:${p}%;background:${c}"></span></div>`:'')+
+      row('apps',gb(s.app))+row('wired (macOS, the GPU)',gb(s.wired))+row('compressed',gb(s.compressed))+row('free or file cache',gb(s.free))+
+      (s.swap_total?row('swap',`${gb(s.swap_used)} of ${gb(s.swap_total)}`):'');}
+  $('memsum').innerHTML=h;
+}
 // what else would let it fit or run faster: macOS's GPU memory limit, the energy mode (one click each: macOS asks
 // for an administrator's password; the Terminal command beside it for those who prefer it)
 function tips(m){
@@ -238,12 +257,14 @@ function log(line){const l=$('log'),end=l.scrollTop+l.clientHeight>=l.scrollHeig
   while(l.childNodes.length>2000)l.firstChild.remove();if(end)l.scrollTop=l.scrollHeight;}
 function note(m){$('note').textContent=m;if(up&&!$('log').classList.contains('open'))$('logbtn').click();log('── '+m+' ──');}
 $('cfg').onchange=()=>send('select',{config:$('cfg').value});
+$('refresh').onclick=()=>send('init');
+$('mem').onclick=()=>{if($('mempop').classList.toggle('open'))send('apps');};
 $('ctx').onchange=()=>{const o=mem&&mem.options.find(o=>o.ctx===+$('ctx').value);if(o)setCtx(o);};
 $('autostart').onchange=e=>send('autostart',{on:e.target.checked});
 $('start2').onclick=()=>send('start');$('showlog').onclick=e=>{e.preventDefault();$('logbtn').click();};
 $('logbtn').onclick=()=>{$('log').classList.toggle('open');$('logbtn').classList.toggle('on');$('log').scrollTop=1e9;layout();};
 $('morebtn').onclick=e=>{e.stopPropagation();$('menu').classList.toggle('open');};
-document.onclick=()=>$('menu').classList.remove('open');$('menu').onclick=e=>e.stopPropagation();
+document.onclick=e=>{$('menu').classList.remove('open');if(!e.target.closest('#memwrap'))$('mempop').classList.remove('open');};$('menu').onclick=e=>e.stopPropagation();
 for(const id of ['start','stop','restart','load','unload','browser','edit_config','reveal','engine_log','copy_key'])
   $(id).onclick=()=>{$('menu').classList.remove('open');send(id);};
 send('init');send('system');
