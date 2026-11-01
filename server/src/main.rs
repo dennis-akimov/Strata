@@ -306,6 +306,23 @@ fn engines_in(ps: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether this server can listen on host:port.  On a wildcard host the loopback address is tried too: the socket's
+/// SO_REUSEADDR lets 0.0.0.0:8080 bind beside another program's 127.0.0.1:8080 (a Docker port), and then the app and
+/// every local client reach that program instead of this server.
+fn port_free(host: &str, port: u16) -> std::io::Result<()> {
+    let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.to_string() }, port);
+    std::net::TcpListener::bind(&addr)?;
+    let lo = match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        _ => return Ok(()),
+    };
+    match std::net::TcpListener::bind((lo, port)) {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(e),
+        _ => Ok(()), // no loopback of that family here: nothing to shadow
+    }
+}
+
 fn listen_problem(host: &str, port: u16, e: &std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::AddrInUse => format!("port {port} is already in use - is Strata (or another server) already running? Close it, or start this one with a different --port"),
@@ -337,7 +354,7 @@ fn main() {
     let host = a.host.clone().or_else(|| get(&cfgv, "host").as_str().filter(|h| !h.is_empty()).map(String::from)).unwrap_or_else(|| "127.0.0.1".into());
     // before the minutes of loading: is the port free?
     let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.clone() }, a.port);
-    if let Err(e) = std::net::TcpListener::bind(&addr) {
+    if let Err(e) = port_free(&host, a.port) {
         let holders = if e.kind() == std::io::ErrorKind::AddrInUse { port_holders(a.port) } else { vec![] };
         let ours: Vec<&(i32, String)> = holders.iter().filter(|(_, c)| is_strata_server(c)).collect();
         if ours.is_empty() || ours.len() != holders.len() {
@@ -712,5 +729,22 @@ mod engine_guard_tests {
         let ps = "    1 /sbin/launchd\n 2148 /home/dadmin/Strata/engine-metal/strata-metal --serve --gguf m.gguf\n 2141 engine-metal/strata-server --engine strata\n  77 strata-metal\n 99 /usr/bin/strata-metal-helper\n 120 /Users/x/My Apps/Strata/engine-metal/strata-metal --serve\n 17790 /Users/x/Strata/engine-metal/strata-metal --plan --gguf m.gguf --max-context 8192\n 300 vim notes-about-strata-metal.txt\n";
         assert_eq!(engines_in(ps), ["2148", "77", "120"]);
         assert!(engines_in("  1 /sbin/init\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::port_free;
+
+    #[test]
+    fn a_wildcard_host_is_refused_when_another_program_has_the_loopback_port() {
+        // a Docker port: 127.0.0.1:P held by another program, this server asked for 0.0.0.0:P
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = other.local_addr().unwrap().port();
+        assert!(std::net::TcpListener::bind(("0.0.0.0", p)).is_ok(), "the wildcard alone binds beside it (SO_REUSEADDR)");
+        assert_eq!(port_free("0.0.0.0", p).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(port_free("127.0.0.1", p).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        drop(other);
+        assert!(port_free("0.0.0.0", p).is_ok());
     }
 }
