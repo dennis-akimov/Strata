@@ -196,6 +196,64 @@ class TestStrataMetal(unittest.TestCase):
         self.assertTrue(line.startswith("ERR") and "json_schema" in line, line)
         self.assertEqual(len(self.e.gen(self.m1, max_new=3)[0]), 3)
 
+    def test_a_lazy_json_schema_starts_after_its_trigger_token(self):
+        # the server's thinking models: the schema holds from the thinking's end token on (grammar_trigger).  llama.cpp
+        # feeds a lazy grammar its trigger token too: a schema grammar that did not begin with it ended the engine
+        # ("empty grammar stack after accepting </think>").  The first token this model writes stands in for </think>.
+        import json
+        from tools.strata_tokenizer import Tokenizer
+        tok = Tokenizer.from_gguf(GGUF)
+        first = self.e.gen(self.m1, max_new=1)[0][0]
+        schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"],
+                  "additionalProperties": False}
+        keys = f"json_schema={json.dumps(schema).encode().hex()} grammar_trigger={first}"
+        for slot in (None, 0):
+            e = Engine("--batch", "1")
+            try:
+                if slot is None:
+                    e.send(f"GEN 40 {keys} " + ",".join(map(str, self.m1)))
+                else:
+                    e.send(f"BGEN 0 40 {keys} " + ",".join(map(str, self.m1)))
+                toks, done = [], False
+                while not done:
+                    line = e.line()
+                    self.assertFalse(line.startswith("ERR") or line == "", f"slot {slot}: {line or 'the engine ended'}")
+                    f = line.split()
+                    if f[0] == "T" or (f[0] == "BT" and f[1] == "0"):
+                        toks.append(int(f[-1]))
+                    # a slot's admission ends with its own DONE (the first token); the slot goes on until BDONE
+                    done = (slot is None and f[0] == "DONE") or (f[0] == "BDONE" and f[1] == "0")
+                self.assertEqual(toks[0], first)                       # the trigger, freely
+                text = tok.decode(toks[1:]).split("<|im_end|>")[0].strip()
+                try:
+                    answer = json.loads(text)["answer"]
+                except ValueError:
+                    self.fail(f"slot {slot}: not JSON: {text!r} from {toks[:12]}")
+                self.assertIn(answer, ("yes", "no"), f"slot {slot}: {text!r}")
+                self.assertEqual(len(e.gen(self.m1, max_new=2)[0]), 2)  # still in step
+            finally:
+                e.close()
+
+    def test_a_grammar_error_ends_the_request_not_the_engine(self):
+        # a lazy grammar that does not begin with its trigger token makes llama.cpp throw when the trigger comes ("empty
+        # grammar stack after accepting ..."): the request (or the slot) ends, the engine goes on for everyone else
+        first = self.e.gen(self.m1, max_new=1)[0][0]
+        keys = f"grammar={b'root ::= [a-z]+'.hex()} grammar_trigger={first}"
+        e = Engine("--batch", "1")
+        try:
+            e.send(f"GEN 8 {keys} " + ",".join(map(str, self.m1)))
+            while not (line := e.line()).startswith(("ERR", "DONE")):
+                self.assertNotEqual(line, "", "the engine ended")
+            self.assertTrue(line.startswith("ERR") and "sampling" in line, line)
+            self.assertEqual(len(e.gen(self.m1, max_new=2)[0]), 2)
+            e.send(f"BGEN 0 8 {keys} " + ",".join(map(str, self.m1)))
+            while not (line := e.line()).startswith(("BDONE", "ERR")):
+                self.assertNotEqual(line, "", "the engine ended")
+            self.assertTrue(line.startswith(("BDONE 0", "ERR")), line)
+            self.assertEqual(len(e.gen(self.m1, max_new=2)[0]), 2)
+        finally:
+            e.close()
+
     def test_a_displaced_conversation_comes_back_from_the_ram_cache(self):
         # document A, then document B in the same sequence (A's cells are gone), then a new question on A: the RAM
         # cache gives A back instead of reading it again, and the answer is the one a fresh engine gives

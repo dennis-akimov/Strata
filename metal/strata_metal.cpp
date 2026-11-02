@@ -770,6 +770,20 @@ struct Engine {
                 if (err) *err = std::string("json_schema: ") + e.what();
                 return nullptr;
             }
+            // lazy (from the thinking's end token): llama.cpp feeds the grammar its trigger token too, so the schema's
+            // JSON comes after that token and the blank lines after it (else "empty grammar stack after accepting
+            // </think>" ended the engine).  ponytail: the converter's own "root" renamed; a schema whose $ref points at
+            // "#" itself would need its references renamed too
+            if (trigger >= 0) {
+                const size_t at = grammar.rfind("root ::=", 0) == 0 ? 0 : grammar.find("\nroot ::=");
+                if (at == std::string::npos) {
+                    if (err) *err = "json_schema: the grammar has no root rule";
+                    return nullptr;
+                }
+                grammar.replace(at == 0 ? 0 : at + 1, 4, "json-root");
+                grammar = "root ::= <[" + std::to_string(trigger) + "]> [ \\t\\n]{0,4} json-root\n" + grammar;   // bounded: a run of blanks never ends the reply
+            }
+            TRACE("json_schema: %zu bytes of grammar, %s", grammar.size(), trigger >= 0 ? "after the trigger token" : "from the first token");
         }
         if (s.top_k <= 0) s.top_k = 64;
         if (!grammar.empty()) {
@@ -956,7 +970,14 @@ struct Engine {
                 if (g_phases && ctx_dft) { llama_synchronize(ctx_dft); ph[2] += ms_since(tc); }
                 if (first) { prompt_ms = ms_since(t0); first = false; }
                 const auto ts = Clock::now();
-                const std::vector<llama_token> ids = common_sampler_sample_and_accept_n(smpl, ctx, draft);
+                std::vector<llama_token> ids;
+                try {                                 // a grammar's error ends this request, never the engine
+                    ids = common_sampler_sample_and_accept_n(smpl, ctx, draft);
+                } catch (const std::exception& e) {
+                    common_sampler_free(smpl);
+                    clear(sq);
+                    return refuse(std::string("sampling: ") + e.what());
+                }
                 if (g_phases) { ph[3] += ms_since(ts); ++ph_n; }
                 drafted += (int64_t) draft.size();
                 accepted += (int64_t) ids.size() - 1;
@@ -1064,8 +1085,16 @@ struct Engine {
             Seq& S = seqs[(size_t) b + 1];
             // row k is this slot's (not sample_and_accept_n(smpl, ctx, std::vector<int>{k}, {}): llama_tokens is a
             // std::vector<int32_t> too, so that picks the overload that takes {k} as a one-token draft and samples row 0)
-            const llama_token t = common_sampler_sample(X.smpl, ctx, (int) k);
-            common_sampler_accept(X.smpl, t, true);
+            llama_token t;
+            try {                                     // a grammar's error ends this slot, never the engine
+                t = common_sampler_sample(X.smpl, ctx, (int) k);
+                common_sampler_accept(X.smpl, t, true);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata-metal: slot %d: sampling: %s; the slot ends\n", b, e.what());
+                clear(b + 1);
+                slot_done(b, "cancel");
+                continue;
+            }
             S.live.push_back(X.pending);
             S.keys.push_back((uint64_t) (uint32_t) X.pending);
             X.pending = t;
