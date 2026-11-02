@@ -77,3 +77,4 @@ tui/target
 # per-machine state: scheduled prompts, voice settings
 .strata-*.json
 .strata-*.json.tmp
+bench/results
