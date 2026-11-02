@@ -180,6 +180,7 @@ fn main() {
 
     println!("{:>6} {:>7} {:>5} | {:>6} {:>8} {:>8} | {:>8} {:>8} {:>7} {:>8} | {:>6} {:>6}  {}",
              "agents", "ctx", "cache", "load_s", "pf_tok/s", "cold_tps", "warm_ttft", "warm_tps", "cached%", "side_tps", "gpu_GB", "wall_s", "err");
+    let mut prev: Option<Child> = None;
     for &a in &agents_l {
         for &ctx in &ctx_l {
             for &gb in &cache_l {
@@ -192,6 +193,11 @@ fn main() {
                 let cell = format!("a{a}-c{}k-g{gb}", ctx / 1024);
                 let cpath = out.join("config.json");
                 fs::write(&cpath, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+                // stop our previous server ourselves: --replace only finds one that already holds the port
+                if let Some(mut c) = prev.take() {
+                    unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
+                    let _ = c.wait();
+                }
                 let mut child = start(&server, &cpath, port, &out.join(format!("server-{cell}.log")), &root);
                 let mut row = json!({"agents": a, "ctx": ctx, "cache_gb": gb, "depth": depth});
                 let t_cell = Instant::now();
@@ -244,6 +250,7 @@ fn main() {
                     }
                 }
                 row["wall_s"] = json!(t_cell.elapsed().as_secs_f64());
+                prev = Some(child);
                 writeln!(rows, "{row}").unwrap();
                 let f = |k: &str| row[k].as_f64().unwrap_or(f64::NAN);
                 println!("{a:>6} {:>6}k {:>4}G | {:>6.1} {:>8.0} {:>8.1} | {:>8.2}s {:>8.1} {:>6.0}% {:>8.1} | {:>6.1} {:>6.0}  {}",
@@ -253,6 +260,10 @@ fn main() {
         }
     }
     // put the original model back on its port, detached: it outlives this process
+    if let Some(mut c) = prev.take() {
+        unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
+        let _ = c.wait();
+    }
     let _ = start(&server, &cfg_path, port, &out.join("server-restore.log"), &root);
     println!("results: {}\nrestored {} on :{port}", out.join("results.jsonl").display(), cfg_path.display());
 }
