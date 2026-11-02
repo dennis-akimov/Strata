@@ -170,6 +170,32 @@ class TestStrataMetal(unittest.TestCase):
             e.close()
         self.assertEqual(resume, len(head))
 
+    def test_a_json_schema_holds_the_reply_to_it(self):
+        # response_format by grammar: json_schema=<hex> on the GEN line, converted by llama.cpp; the reply can only be
+        # JSON the schema accepts, and a schema that does not parse is refused with the engine still in step
+        import json
+        from tools.strata_tokenizer import Tokenizer
+        self.assertEqual(self.e.info.get("json_schema"), "1")
+        schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"],
+                  "additionalProperties": False}
+        hexs = json.dumps(schema).encode().hex()
+        self.e.send(f"GEN 40 json_schema={hexs} " + ",".join(map(str, self.m1)))
+        toks = []
+        while True:
+            line = self.e.line()
+            if line.startswith("T "):
+                toks.append(int(line[2:]))
+            elif line.startswith(("DONE", "ERR")):
+                self.assertTrue(line.startswith("DONE"), line)
+                break
+        text = Tokenizer.from_gguf(GGUF).decode([t for t in toks if t != self.e.im_start]).strip()
+        self.assertIn(json.loads(text.split("<|im_end|>")[0].strip())["answer"], ("yes", "no"), text)
+        self.e.send(f"GEN 8 json_schema={b'{not json'.hex()} " + ",".join(map(str, self.m1)))
+        while not (line := self.e.line()).startswith(("ERR", "DONE")):
+            pass
+        self.assertTrue(line.startswith("ERR") and "json_schema" in line, line)
+        self.assertEqual(len(self.e.gen(self.m1, max_new=3)[0]), 3)
+
     def test_a_displaced_conversation_comes_back_from_the_ram_cache(self):
         # document A, then document B in the same sequence (A's cells are gone), then a new question on A: the RAM
         # cache gives A back instead of reading it again, and the answer is the one a fresh engine gives

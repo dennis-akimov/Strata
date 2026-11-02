@@ -29,6 +29,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "json-schema-to-grammar.h"
 
 #include <unistd.h>
 
@@ -719,7 +720,7 @@ struct Engine {
     // not parse is an error, here or in common_sampler_init (it throws): `err` says it, the sampler is null.
     common_sampler* sampler(const std::string& line_keys, std::string* err = nullptr) {
         common_params_sampling s = params.sampling;
-        std::string grammar;
+        std::string grammar, schema;
         long long trigger = -1;
         s.temp = 0.0f;                        // absent keys: greedy, as the CUDA engine
         s.top_k = 20;
@@ -746,13 +747,28 @@ struct Engine {
             else if (k == "penalty_last_n") s.penalty_last_n = std::atoi(v);
             else if (k == "seed") s.seed = (uint32_t) std::strtoull(v, nullptr, 10);
             else if (k == "grammar_trigger") trigger = std::strtoll(v, nullptr, 10);
-            else if (k == "grammar") {
+            else if (k == "grammar" || k == "json_schema") {   // hex: the line is split at spaces
                 const std::string h(v);
                 if (h.size() % 2 || h.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
-                    if (err) *err = "grammar: not hex";
+                    if (err) *err = k + ": not hex";
                     return nullptr;
                 }
-                for (size_t q = 0; q < h.size(); q += 2) grammar += (char) std::stoi(h.substr(q, 2), nullptr, 16);
+                std::string& to = k == "grammar" ? grammar : schema;
+                for (size_t q = 0; q < h.size(); q += 2) to += (char) std::stoi(h.substr(q, 2), nullptr, 16);
+            }
+        }
+        // json_schema=<hex of a JSON schema>: llama.cpp's converter makes it the grammar (a response_format the reply
+        // can only meet), lazy from grammar_trigger as any grammar
+        if (!schema.empty()) {
+            if (!grammar.empty()) {
+                if (err) *err = "grammar and json_schema: give one";
+                return nullptr;
+            }
+            try {
+                grammar = json_schema_to_grammar(common_json::parse(schema));
+            } catch (const std::exception& e) {
+                if (err) *err = std::string("json_schema: ") + e.what();
+                return nullptr;
             }
         }
         if (s.top_k <= 0) s.top_k = 64;
@@ -813,7 +829,8 @@ struct Engine {
         }
         {                                             // a grammar that does not parse: refused before the prompt is read
             std::string gerr;
-            common_sampler* probe = keys_txt.find(" grammar=") != std::string::npos ? sampler(keys_txt, &gerr) : nullptr;
+            const bool constrained = keys_txt.find(" grammar=") != std::string::npos || keys_txt.find(" json_schema=") != std::string::npos;
+            common_sampler* probe = constrained ? sampler(keys_txt, &gerr) : nullptr;
             if (probe) common_sampler_free(probe);
             if (!gerr.empty()) return refuse(gerr);
         }
@@ -1128,7 +1145,7 @@ int main(int argc, char** argv) {
     const char* backend = "vulkan";
 #endif
     out("INFO engine=" STRATA_VERSION "-metal backend=%s llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
-        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu grammar=1 "
+        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu grammar=1 json_schema=1 "
         "conversation_cache_mib=%lld conversation_cache_slots=%d\n", backend,
         (long long) e.o.max_context, e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0,
         e.spec ? e.o.spec : 0, gpu_used, gpu_total, (long long) e.o.cache_mib, e.o.cache_mib > 0 ? e.o.cache_slots : 0);

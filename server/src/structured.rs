@@ -1,5 +1,6 @@
-//! JSON response formats at the HTTP boundary (serve/structured.py): prompt once, validate before delivery.  The
-//! engine has no grammar decoder; a failed generation is an error, never retried or passed off as valid output.
+//! JSON response formats at the HTTP boundary (serve/structured.py): prompt once, validate before delivery.  On an
+//! engine whose INFO says json_schema=1 the schema is also its grammar (run.rs), so the reply can only be JSON it
+//! accepts; elsewhere a failed generation is an error, never retried or passed off as valid output.
 
 use crate::errors::Fail;
 use crate::py::get;
@@ -65,6 +66,15 @@ fn check_refs(node: &Value) -> Result<(), Fail> {
 }
 
 /// (messages with the format's instruction, the validator) - or the messages as they are for none / text.
+/// The JSON schema a response_format asks for, for the engine's grammar (json_object: any object), or None.
+pub fn grammar_schema(rf: &Value) -> Option<Value> {
+    match get(rf, "type").as_str() {
+        Some("json_object") => Some(json!({"type": "object"})),
+        Some("json_schema") => Some(get(get(rf, "json_schema"), "schema").clone()).filter(Value::is_object),
+        _ => None,
+    }
+}
+
 pub fn prepare_format(rf: &Value, messages: Vec<Value>, with_tools: bool) -> Result<(Vec<Value>, Option<Validator>), Fail> {
     if rf.is_null() {
         return Ok((messages, None));

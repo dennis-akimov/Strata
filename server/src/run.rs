@@ -145,15 +145,31 @@ impl Service {
             sampling.insert("strata_tool_grammar".into(), json!(g));
             sampling.insert("strata_tool_grammar_from".into(), json!(from));
         }
+        // a response_format's JSON schema by grammar, on an engine that has it (INFO json_schema=1): the reply can only
+        // be JSON the schema accepts (still validated after); a thinking model thinks freely and is held to it from its
+        // thinking's end token on - when that is one token, else no grammar (validation alone, as before)
+        let schema = sampling.remove("strata_json_schema");
+        sampling.remove("strata_json_schema_hex");
+        sampling.remove("strata_json_schema_from");
+        if let (Some(Value::String(s)), Some(e)) = (schema, self.engine.strata()) {
+            if e.info.lock().unwrap().get("json_schema").and_then(Value::as_i64) == Some(1) {
+                let from = if thinking { match self.tok.encode(THINK_END, true)[..] { [t] => Some(Some(t)), _ => None } } else { Some(None) };
+                if let Some(from) = from {
+                    sampling.insert("strata_json_schema_hex".into(), json!(s.bytes().map(|b| format!("{b:02x}")).collect::<String>()));
+                    if let Some(t) = from {
+                        sampling.insert("strata_json_schema_from".into(), json!(t));
+                    }
+                }
+            }
+        }
         let samp_v = Value::Object(sampling.clone());
         let mut budget = if thinking { self.reasoning_budget(&samp_v).map_err(Stop::Err)? } else { None };
-        if let Some(b) = budget {
-            if max_new > 0 {
-                let reserve = (ANSWER_RESERVE_MIN.max(max_new / 4)).min(max_new / 2);
-                if b > max_new - reserve {
-                    say(&format!("thinking capped at {} of max_tokens {max_new} to leave room for the answer (budget {b})", max_new - reserve));
-                    budget = Some((max_new - reserve).max(1));
-                }
+        if thinking {
+            let capped = thinking_cap(budget, self.budget_given(&samp_v), max_new);
+            if capped != budget {
+                say(&format!("thinking capped at {} of max_tokens {max_new} to leave room for the answer ({})", capped.unwrap_or(0),
+                             budget.map(|b| format!("budget {b}")).unwrap_or_else(|| "no budget given".into())));
+                budget = capped;
             }
         }
         let mut parser: Box<dyn Parse> = if self.harmony {

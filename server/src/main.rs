@@ -632,9 +632,8 @@ fn main() {
     let host_names = net::host_names_for(&host, &set.allowed_hosts, &set.trusted_origins);
     set.host_names = host_names;
     let mut svc = Service::new(engine.clone(), tok, template, model, vision.clone(), set);
-    if svc.set.reasoning_budget_tokens.is_null() {
-        svc.set.reasoning_budget_tokens = json!(0);
-    } else {
+    // left unset (null) when the config has none: a request without a budget then keeps room to answer (thinking_cap)
+    if !svc.set.reasoning_budget_tokens.is_null() {
         match svc.reasoning_budget(&json!({})) {
             Err(e) => exit_msg(&format!("[strata] config {e}")),
             Ok(Some(b)) => say(&format!("thinking budget: {b} tokens (reasoning_budget_tokens; a request can set its own)")),

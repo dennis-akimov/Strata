@@ -172,6 +172,15 @@ pub fn sampling_keys(s: &Map<String, Value>) -> String {
             keys += &format!(" grammar={g} grammar_trigger={t}");
         }
     }
+    // a response_format's schema (run.rs sets it, as hex), from the thinking's end token when the model thinks
+    if let Some(Value::String(h)) = s.get("strata_json_schema_hex") {
+        if !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()) && !keys.contains(" grammar=") {
+            keys += &format!(" json_schema={h}");
+            if let Some(t) = int("strata_json_schema_from").filter(|t| *t >= 0) {
+                keys += &format!(" grammar_trigger={t}");
+            }
+        }
+    }
     if let Some(Value::Number(pn)) = s.get("strata_prefix").and_then(|p| p.get("tokens")) {
         if let Some(pn) = pn.as_i64().filter(|n| *n > 0) {
             keys += &format!(" pin={pn}");
@@ -2345,6 +2354,10 @@ mod grammar_key_tests {
         assert_eq!(keys(json!({"strata_tool_grammar": "root ::= x", "strata_tool_grammar_from": 7})), "");
         assert_eq!(keys(json!({"strata_tool_grammar": "726f6f74"})), "");
         assert_eq!(keys(json!({"grammar": "root ::= x"})), "", "a client's grammar field is not Strata's");
+        assert_eq!(keys(json!({"strata_json_schema_hex": "7b7d"})), " json_schema=7b7d");
+        assert_eq!(keys(json!({"strata_json_schema_hex": "7b7d", "strata_json_schema_from": 9})), " json_schema=7b7d grammar_trigger=9");
+        assert_eq!(keys(json!({"strata_json_schema_hex": "{}"})), "", "only hex goes on the line");
+        assert_eq!(keys(json!({"json_schema": "7b7d"})), "", "a client's json_schema field is not Strata's");
     }
 }
 

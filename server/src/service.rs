@@ -46,6 +46,21 @@ pub fn effort_text(level: &str) -> &'static str {
 }
 pub const REPEAT_STOP_TOKENS: i64 = 256;
 pub const ANSWER_RESERVE_MIN: i64 = 512;
+
+/// The thinking budget a reply runs with: a given one capped so a quarter of max_tokens (at least ANSWER_RESERVE_MIN,
+/// at most half) stays for the answer; with none given at all, that same cap - a reply that spends max_tokens thinking
+/// has no answer (a reasoning model such as LFM2.5 always thinks first).  An explicit 0 keeps no budget.
+pub fn thinking_cap(budget: Option<i64>, given: bool, max_new: i64) -> Option<i64> {
+    if max_new <= 0 {
+        return budget;
+    }
+    let room = (max_new - (ANSWER_RESERVE_MIN.max(max_new / 4)).min(max_new / 2)).max(1);
+    match budget {
+        Some(b) => Some(b.min(room)),
+        None if !given => Some(room),
+        None => None,
+    }
+}
 pub const REASONING_CLOSE: &str = "\n</think>\n\n";
 pub const REASONING_WRAP_UP: &str = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n";
 pub const HARMONY_CLOSE: &str = "<|end|><|start|>assistant<|channel|>final<|message|>";
@@ -582,6 +597,11 @@ impl Service {
     }
 
     /// #123: the most tokens this request may think, or None; ValueError for anything but a whole number.
+    /// Whether the request or the config names a thinking budget at all (0 included: "no budget" said on purpose).
+    pub fn budget_given(&self, req: &Value) -> bool {
+        !get(req, "reasoning_budget_tokens").is_null() || !self.set.reasoning_budget_tokens.is_null()
+    }
+
     pub fn reasoning_budget(&self, req: &Value) -> Result<Option<i64>, Fail> {
         let mut value = get(req, "reasoning_budget_tokens").clone();
         if value.is_null() {
@@ -1443,4 +1463,22 @@ pub fn gpu_memory_from_engine(mut hardware: Value, engine: &Map<String, Value>) 
         hardware["gpu_mem_total"] = engine["gpu_total"].clone();
     }
     hardware
+}
+
+#[cfg(test)]
+mod thinking_cap_tests {
+    use super::thinking_cap;
+
+    #[test]
+    fn a_reply_keeps_room_to_answer_unless_no_budget_was_asked_for() {
+        // a given budget: capped as before so a quarter of max_tokens (at least 512, at most half) stays for the answer
+        assert_eq!(thinking_cap(Some(300), true, 4096), Some(300));
+        assert_eq!(thinking_cap(Some(4000), true, 4096), Some(3072));
+        // no budget anywhere (the 8B quiz's cut-offs): the same room, instead of thinking until max_tokens
+        assert_eq!(thinking_cap(None, false, 1500), Some(988));
+        assert_eq!(thinking_cap(None, false, 32), Some(16));                 // a short final-line request: half each
+        // reasoning_budget_tokens: 0 said on purpose, or no max_tokens: no budget
+        assert_eq!(thinking_cap(None, true, 1500), None);
+        assert_eq!(thinking_cap(None, false, 0), None);
+    }
 }

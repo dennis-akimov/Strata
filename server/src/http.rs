@@ -1043,6 +1043,11 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     if validator.is_some() && (tools.is_some() || truthy(get(&rv, "strata_mcp"))) {
         return Err(Fail::Value("structured response_format with tools/MCP is not supported".into()));
     }
+    // the schema for the engine's grammar (run.rs sends it when the engine has one); never a client's own key
+    req.remove("strata_json_schema");
+    if let Some(s) = crate::structured::grammar_schema(get(&rv, "response_format")) {
+        req.insert("strata_json_schema".into(), json!(s.to_string()));
+    }
     svc.load()?;
     let mt = if truthy(get(&rv, "max_completion_tokens")) { get(&rv, "max_completion_tokens") } else { get(&rv, "max_tokens") };
     let max_req = int_of(if truthy(mt) { mt } else { &Value::Null })?;
