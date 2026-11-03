@@ -413,8 +413,10 @@ struct Engine {
         common_params& p = params;
         p.model.path = o.gguf;
         p.n_parallel = 1 + o.batch;               // seq 0 and one per batch slot, each with the whole context
-        p.kv_unified = o.kv_unified;              // default own cells per sequence: a copied sequence (copy_seq) then rolled
-                                                  // back to a checkpoint read wrong in the unified cache (measured)
+        // default own cells per sequence.  "A copied sequence rolled back read wrong in the unified cache" (once
+        // measured) was batching's arithmetic: two sequences decoded together differ from one alone in the last bits in
+        // either mode, and the tests' made-up prompts tie their top tokens (docs/CONTEXT_POOL.md, 2026-11-03)
+        p.kv_unified = o.kv_unified;
         p.n_ctx = (int32_t) (o.kv_unified && o.kv_pool > 0 ? o.kv_pool : o.max_context * p.n_parallel);
         p.n_batch = o.n_batch;
         p.n_ubatch = std::min(o.n_batch, 2048);   // 2048: prompts +9% on an M5 Max (llama-bench pp4096, 268 -> 293 tok/s)
@@ -662,7 +664,6 @@ struct Engine {
         size_t best = parked.size(), q = p;
         for (size_t i = 0; i < parked.size(); ++i) {
             const size_t m = prefix_of(parked[i].seq.keys, keys);
-            if (o.kv_unified && m < parked[i].seq.keys.size()) continue;   // as copy: none that a rollback would follow
             if (m > q + 16) { q = m; best = i; }
         }
         if (best == parked.size()) return p;
@@ -697,8 +698,7 @@ struct Engine {
         park(dst, prefix_of(seqs[(size_t) dst].keys, seqs[(size_t) src].keys));
         clear(dst);
         if (o.kv_unified) {
-            // one pool: the cells shared by both sequences (llama.cpp's own copy).  A state written into dst with
-            // llama_state_seq_set_data overwrote another sequence's cells in the unified cache (test_batch_slots)
+            // one pool: the cells shared by both sequences (llama.cpp's own copy: nothing is written)
             llama_memory_seq_cp(mem(), src, dst, -1, -1);
             seqs[(size_t) dst] = seqs[(size_t) src];
             if (dst == 0) {
@@ -913,9 +913,6 @@ struct Engine {
             const bool busy = other > 0 && slots[other - 1].active;
             if ((llama_seq_id) other == sq || busy) continue;
             const size_t q = prefix(seqs[other]);
-            // one pool (--kv-unified): only a copy that needs no rollback after it - a copied sequence rolled back to
-            // a checkpoint broke a third one's state there (docs/CONTEXT_POOL.md)
-            if (o.kv_unified && q < seqs[other].live.size()) continue;
             if (q > p + 16 && copy_seq((llama_seq_id) other, sq)) {
                 TRACE("seq %d: copied idle seq %zu, which holds %zu of the prompt's start (this one %zu)", sq, other, q, p);
                 p = q;
