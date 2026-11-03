@@ -35,6 +35,8 @@ pub struct Caps {
     pub supports_system_role: bool,
     pub supports_parallel_tool_calls: bool,
     pub supports_preserve_reasoning: bool,
+    /// The template knows thinking (`<think>`, `enable_thinking`, GPT-OSS's channels); without, all output is answer
+    pub thinks: bool,
 }
 
 pub struct ChatTemplate {
@@ -196,6 +198,8 @@ impl ChatTemplate {
             supports_system_role: self.probe(&[json!({"role": "system", "content": "strata_caps_system"}), user.clone()], None).contains("strata_caps_system"),
             supports_parallel_tool_calls: calls_supported(2),
             supports_preserve_reasoning: self.probe(&history, None).contains("strata_caps_reasoning"),
+            // ponytail: a word in the source, not a probe; Qwen3-Coder's and the plain base-model template have none
+            thinks: self.source.contains("think") || harmony,
         }
     }
 }
@@ -203,6 +207,13 @@ impl ChatTemplate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_template_without_thinking_marks_a_model_that_does_not_think() {
+        let plain = ChatTemplate::from_source("{% for m in messages %}User: {{ m.content }}\n{% endfor %}Assistant:".into()).unwrap();
+        assert!(!plain.caps.thinks);
+        assert!(ChatTemplate::load(&crate::root().join("server/chat_template.jinja")).unwrap().caps.thinks);
+    }
 
     #[test]
     fn lfm_tool_calls_round_trip_through_its_template() {

@@ -1315,8 +1315,8 @@ impl Service {
                 req.insert("strata_prefix".into(), r);
             }
         }
-        // Apple's on-device model does not think: its text is all answer
-        Ok((ids, !thinking_off && !matches!(self.engine, crate::engine::Engine::Afm(_)), max_new))
+        // Apple's on-device model and a template without thinking (a base model, Qwen3-Coder): the text is all answer
+        Ok((ids, !thinking_off && self.template.caps.thinks && !matches!(self.engine, crate::engine::Engine::Afm(_)), max_new))
     }
 
     /// R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix -> {"tokens": N} or {}.
