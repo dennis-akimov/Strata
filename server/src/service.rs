@@ -1029,6 +1029,8 @@ impl Service {
         let requests: Vec<Value> = hist.iter().rev().take(n).cloned().collect();
         let hardware = gpu_memory_from_engine(tel["now"].clone(), &engine);
         json!({"engine": engine, "live": live, "requests": requests,
+            "failures": crate::observe::FAILURES.lock().unwrap().view(), "latency": crate::observe::latency_view(&hist),
+            "mcp_tools": crate::observe::tools_view(),
             "conversation_cache": conversation_cache_view(&engine, &hist, &totals, &parked),
             "requests_kept": hist.len(), "totals": totals, "hardware": hardware, "hardware_static": tel["static"],
             "history": tel["history"], "time": t})

@@ -231,6 +231,11 @@ impl Ctx {
     }
 
     fn json_h(&mut self, code: u16, obj: &Value, extra: Vec<(String, String)>) {
+        if code >= 400 {
+            let e = obj.get("error");
+            let msg = e.and_then(|e| e.get("message").or(Some(e))).map(|m| m.as_str().map(String::from).unwrap_or_else(|| m.to_string())).unwrap_or_default();
+            crate::observe::failed(self.raw_path.split('?').next().unwrap_or(""), code, e.and_then(|e| e.get("type")).and_then(Value::as_str).unwrap_or(""), &msg);
+        }
         if let Some(r) = &self.record {
             let mut r = r.lock().unwrap();
             r.insert("http_status".into(), json!(code));
@@ -849,7 +854,6 @@ fn error_answer(c: &mut Ctx, path: &str, e: Fail) {
     let responses = path == "/v1/responses";
     match e {
         Fail::Value(m) | Fail::Session { message: m, .. } => {
-            say(&format!("400 invalid request: {m}"));
             if responses {
                 c.json(400, rs::error_body(&m, "invalid_request_error", None, None));
             } else {

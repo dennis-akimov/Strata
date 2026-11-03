@@ -646,7 +646,11 @@ impl Service {
                 (Some(g2), Some(d)) if n != 0 && g2 != 0 && d != 0.0 => json!(pyround(g2 as f64 / (d / 1000.0), 1)),
                 _ => Value::Null,
             };
+            // from arrival: the wait in the queue (and a model load), then to the first token (OpenTelemetry's TTFT)
+            let waited = crate::service::trace().map(|t| { let t = t.lock().unwrap(); ["queue_s", "load_s"].iter().filter_map(|k| t.get(*k).and_then(Value::as_f64)).sum::<f64>() }).unwrap_or(0.0);
+            let ttft = s.get("first_token").and_then(Value::as_f64).map(|f| pyround(waited + f - started, 3));
             let rec = json!({
+                "queue_s": pyround(waited, 3), "ttft_s": ttft,
                 "projection": if loaded { json!(sampling.get("experimental_speed_projection") != Some(&Value::Bool(false))) } else { Value::Null },
                 "time": started, "duration_s": pyround(t - started, 1), "finish": finish,
                 "prompt_tokens": seen, "reused": g("reused"), "output_tokens": n,

@@ -380,7 +380,7 @@ impl Default for ConvCacheLog {
 
 impl ConvCacheLog {
     fn reset(&mut self) {
-        self.state = json!({"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": null, "last_tokens": null, "last_at": null})
+        self.state = json!({"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "park_ms": 0.0, "restore_ms": 0.0, "last_ms": null, "last_event": null, "last_tokens": null, "last_at": null})
             .as_object()
             .cloned()
             .unwrap();
@@ -407,7 +407,7 @@ impl ConvCacheLog {
         let now = crate::sync::now();
         static EVENT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         static DROPPED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let ev = EVENT.get_or_init(|| regex::Regex::new(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)(?: evictions=(\d+))?").unwrap());
+        let ev = EVENT.get_or_init(|| regex::Regex::new(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)(?: evictions=(\d+))?(?: ms=([\d.]+))?").unwrap());
         let dr = DROPPED.get_or_init(|| regex::Regex::new(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)").unwrap());
         for line in data[..end].lines() {
             if !line.contains("conversation cache:") {
@@ -427,6 +427,14 @@ impl ConvCacheLog {
                     st.insert("last_event".into(), json!(&m[1]));
                     st.insert("last_tokens".into(), json!(m[2].parse::<i64>().unwrap_or(0)));
                     st.insert("last_at".into(), json!(now));
+                    // the copy's time (engines from 2026-11-03 on), summed per kind
+                    let ms = m.get(6).and_then(|x| x.as_str().parse::<f64>().ok());
+                    if let Some(ms) = ms {
+                        let k = if &m[1] == "parked" { "park_ms" } else { "restore_ms" };
+                        let t = st.get(k).and_then(Value::as_f64).unwrap_or(0.0) + ms;
+                        st.insert(k.into(), json!((t * 10.0).round() / 10.0));
+                    }
+                    st.insert("last_ms".into(), json!(ms));
                 }
                 continue;
             }
@@ -2384,5 +2392,23 @@ mod slot_pick_tests {
         assert_eq!(StrataEngine::pick_slot(&s, &with(sys.clone(), 400..460)), Some(2));
         // a conversation going on (the slot's whole history, then more) stays in its slot
         assert_eq!(StrataEngine::pick_slot(&s, &with(with(doc(2), 900..960), 10..20)), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod conv_cache_log_tests {
+    use super::ConvCacheLog;
+    use serde_json::json;
+
+    #[test]
+    fn parks_and_restores_are_counted_and_timed() {
+        let p = std::env::temp_dir().join(format!("strata-cclog-{}.log", std::process::id()));
+        std::fs::write(&p, "strata-metal: conversation cache: parked 9000 tokens (seq 1) parked=1 bytes=100 evictions=0\n\
+            strata-metal: conversation cache: parked 8000 tokens (seq 2) parked=2 bytes=200 evictions=0 ms=12.5\n\
+            strata-metal: conversation cache: restored 9000 tokens (seq 1) parked=1 bytes=100 evictions=0 ms=40.0\n").unwrap();
+        let st = ConvCacheLog::default().poll(p.to_str(), Some(0));
+        assert_eq!((st["parks"].clone(), st["restores"].clone()), (json!(2), json!(1)));
+        assert_eq!((st["park_ms"].clone(), st["restore_ms"].clone(), st["last_ms"].clone()), (json!(12.5), json!(40.0), json!(40.0)));
+        std::fs::remove_file(&p).ok();
     }
 }

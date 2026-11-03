@@ -42,6 +42,14 @@ unsafe extern "C" {
     fn IOReportChannelGetChannelName(ch: Cf) -> Cf;
     fn IOReportChannelGetUnitLabel(ch: Cf) -> Cf;
     fn IOReportSimpleGetIntegerValue(ch: Cf, i: i32) -> i64;
+    fn IOReportStateGetCount(ch: Cf) -> i32;
+    fn IOReportStateGetResidency(ch: Cf, i: i32) -> i64;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn notify_register_check(name: *const i8, token: *mut i32) -> u32;
+    fn notify_get_state(token: i32, state: *mut u64) -> u32;
 }
 
 #[cfg(target_os = "macos")]
@@ -149,6 +157,35 @@ pub fn energy_watts(delta: f64, unit: &str, seconds: f64) -> Option<f64> {
     Some(delta * scale / seconds)
 }
 
+/// The GPU's DVFS table: `ioreg -l -w0 -n pmgr`'s "voltage-states9" (pairs of little-endian u32: Hz, mV) -> MHz per
+/// performance state, state 0 (off) first.  macmon reads the same table.
+pub fn dvfs_mhz(ioreg: &str) -> Vec<f64> {
+    let Some(hex) = regex::Regex::new(r#""voltage-states9" = <([0-9a-f]+)>"#).unwrap().captures(ioreg).map(|c| c[1].to_string()) else { return vec![] };
+    let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()).collect();
+    bytes.chunks_exact(8).map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as f64 / 1e6).collect()
+}
+
+/// The GPU's clock over a sample: its active states' frequencies weighted by the time spent in each (None when idle)
+pub fn gpu_mhz(residency: &[i64], mhz: &[f64]) -> Option<f64> {
+    let (mut t, mut w) = (0f64, 0f64);
+    for (r, f) in residency.iter().zip(mhz).filter(|(_, f)| **f > 0.0) {
+        t += *r as f64;
+        w += *r as f64 * f;
+    }
+    if t > 0.0 { Some(w / t) } else { None }
+}
+
+/// What the sampler reads besides load and memory (null when it cannot be read)
+#[derive(Default)]
+pub struct Readings {
+    pub gpu_power: Option<f64>,
+    pub cpu_power: Option<f64>,
+    pub dram_power: Option<f64>,
+    pub temp: Option<f64>,
+    pub gpu_mhz: Option<f64>,
+    pub gpu_mhz_max: Option<f64>,
+}
+
 #[cfg(target_os = "macos")]
 struct MacSensors {
     power_ok: bool,
@@ -157,6 +194,11 @@ struct MacSensors {
     zero_streak: u32,
     sub: Cf,
     sub_ch: Cf,
+    /// "GPU Stats / GPU Performance States": the time in each P-state
+    gpu_sub: Cf,
+    gpu_ch: Cf,
+    gpu_prev: Option<usize>,
+    dvfs: Vec<f64>,
     client: Cf,
     k_channels: Cf,
     k_product: Cf,
@@ -191,31 +233,42 @@ impl MacSensors {
             if !client.is_null() && !matching.is_null() {
                 IOHIDEventSystemClientSetMatching(client, matching);
             }
-            MacSensors { power_ok: !sub.is_null() && !sub_ch.is_null(), temp_ok: !client.is_null() && !matching.is_null(), prev: None, zero_streak: 0, sub, sub_ch, client, k_channels, k_product }
+            let gchans = IOReportCopyChannelsInGroup(cfs("GPU Stats"), cfs("GPU Performance States"), 0, 0, 0);
+            let (mut gpu_ch, mut gpu_sub): (Cf, Cf) = (std::ptr::null(), std::ptr::null());
+            if !gchans.is_null() {
+                gpu_sub = IOReportCreateSubscription(std::ptr::null(), gchans, &mut gpu_ch, 0, std::ptr::null());
+            }
+            let pmgr = std::process::Command::new("ioreg").args(["-l", "-w0", "-n", "pmgr"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+            MacSensors { power_ok: !sub.is_null() && !sub_ch.is_null(), temp_ok: !client.is_null() && !matching.is_null(), prev: None, zero_streak: 0, sub, sub_ch,
+                         gpu_sub, gpu_ch, gpu_prev: None, dvfs: dvfs_mhz(&pmgr), client, k_channels, k_product }
         }
     }
 
-    fn gpu_watts(&mut self) -> Option<f64> {
+    /// (GPU, CPU, DRAM) watts over the time since the last call
+    fn watts(&mut self) -> (Option<f64>, Option<f64>, Option<f64>) {
         unsafe {
             let sample = IOReportCreateSamples(self.sub, self.sub_ch, std::ptr::null());
             let now = Instant::now();
             if sample.is_null() {
-                return None;
+                return (None, None, None);
             }
-            let prev = self.prev.replace((sample as usize, now))?;
+            let Some(prev) = self.prev.replace((sample as usize, now)) else { return (None, None, None) };
             let delta = IOReportCreateSamplesDelta(prev.0 as Cf, sample, std::ptr::null());
             CFRelease(prev.0 as Cf);
             if delta.is_null() {
-                return None;
+                return (None, None, None);
             }
             let chans = CFDictionaryGetValue(delta, self.k_channels);
             let n = if chans.is_null() { 0 } else { CFArrayGetCount(chans) };
-            let mut out = None;
+            let mut out = (None, None, None);
             for i in 0..n {
                 let ch = CFArrayGetValueAtIndex(chans, i);
-                if cf_str(IOReportChannelGetChannelName(ch)) == "GPU Energy" {
-                    out = energy_watts(IOReportSimpleGetIntegerValue(ch, 0) as f64, &cf_str(IOReportChannelGetUnitLabel(ch)), (now - prev.1).as_secs_f64());
-                    break;
+                let w = || energy_watts(IOReportSimpleGetIntegerValue(ch, 0) as f64, &cf_str(IOReportChannelGetUnitLabel(ch)), (now - prev.1).as_secs_f64());
+                match cf_str(IOReportChannelGetChannelName(ch)).as_str() {
+                    "GPU Energy" => out.0 = w(),
+                    "CPU Energy" => out.1 = w(),
+                    "DRAM" => out.2 = w(),
+                    _ => {}
                 }
             }
             CFRelease(delta);
@@ -248,8 +301,39 @@ impl MacSensors {
         out
     }
 
-    fn read(&mut self, util: Option<f64>) -> (Option<f64>, Option<f64>) {
-        let mut watts = if self.power_ok { self.gpu_watts() } else { None };
+    /// The time in each GPU P-state since the last call
+    fn gpu_residency(&mut self) -> Option<Vec<i64>> {
+        if self.gpu_sub.is_null() || self.gpu_ch.is_null() {
+            return None;
+        }
+        unsafe {
+            let sample = IOReportCreateSamples(self.gpu_sub, self.gpu_ch, std::ptr::null());
+            if sample.is_null() {
+                return None;
+            }
+            let prev = self.gpu_prev.replace(sample as usize)?;
+            let delta = IOReportCreateSamplesDelta(prev as Cf, sample, std::ptr::null());
+            CFRelease(prev as Cf);
+            if delta.is_null() {
+                return None;
+            }
+            let chans = CFDictionaryGetValue(delta, self.k_channels);
+            let n = if chans.is_null() { 0 } else { CFArrayGetCount(chans) };
+            let mut out = None;
+            for i in 0..n {
+                let ch = CFArrayGetValueAtIndex(chans, i);
+                if cf_str(IOReportChannelGetChannelName(ch)) == "GPUPH" {
+                    out = Some((0..IOReportStateGetCount(ch)).map(|k| IOReportStateGetResidency(ch, k)).collect());
+                    break;
+                }
+            }
+            CFRelease(delta);
+            out
+        }
+    }
+
+    fn read(&mut self, util: Option<f64>) -> Readings {
+        let (mut watts, cpu_w, dram_w) = if self.power_ok { self.watts() } else { (None, None, None) };
         let temp = if self.temp_ok { chip_temp(&self.temps()) } else { None };
         let busy = util.map(|u| u >= 10.0).unwrap_or(false);
         if watts == Some(0.0) && busy {
@@ -260,8 +344,33 @@ impl MacSensors {
         } else if watts.is_some() {
             self.zero_streak = 0;
         }
-        (watts.filter(|w| w.is_finite()), temp.filter(|t| t.is_finite()))
+        let fin = |x: Option<f64>| x.filter(|v| v.is_finite());
+        let res = self.gpu_residency();
+        Readings { gpu_power: fin(watts), cpu_power: fin(cpu_w), dram_power: fin(dram_w), temp: fin(temp),
+                   gpu_mhz: res.and_then(|r| gpu_mhz(&r, &self.dvfs)), gpu_mhz_max: self.dvfs.iter().cloned().reduce(f64::max) }
     }
+}
+
+/// (used, total) swap bytes: vm.swapusage's struct xsw_usage (total, avail, used: u64, ...)
+#[cfg(target_os = "macos")]
+pub fn swap() -> (Option<u64>, Option<u64>) {
+    let mut b = [0u64; 4];
+    let mut len = std::mem::size_of_val(&b);
+    let r = unsafe { libc::sysctlbyname(c"vm.swapusage".as_ptr(), b.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0) };
+    if r != 0 || len < 24 { (None, None) } else { (Some(b[2]), Some(b[0])) }
+}
+
+/// macOS's thermal pressure (the notify state ProcessInfo.thermalState follows): 0 nominal, 1 moderate, 2 heavy,
+/// 3 trapping, 4 sleeping
+#[cfg(target_os = "macos")]
+pub fn thermal_level() -> Option<u64> {
+    static TOKEN: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    let token = (*TOKEN.get_or_init(|| {
+        let mut t = 0i32;
+        (unsafe { notify_register_check(c"com.apple.system.thermalpressurelevel".as_ptr(), &mut t) } == 0).then_some(t)
+    }))?;
+    let mut v = 0u64;
+    (unsafe { notify_get_state(token, &mut v) } == 0).then_some(v)
 }
 
 /// Off a Mac (the server in a Linux container): no GPU of its own to read; CPU and RAM from /proc.
@@ -294,8 +403,8 @@ mod other {
         pub fn new() -> Self {
             MacSensors
         }
-        pub fn read(&mut self, _util: Option<f64>) -> (Option<f64>, Option<f64>) {
-            (None, None)
+        pub fn read(&mut self, _util: Option<f64>) -> super::Readings {
+            super::Readings::default()
         }
     }
 }
@@ -430,7 +539,7 @@ pub struct Telemetry {
     stop: crate::sync::Event,
 }
 
-const HIST_KEYS: [&str; 10] = ["gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"];
+const HIST_KEYS: [&str; 12] = ["gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean", "gpu_mhz", "dram_power"];
 
 impl Telemetry {
     pub fn start(extra: Extra) -> Arc<Self> {
@@ -456,13 +565,25 @@ impl Telemetry {
                     let mut s = Map::new();
                     if total > 0 {
                         let (util, used) = parse_ioreg(&ioreg("IOAccelerator"));
-                        let (power, temp) = sensors.read(util.map(|u| u as f64));
+                        let r = sensors.read(util.map(|u| u as f64));
                         s.insert("gpu_util".into(), json!(util));
                         s.insert("gpu_mem_used".into(), json!(used));
                         s.insert("gpu_mem_total".into(), json!(total));
                         s.insert("gpu_unified".into(), json!(true));
-                        s.insert("gpu_power".into(), json!(power));
-                        s.insert("gpu_temp".into(), json!(temp));
+                        s.insert("gpu_power".into(), json!(r.gpu_power));
+                        s.insert("gpu_temp".into(), json!(r.temp));
+                        s.insert("cpu_power".into(), json!(r.cpu_power));
+                        s.insert("dram_power".into(), json!(r.dram_power));
+                        s.insert("gpu_mhz".into(), json!(r.gpu_mhz.map(|m| m.round())));
+                        s.insert("gpu_mhz_max".into(), json!(r.gpu_mhz_max.map(|m| m.round())));
+                        #[cfg(target_os = "macos")]
+                        {
+                            let (su, st) = swap();
+                            s.insert("swap_used".into(), json!(su));
+                            s.insert("swap_total".into(), json!(st));
+                            s.insert("memory_pressure".into(), json!(sysctl_u64("kern.memorystatus_vm_pressure_level")));
+                            s.insert("thermal_level".into(), json!(thermal_level()));
+                        }
                     }
                     #[cfg(target_os = "linux")]
                     {
@@ -553,6 +674,16 @@ mod tests {
         assert_eq!(energy_watts(2000.0, "mJ", 2.0), Some(1.0));
         assert_eq!(energy_watts(-1.0, "mJ", 2.0), None);
         assert_eq!(chip_temp(&[("PMU tdie1".into(), 50.0), ("PMU tdie2".into(), 61.5), ("PMU tdev1".into(), 90.0)]), Some(61.5));
+    }
+
+    #[test]
+    fn the_gpu_clock_comes_from_the_dvfs_table_and_the_residencies() {
+        // an M5 Max's pmgr, its first four states (off, then 338, 485, 635 MHz)
+        let t = dvfs_mhz(r#"| |   "voltage-states9" = <000000007d000000807825144e02000080c5f71c760200000097e825ad020000>"#);
+        assert_eq!(t, vec![0.0, 338.0, 485.0, 635.0]);
+        assert_eq!(gpu_mhz(&[50, 0, 300, 100], &t), Some((485.0 * 300.0 + 635.0 * 100.0) / 400.0)); // off left out
+        assert_eq!(gpu_mhz(&[80, 0, 0, 0], &t), None); // idle: no clock
+        assert!(dvfs_mhz("no table").is_empty());
     }
 
     #[test]

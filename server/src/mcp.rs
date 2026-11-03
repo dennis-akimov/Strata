@@ -841,6 +841,7 @@ impl McpHub {
         out.insert("chars".into(), json!(full));
         out.insert("truncated".into(), json!(truncated));
         out.insert("ms".into(), json!(t0.elapsed().as_millis() as i64));
+        crate::observe::tool_call(name, ok, t0.elapsed().as_millis() as u64, if ok { None } else { out.get("text").and_then(Value::as_str) });
         Ok(out)
     }
 

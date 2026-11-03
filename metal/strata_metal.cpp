@@ -609,8 +609,10 @@ struct Engine {
         parked.erase(std::remove_if(parked.begin(), parked.end(), [&](const Parked& x) { return prefix_of(x.seq.keys, S.keys) == x.seq.keys.size(); }), parked.end());
         if (parked.size() != before) TRACE("conversation cache: dropped %zu superseded by seq %d", before - parked.size(), sq);
         Parked e;
+        const auto t0 = std::chrono::steady_clock::now();
         e.state.resize(llama_state_seq_get_size(ctx, sq));
         if (e.state.empty() || llama_state_seq_get_data(ctx, e.state.data(), e.state.size(), sq) == 0) return;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         e.seq = S;                            // a copy: the caller decides what the sequence holds next
         for (auto& c : e.seq.ckpts) { c.dft.clear(); c.spec.clear(); }   // the drafter starts from new tokens anyway
         e.bytes = e.state.size() + e.seq.keys.size() * (sizeof(uint64_t) + sizeof(llama_token));
@@ -625,7 +627,7 @@ struct Engine {
         }
         e.used = ++park_clock;
         parked.push_back(std::move(e));
-        out_cache("parked", n, sq);
+        out_cache("parked", n, sq, ms);
     }
 
     // The parked conversation that starts this prompt furthest, when it gives more than `p` cells: moved into `sq`
@@ -641,6 +643,7 @@ struct Engine {
         parked.erase(parked.begin() + (long) best);
         park(sq, p);
         llama_memory_seq_rm(mem(), sq, -1, -1);
+        const auto t0 = std::chrono::steady_clock::now();
         if (llama_state_seq_set_data(ctx, e.state.data(), e.state.size(), sq) == 0) {
             clear(sq);
             std::fprintf(stderr, "strata-metal: conversation cache: could not restore %zu tokens; reading the prompt again\n", e.seq.live.size());
@@ -648,14 +651,14 @@ struct Engine {
         }
         seqs[(size_t) sq] = std::move(e.seq);
         if (sq == 0 && ctx_dft) llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
-        out_cache("restored", seqs[(size_t) sq].live.size(), sq);
+        out_cache("restored", seqs[(size_t) sq].live.size(), sq, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         return q;
     }
 
-    // the CUDA engine's log line, which the server reads into /metrics ("conversation_cache")
-    void out_cache(const char* what, size_t n, llama_seq_id sq) {
-        std::fprintf(stderr, "strata-metal: conversation cache: %s %zu tokens (seq %d) parked=%zu bytes=%zu evictions=%ld\n", what, n, sq,
-                     parked.size(), parked_bytes(), evictions);
+    // the CUDA engine's log line, which the server reads into /metrics ("conversation_cache"); ms: the state's copy
+    void out_cache(const char* what, size_t n, llama_seq_id sq, double ms) {
+        std::fprintf(stderr, "strata-metal: conversation cache: %s %zu tokens (seq %d) parked=%zu bytes=%zu evictions=%ld ms=%.1f\n", what, n, sq,
+                     parked.size(), parked_bytes(), evictions, ms);
     }
     void out_cache(const char* what, size_t n, const char* why) {
         std::fprintf(stderr, "strata-metal: conversation cache: %s %zu tokens (%s) parked=%zu bytes=%zu\n", what, n, why, parked.size(), parked_bytes());

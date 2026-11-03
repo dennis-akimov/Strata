@@ -9,6 +9,7 @@ pub mod http;
 pub mod imagegen;
 pub mod mcp;
 pub mod net;
+pub mod observe;
 pub mod parser;
 pub mod prometheus;
 pub mod py;
