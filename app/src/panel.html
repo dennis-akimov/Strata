@@ -100,8 +100,8 @@ function init(s){
   $('cfg').innerHTML=s.configs.map(c=>{const l=name(c)+(c.problem?' (not ready)':''),sh=c.name.replace(/^strata-|\.json$/g,'');
     return `<option value="${esc(c.path)}"${c.problem?' disabled':''} data-s="${esc(sh)}" data-l="${esc(l)}">${esc(l)}</option>`;}).join('')||'<option>no run config yet: make setup</option>';
   const cur=s.configs.find(c=>c.path===s.config),pn=cur?cur.parallel||1:1;
-  const cm=cur?cur.cache_mib||0:0,cachev=[0,2048,4096,8192,16384,32768].concat([0,2048,4096,8192,16384,32768].includes(cm)?[]:[cm]).sort((a,b)=>a-b);
-  $('cache').innerHTML=cachev.map(v=>{const g=Math.round(v/1024*10)/10;return `<option value="${v}"${v===cm?' selected':''} data-s="${v?'cache '+g+' GB':'no cache'}" data-l="${v?`conversation cache ${g} GB of RAM: displaced conversations come back without reading them again`:'no conversation cache: a displaced conversation is read again'}"></option>`;}).join('');
+  const cm=cur&&cur.cache_mib!=null?cur.cache_mib:-1,cachev=[-1,0,2048,4096,8192,16384,32768].concat([-1,0,2048,4096,8192,16384,32768].includes(cm)?[]:[cm]).sort((a,b)=>a-b);
+  $('cache').innerHTML=cachev.map(v=>{const g=Math.round(v/1024*10)/10;return `<option value="${v}"${v===cm?' selected':''} data-s="${v<0?'cache auto':v?'cache '+g+' GB':'no cache'}" data-l="${v<0?'conversation cache sized for this Mac (its RAM beside the model; the server log says how much)':v?`conversation cache ${g} GB of RAM: displaced conversations come back without reading them again`:'no conversation cache: a displaced conversation is read again'}"></option>`;}).join('');
   $('par').innerHTML=[1,2,3,4,5,6,7,8].map(n=>`<option value="${n}"${n===pn?' selected':''} data-s="${n===1?'1 agent':n+' agents'}" data-l="${n===1?'1 agent: one request at a time':n+' agents at once, each with its own context'}"></option>`).join('');
   const bad=s.configs.filter(c=>c.problem);
   $('notready').innerHTML=bad.length?'<b>Not ready yet:</b>'+bad.map(c=>`<div>${esc(name(c))}: ${esc(c.problem)}</div>`).join(''):'';

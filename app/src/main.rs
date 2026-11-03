@@ -683,24 +683,25 @@ fn set_parallel(cfg_path: &Path, n: u64) -> Result<(), String> {
 }
 
 /// The engine's conversation cache in RAM (`--conversation-cache-mib N` in "args"): conversations another one displaced
-/// come back without being read again; 0 takes the flag out (off).  A running server restarts with it.
-fn set_cache_mib(cfg_path: &Path, mib: u64) -> Result<(), String> {
+/// come back without being read again; 0 writes "0" (off), -1 takes the flag out (the server sizes it for this Mac).
+/// A running server restarts with it.
+fn set_cache_mib(cfg_path: &Path, mib: i64) -> Result<(), String> {
     let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
     let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
     let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
     if let Some(i) = args.iter().position(|a| a == "--conversation-cache-mib") {
         args.drain(i..(i + 2).min(args.len()));
     }
-    if mib > 0 {
+    if mib >= 0 {
         args.extend([json!("--conversation-cache-mib"), json!(mib.to_string())]);
     }
     write_config(cfg_path, &text, &v)
 }
 
-/// The config's conversation cache budget in MiB (0: off).
-fn cache_mib(c: &Value) -> u64 {
+/// The config's conversation cache budget in MiB (0: off, -1: none set, the server's automatic size).
+fn cache_mib(c: &Value) -> i64 {
     let a = c["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    a.iter().position(|x| x == "--conversation-cache-mib").and_then(|i| a.get(i + 1)).and_then(Value::as_str).and_then(|n| n.parse().ok()).unwrap_or(0)
+    a.iter().position(|x| x == "--conversation-cache-mib").and_then(|i| a.get(i + 1)).and_then(Value::as_str).and_then(|n| n.parse().ok()).unwrap_or(-1)
 }
 
 /// The config written back with the indent it had (its other keys as they were).
@@ -1530,7 +1531,7 @@ fn main() {
                 "set_cache" => {
                     // the conversation cache's RAM budget in the config; a running server restarts with it
                     let Some(cfg) = st.lock().unwrap().config.clone() else { return };
-                    let mib = v["mib"].as_u64().unwrap_or(0);
+                    let mib = v["mib"].as_i64().unwrap_or(-1);
                     let running = st.lock().unwrap().child.is_some();
                     let (st2, p2) = (st.clone(), proxy.clone());
                     std::thread::spawn(move || {
@@ -1539,6 +1540,7 @@ fn main() {
                         }
                         let msg = match set_cache_mib(&cfg, mib) {
                             Ok(()) if mib > 0 => format!("── conversation cache {} GB in RAM in {} ──", mib / 1024, cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Ok(()) if mib < 0 => format!("── conversation cache automatic (sized for this Mac) in {} ──", cfg.file_name().unwrap_or_default().to_string_lossy()),
                             Ok(()) => format!("── conversation cache off in {} ──", cfg.file_name().unwrap_or_default().to_string_lossy()),
                             Err(e) => format!("── the config could not be changed: {e} ──"),
                         };
@@ -2375,7 +2377,7 @@ mod tests {
     }
 
     #[test]
-    fn the_conversation_cache_is_set_in_args_and_taken_out_at_zero() {
+    fn the_conversation_cache_is_set_in_args_zero_is_off_and_none_is_automatic() {
         let d = std::env::temp_dir().join(format!("strata-cache-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("strata-x.json");
@@ -2384,9 +2386,12 @@ mod tests {
         set_cache_mib(&p, 16384).unwrap();                                   // replaced, never added twice
         assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "16384"]));
         assert_eq!(cache_mib(&read_config(&p)), 16384);
-        set_cache_mib(&p, 0).unwrap();                                       // off: no flag at all
-        assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16"]));
+        set_cache_mib(&p, 0).unwrap();                                       // off: "0", or the server would size one
+        assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "0"]));
         assert_eq!(cache_mib(&read_config(&p)), 0);
+        set_cache_mib(&p, -1).unwrap();                                      // automatic: no flag at all
+        assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16"]));
+        assert_eq!(cache_mib(&read_config(&p)), -1);
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -1,7 +1,7 @@
 //! Agents x context x conversation-cache matrix: decode and prefill tok/s of N concurrent agents.
 //!
 //!     strata-bench strata-qwen3.6-35b.json [--agents 3,4] [--ctx 16384,32768,65536,131072,262144]
-//!                  [--cache-gb 0,8,16,32] [--depth 8000] [--out bench/results/DATE-agents-matrix] [--restore CONFIG]
+//!                  [--cache-gb 0,8,16,32,auto] [--depth 8000] [--out bench/results/DATE-agents-matrix] [--restore CONFIG]
 //!
 //! Each cell restarts the config's server (--replace on its port) with --batch = agents, --max-context = ctx (per
 //! slot) and --conversation-cache-mib = cache.  Every agent then runs, all agents in lockstep:
@@ -138,7 +138,9 @@ fn main() {
     let base_cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
     let agents_l = arg_list(&args, "--agents", "3,4");
     let ctx_l = arg_list(&args, "--ctx", "16384,32768,65536,131072,262144");
-    let cache_l = arg_list(&args, "--cache-gb", "0,8,16,32");
+    // "auto": no --conversation-cache-mib, the server sizes it for this Mac (its log says how much)
+    let cache_l: Vec<Option<u64>> = args.iter().position(|a| a == "--cache-gb").and_then(|i| args.get(i + 1)).map(String::as_str).unwrap_or("0,8,16,32")
+        .split(',').map(|x| (x.trim() != "auto").then(|| x.trim().parse().unwrap_or_else(|_| panic!("--cache-gb: not a number or auto: {x}")))).collect();
     let depth = arg_list(&args, "--depth", "8000")[0];
     let root = PathBuf::from(base_cfg["cwd"].as_str().unwrap());
     let out = args.iter().position(|a| a == "--out").map(|i| PathBuf::from(&args[i + 1]))
@@ -162,10 +164,18 @@ fn main() {
                 let mut cfg = base_cfg.clone();
                 let cargs = cfg["args"].as_array_mut().unwrap();
                 set_arg(cargs, "--max-context", ctx.to_string());
-                set_arg(cargs, "--conversation-cache-mib", (gb * 1024).to_string());
+                match gb {
+                    Some(gb) => set_arg(cargs, "--conversation-cache-mib", (gb * 1024).to_string()),
+                    None => {
+                        if let Some(i) = cargs.iter().position(|a| a == "--conversation-cache-mib") {
+                            cargs.drain(i..(i + 2).min(cargs.len()));
+                        }
+                    }
+                }
+                let gb_s = gb.map(|g| format!("{g}G")).unwrap_or_else(|| "auto".into());
                 cfg["parallel"] = json!(a);
                 cfg["log"] = json!(out.join("engine.log"));
-                let cell = format!("a{a}-c{}k-g{gb}", ctx / 1024);
+                let cell = format!("a{a}-c{}k-g{}", ctx / 1024, gb.map(|g| g.to_string()).unwrap_or_else(|| "auto".into()));
                 let cpath = out.join("config.json");
                 fs::write(&cpath, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
                 // stop our previous server ourselves: --replace only finds one that already holds the port
@@ -173,7 +183,7 @@ fn main() {
                     stop(c);
                 }
                 let mut child = start(&server, &cpath, port, &out.join(format!("server-{cell}.log")), &root);
-                let mut row = json!({"agents": a, "ctx": ctx, "cache_gb": gb, "depth": depth});
+                let mut row = json!({"agents": a, "ctx": ctx, "cache_gb": gb.map(|g| json!(g)).unwrap_or(json!("auto")), "depth": depth});
                 let t_cell = Instant::now();
                 match wait_loaded(&mut child, &base, &key) {
                     Err(e) => row["error"] = json!(e),
@@ -227,8 +237,8 @@ fn main() {
                 prev = Some(child);
                 writeln!(rows, "{row}").unwrap();
                 let f = |k: &str| row[k].as_f64().unwrap_or(f64::NAN);
-                println!("{a:>6} {:>6}k {:>4}G | {:>6.1} {:>8.0} {:>8.1} | {:>8.2}s {:>8.1} {:>6.0}% {:>8.1} | {:>6.1} {:>6.0}  {}",
-                         ctx / 1024, gb, f("load_s"), f("prefill_tok_s"), f("cold_decode_tok_s"), f("warm_ttft_s"), f("warm_decode_tok_s"),
+                println!("{a:>6} {:>6}k {:>5} | {:>6.1} {:>8.0} {:>8.1} | {:>8.2}s {:>8.1} {:>6.0}% {:>8.1} | {:>6.1} {:>6.0}  {}",
+                         ctx / 1024, gb_s, f("load_s"), f("prefill_tok_s"), f("cold_decode_tok_s"), f("warm_ttft_s"), f("warm_decode_tok_s"),
                          f("warm_cached_pct"), f("side_decode_tok_s"), f("gpu_mem_gb"), f("wall_s"), row["error"].as_str().unwrap_or(""));
             }
         }

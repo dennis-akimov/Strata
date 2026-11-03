@@ -223,6 +223,46 @@ fn model_name_from_args(args: &[String]) -> String {
     "qwen3.8-flash-next".into()
 }
 
+/// The conversation cache when the config sets no --conversation-cache-mib: by the RAM left beside the model's file.
+/// Measured (strata-bench): 16 GB kept 4 Qwen3.6 agents' conversations on the 128 GB M5 Max; on the 16 GB M1 4 GB
+/// brought one agent's conversation back in 0.6 s instead of 9.8, but slowed 2-4 agents' follow-ups (too few fit).
+fn auto_cache_mib(ram_gib: f64, model_gib: f64, agents: u64) -> u64 {
+    match ram_gib - model_gib {
+        f if f >= 64.0 => 16384,
+        f if f >= 24.0 => 8192,
+        f if f >= 8.0 && agents <= 1 => 4096,
+        _ => 0,
+    }
+}
+
+/// The model's size on disk: its --gguf, with the other shards of a split file (NAME-00001-of-00003.gguf)
+fn model_gib(args: &[String]) -> Option<f64> {
+    let g = Path::new(args.get(args.iter().position(|a| a == "--gguf")? + 1)?);
+    let name = g.file_name()?.to_str()?;
+    let prefix = name.split_once("-00001-of-").map(|(p, _)| format!("{p}-0")).unwrap_or_else(|| name.to_string());
+    let bytes: u64 = std::fs::read_dir(g.parent()?).ok()?.flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n == name || (n.starts_with(&prefix) && n.ends_with(".gguf"))))
+        .filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+    Some(bytes as f64 / 1073741824.0)
+}
+
+/// --conversation-cache-mib added by auto_cache_mib when the args have none ("0" in the config: off)
+fn add_auto_cache(args: &mut Vec<String>) {
+    if args.iter().any(|a| a == "--conversation-cache-mib") {
+        return;
+    }
+    let (_, total) = strata_server::telemetry::ram();
+    let (Some(total), Some(model)) = (total, model_gib(args)) else { return };
+    let ram = total as f64 / 1073741824.0;
+    let agents = args.iter().position(|a| a == "--batch").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(1);
+    let mib = auto_cache_mib(ram, model, agents);
+    say(&format!("conversation cache: {} (automatic: {ram:.0} GB of RAM, the model {model:.1} GB, {agents} agent(s); \"--conversation-cache-mib\" in the config's args sets it, 0 = off)",
+                 if mib > 0 { format!("{} GB", mib / 1024) } else { "off".into() }));
+    if mib > 0 {
+        args.extend(["--conversation-cache-mib".into(), mib.to_string()]);
+    }
+}
+
 fn warn_budget_over_ram(args: &[String]) {
     let Some(i) = args.iter().position(|a| a == "--resident-budget-gib") else { return };
     let Some(budget) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) else { return };
@@ -478,6 +518,7 @@ fn main() {
         };
         effort_end = effort_end_args(&cfgv, &exe, &*tok).unwrap_or_else(|e| exit_msg(&format!("[strata] config {e}")));
         let mut args = engine_args(&cfgv);
+        add_auto_cache(&mut args);
         args.extend(effort_end.clone().unwrap_or_default());
         let spawn = Spawn { exe, args, cwd: cwd.clone(), log: get(&cfgv, "log").as_str().map(String::from), env, jail: get(&cfgv, "sandbox") != &json!(false) };
         let e = match StrataEngine::new(spawn, lazy) {
@@ -738,6 +779,33 @@ mod engine_guard_tests {
         let ps = "    1 /sbin/launchd\n 2148 /home/dadmin/Strata/engine-metal/strata-metal --serve --gguf m.gguf\n 2141 engine-metal/strata-server --engine strata\n  77 strata-metal\n 99 /usr/bin/strata-metal-helper\n 120 /Users/x/My Apps/Strata/engine-metal/strata-metal --serve\n 17790 /Users/x/Strata/engine-metal/strata-metal --plan --gguf m.gguf --max-context 8192\n 300 vim notes-about-strata-metal.txt\n";
         assert_eq!(engines_in(ps), ["2148", "77", "120"]);
         assert!(engines_in("  1 /sbin/init\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::{auto_cache_mib, model_gib};
+
+    #[test]
+    fn the_cache_follows_the_ram_beside_the_model() {
+        assert_eq!(auto_cache_mib(128.0, 22.0, 4), 16384); // M5 Max, Qwen3.6
+        assert_eq!(auto_cache_mib(128.0, 86.0, 2), 8192); // M5 Max, GLM-5.3
+        assert_eq!(auto_cache_mib(16.0, 1.8, 1), 4096); // M1, Sheared-LLaMA, one agent
+        assert_eq!(auto_cache_mib(16.0, 1.8, 3), 0); // ... several: measured slower with it
+        assert_eq!(auto_cache_mib(16.0, 8.4, 1), 0); // M1, LFM2.5-8B: no room
+    }
+
+    #[test]
+    fn a_split_model_counts_all_its_shards() {
+        let d = std::env::temp_dir().join(format!("strata-shards-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for (n, len) in [("m-00001-of-00002.gguf", 3), ("m-00002-of-00002.gguf", 5), ("other.gguf", 7)] {
+            std::fs::write(d.join(n), vec![0u8; len]).unwrap();
+        }
+        let gib = |f: &str| model_gib(&["--gguf".into(), d.join(f).to_string_lossy().into_owned()]).unwrap() * 1073741824.0;
+        assert_eq!(gib("m-00001-of-00002.gguf").round(), 8.0);
+        assert_eq!(gib("other.gguf").round(), 7.0);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
 
