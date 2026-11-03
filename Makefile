@@ -74,7 +74,7 @@ help:
 	@echo "  make pull          build the engine and download a model, without starting it: make pull MODEL=Q2_0"
 	@echo "                     (from Hugging Face into ../Strata-data, resumable: run it again if it stops)"
 	@echo "                     MODEL: Q2_0 IQ2_XS IQ3_XXS IQ3_S IQ1_M UD-Q4_K_XL UD-IQ4_XS (setup), or GLM-5.3"
-	@echo "                     GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B NUCLEUS"
+	@echo "                     GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B QWEN3-CODER-30B NUCLEUS"
 	@echo "                     HUNYUAN WAN2.2"
 	@echo "                     (tools/pull_model.py; GPT-OSS-120B-DFLASH, NUCLEUS and HUNYUAN convert too; WAN2.2"
 	@echo "                     builds stable-diffusion.cpp's sd-cli for videos)"
@@ -113,8 +113,8 @@ else
 endif
 
 # setup's own download (Hugging Face, resumable; HF_ENDPOINT for a mirror, SETUP_ARGS="--data-dir DIR" for elsewhere);
-# the models setup does not install (GLM-5.3, GPT-OSS-120B, GPT-OSS-120B-HERETIC, GPT-OSS-120B-DFLASH, GPT-OSS-20B, QWEN3.6-35B, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.py
-PULL_EXTRA  := GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B LFM2.5-24B LFM2.5-8B NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b gpt-oss-120b-heretic gpt-oss-120b-dflash gpt-oss-20b qwen3.6-35b lfm2.5-24b lfm2.5-8b nucleus hunyuan wan2.2
+# the models setup does not install (GLM-5.3, GPT-OSS-120B, GPT-OSS-120B-HERETIC, GPT-OSS-120B-DFLASH, GPT-OSS-20B, QWEN3.6-35B, QWEN3-CODER-30B, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.py
+PULL_EXTRA  := GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B QWEN3-CODER-30B LFM2.5-24B LFM2.5-8B NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b gpt-oss-120b-heretic gpt-oss-120b-dflash gpt-oss-20b qwen3.6-35b qwen3-coder-30b lfm2.5-24b lfm2.5-8b nucleus hunyuan wan2.2
 DATA_DIR    ?= ../Strata-data
 pull:
 	$(if $(filter $(MODEL),$(PULL_EXTRA)),$(PY) tools/pull_model.py $(MODEL) $(DATA_DIR),python3 bootstrap.py --setup --no-start $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS))

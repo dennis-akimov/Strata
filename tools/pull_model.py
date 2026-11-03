@@ -10,6 +10,7 @@ Hugging Face revision; a stopped download continues when you run the same line a
                  (strata-metal --dflash; it needs metal/patches/core/0002)
   GPT-OSS-20B    gpt-oss-20b MXFP4 (12.1 GB, sha-256 checked) and its tokenizer pack
   QWEN3.6-35B    Qwen3.6-35B-A3B MXFP4_MOE (21.7 GB, sha-256 checked) and its tokenizer pack
+  QWEN3-CODER-30B  Qwen3-Coder-30B-A3B-Instruct Q8_0 (32.5 GB, sha-256 checked) and its tokenizer pack
   LFM2.5-24B     LiquidAI's LFM2.5-24B-A2B (2.45B active, always thinks) in mradermacher's Q3_K_M (11.5 GB, sha-256
                  checked): fits a 16 GB Mac; and its tokenizer pack.  Not Unsloth's UD-Q3_K_XL: its IQ3_XXS experts
                  decode at 1.3 tok/s on Linux's Apple GPU driver (that mat-vec runs 15-30x slower there)
@@ -42,7 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 PY = ROOT / ".venv" / "bin" / "python"
 MTP_PY = ROOT / ".venv-mtp" / "bin" / "python"
-NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "LFM2.5-24B", "LFM2.5-8B",
+NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "QWEN3-CODER-30B", "LFM2.5-24B", "LFM2.5-8B",
          "NUCLEUS", "HUNYUAN", "WAN2.2")
 
 
@@ -216,6 +217,10 @@ def pull(name: str, data: Path) -> None:
         g = get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
                 "2fdd20997c4d88ee25f70f500c61f8b999378d92ab055f9d450fc70d617158d3")
         tokenizer(g, data / "packs" / "qwen3.6-35b-a3b")
+    elif name == "QWEN3-CODER-30B":
+        g = get(m / "Qwen3-Coder-30B-A3B-Instruct", "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/b17cb02dd882d5b6ab62fc777ad2995f19668350/Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf",
+                "4ff1cff607804037bf6d2168249c570baa4e1621292b159c0e06591e0d7c3066")
+        tokenizer(g, data / "packs" / "qwen3-coder-30b-a3b")
     elif name == "LFM2.5-24B":
         g = get(m / "LFM2.5-24B-A2B", "https://huggingface.co/mradermacher/LFM2.5-24B-A2B-GGUF/resolve/38c24e5c182245615c52f66a4d6e58ea430ba7c5/LFM2.5-24B-A2B.Q3_K_M.gguf",
                 "5d91897ff9357e9ecb2a1be7134be78eb1d9fb3c07909427605f0aada665069b")
