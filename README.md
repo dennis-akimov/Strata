@@ -132,6 +132,28 @@ in the same run.
 - The follow-up's first token comes in 0.3-0.7 s with 1-2 agents and about 1 s with 3-4, while every agent's
   conversation stays in the cache.
 
+**Agents of different sizes: own slots, one shared pool, or a router.** By default each agent holds its whole context
+from the start (4 agents at 128K = 4 x 128K of K/V). Two other ways, measured on the M5 Max, 2026-11-03, Qwen3.6-35B-A3B,
+four agents at once with ~20K / 40K / 50K / 100K-token conversations (docs/CONTEXT_POOL.md):
+
+| Layout | Memory | Reading the 4 prompts (~210K tokens) | First token, cold: 20K / 40K / 50K / 100K | Follow-up's first token | Decode, 4 at once | Decode, each |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| Own slots, 4 x 128K (the default) | 35.5 GB | 273 s | 14 / 107 / 68 / 258 s | 0.3-1.5 s | **58.1 tok/s** | 14.7-15.2 |
+| A shared pool of 288K, each agent up to 128K | **29.2 GB** | 255 s | 14 / 234 / 200 / 153 s | 0.6-2.4 s | 47.5 tok/s | 12.0-12.5 |
+| A router: servers of 32K, 2 x 64K and 128K | three engines | 259 s | 42 / 86 / 219 / 247 s | 0.4-4.0 s | 47.2 tok/s | 12.2-14.5 |
+
+- **Own slots decode fastest** (22% faster than a pool): each agent's attention reads only its own conversation. Take
+  them when the agents' contexts fit in memory (Qwen3.6 keeps K/V on 10 of its 40 layers, so they easily do).
+- **A pool holds the same agents in less memory** (6.3 GB less here) and lets any agent grow to the cap, but each
+  token's attention walks the whole pool. Take it when the contexts would not fit as own slots: a model with a big
+  K/V per token (GLM-5.3, GPT-OSS 120B) at long contexts. In Strata.app: the *pool* menu beside *agents* (off, or a
+  half / three quarters / all of context x agents, kept in proportion when you change either); in a run config:
+  `"args": [..., "--kv-unified", "--kv-pool", "294912"]`.
+- **A router** (`strata-router --backend URL=CONTEXT ...`) sends each request to the smallest server it fits; on one
+  Mac its engines compete for the GPU instead of sharing a batch, so it was slowest. It is for spreading agents over
+  several Macs.
+- Reading prompts dominates a first request in every layout (they are read one at a time); follow-ups reuse ~100%.
+
 On a 16 GB Mac: a 13-inch MacBook Pro with the M1 (2020), 2026-10-29/30, short answers, on macOS and on Linux on the
 same Mac:
 

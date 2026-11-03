@@ -48,3 +48,17 @@ any of them up to 128K; B gains nothing on one GPU (its engines compete instead 
 token 42 s against 14 s).  Qwen3.6 keeps K/V on 10 of its 40 layers, so the gain is small here; models with a big K/V
 per token (GLM-5.3, GPT-OSS 120B) are where a pool matters.  One run each: differences under ~10% are noise.
 Raw rows: bench/results/2026-11-03-context-ab.jsonl.
+
+### Decode (the conversations read first, then all 4 agents write up to 512 tokens at once)
+
+| Layout | Together | Each | Follow-up's first token |
+| --- | ---: | ---: | --- |
+| A: 4 slots x 128K | **58.1 tok/s** | 14.7-15.2 | 0.3-1.5 s |
+| B: router | 47.2 tok/s | 12.2-14.5 | 0.4-4.0 s |
+| C: pool 288K | 47.5 tok/s | 12.0-12.5 | 0.6-2.2 s |
+
+The pool decodes 18% slower: in llama.cpp's unified cache each sequence's attention walks the whole pool's cells
+(the others' masked), where a slot of its own walks only its own.  So: a pool where memory decides (a model whose K/V
+for the agents' contexts would not fit as fixed slots: GLM-5.3, GPT-OSS 120B at long contexts), fixed slots where
+speed does (Qwen3.6: small K/V).  The router is slower in both tests on one GPU.  Raw: bench/results/2026-11-03-context-decode.jsonl.
+
