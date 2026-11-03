@@ -270,6 +270,11 @@ fn add_auto_cache(args: &mut Vec<String>) {
     }
 }
 
+/// Where a draining server leaves its agents' conversations for the one that took its port (docs/BLUE_GREEN.md)
+fn handoff_dir(port: u16) -> PathBuf {
+    std::env::temp_dir().join(format!("strata-handoff-{port}"))
+}
+
 /// The server's listener, SO_REUSEPORT on: a newer server (--handoff) can bind beside it, and macOS gives the newest
 /// listener the new connections (measured).  Two servers on one port by mistake stay impossible: port_free's plain
 /// bind, before this, fails while one listens.
@@ -741,15 +746,35 @@ fn main() {
     }
     let listener = rt.block_on(listen(&addr)).unwrap_or_else(|e| die(&format!("strata-server: error: {}", listen_problem(&host, a.port, &e))));
     let router = axum::Router::new().fallback(http::handle).with_state(app);
-    // SIGUSR2 (a newer server took the port over): stop accepting, finish every request in flight, then stop
+    // SIGUSR2 (a newer server took the port over): stop accepting, finish every request in flight, then stop; the
+    // agents' conversations go to the new engine as they come free (docs/BLUE_GREEN.md)
     let drained = Arc::new(tokio::sync::Notify::new());
+    let handing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hdir = handoff_dir(a.port);
+    let strata_engine = engine.strata().cloned();
     let mut usr2 = rt.block_on(async { tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) }).expect("signal");
     rt.spawn({
-        let drained = drained.clone();
+        let (drained, handing, hdir) = (drained.clone(), handing.clone(), hdir.clone());
         async move {
+            let (handing, hdir, eng) = (handing.clone(), hdir.clone(), strata_engine.clone());
             let drain = async move {
                 usr2.recv().await;
                 say("handed over: no new requests here; finishing the ones in flight, then stopping");
+                handing.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(e) = eng {
+                    // now, and again each time a slot's request ends: those agents' state goes over one by one
+                    std::thread::spawn(move || {
+                        let mut busy_before = usize::MAX;
+                        while !e.ended.load(std::sync::atomic::Ordering::SeqCst) {
+                            let busy = e.slots_view().iter().filter(|s| s["state"] != "idle").count();
+                            if busy < busy_before && e.handoff("EXPORT", &hdir).is_err() {
+                                return;
+                            }
+                            busy_before = busy;
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                        }
+                    });
+                }
             };
             let _ = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(drain).await;
             drained.notify_one();
@@ -758,6 +783,23 @@ fn main() {
     for pid in &handoff_from {
         say(&format!("handoff: port {} is this server's now; pid {pid} finishes its requests and stops", a.port));
         unsafe { libc::kill(*pid, libc::SIGUSR2) };
+    }
+    if let (false, Some(e)) = (handoff_from.is_empty(), engine.strata().cloned()) {
+        // the old server's agents, as it writes them: into this engine's conversation cache
+        let (blue, dir) = (handoff_from.clone(), handoff_dir(a.port));
+        std::thread::spawn(move || {
+            let mut after = 0;
+            while after < 10 {
+                if !blue.iter().any(|p| unsafe { libc::kill(*p, 0) } == 0) {
+                    after += 1;
+                }
+                let waiting = std::fs::read_dir(&dir).map(|d| d.flatten().any(|f| f.path().extension().is_some_and(|x| x == "sseq"))).unwrap_or(false);
+                if waiting && e.handoff("IMPORT", &dir).is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
     }
     svc.start_idle_unload();
     let here = if ["0.0.0.0", "", "::"].contains(&host.as_str()) { "127.0.0.1".to_string() } else { host.clone() };
@@ -801,6 +843,11 @@ fn main() {
     });
     println!();
     say("stopping (Ctrl+C again to end the engine at once) ...");
+    if handing.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(e) = engine.strata() {
+            let _ = e.handoff("EXPORT", &handoff_dir(a.port)); // the last ones, before QUIT (the engine reads in order)
+        }
+    }
     std::thread::spawn(|| {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async { let _ = tokio::signal::ctrl_c().await; });

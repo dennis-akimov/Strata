@@ -44,6 +44,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1115,6 +1118,109 @@ struct Engine {
         }
     }
 
+    // Blue-green (docs/BLUE_GREEN.md): the conversations this engine holds - the parked ones and every slot not in a
+    // request - written for the new engine (EXPORT <dir>), and that engine taking them into its conversation cache
+    // (IMPORT <dir>).  A file each, named by its content: "SSEQ1", n (u64), n keys (u64), n tokens (i32), the state's
+    // size (u64) and bytes (llama_state_seq_get_data).  Written under a temporary name, then renamed.  No stdout reply:
+    // the server sends these beside requests in flight; the log says what was done.
+    std::set<uint64_t> exported;
+
+    static uint64_t keys_hash(const std::vector<uint64_t>& k) {
+        uint64_t h = 1469598103934665603ULL;
+        for (uint64_t x : k) h = (h ^ x) * 1099511628211ULL;
+        return h ^ k.size();
+    }
+
+    bool write_conv(const std::string& dir, const Seq& S, const std::vector<uint8_t>& state) {
+        const uint64_t h = keys_hash(S.keys);
+        if (S.live.empty() || state.empty() || S.keys.size() != S.live.size() || !exported.insert(h).second) return false;
+        char name[32];
+        std::snprintf(name, sizeof name, "%016llx.sseq", (unsigned long long) h);
+        const std::string path = dir + "/" + name, tmp = path + ".part";
+        std::ofstream f(tmp, std::ios::binary);
+        const uint64_t n = S.live.size(), sz = state.size();
+        f.write("SSEQ1", 5);
+        f.write((const char*) &n, sizeof n);
+        f.write((const char*) S.keys.data(), (std::streamsize) (n * sizeof(uint64_t)));
+        f.write((const char*) S.live.data(), (std::streamsize) (n * sizeof(llama_token)));
+        f.write((const char*) &sz, sizeof sz);
+        f.write((const char*) state.data(), (std::streamsize) sz);
+        f.close();
+        if (!f || std::rename(tmp.c_str(), path.c_str()) != 0) {
+            std::remove(tmp.c_str());
+            exported.erase(h);
+            return false;
+        }
+        return true;
+    }
+
+    void export_all(const std::string& dir) {
+        const auto t0 = Clock::now();
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        size_t n = 0, bytes = 0;
+        for (const auto& x : parked)
+            if (write_conv(dir, x.seq, x.state)) { ++n; bytes += x.state.size(); }
+        for (size_t sq = 0; sq < seqs.size(); ++sq) {
+            if (sq >= 1 && sq - 1 < slots.size() && slots[sq - 1].active) continue;   // in a request: when it ends
+            const Seq& S = seqs[sq];
+            if (S.live.empty() || exported.count(keys_hash(S.keys))) continue;
+            std::vector<uint8_t> st(llama_state_seq_get_size(ctx, (llama_seq_id) sq));
+            if (st.empty() || llama_state_seq_get_data(ctx, st.data(), st.size(), (llama_seq_id) sq) == 0) continue;
+            if (write_conv(dir, S, st)) { ++n; bytes += st.size(); }
+        }
+        std::fprintf(stderr, "strata-metal: handoff: exported %zu conversations (%zu bytes) to %s in %.0f ms\n", n, bytes, dir.c_str(), ms_since(t0));
+    }
+
+    void import_all(const std::string& dir) {
+        const auto t0 = Clock::now();
+        if (o.cache_mib == 0) {
+            std::fprintf(stderr, "strata-metal: handoff: no conversation cache here, nothing imported from %s\n", dir.c_str());
+            return;
+        }
+        const size_t budget = (size_t) o.cache_mib << 20;
+        size_t n = 0;
+        std::error_code ec;
+        for (const auto& ent : std::filesystem::directory_iterator(dir, ec)) {
+            if (ent.path().extension() != ".sseq") continue;
+            std::ifstream f(ent.path(), std::ios::binary);
+            char magic[5];
+            uint64_t len = 0, sz = 0;
+            Parked e;
+            bool ok = f.read(magic, 5) && std::memcmp(magic, "SSEQ1", 5) == 0 && f.read((char*) &len, sizeof len) && len > 0 && len <= (uint64_t) o.max_context;
+            if (ok) {
+                e.seq.keys.resize(len);
+                e.seq.live.resize(len);
+                ok = f.read((char*) e.seq.keys.data(), (std::streamsize) (len * sizeof(uint64_t))) &&
+                     f.read((char*) e.seq.live.data(), (std::streamsize) (len * sizeof(llama_token))) &&
+                     f.read((char*) &sz, sizeof sz) && sz > 0 && sz <= budget;
+            }
+            if (ok) {
+                e.state.resize(sz);
+                ok = (bool) f.read((char*) e.state.data(), (std::streamsize) sz);
+            }
+            f.close();
+            std::filesystem::remove(ent.path(), ec);
+            if (!ok) continue;
+            // as park(): one with as much or more of it already here wins; what it supersedes goes; the oldest make room
+            bool have = false;
+            for (auto& x : parked)
+                if (prefix_of(x.seq.keys, e.seq.keys) == len) { have = true; break; }
+            if (have) continue;
+            parked.erase(std::remove_if(parked.begin(), parked.end(), [&](const Parked& x) { return prefix_of(x.seq.keys, e.seq.keys) == x.seq.keys.size(); }), parked.end());
+            e.bytes = e.state.size() + len * (sizeof(uint64_t) + sizeof(llama_token));
+            while (!parked.empty() && ((int) parked.size() >= o.cache_slots || parked_bytes() + e.bytes > budget)) {
+                parked.erase(std::min_element(parked.begin(), parked.end(), [](const Parked& a, const Parked& b) { return a.used < b.used; }));
+                ++evictions;
+            }
+            e.used = ++park_clock;
+            parked.push_back(std::move(e));
+            out_cache("parked", (size_t) len, -1, 0.0);
+            ++n;
+        }
+        std::fprintf(stderr, "strata-metal: handoff: imported %zu conversations from %s in %.0f ms\n", n, dir.c_str(), ms_since(t0));
+    }
+
     void save(const std::string& path) {
         const auto t0 = Clock::now();
         const Seq& S = seqs[0];
@@ -1213,6 +1319,8 @@ int main(int argc, char** argv) {
         } else if (line.rfind("GENI ", 0) == 0) e.gen(line, true);
         else if (line.rfind("GEN ", 0) == 0) e.gen(line, false);
         else if (line.rfind("SAVE ", 0) == 0) e.save(line.substr(5));
+        else if (line.rfind("EXPORT ", 0) == 0) e.export_all(line.substr(7));
+        else if (line.rfind("IMPORT ", 0) == 0) e.import_all(line.substr(7));
         else if (line.rfind("RESTORE ", 0) == 0) e.restore(line.substr(8));
         else if (line.rfind("VRAM", 0) == 0) out("ERR the Metal engine has no expert cache to resize\n");
         else if (!line.empty()) out("ERR unknown command: %.40s\n", line.c_str());

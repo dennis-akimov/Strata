@@ -915,6 +915,16 @@ impl StrataEngine {
         m
     }
 
+    /// Blue-green (docs/BLUE_GREEN.md): `EXPORT <dir>` / `IMPORT <dir>` of the conversations it holds.  The engine
+    /// answers nothing on stdout (they go beside requests in flight); its log says what it did.
+    pub fn handoff(&self, verb: &str, dir: &std::path::Path) -> Result<(), Fail> {
+        let d = dir.to_string_lossy();
+        if !matches!(verb, "EXPORT" | "IMPORT") || d.contains(['\r', '\n', '\0']) {
+            return Err(Fail::Value("invalid handoff command".into()));
+        }
+        self.send(&format!("{verb} {d}"))
+    }
+
     fn send(&self, text: &str) -> Result<(), Fail> {
         btrace(&format!("send> {}", py::chars_prefix(text, 60)));
         let ok = {

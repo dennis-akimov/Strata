@@ -101,12 +101,12 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
     let me = std::process::id() as i32;
     let old: Vec<i32> = pids("/usr/bin/pgrep", &["-f", "Strata.app/Contents/MacOS/Strata$"]).into_iter().filter(|p| *p != me).collect();
     let bundle = root.join("Strata.app");
+    // -n always: right after the old app quits, LaunchServices may still count it and only "activate" it (2026-11-03)
     let open = |extra: &[&str]| {
         let mut c = Command::new("/usr/bin/open");
+        c.arg("-n").arg(&bundle);
         if !extra.is_empty() {
-            c.arg("-n").arg(&bundle).arg("--args").args(extra);
-        } else {
-            c.arg(&bundle);
+            c.arg("--args").args(extra);
         }
         c.status().map(|s| s.success()).unwrap_or(false)
     };
@@ -129,6 +129,27 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
     };
     let key = if key.is_empty() { crate::env_api_key(&cfg) } else { key };
     let metrics = || crate::get_json(&format!("http://127.0.0.1:{port}/metrics"), &key);
+    // an engine the old app did not start (another config, a test) makes the new server refuse to start ("another
+    // Strata engine is running"): say so before anything is stopped
+    let ours: Vec<i32> = old.iter().flat_map(|p| pids("/usr/bin/pgrep", &["-P", &p.to_string()])).flat_map(|s| { let mut v = pids("/usr/bin/pgrep", &["-P", &s.to_string()]); v.push(s); v }).collect();
+    let foreign: Vec<i32> = pids("/usr/bin/pgrep", &["-f", "strata-metal --serve"]).into_iter().filter(|p| !ours.contains(p)).collect();
+    if !foreign.is_empty() {
+        say(&format!("another Strata engine runs (pid {foreign:?}): the new app's server would refuse to start beside it. Stop it first; nothing was changed"));
+        return 1;
+    }
+    // the new server answers: the deploy is done only then
+    let up = || {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(600) {
+            if crate::get_json(&format!("http://127.0.0.1:{port}/health"), &key).is_some_and(|h| h["loaded"] == true) {
+                say(&format!("the new server answers on port {port} ({:.0} s)", t.elapsed().as_secs_f64()));
+                return 0;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        say(&format!("no server answers on port {port} after 10 min: see Strata.app's log"));
+        1
+    };
     let m = metrics();
     let share = can_share(&host, port);
     let fit = m.as_ref().is_some_and(|m| fits(m, model_bytes(&cfg)));
@@ -136,7 +157,7 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
     say(&format!("{p:?} (old app {old:?}, port {port}, {}, sharable {share}, a second engine fits {fit})",
                  if m.as_ref().is_some_and(busy) { "busy" } else { "idle" }));
     match p {
-        Plan::Open => return if open(&[]) { 0 } else { 1 },
+        Plan::Open => return if open(&[]) { up() } else { 1 },
         Plan::WaitIdle => {
             let t = Instant::now();
             let mut last = Instant::now();
@@ -177,7 +198,7 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
         Plan::Restart => {}
     }
     quit_old();
-    if open(&[]) { 0 } else { 1 }
+    if open(&[]) { up() } else { 1 }
 }
 
 #[cfg(test)]
