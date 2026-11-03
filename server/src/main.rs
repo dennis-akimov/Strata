@@ -312,14 +312,17 @@ fn engines_in(ps: &str) -> Vec<String> {
 fn port_free(host: &str, port: u16) -> std::io::Result<()> {
     let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.to_string() }, port);
     std::net::TcpListener::bind(&addr)?;
-    let lo = match host {
+    // and the other way round: macOS lets 127.0.0.1:port bind while another server holds 0.0.0.0:port (a server
+    // on "host": "0.0.0.0" then hid from --replace, and its engine made this one refuse to start)
+    let other = match host {
         "0.0.0.0" => "127.0.0.1",
         "::" => "::1",
-        _ => return Ok(()),
+        h if h.contains(':') => "::",
+        _ => "0.0.0.0",
     };
-    match std::net::TcpListener::bind((lo, port)) {
+    match std::net::TcpListener::bind((other, port)) {
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(e),
-        _ => Ok(()), // no loopback of that family here: nothing to shadow
+        _ => Ok(()), // no address of that family here: nothing to shadow
     }
 }
 
@@ -752,5 +755,15 @@ mod port_tests {
         assert_eq!(port_free("127.0.0.1", p).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
         drop(other);
         assert!(port_free("0.0.0.0", p).is_ok());
+    }
+
+    #[test]
+    fn a_loopback_host_is_refused_when_another_server_has_the_wildcard_port() {
+        // a Strata server on "host": "0.0.0.0", this one asked for 127.0.0.1: --replace must see that one
+        let other = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let p = other.local_addr().unwrap().port();
+        assert_eq!(port_free("127.0.0.1", p).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        drop(other);
+        assert!(port_free("127.0.0.1", p).is_ok());
     }
 }

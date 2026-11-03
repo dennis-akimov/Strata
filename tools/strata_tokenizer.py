@@ -101,6 +101,8 @@ PRE = {
     "glm4": (GLM4_PATTERN, "zai-org/GLM-5.3-Flash tokenizer.json pre_tokenizer; model.ignore_merges", True),
     # LFM2 / LFM2.5 (LiquidAI): their tokenizer.json's pattern is glm4's, character for character
     "lfm2": (GLM4_PATTERN, "LiquidAI/LFM2.5-24B-A2B tokenizer.json pre_tokenizer (= glm4's); model.ignore_merges", True),
+    # Qwen2 / Qwen2.5 / Qwen3 / Qwen3-Coder: hunyuan's pattern, character for character; no ignore_merges in the model
+    "qwen2": (HUNYUAN_PATTERN, "Qwen/Qwen3-Coder-30B-A3B-Instruct tokenizer.json pre_tokenizer (= hunyuan's)", False),
     "hunyuan": (HUNYUAN_PATTERN, "tencent/HunyuanImage-3.0-Instruct-Distil tokenizer.json pre_tokenizer; "
                                  "model.ignore_merges", True),
 }

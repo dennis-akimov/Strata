@@ -1,7 +1,7 @@
 //! Agents x context x conversation-cache matrix: decode and prefill tok/s of N concurrent agents.
 //!
 //!     strata-bench strata-qwen3.6-35b.json [--agents 3,4] [--ctx 16384,32768,65536,131072,262144]
-//!                  [--cache-gb 0,8,16,32] [--depth 8000] [--out bench/results/DATE-agents-matrix]
+//!                  [--cache-gb 0,8,16,32] [--depth 8000] [--out bench/results/DATE-agents-matrix] [--restore CONFIG]
 //!
 //! Each cell restarts the config's server (--replace on its port) with --batch = agents, --max-context = ctx (per
 //! slot) and --conversation-cache-mib = cache.  Every agent then runs, all agents in lockstep:
@@ -264,6 +264,7 @@ fn main() {
         unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
         let _ = c.wait();
     }
-    let _ = start(&server, &cfg_path, port, &out.join("server-restore.log"), &root);
-    println!("results: {}\nrestored {} on :{port}", out.join("results.jsonl").display(), cfg_path.display());
+    let restore = args.iter().position(|a| a == "--restore").map(|i| PathBuf::from(&args[i + 1])).unwrap_or(cfg_path);
+    let _ = start(&server, &restore, port, &out.join("server-restore.log"), &root);
+    println!("results: {}\nrestored {} on :{port}", out.join("results.jsonl").display(), restore.display());
 }

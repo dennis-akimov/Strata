@@ -77,6 +77,8 @@ impl ChatTemplate {
         env.set_syntax(minijinja::syntax::SyntaxConfig::builder().trim_blocks(true).lstrip_blocks(true).build()?);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", tojson);
+        // jinja2: None is not iterable (minijinja's says it is); Qwen3-Coder's template then takes `tools | length` of none
+        env.add_test("iterable", |v: MjValue| !v.is_none() && v.try_iter().is_ok());
         env.add_function("raise_exception", |msg: String| -> Result<String, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, format!("{RAISED}{msg}")))
         });
@@ -224,5 +226,13 @@ List of tools: [{%- for t in tools -%}{{ t | tojson }}{% if not loop.last %}, {%
         let t = ChatTemplate::from_source("{%- for m in messages %}<{{ m.role }}>{%- generation -%} {{ m.content }} {%- endgeneration -%}</>{% endfor %}".into()).unwrap();
         let p = t.render(&[json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "yo"})], None, false, &Map::new()).unwrap();
         assert_eq!(p, "<user>hi</><assistant>yo</>");
+    }
+
+    #[test]
+    fn none_is_not_iterable_as_in_jinja2() {
+        // Qwen3-Coder's template: no tools sent -> tools is none -> must skip the `| length` branch
+        let t = ChatTemplate::from_source("{%- if tools is iterable and tools | length > 0 %}T{% endif %}{{ messages[0].content }}{{ 'ab' is iterable }}{{ 3 is iterable }}".into()).unwrap();
+        assert_eq!(t.render(&[json!({"role": "user", "content": "hi"})], None, false, &Map::new()).unwrap(), "hiTrueFalse");
+        assert_eq!(t.render(&[json!({"role": "user", "content": "hi"})], Some(&[json!({"name": "f"})]), false, &Map::new()).unwrap(), "ThiTrueFalse");
     }
 }
