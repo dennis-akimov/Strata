@@ -145,11 +145,14 @@ struct Options {
     int batch = 0;                                     // --batch N: batch slots (the server's "parallel")
     int poll = -1;                                     // --poll N: ggml's CPU busy-wait level (llama.cpp default 50)
     // --ablate <file>: directions projected out of every layer's output while the model runs (directional ablation;
-    // the GGUF is not changed; metal/patches/core).  Raw float32, layers x k x n_embd, each layer's k rows orthonormal,
-    // a layer of zeros left alone.  --ablate-layers: the file's layer count (default: the model's); k follows from it
+    // the GGUF is not changed; metal/patches/core).  Raw float32, layers x k x n_embd, each layer's k rows orthogonal
+    // and of length <= 1 (a row of length sqrt(w) removes w of its direction: strata-ablate's per-layer weights), a
+    // layer of zeros left alone.  --ablate-layers: the file's layer count (default: the model's); k follows from it.
+    // --ablate-mid: also right after each layer's attention, before its experts read the stream (metal/patches/core/0004)
     std::string ablate;
     int ablate_layers = 0;
     float ablate_scale = 1.0f;
+    bool ablate_mid = false;
     bool plan = false;                                 // --plan: print the memory this model needs (JSON) and exit
 };
 
@@ -195,6 +198,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--ablate") o.ablate = val("--ablate");
         else if (a == "--ablate-layers") o.ablate_layers = std::atoi(val("--ablate-layers"));
         else if (a == "--ablate-scale") o.ablate_scale = (float) std::atof(val("--ablate-scale"));
+        else if (a == "--ablate-mid") o.ablate_mid = true;
         else if (a == "--eos-ids") {
             if (!parse_ids(val("--eos-ids"), o.eos)) { std::fprintf(stderr, "strata-metal: bad --eos-ids\n"); return false; }
         } else if (a.rfind("--", 0) == 0) {
@@ -484,8 +488,9 @@ struct Engine {
             return false;
         }
         const int k = (int) (v.size() / per);
-        // each steered layer's directions orthonormal: x - sum (x . v) v removes them only then, and a file of another
-        // layout (a wrong --ablate-layers, another model's width) fails here instead of steering at random
+        // each steered layer's directions orthogonal and no longer than 1: x - sum (x . v) v then removes |v|^2 of each
+        // (a weight), never more; a file of another layout (a wrong --ablate-layers, another model's width) fails here
+        // instead of steering at random
         int steered = 0;
         for (int l = 0; l < layers; ++l) {
             const float* L = v.data() + (size_t) l * k * n_embd;
@@ -495,8 +500,8 @@ struct Engine {
                 for (int b = a; b < k; ++b) {
                     double d = 0.0;
                     for (int e = 0; e < n_embd; ++e) d += (double) L[(size_t) a * n_embd + e] * L[(size_t) b * n_embd + e];
-                    if (std::fabs(d - (a == b ? 1.0 : 0.0)) > 1e-3) {
-                        err = "--ablate " + o.ablate + ": layer " + std::to_string(l) + "'s directions are not orthonormal (v" +
+                    if (a == b ? (d <= 0.0 || d > 1.0 + 1e-3) : std::fabs(d) > 1e-3) {
+                        err = "--ablate " + o.ablate + ": layer " + std::to_string(l) + "'s directions are not orthogonal of length <= 1 (v" +
                               std::to_string(a) + " . v" + std::to_string(b) + " = " + std::to_string(d) + ")";
                         return false;
                     }
@@ -506,8 +511,9 @@ struct Engine {
             err = "llama.cpp refused --ablate " + o.ablate;
             return false;
         }
-        std::fprintf(stderr, "strata-metal: --ablate %s: %d of %d layers steered, %d directions each, scale %.2f\n",
-                     o.ablate.c_str(), steered, layers, k, o.ablate_scale);
+        if (o.ablate_mid) llama_set_adapter_ablation_mid(ctx, true);
+        std::fprintf(stderr, "strata-metal: --ablate %s: %d of %d layers steered, %d directions each, scale %.2f%s\n",
+                     o.ablate.c_str(), steered, layers, k, o.ablate_scale, o.ablate_mid ? ", after the attention too" : "");
         return true;
     }
 

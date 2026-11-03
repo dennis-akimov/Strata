@@ -4,6 +4,9 @@
 //                         "ACT <bytes>\n" + layers x n x n_embd f32
 //   LOGP <id,id,...>      the log-softmax over the vocabulary at the prompt's last token: "LOGP <bytes>\n" + n_vocab f32
 //   ABL <path> | ABL -    project the file's directions out of every layer (as strata-metal --ablate), or stop: "OK"
+//   MID 1 | MID 0         also right after each layer's attention (strata-metal --ablate-mid), or not: "OK"
+//   GEN <n> <id,id,...>   the greedy answer, at most n tokens, up to the end-of-turn token: "GEN <bytes>\n" + its token ids
+//                         as f32 (exact below 2^24)
 // Each prompt starts from an empty memory.  Errors: "ERR <message>" (the command is skipped, the process keeps going).
 //
 //     strata-directions --gguf MODEL.gguf [--max-context 4096]
@@ -12,6 +15,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -125,9 +129,18 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             continue;
         }
-        if (cmd != "ACT" && cmd != "LOGP") { err("unknown command " + cmd); continue; }
-        int n_last = 1;
+        if (cmd == "MID") {
+            int on = 0;
+            in >> on;
+            llama_set_adapter_ablation_mid(ctx, on != 0);
+            std::printf("OK\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (cmd != "ACT" && cmd != "LOGP" && cmd != "GEN") { err("unknown command " + cmd); continue; }
+        int n_last = 1, n_gen = 0;
         if (cmd == "ACT") in >> n_last;
+        if (cmd == "GEN") in >> n_gen;
         std::string ids_s;
         in >> ids_s;
         std::vector<llama_token> ids = ids_of(ids_s);
@@ -157,6 +170,20 @@ int main(int argc, char** argv) {
         }
         if (cap.on) {
             reply("ACT", cap.out);
+            continue;
+        }
+        if (cmd == "GEN") {
+            const llama_vocab* vocab = llama_model_get_vocab(model);
+            std::vector<float> out;
+            llama_pos pos = (llama_pos) ids.size();
+            for (int i = 0; i < n_gen && pos < n_ctx; i++, pos++) {
+                const float* lg = llama_get_logits_ith(ctx, -1);
+                llama_token t = (llama_token) (std::max_element(lg, lg + n_vocab) - lg);
+                if (llama_vocab_is_eog(vocab, t)) break;
+                out.push_back((float) t);
+                if (llama_decode(ctx, llama_batch_get_one(&t, 1)) != 0) break;
+            }
+            reply("GEN", out);
             continue;
         }
         const float* lg = llama_get_logits_ith(ctx, -1);
