@@ -699,6 +699,29 @@ fn set_cache_mib(cfg_path: &Path, mib: i64) -> Result<(), String> {
     write_config(cfg_path, &text, &v)
 }
 
+/// The shared K/V pool (docs/CONTEXT_POOL.md): `--kv-unified --kv-pool N` in "args" (N tokens all agents draw from,
+/// each up to its --max-context); 0 takes both out (each agent its own context).  A running server restarts with it.
+fn set_pool(cfg_path: &Path, tokens: u64) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
+    if let Some(i) = args.iter().position(|a| a == "--kv-pool") {
+        args.drain(i..(i + 2).min(args.len()));
+    }
+    args.retain(|a| a != "--kv-unified");
+    if tokens > 0 {
+        args.extend([json!("--kv-unified"), json!("--kv-pool"), json!(tokens.to_string())]);
+    }
+    write_config(cfg_path, &text, &v)
+}
+
+/// The config's shared pool in tokens (0: none) and its per-agent context
+fn pool_of(c: &Value) -> (u64, u64) {
+    let a = c["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let val = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).and_then(Value::as_str).and_then(|n| n.parse().ok());
+    (if a.iter().any(|x| x == "--kv-unified") { val("--kv-pool").unwrap_or(0) } else { 0 }, val("--max-context").unwrap_or(0))
+}
+
 /// The config's conversation cache budget in MiB (0: off, -1: none set, the server's automatic size).
 fn cache_mib(c: &Value) -> i64 {
     let a = c["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -1158,7 +1181,8 @@ fn snapshot(st: &Shared) -> Value {
         .map(|p| {
             let c = read_config(p);
             json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"], "problem": problem(&c),
-                "parallel": c["parallel"].as_u64().filter(|n| *n > 1).map(|n| n.min(8)).unwrap_or(1), "cache_mib": cache_mib(&c)})
+                "parallel": c["parallel"].as_u64().filter(|n| *n > 1).map(|n| n.min(8)).unwrap_or(1), "cache_mib": cache_mib(&c),
+                "pool": pool_of(&c).0, "ctx": pool_of(&c).1})
         })
         .collect();
     let settings = load_settings();
@@ -1528,6 +1552,31 @@ fn main() {
                         }
                         let msg = match set_parallel(&cfg, n) {
                             Ok(()) => format!("── {n} request{} at once in {} ──", if n == 1 { "" } else { "s" }, cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        if running {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                        check_memory(&st2, &p2, None);
+                    });
+                }
+                "set_pool" => {
+                    // the shared K/V pool in the config; a running server restarts with it
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let tokens = v["tokens"].as_u64().unwrap_or(0);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let name = cfg.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        let msg = match set_pool(&cfg, tokens) {
+                            Ok(()) if tokens > 0 => format!("── one K/V pool of {}K tokens for all agents in {name} ──", tokens / 1024),
+                            Ok(()) => format!("── each agent its own context in {name} ──"),
                             Err(e) => format!("── the config could not be changed: {e} ──"),
                         };
                         let _ = p2.send_event(Ev::Log(msg));
@@ -2397,6 +2446,13 @@ mod tests {
         set_cache_mib(&p, 16384).unwrap();                                   // replaced, never added twice
         assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "16384"]));
         assert_eq!(cache_mib(&read_config(&p)), 16384);
+        set_pool(&p, 294912).unwrap();                                       // a pool: both flags, once
+        set_pool(&p, 393216).unwrap();
+        assert_eq!(pool_of(&read_config(&p)).0, 393216);
+        assert_eq!(read_config(&p)["args"].as_array().unwrap().iter().filter(|a| *a == "--kv-unified").count(), 1);
+        set_pool(&p, 0).unwrap();
+        assert_eq!(pool_of(&read_config(&p)).0, 0);
+        assert!(!read_config(&p)["args"].as_array().unwrap().iter().any(|a| a == "--kv-unified" || a == "--kv-pool"));
         set_cache_mib(&p, 0).unwrap();                                       // off: "0", or the server would size one
         assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "0"]));
         assert_eq!(cache_mib(&read_config(&p)), 0);
