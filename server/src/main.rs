@@ -34,6 +34,10 @@ struct Args {
     /// if another Strata server holds the port, stop it and start this one
     #[arg(long)]
     replace: bool,
+    /// blue-green (make app-run while the model is busy): share the port with the Strata server that holds it, load the
+    /// model first, then take every new connection and have that one finish its requests and stop (SIGUSR2)
+    #[arg(long, conflicts_with = "replace")]
+    handoff: bool,
     #[arg(long)]
     gpu: Option<String>,
     /// pack tokenizer directory (falls back to a byte tokenizer if absent)
@@ -263,6 +267,18 @@ fn add_auto_cache(args: &mut Vec<String>) {
     }
 }
 
+/// The server's listener, SO_REUSEPORT on: a newer server (--handoff) can bind beside it, and macOS gives the newest
+/// listener the new connections (measured).  Two servers on one port by mistake stay impossible: port_free's plain
+/// bind, before this, fails while one listens.
+async fn listen(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    let sa = tokio::net::lookup_host(addr).await?.next().ok_or_else(|| std::io::Error::other(format!("{addr}: no address")))?;
+    let s = if sa.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    s.set_reuseaddr(true)?;
+    s.set_reuseport(true)?;
+    s.bind(sa)?;
+    s.listen(1024)
+}
+
 fn warn_budget_over_ram(args: &[String]) {
     let Some(i) = args.iter().position(|a| a == "--resident-budget-gib") else { return };
     let Some(budget) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) else { return };
@@ -404,6 +420,7 @@ fn main() {
     let host = a.host.clone().or_else(|| get(&cfgv, "host").as_str().filter(|h| !h.is_empty()).map(String::from)).unwrap_or_else(|| "127.0.0.1".into());
     // before the minutes of loading: is the port free?
     let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.clone() }, a.port);
+    let mut handoff_from: Vec<i32> = vec![];
     if let Err(e) = port_free(&host, a.port) {
         let holders = if e.kind() == std::io::ErrorKind::AddrInUse { port_holders(a.port) } else { vec![] };
         let ours: Vec<&(i32, String)> = holders.iter().filter(|(_, c)| is_strata_server(c)).collect();
@@ -414,6 +431,10 @@ fn main() {
         let (pid, cmd) = ours[0];
         let config = cmd.split_once("--config").map(|(_, r)| r.split_whitespace().next().unwrap_or("?").trim_matches('"').to_string()).unwrap_or_else(|| "?".into());
         say(&format!("port {} is held by another Strata server: pid {pid}, {}", a.port, Path::new(&config).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or(config)));
+        if a.handoff {
+            handoff_from = ours.iter().map(|(p, _)| *p).collect();
+            say(&format!("handoff: this server takes port {} over from pid {pid} once its model is loaded", a.port));
+        } else {
         if !a.replace {
             use std::io::IsTerminal;
             if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
@@ -431,6 +452,7 @@ fn main() {
             die(&format!("strata-server: error: could not free port {} (pid {pid} did not stop)", a.port));
         }
         say(&format!("port {} is free", a.port));
+        }
     }
     // "engine": "afm": Apple's on-device model (metal/afm/strata-afm, FoundationModels): text in and out, so bytes for
     // tokens and the conversation as JSON for a prompt
@@ -500,7 +522,8 @@ fn main() {
         // two engines need the memory for two models: on a 16 GB Mac the kernel's out-of-memory killer then ends one of
         // them (and systemd the session it ran in: a TUI was lost that way).  --replace has already stopped this port's.
         let others = other_engines();
-        if !others.is_empty() && std::env::var("STRATA_ALLOW_SECOND_ENGINE").map(|v| v != "1").unwrap_or(true) {
+        // a handoff runs two engines for a while: the weights are the same mapped file, only the contexts are twice
+        if !others.is_empty() && handoff_from.is_empty() && std::env::var("STRATA_ALLOW_SECOND_ENGINE").map(|v| v != "1").unwrap_or(true) {
             exit_msg(&format!(
                 "[strata] another Strata engine is running (pid {}): two models need the memory of both, and the system ends one when it runs out. \
                  Stop that one first (Ctrl+S in its make tui, Stop in Strata.app, or make stop), or start this one with --replace on its port. \
@@ -706,11 +729,33 @@ fn main() {
     svc.start_telemetry();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().max_blocking_threads(1024).build().expect("runtime");
     let app = http::App::new(svc.clone());
-    let listener = rt.block_on(tokio::net::TcpListener::bind(&addr)).unwrap_or_else(|e| die(&format!("strata-server: error: {}", listen_problem(&host, a.port, &e))));
+    if !handoff_from.is_empty() {
+        // the old server keeps answering until this one can: the model is loaded before the port is taken
+        say("handoff: loading the model before taking the port ...");
+        if let Err(e) = svc.ensure_loaded() {
+            die(&format!("strata-server: error: handoff: the model did not load ({e}); the server on port {} keeps running", a.port));
+        }
+    }
+    let listener = rt.block_on(listen(&addr)).unwrap_or_else(|e| die(&format!("strata-server: error: {}", listen_problem(&host, a.port, &e))));
     let router = axum::Router::new().fallback(http::handle).with_state(app);
-    rt.spawn(async move {
-        let _ = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+    // SIGUSR2 (a newer server took the port over): stop accepting, finish every request in flight, then stop
+    let drained = Arc::new(tokio::sync::Notify::new());
+    let mut usr2 = rt.block_on(async { tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) }).expect("signal");
+    rt.spawn({
+        let drained = drained.clone();
+        async move {
+            let drain = async move {
+                usr2.recv().await;
+                say("handed over: no new requests here; finishing the ones in flight, then stopping");
+            };
+            let _ = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(drain).await;
+            drained.notify_one();
+        }
     });
+    for pid in &handoff_from {
+        say(&format!("handoff: port {} is this server's now; pid {pid} finishes its requests and stops", a.port));
+        unsafe { libc::kill(*pid, libc::SIGUSR2) };
+    }
     svc.start_idle_unload();
     let here = if ["0.0.0.0", "", "::"].contains(&host.as_str()) { "127.0.0.1".to_string() } else { host.clone() };
     println!("ready: http://{here}:{}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context {} tokens{}{})", a.port, engine.max_context(), if vision.is_some() { ", images on" } else { "" }, if svc.set.api_key.is_empty() { "" } else { ", API key required" });
@@ -748,6 +793,7 @@ fn main() {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = term.recv() => {},
+            _ = drained.notified() => {},
         }
     });
     println!();
