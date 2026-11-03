@@ -11,11 +11,15 @@
 //! Rows go to results.jsonl and a table on stdout.  At the end the original config is started again on its port.
 // ponytail: fixed depth, not a fill of the whole window; pass --depth to go deeper (prefill time grows with it).
 
+#[path = "common/server.rs"]
+mod server;
+
 use serde_json::{Value, json};
+use server::{get_json, start, stop, wait_loaded};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -121,35 +125,6 @@ fn chat(base: &str, key: &str, model: &str, messages: &Value) -> Turn {
     t
 }
 
-fn get_json(url: &str, key: &str) -> Option<Value> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(5))).build().into();
-    let r = agent.get(url).header("Authorization", format!("Bearer {key}")).call().ok()?;
-    serde_json::from_reader(r.into_body().into_reader()).ok()
-}
-
-fn start(server: &Path, cfg: &Path, port: u64, log: &Path, root: &Path) -> Child {
-    let log = fs::File::create(log).unwrap();
-    Command::new(server).args(["--engine", "strata", "--config"]).arg(cfg).args(["--port", &port.to_string(), "--replace"])
-        .current_dir(root).stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).spawn().expect("start strata-server")
-}
-
-/// Waits for /health loaded; Err when the server exits first (e.g. the engine does not fit) or after 10 minutes.
-fn wait_loaded(child: &mut Child, base: &str, key: &str) -> Result<f64, String> {
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(600) {
-        if let Ok(Some(s)) = child.try_wait() {
-            return Err(format!("server exited ({s})"));
-        }
-        // the port may still be the server --replace is stopping: ours only once our child runs its engine
-        let ours = Command::new("/usr/bin/pgrep").args(["-P", &child.id().to_string(), "strata-metal"]).output().is_ok_and(|o| o.status.success());
-        if ours && get_json(&format!("{base}/health"), key).is_some_and(|h| h["loaded"] == true) {
-            return Ok(t0.elapsed().as_secs_f64());
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    Err("not loaded after 600 s".into())
-}
-
 fn sum_tps(ts: &[Turn]) -> f64 {
     ts.iter().map(|t| t.decode_tps).sum()
 }
@@ -194,9 +169,8 @@ fn main() {
                 let cpath = out.join("config.json");
                 fs::write(&cpath, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
                 // stop our previous server ourselves: --replace only finds one that already holds the port
-                if let Some(mut c) = prev.take() {
-                    unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
-                    let _ = c.wait();
+                if let Some(c) = prev.take() {
+                    stop(c);
                 }
                 let mut child = start(&server, &cpath, port, &out.join(format!("server-{cell}.log")), &root);
                 let mut row = json!({"agents": a, "ctx": ctx, "cache_gb": gb, "depth": depth});
@@ -260,9 +234,8 @@ fn main() {
         }
     }
     // put the original model back on its port, detached: it outlives this process
-    if let Some(mut c) = prev.take() {
-        unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
-        let _ = c.wait();
+    if let Some(c) = prev.take() {
+        stop(c);
     }
     let restore = args.iter().position(|a| a == "--restore").map(|i| PathBuf::from(&args[i + 1])).unwrap_or(cfg_path);
     let _ = start(&server, &restore, port, &out.join("server-restore.log"), &root);
