@@ -90,8 +90,9 @@ class GGUFFile:
         if magic != GGUF_MAGIC:
             raise ValueError(f"{self.path.name}: not a GGUF file (magic {magic:#x})")
         self.version, n_tensors, n_kv = struct.unpack("<IQQ", fh.read(20))
-        if self.version != 3:
-            raise ValueError(f"{self.path.name}: GGUF v{self.version}, this reader handles v3")
+        # v2 and v3 share the little-endian layout (v3 only added big-endian files)
+        if self.version not in (2, 3):
+            raise ValueError(f"{self.path.name}: GGUF v{self.version}, this reader handles v2 and v3")
         for _ in range(n_kv):
             key = self._str(fh)
             self.metadata[key] = self._value(fh)

@@ -1,5 +1,5 @@
-//! The pack's byte-level BPE tokenizer (tools/strata_tokenizer.py, the reference of record) and the byte stand-in the
-//! mock engine uses.  Offsets are byte offsets of the text (Python's were character offsets: the same spans).
+//! The pack's byte-level BPE and SentencePiece tokenizers (tools/strata_tokenizer.py, the reference of record) and the
+//! byte stand-in the mock engine uses.  Offsets are byte offsets of the text (Python's were character offsets: the same spans).
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{anyhow, bail, Context, Result};
@@ -402,6 +402,187 @@ impl Tokenizer {
     }
 }
 
+/// The pack's `tokenizer/` directory as whichever tokenizer its tokenizer.json names: `llama` (SentencePiece) or BPE.
+pub fn from_pack_dir(dir: &Path) -> Result<Box<dyn Tokenize>> {
+    let cfg: serde_json::Value =
+        std::fs::read_to_string(dir.join("tokenizer.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    Ok(if cfg["model"] == "llama" { Box::new(SpmTokenizer::from_dir(dir)?) } else { Box::new(Tokenizer::from_dir(dir)?) })
+}
+
+const SPACE: char = '\u{2581}'; // SentencePiece's visible space
+
+/// SentencePiece as llama.cpp runs it (llm_tokenizer_spm_session): characters merged pairwise, highest score first
+/// (leftmost among equals), while the pair spells a token; a final symbol that is no token becomes its `<0xXX>` bytes.
+/// A text fragment at the start or right after a special token gets one leading space (add_space_prefix).
+pub struct SpmTokenizer {
+    tokens: Vec<String>,
+    scores: Vec<f64>,
+    types: Vec<i64>,
+    ids: HashMap<String, u32>,
+    add_space_prefix: bool,
+    byte_ids: [u32; 256],
+    control: Vec<String>,
+    always_re: Option<(AhoCorasick, Vec<u32>)>,
+    special_re: Option<(AhoCorasick, Vec<u32>)>,
+}
+
+/// A candidate merge: popped highest score first, then leftmost (llm_bigram_spm::comparator).
+#[derive(PartialEq)]
+struct Bigram {
+    score: f64,
+    left: usize,
+    right: usize,
+    size: usize,
+}
+
+impl Eq for Bigram {}
+
+impl Ord for Bigram {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        // partial_cmp, not total_cmp: -0.0 == 0.0 as C++'s `<` has it
+        self.score.partial_cmp(&o.score).unwrap_or(std::cmp::Ordering::Equal).then(o.left.cmp(&self.left))
+    }
+}
+
+impl PartialOrd for Bigram {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl SpmTokenizer {
+    pub fn new(tokens: Vec<String>, scores: Vec<f64>, types: Vec<i64>, add_space_prefix: bool, unk: u32) -> Result<Self> {
+        if scores.len() != tokens.len() || types.len() != tokens.len() {
+            bail!("{} tokens, {} scores, {} token types", tokens.len(), scores.len(), types.len());
+        }
+        let ids: HashMap<String, u32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        if ids.len() != tokens.len() {
+            bail!("vocabulary has duplicate tokens: {} entries, {} unique", tokens.len(), ids.len());
+        }
+        let mut byte_ids = [unk; 256];
+        for (b, id) in byte_ids.iter_mut().enumerate() {
+            if let Some(&i) = ids.get(&format!("<0x{b:02X}>")).or_else(|| ids.get(&(b as u8 as char).to_string())) {
+                *id = i;
+            }
+        }
+        // llama.cpp's special cache: CONTROL (3) and UNKNOWN (2) need parse_special, USER_DEFINED (4) always matches
+        let both: Vec<(&String, u32)> = (0..tokens.len()).filter(|&i| matches!(types[i], 2..=4)).map(|i| (&tokens[i], i as u32)).collect();
+        let always: Vec<(&String, u32)> = both.iter().copied().filter(|&(_, i)| types[i as usize] == 4).collect();
+        let control = (0..tokens.len()).filter(|&i| types[i] == 3).map(|i| tokens[i].clone()).collect();
+        let (always_re, special_re) = (alt(&always), alt(&both));
+        Ok(SpmTokenizer { tokens, scores, types, ids, add_space_prefix, byte_ids, control, always_re, special_re })
+    }
+
+    /// The pack's `tokenizer/` directory: vocab.json, scores.json, token_type.json, tokenizer.json (add_space_prefix).
+    pub fn from_dir(dir: &Path) -> Result<Self> {
+        let vocab: HashMap<String, usize> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("vocab.json")).context("vocab.json")?)?;
+        let mut tokens = vec![String::new(); vocab.len()];
+        for (t, i) in vocab {
+            *tokens.get_mut(i).ok_or_else(|| anyhow!("vocab id {i} out of range"))? = t;
+        }
+        let scores = serde_json::from_str(&std::fs::read_to_string(dir.join("scores.json")).context("scores.json")?)?;
+        let types = serde_json::from_str(&std::fs::read_to_string(dir.join("token_type.json")).context("token_type.json")?)?;
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer.json")).context("tokenizer.json")?)?;
+        let unk = cfg["special_ids"]["tokenizer.ggml.unknown_token_id"].as_u64().unwrap_or(0) as u32;
+        Self::new(tokens, scores, types, cfg["add_space_prefix"].as_bool().unwrap_or(true), unk)
+    }
+
+    /// One text fragment (spaces already U+2581), as llm_tokenizer_spm_session::tokenize.
+    fn spm(&self, text: &str, out: &mut Vec<u32>) {
+        let start: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        let n = start.len();
+        if n == 0 {
+            return;
+        }
+        let mut size: Vec<usize> = (0..n).map(|i| start.get(i + 1).unwrap_or(&text.len()) - start[i]).collect(); // bytes; 0 = merged away
+        let mut nxt: Vec<isize> = (1..=n as isize).collect();
+        nxt[n - 1] = -1;
+        let mut prv: Vec<isize> = (-1..n as isize - 1).collect();
+        let mut heap = BinaryHeap::new();
+        let add = |heap: &mut BinaryHeap<Bigram>, size: &[usize], l: isize, r: isize| {
+            if l < 0 || r < 0 {
+                return;
+            }
+            let (l, r) = (l as usize, r as usize);
+            if let Some(&i) = self.ids.get(&text[start[l]..start[l] + size[l] + size[r]]) {
+                heap.push(Bigram { score: self.scores[i as usize], left: l, right: r, size: size[l] + size[r] });
+            }
+        };
+        for i in 1..n {
+            add(&mut heap, &size, i as isize - 1, i as isize);
+        }
+        while let Some(b) = heap.pop() {
+            if size[b.left] == 0 || size[b.right] == 0 || size[b.left] + size[b.right] != b.size {
+                continue; // stale: one of its symbols has merged since
+            }
+            size[b.left] += size[b.right];
+            size[b.right] = 0;
+            nxt[b.left] = nxt[b.right];
+            if nxt[b.right] >= 0 {
+                prv[nxt[b.right] as usize] = b.left as isize;
+            }
+            add(&mut heap, &size, prv[b.left], b.left as isize);
+            add(&mut heap, &size, b.left as isize, nxt[b.left]);
+        }
+        let mut i = 0isize;
+        while i >= 0 {
+            let piece = &text[start[i as usize]..start[i as usize] + size[i as usize]];
+            // a merged symbol always spells a token, so llama.cpp's rev_merge split-back never runs: bytes it is
+            match self.ids.get(piece) {
+                Some(&id) => out.push(id),
+                None => out.extend(piece.bytes().map(|b| self.byte_ids[b as usize])),
+            }
+            i = nxt[i as usize];
+        }
+    }
+
+    fn ordinary(&self, text: &str, prev_special: bool, out: &mut Vec<u32>) {
+        let prefix = if self.add_space_prefix && prev_special { " " } else { "" };
+        self.spm(&format!("{prefix}{text}").replace(' ', &SPACE.to_string()), out);
+    }
+}
+
+impl Tokenize for SpmTokenizer {
+    fn encode_plain(&self, text: &str, parse_special: bool, plain: &[(usize, usize)]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let (mut pos, mut prev_special) = (0, true);
+        if let Some((ac, ids)) = if parse_special { &self.special_re } else { &self.always_re } {
+            for m in ac.find_iter(text) {
+                if plain.iter().any(|&(a, b)| a <= m.start() && m.start() < b) {
+                    continue;
+                }
+                if m.start() > pos {
+                    self.ordinary(&text[pos..m.start()], prev_special, &mut out);
+                }
+                out.push(ids[m.pattern().as_usize()]);
+                (pos, prev_special) = (m.end(), true);
+            }
+        }
+        if pos < text.len() {
+            self.ordinary(&text[pos..], prev_special, &mut out);
+        }
+        out
+    }
+
+    fn token_bytes(&self, id: u32) -> Vec<u8> {
+        let Some(t) = self.tokens.get(id as usize) else { return vec![] };
+        match self.types[id as usize] {
+            6 => u8::from_str_radix(t.get(3..5).unwrap_or(""), 16).map(|b| vec![b]).unwrap_or_default(), // BYTE: <0xXX>
+            1 => t.replace(SPACE, " ").into_bytes(),
+            _ => t.clone().into_bytes(),
+        }
+    }
+
+    fn control_tokens(&self) -> Vec<String> {
+        self.control.clone()
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.tokens.len()
+    }
+}
+
 /// Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256.
 pub struct ByteTokenizer;
 
@@ -504,6 +685,22 @@ mod tests {
         assert!(d.pending());
         assert_eq!(d.push(&e[1..]), "é");
         assert_eq!(d.push(&[0xff, b'a']), "\u{fffd}a");
+    }
+
+    #[test]
+    fn sentencepiece_merges_by_score_with_a_space_prefix_and_byte_fallback() {
+        let toks = ["<unk>", "<s>", "</s>", "<0x0A>", "\u{2581}", "a", "b", "\u{2581}a", "ab"];
+        let scores = vec![0.0, 0.0, 0.0, 0.0, -1.0, -1.0, -1.0, -2.0, -3.0];
+        let types = vec![2, 3, 3, 6, 1, 1, 1, 1, 1];
+        let t = SpmTokenizer::new(toks.iter().map(|s| s.to_string()).collect(), scores, types, true, 0).unwrap();
+        // "\u{2581}a" (-2) outscores "ab" (-3): taken first, so "ab" never forms
+        assert_eq!(t.encode("ab", false), vec![7, 6]);
+        assert_eq!(t.decode(&[7, 6]), " ab");
+        // a special token, then a fragment that gets its own space prefix; "\n" is no token: its byte
+        assert_eq!(t.encode("<s>\n", true), vec![1, 4, 3]);
+        assert_eq!(t.decode(&[4, 3]), " \n");
+        // without parse_special "<s>" is text: bytes with no <0xXX> token are <unk>
+        assert_eq!(t.encode("<s>", false), vec![4, 0, 0, 0]);
     }
 
     #[test]

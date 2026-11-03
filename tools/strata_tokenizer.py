@@ -371,12 +371,159 @@ class Tokenizer:
         return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
 
 
+# ------------------------------------------------------------------ SentencePiece (GGUF model `llama`)
+SPACE = "\u2581"   # SentencePiece's visible space
+
+
+class SpmTokenizer:
+    """SentencePiece as llama.cpp runs it (src/llama-vocab.cpp llm_tokenizer_spm_session): Llama 1/2, Open-LLaMA,
+    Sheared-LLaMA.  No merges list: the text's characters are merged pairwise, HIGHEST SCORE first (leftmost among
+    equals), while the pair spells a vocabulary token.  A final symbol that is no token falls back to its bytes as
+    the `<0xXX>` tokens.  Spaces become U+2581 and a text fragment at the start or right after a special token gets
+    one leading space (add_space_prefix), which is why `encode("Hi")` starts with `\u2581Hi`."""
+
+    def __init__(self, tokens: list[str], scores: list[float], token_types: list[int],
+                 add_space_prefix: bool = True, special_ids: dict[str, int] | None = None):
+        self.tokens, self.scores, self.token_types = tokens, scores, token_types
+        self.add_space_prefix = add_space_prefix
+        self.special_ids = special_ids or {}
+        self.ids = {t: i for i, t in enumerate(tokens)}
+        if len(self.ids) != len(tokens):
+            raise ValueError("vocabulary has duplicate tokens: %d entries, %d unique" % (len(tokens), len(self.ids)))
+        self.unk = self.special_ids.get("tokenizer.ggml.unknown_token_id", 0)
+        # llama.cpp's special cache: CONTROL (3) and UNKNOWN (2) need parse_special, USER_DEFINED (4) always matches
+        self.special_tokens = {tokens[i]: i for i, ty in enumerate(token_types) if ty in (2, 3, 4)}
+        self.control_tokens = [tokens[i] for i, ty in enumerate(token_types) if ty == 3]
+        self._always_re = Tokenizer._alt([t for t, i in self.special_tokens.items() if token_types[i] == 4])
+        self._special_re = Tokenizer._alt(list(self.special_tokens))
+
+    @classmethod
+    def from_gguf(cls, path) -> "SpmTokenizer":
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        from gguf_reader import GGUFFile
+        md = GGUFFile(pathlib.Path(path)).metadata
+        missing = [k for k in ("tokenizer.ggml.tokens", "tokenizer.ggml.scores", "tokenizer.ggml.token_type")
+                   if k not in md]
+        if missing:
+            raise ValueError("GGUF is missing %s; it does not carry a tokenizer" % ", ".join(missing))
+        special = {k: int(md[k]) for k in md if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
+        return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.scores"]),
+                   list(md["tokenizer.ggml.token_type"]), bool(md.get("tokenizer.ggml.add_space_prefix", True)),
+                   special)
+
+    def _byte_id(self, b: int) -> int:
+        i = self.ids.get("<0x%02X>" % b)
+        if i is None:
+            i = self.ids.get(chr(b), self.unk)
+        return i
+
+    def _spm(self, text: str) -> list[int]:
+        import heapq
+        if not text:
+            return []
+        n = len(text)
+        start = list(range(n))
+        size = [1] * n                      # characters; 0 = merged into its left neighbour
+        nxt = list(range(1, n)) + [-1]
+        prv = list(range(-1, n - 1))
+        heap: list[tuple[float, int, int, int]] = []    # (-score, left, size, right)
+
+        def add(left: int, right: int) -> None:
+            if left < 0 or right < 0:
+                return
+            i = self.ids.get(text[start[left]:start[left] + size[left] + size[right]])
+            if i is not None:
+                heapq.heappush(heap, (-self.scores[i], left, size[left] + size[right], right))
+
+        for i in range(1, n):
+            add(i - 1, i)
+        while heap:
+            _, left, sz, right = heapq.heappop(heap)
+            if size[left] == 0 or size[right] == 0 or size[left] + size[right] != sz:
+                continue                    # stale: one of its symbols has merged since
+            size[left] += size[right]
+            size[right] = 0
+            nxt[left] = nxt[right]
+            if nxt[right] >= 0:
+                prv[nxt[right]] = left
+            add(prv[left], left)
+            add(left, nxt[left])
+        out: list[int] = []
+        i = 0
+        while i != -1:
+            piece = text[start[i]:start[i] + size[i]]
+            tid = self.ids.get(piece)
+            # a merged symbol always spells a token, so llama.cpp's rev_merge split-back never runs: bytes it is
+            out.extend([tid] if tid is not None else [self._byte_id(b) for b in piece.encode("utf-8")])
+            i = nxt[i]
+        return out
+
+    def encode(self, text: str, parse_special: bool = False, plain=()) -> list[int]:
+        pat = self._special_re if parse_special else self._always_re
+        out: list[int] = []
+        pos, prev_special = 0, True
+
+        def ordinary(t: str) -> None:
+            out.extend(self._spm(((" " if self.add_space_prefix and prev_special else "") + t).replace(" ", SPACE)))
+
+        for m in (pat.finditer(text) if pat else ()):
+            if any(a <= m.start() < b for a, b in plain):
+                continue
+            if m.start() > pos:
+                ordinary(text[pos:m.start()])
+            out.append(self.special_tokens[m.group(0)])
+            pos, prev_special = m.end(), True
+        if pos < len(text):
+            ordinary(text[pos:])
+        return out
+
+    def token_bytes(self, i: int) -> bytes:
+        if i < 0 or i >= len(self.tokens):
+            raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+        t = self.tokens[i]
+        if self.token_types[i] == 6:        # BYTE: <0xXX>
+            return bytes([int(t[3:5], 16)])
+        return (t.replace(SPACE, " ") if self.token_types[i] == 1 else t).encode("utf-8")
+
+    def decode(self, ids: list[int], errors: str = "replace") -> str:
+        return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
+
+
+def from_gguf(path):
+    """The GGUF's tokenizer: byte-level BPE (`gpt2`) or SentencePiece (`llama`)."""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from gguf_reader import GGUFFile
+    model = GGUFFile(pathlib.Path(path)).metadata.get("tokenizer.ggml.model")
+    return SpmTokenizer.from_gguf(path) if model == "llama" else Tokenizer.from_gguf(path)
+
+
+# A base model without a chat template (Llama 1/2 era): the turns as plain "User:" / "Assistant:" lines
+PLAIN_TEMPLATE = (
+    "<s>{%- for m in messages %}{%- if m.role == 'system' %}{{ m.content }}\n\n"
+    "{%- elif m.role == 'user' %}User: {{ m.content }}\n"
+    "{%- elif m.role == 'assistant' %}Assistant: {{ m.content }}</s>\n{%- endif %}{%- endfor %}"
+    "{%- if add_generation_prompt %}Assistant:{%- endif %}"
+)
+
+
 # ------------------------------------------------------------------ the pack's tokenizer/ directory
 def extract(gguf_path, out_dir) -> dict:
     """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
-    tk = Tokenizer.from_gguf(gguf_path)
+    tk = from_gguf(gguf_path)
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from gguf_reader import GGUFFile
+    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
+    if isinstance(tk, SpmTokenizer):
+        cfg = {"model": "llama", "vocab_size": len(tk.tokens), "special_ids": tk.special_ids,
+               "add_space_prefix": tk.add_space_prefix}
+        (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
+        (out / "scores.json").write_text(json.dumps(tk.scores), encoding="utf-8")
+        (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
+        (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        (out / "chat_template.jinja").write_text(tpl or PLAIN_TEMPLATE, encoding="utf-8", newline="\n")
+        return cfg
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,
@@ -396,9 +543,6 @@ def extract(gguf_path, out_dir) -> dict:
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from gguf_reader import GGUFFile
-    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg
@@ -412,10 +556,10 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
     args = ap.parse_args()
     cfg = extract(args.gguf, args.out)
-    print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
-          % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))
+    print("tokenizer/: %s, vocab %d, merges %s, pre %s, specials %s"
+          % (cfg["model"], cfg["vocab_size"], cfg.get("n_merges", "-"), cfg.get("pre", "-"), cfg["special_ids"]))
     if args.check:
-        tk = Tokenizer.from_gguf(args.gguf)
+        tk = from_gguf(args.gguf)
         corpus = ["", "Hello, world!", "  leading and trailing  ", "a\n\n\nb",
                   "def f(x):\n\treturn x  # comment\n", "\u4f60\u597d\uff0c\u4e16\u754c", "\u0645\u0631\u062d\u0628\u0627",
                   "\U0001f600\U0001f680\U0001f1fa\U0001f1f8", "e\u0301\u0301 combining", "\x00\x01\x7f control",
@@ -425,6 +569,8 @@ def main() -> int:
         for s in corpus:
             ids = tk.encode(s)
             back = tk.decode(ids)
+            if getattr(tk, "add_space_prefix", False) and s:
+                s = " " + s      # SentencePiece's add_space_prefix: decode gives it back, as llama.cpp's does
             if back != s:
                 print("  *** ROUND TRIP FAILED *** %r -> %d ids -> %r" % (s[:40], len(ids), back[:40]))
                 bad += 1

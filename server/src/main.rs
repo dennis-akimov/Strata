@@ -12,7 +12,7 @@ use std::sync::Arc;
 use strata_server::engine::{py_g, AfmEngine, Engine, MockEngine, Spawn, StrataEngine, ENGINE_SILENCE_S};
 use strata_server::py::{self, get, truthy};
 use strata_server::service::{clean_shared_defaults, sampling_defaults_from_config, Service, Settings, REPEAT_STOP_TOKENS};
-use strata_server::tokenizer::{ByteTokenizer, Tokenize, Tokenizer};
+use strata_server::tokenizer::{ByteTokenizer, Tokenize};
 use strata_server::{http, mcp, net, root, say};
 
 #[derive(Parser)]
@@ -400,8 +400,8 @@ fn main() {
         die(&format!("strata-server: error: the model's tokenizer is missing ({}); run setup again", tpath.join("vocab.json").display()));
     }
     let tok: Arc<dyn Tokenize> = if !afm && tpath.join("vocab.json").exists() {
-        match Tokenizer::from_dir(&tpath) {
-            Ok(t) => Arc::new(t),
+        match strata_server::tokenizer::from_pack_dir(&tpath) {
+            Ok(t) => Arc::from(t),
             Err(e) => die(&format!("strata-server: error: the tokenizer in {}: {e}", tpath.display())),
         }
     } else {
