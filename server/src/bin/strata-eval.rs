@@ -2,7 +2,7 @@
 //! followed.  Fixed samples of public benchmarks, graded by code, so two models (or two quants) compare on the same tasks.
 //!
 //!     strata-eval CONFIG.json [CONFIG2.json ...] [--n 15] [--data ../Strata-data/eval] [--out bench/results/DATE-eval]
-//!                 [--restore CONFIG]
+//!                 [--effort none|low|medium|high] [--parallel 4] [--restore CONFIG]
 //!     strata-eval --selftest [--n 15]       graders against the benchmarks' own answers (no model)
 //!
 //! Areas (n tasks each):
@@ -12,9 +12,10 @@
 //!   tools BFCL v3 simple / multiple / parallel (gorilla-llm, Apache-2.0): the API's tool_calls against the
 //!         possible answers, BFCL's AST rules (name, no extra arguments, each value one of the accepted ones)
 //!   ifeval IFEval (google, Apache-2.0): every rule of the prompt followed (prompt-level strict)
-//! Score: code = mean(py, rs, cpp); overall = mean(code, tools, ifeval).  Each config is started on its port with 4 slots
-//! and a 32K context, tasks run 4 at a time, greedy (temperature 0).  At the end --restore (default: the first config)
-//! is started again.  Rows: tasks.jsonl (every answer and why it failed) and scores.jsonl; a table on stdout.
+//! Score: code = mean(py, rs, cpp); overall = mean(code, tools, ifeval).  Each config is started on its port with
+//! --parallel slots (4; fewer for a model that does not fit) and a 32K context, tasks run that many at a time, greedy (temperature 0).  At the end --restore (default: the first config)
+//! is started again.  --effort goes to the API's reasoning_effort: none (the default) turns thinking off where the
+//! template can (GPT-OSS always reasons a little), so a run takes minutes, not an hour.  Rows: tasks.jsonl (every answer and why it failed) and scores.jsonl; a table on stdout.
 //
 // ponytail: generated code runs as you, in a temp dir with a timeout, not in a sandbox (as evalplus/MultiPL-E do);
 // IFEval's sentence count and capital words use regexes instead of nltk's punkt/word_tokenize, and its two case rules
@@ -187,8 +188,9 @@ struct Answer {
     err: Option<String>,
 }
 
-fn ask(base: &str, key: &str, model: &str, t: &Value) -> Answer {
-    let mut body = json!({"model": model, "messages": messages(t), "max_tokens": 4096, "temperature": 0, "stream": false});
+fn ask(base: &str, key: &str, model: &str, effort: &str, t: &Value) -> Answer {
+    let mut body = json!({"model": model, "messages": messages(t), "max_tokens": 4096, "temperature": 0, "stream": false,
+                          "reasoning_effort": effort});
     if t["area"] == "tools" {
         body["tools"] = t["tools"].clone();
     }
@@ -230,7 +232,8 @@ fn ask(base: &str, key: &str, model: &str, t: &Value) -> Answer {
 
 /// The code block of the answer: the first one tagged with the language, else the first one, else the whole text.
 fn code_block(text: &str, tag: &str) -> String {
-    let re = Regex::new(r"(?s)```([A-Za-z0-9+#]*)[^\n]*\n(.*?)```").unwrap();
+    // fences at the start of a line only: a doc comment's own /// ``` example is not one
+    let re = Regex::new(r"(?ms)^```([A-Za-z0-9+#]*)[^\n]*\n(.*?)^```").unwrap();
     let blocks: Vec<(String, String)> = re.captures_iter(text).map(|c| (c[1].to_lowercase(), c[2].to_string())).collect();
     let alias = |t: &str| t == tag || (tag == "cpp" && t == "c++") || (tag == "rust" && t == "rs") || (tag == "python" && t == "py");
     blocks.iter().find(|b| alias(&b.0)).or(blocks.first()).map(|b| b.1.clone()).unwrap_or_else(|| text.to_string())
@@ -429,7 +432,7 @@ fn ifeval_rule(id: &str, k: &Value, v: &str, prompt: &str) -> bool {
             n == k["num_bullets"].as_u64().unwrap() as usize
         }
         "detectable_format:multiple_sections" => {
-            re(&format!(r"\s?{}\s?\d+\s?", regex::escape(s("section_spliter")))).split(v).count() - 1 >= k["num_sections"].as_u64().unwrap() as usize
+            re(&format!(r"\s?{}\s?\d+\s?", regex::escape(s("section_spliter")))).split(v).count() > k["num_sections"].as_u64().unwrap() as usize
         }
         "detectable_format:title" => re(r"<<[^\n]+>>").find_iter(v).any(|m| !m.as_str().trim_start_matches('<').trim_end_matches('>').trim().is_empty()),
         "detectable_format:json_format" => {
@@ -545,6 +548,8 @@ fn selftest(ts: &[Value], scratch: &Path) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let n: usize = arg(&args, "--n").map_or(15, |x| x.parse().expect("--n"));
+    let effort = arg(&args, "--effort").unwrap_or("none");
+    let slots: usize = arg(&args, "--parallel").map_or(4, |x| x.parse().expect("--parallel"));
     let configs: Vec<PathBuf> = {
         let mut v = vec![];
         let mut it = args.iter();
@@ -586,7 +591,7 @@ fn main() {
         server_exe = Path::new(cfg["exe"].as_str().unwrap()).with_file_name("strata-server");
         let cwd = PathBuf::from(cfg["cwd"].as_str().unwrap());
         set_arg(cfg["args"].as_array_mut().unwrap(), "--max-context", "32768");
-        cfg["parallel"] = json!(4);
+        cfg["parallel"] = json!(slots);
         cfg["log"] = json!(out.join("engine.log"));
         let name = cfg_path.file_stem().unwrap().to_string_lossy().trim_start_matches("strata-").to_string();
         let cpath = out.join("config.json");
@@ -605,11 +610,11 @@ fn main() {
         let next = AtomicUsize::new(0);
         let rows = Mutex::new(vec![]);
         std::thread::scope(|s| {
-            for _ in 0..4 {
+            for _ in 0..slots {
                 s.spawn(|| loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(t) = ts.get(i) else { break };
-                    let a = ask(&base, &key, &model, t);
+                    let a = ask(&base, &key, &model, effort, t);
                     let dir = scratch.join(format!("{name}-{}", t["id"].as_str().unwrap().replace('/', "-")));
                     let r = grade(t, &a, &dir);
                     let _ = fs::remove_dir_all(&dir);
@@ -627,6 +632,7 @@ fn main() {
         let mut sc = scores(&rows.iter().map(|(t, ok, _)| (t.clone(), *ok)).collect::<Vec<_>>());
         sc.insert("model".into(), json!(name));
         sc.insert("n".into(), json!(n));
+        sc.insert("effort".into(), json!(effort));
         sc.insert("wall_s".into(), json!(t0.elapsed().as_secs_f64()));
         sc.insert("out_tokens".into(), json!(rows.iter().map(|r| r.2["out_tokens"].as_u64().unwrap_or(0)).sum::<u64>()));
         writeln!(score_rows, "{}", Value::Object(sc.clone())).unwrap();
@@ -690,6 +696,7 @@ mod tests {
     fn code_block_prefers_the_language_tag() {
         assert_eq!(code_block("x\n```text\nno\n```\n```rust\nfn a() {}\n```", "rust"), "fn a() {}\n");
         assert_eq!(code_block("```\nplain\n```", "cpp"), "plain\n");
+        assert_eq!(code_block("```rust\n/// ```\n/// f();\n/// ```\nfn f() {}\n```", "rust"), "/// ```\n/// f();\n/// ```\nfn f() {}\n");
         assert_eq!(fn_name("/// doc\nfn has_close(numbers: Vec<f64>) -> bool {\n", "rs"), "has_close");
         assert_eq!(fn_name("#include<assert.h>\nbool has_close(std::vector<float> n) {\n", "cpp"), "has_close");
     }

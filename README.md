@@ -211,6 +211,26 @@ The context's cache comes on top of the model file (a few GB; more for long cont
 the same Mac wrote long answers 2-3x slower. Other Macs were not measured. Every number and how it was measured:
 [docs/MACOS.md](docs/MACOS.md#measured).
 
+## How good is it?
+
+`server/target/release/strata-eval CONFIG.json [CONFIG2.json ...] [--n 15] [--effort none]` scores models on the same
+fixed tasks of public benchmarks, graded by code: HumanEval+ in Python, MultiPL-E's HumanEval in Rust and C++ (compiled
+and run against their tests), BFCL v3 tool calls (simple, choose one of several, parallel) and IFEval instructions.
+Overall = mean of code (Python, Rust, C++), tools and instructions. `strata-eval --selftest` checks the graders
+against the benchmarks' own answers. M5 Max, 2026-11-02, 15 tasks per area, thinking off, greedy (results in
+`bench/results/2026-11-02-eval`; with 15 tasks a score moves about ±10 between close models, `--n 40` separates them):
+
+| Model | Overall | Code (Python / Rust / C++) | Tool calls | Instructions | Time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.6-35B-A3B (MXFP4_MOE) | 91 | 93 (93 / 87 / 100) | 80 | 100 | 193 s |
+| Qwen3-Coder-30B-A3B (Q4_K_M) | 90 | 91 (87 / 93 / 93) | 93 | 87 | 163 s |
+| Qwen3.8-Flash-Next (Q2_0) | 88 | 84 (73 / 80 / 100) | 80 | 100 | 245 s |
+| GPT-OSS 120B heretic (MXFP4) | 74 | 96 (87 / 100 / 100) | 53 | 73 | 301 s |
+
+- GPT-OSS writes the best code here but makes one tool call where a task needs two or three at once, and breaks
+  rules like "no commas"; Qwen3.6 sometimes answers from memory instead of calling the tool; Qwen3-Coder calls tools
+  best.
+
 ## What you need
 
 | | |
