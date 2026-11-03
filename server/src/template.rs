@@ -35,7 +35,9 @@ pub struct Caps {
     pub supports_system_role: bool,
     pub supports_parallel_tool_calls: bool,
     pub supports_preserve_reasoning: bool,
-    /// The template knows thinking (`<think>`, `enable_thinking`, GPT-OSS's channels); without, all output is answer
+    /// The template knows thinking (`<think>`, `enable_thinking`, GPT-OSS's channels); without, all output is answer.
+    /// Not in /props: the reference's caps have no such key
+    #[serde(skip)]
     pub thinks: bool,
 }
 
