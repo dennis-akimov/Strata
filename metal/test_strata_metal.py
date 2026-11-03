@@ -28,7 +28,9 @@ def embeddings(path, images, n_embd):
 
 class Engine:
     def __init__(self, *extra):
-        self.p = subprocess.Popen([EXE, "--serve", "--gguf", GGUF, "--max-context", "4096", "--image-pad-id", str(PAD), *extra],
+        # STRATA_METAL_EXTRA: more engine options for the whole suite (--kv-unified: docs/CONTEXT_POOL.md)
+        self.p = subprocess.Popen([EXE, "--serve", "--gguf", GGUF, "--max-context", "4096", "--image-pad-id", str(PAD), *extra,
+                                   *os.environ.get("STRATA_METAL_EXTRA", "").split()],
                                   stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.info = {}

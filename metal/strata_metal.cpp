@@ -156,6 +156,11 @@ struct Options {
     int ablate_layers = 0;
     float ablate_scale = 1.0f;
     bool ablate_mid = false;
+    // --kv-unified: one K/V pool shared by all sequences (llama.cpp's kv_unified) instead of a fixed share each, so an
+    // agent can take up to --max-context while the others use less (docs/CONTEXT_POOL.md); --kv-pool N: the pool's
+    // cells (default --max-context x sequences)
+    bool kv_unified = false;
+    int64_t kv_pool = 0;
     bool plan = false;                                 // --plan: print the memory this model needs (JSON) and exit
 };
 
@@ -202,6 +207,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--ablate-layers") o.ablate_layers = std::atoi(val("--ablate-layers"));
         else if (a == "--ablate-scale") o.ablate_scale = (float) std::atof(val("--ablate-scale"));
         else if (a == "--ablate-mid") o.ablate_mid = true;
+        else if (a == "--kv-unified") o.kv_unified = true;
+        else if (a == "--kv-pool") o.kv_pool = std::atoll(val("--kv-pool"));
         else if (a == "--eos-ids") {
             if (!parse_ids(val("--eos-ids"), o.eos)) { std::fprintf(stderr, "strata-metal: bad --eos-ids\n"); return false; }
         } else if (a.rfind("--", 0) == 0) {
@@ -406,9 +413,9 @@ struct Engine {
         common_params& p = params;
         p.model.path = o.gguf;
         p.n_parallel = 1 + o.batch;               // seq 0 and one per batch slot, each with the whole context
-        p.kv_unified = false;                     // own cells per sequence: a copied sequence (copy_seq) then rolled back
-                                                  // to a checkpoint read wrong in the unified cache (measured)
-        p.n_ctx = (int32_t) (o.max_context * p.n_parallel);
+        p.kv_unified = o.kv_unified;              // default own cells per sequence: a copied sequence (copy_seq) then rolled
+                                                  // back to a checkpoint read wrong in the unified cache (measured)
+        p.n_ctx = (int32_t) (o.kv_unified && o.kv_pool > 0 ? o.kv_pool : o.max_context * p.n_parallel);
         p.n_batch = o.n_batch;
         p.n_ubatch = std::min(o.n_batch, 2048);   // 2048: prompts +9% on an M5 Max (llama-bench pp4096, 268 -> 293 tok/s)
         p.n_gpu_layers = 999;                     // everything in unified memory
@@ -688,6 +695,17 @@ struct Engine {
     bool copy_seq(llama_seq_id src, llama_seq_id dst) {
         park(dst, prefix_of(seqs[(size_t) dst].keys, seqs[(size_t) src].keys));
         clear(dst);
+        if (o.kv_unified) {
+            // one pool: the cells shared by both sequences (llama.cpp's own copy).  A state written into dst with
+            // llama_state_seq_set_data overwrote another sequence's cells in the unified cache (test_batch_slots)
+            llama_memory_seq_cp(mem(), src, dst, -1, -1);
+            seqs[(size_t) dst] = seqs[(size_t) src];
+            if (dst == 0) {
+                for (auto& c : seqs[0].ckpts) { c.dft.clear(); c.spec.clear(); }
+                if (ctx_dft) llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+            }
+            return true;
+        }
         std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, src));
         if (buf.empty() || llama_state_seq_get_data(ctx, buf.data(), buf.size(), src) == 0 ||
             llama_state_seq_set_data(ctx, buf.data(), buf.size(), dst) == 0) {
