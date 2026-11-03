@@ -222,6 +222,7 @@ against the benchmarks' own answers. M5 Max, 2026-11-02, 15 tasks per area, thin
 
 | Model | Overall | Code (Python / Rust / C++) | Tool calls | Instructions | Time |
 | --- | ---: | ---: | ---: | ---: | ---: |
+| GLM-5.3-Flash (Maya-S24), 2 slots | 93 | 93 (93 / 93 / 93) | 100 | 87 | 576 s |
 | Qwen3.6-35B-A3B (MXFP4_MOE) | 91 | 93 (93 / 87 / 100) | 80 | 100 | 193 s |
 | Qwen3-Coder-30B-A3B (Q4_K_M) | 90 | 91 (87 / 93 / 93) | 93 | 87 | 163 s |
 | Qwen3.8-Flash-Next (Q2_0) | 88 | 84 (73 / 80 / 100) | 80 | 100 | 245 s |
