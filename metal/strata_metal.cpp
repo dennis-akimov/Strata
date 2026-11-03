@@ -585,6 +585,16 @@ struct Engine {
             }
             std::fprintf(stderr, "strata-metal: checkpoint at %zu could not be restored; reading the prompt again\n", c.n);
         }
+        // plain K/V (no recurrent part, so no checkpoints): the cells past p cut, nothing to restore.  A recurrent
+        // model's memory refuses a partial cut; a picture's cells have positions of their own; EAGLE3 lags a cell
+        const bool text = std::none_of(S.live.begin(), S.live.begin() + (long) std::min(p, S.live.size()), [](llama_token t) { return t == g_image_pad; });
+        if (S.ckpts.empty() && text && o.eagle3.empty() && p > 0 && llama_memory_seq_rm(mem(), sq, (llama_pos) p, -1) &&
+            !(sq == 0 && ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, (llama_pos) p, -1))) {
+            TRACE("seq %d: back to %zu of %zu held: cut (plain K/V)", sq, p, S.live.size());
+            S.live.resize(p);
+            S.keys.resize(p);
+            return;
+        }
         clear(sq);
     }
 
@@ -1120,8 +1130,10 @@ struct Engine {
 
     // Blue-green (docs/BLUE_GREEN.md): the conversations this engine holds - the parked ones and every slot not in a
     // request - written for the new engine (EXPORT <dir>), and that engine taking them into its conversation cache
-    // (IMPORT <dir>).  A file each, named by its content: "SSEQ1", n (u64), n keys (u64), n tokens (i32), the state's
-    // size (u64) and bytes (llama_state_seq_get_data).  Written under a temporary name, then renamed.  No stdout reply:
+    // (IMPORT <dir>).  A file each, named by its content: "SSEQ2", n (u64), n keys (u64), n tokens (i32), the state's
+    // size (u64) and bytes (llama_state_seq_get_data), then its checkpoints - a follow-up that differs at the end goes
+    // back to one instead of reading the prompt again: count (u64), each n (u64), pos (i32), inside (u8), size (u64)
+    // and bytes (the drafter's parts left out, as park does).  Written under a temporary name, then renamed.  No stdout reply:
     // the server sends these beside requests in flight; the log says what was done.
     std::set<uint64_t> exported;
 
@@ -1139,12 +1151,24 @@ struct Engine {
         const std::string path = dir + "/" + name, tmp = path + ".part";
         std::ofstream f(tmp, std::ios::binary);
         const uint64_t n = S.live.size(), sz = state.size();
-        f.write("SSEQ1", 5);
+        f.write("SSEQ2", 5);
         f.write((const char*) &n, sizeof n);
         f.write((const char*) S.keys.data(), (std::streamsize) (n * sizeof(uint64_t)));
         f.write((const char*) S.live.data(), (std::streamsize) (n * sizeof(llama_token)));
         f.write((const char*) &sz, sizeof sz);
         f.write((const char*) state.data(), (std::streamsize) sz);
+        const uint64_t nc = S.ckpts.size();
+        f.write((const char*) &nc, sizeof nc);
+        for (const auto& c : S.ckpts) {
+            const uint64_t cn = c.n, cs = c.tgt.size();
+            const int32_t cp = c.pos;
+            const uint8_t in = c.inside;
+            f.write((const char*) &cn, sizeof cn);
+            f.write((const char*) &cp, sizeof cp);
+            f.write((const char*) &in, sizeof in);
+            f.write((const char*) &cs, sizeof cs);
+            f.write((const char*) c.tgt.data(), (std::streamsize) cs);
+        }
         f.close();
         if (!f || std::rename(tmp.c_str(), path.c_str()) != 0) {
             std::remove(tmp.c_str());
@@ -1187,7 +1211,7 @@ struct Engine {
             char magic[5];
             uint64_t len = 0, sz = 0;
             Parked e;
-            bool ok = f.read(magic, 5) && std::memcmp(magic, "SSEQ1", 5) == 0 && f.read((char*) &len, sizeof len) && len > 0 && len <= (uint64_t) o.max_context;
+            bool ok = f.read(magic, 5) && std::memcmp(magic, "SSEQ2", 5) == 0 && f.read((char*) &len, sizeof len) && len > 0 && len <= (uint64_t) o.max_context;
             if (ok) {
                 e.seq.keys.resize(len);
                 e.seq.live.resize(len);
@@ -1199,6 +1223,19 @@ struct Engine {
                 e.state.resize(sz);
                 ok = (bool) f.read((char*) e.state.data(), (std::streamsize) sz);
             }
+            uint64_t nc = 0;
+            if (ok) ok = f.read((char*) &nc, sizeof nc) && nc <= 64;
+            for (uint64_t i = 0; ok && i < nc; ++i) {
+                uint64_t cn = 0, cs = 0;
+                int32_t cp = 0;
+                uint8_t in = 0;
+                ok = f.read((char*) &cn, sizeof cn) && f.read((char*) &cp, sizeof cp) && f.read((char*) &in, sizeof in) &&
+                     f.read((char*) &cs, sizeof cs) && cn <= len && cs <= budget;
+                if (!ok) break;
+                Checkpoint c{(size_t) cn, (llama_pos) cp, std::vector<uint8_t>(cs), {}, {}, in != 0};
+                ok = (bool) f.read((char*) c.tgt.data(), (std::streamsize) cs);
+                if (ok) e.seq.ckpts.push_back(std::move(c));
+            }
             f.close();
             std::filesystem::remove(ent.path(), ec);
             if (!ok) continue;
@@ -1209,6 +1246,7 @@ struct Engine {
             if (have) continue;
             parked.erase(std::remove_if(parked.begin(), parked.end(), [&](const Parked& x) { return prefix_of(x.seq.keys, e.seq.keys) == x.seq.keys.size(); }), parked.end());
             e.bytes = e.state.size() + len * (sizeof(uint64_t) + sizeof(llama_token));
+            for (const auto& c : e.seq.ckpts) e.bytes += c.tgt.size();
             while (!parked.empty() && ((int) parked.size() >= o.cache_slots || parked_bytes() + e.bytes > budget)) {
                 parked.erase(std::min_element(parked.begin(), parked.end(), [](const Parked& a, const Parked& b) { return a.used < b.used; }));
                 ++evictions;
