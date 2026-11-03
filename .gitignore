@@ -78,3 +78,5 @@ tui/target
 .strata-*.json
 .strata-*.json.tmp
 bench/results
+# refusal-ablation design notes: local only
+docs/ABLATION.md

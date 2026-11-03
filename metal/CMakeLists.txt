@@ -80,6 +80,11 @@ target_compile_definitions(strata-metal PRIVATE STRATA_VERSION="${PROJECT_VERSIO
                            STRATA_LLAMA_COMMIT="${STRATA_LLAMA_COMMIT}")
 target_link_libraries(strata-metal PRIVATE llama llama-common)
 
+# the residual stream and next-token log-probabilities for strata-ablate (docs/ABLATION.md)
+add_executable(strata-directions strata_directions.cpp)
+target_compile_features(strata-directions PRIVATE cxx_std_17)
+target_link_libraries(strata-directions PRIVATE llama)
+
 # the image engine (Nucleus-Image on ggml/Metal, docs/MACOS.md): its own executable, as strata-vision is.  Hardened as
 # bible's C++ skill lists for Apple clang 17 on arm64 (flags the compiler and linker accept there)
 add_executable(strata-image ${CMAKE_CURRENT_SOURCE_DIR}/image/strata_image.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/nucleus_dit.cpp
