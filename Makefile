@@ -193,10 +193,10 @@ models:
 build: server
 ifeq ($(shell uname -s),Darwin)
 	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON
-	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
+	$(CMAKE) --build build-metal --target strata-metal strata-vision strata-directions -j
 	@# installed where the run configs point; rm first: macOS kills a program whose binary was rewritten in place
-	rm -f engine-metal/strata-metal engine-metal/strata-vision engine-metal/strata-afm engine-metal/strata-voice
-	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
+	rm -f engine-metal/strata-metal engine-metal/strata-vision engine-metal/strata-directions engine-metal/strata-afm engine-metal/strata-voice
+	cp build-metal/metal/strata-metal build-metal/metal/strata-vision build-metal/metal/strata-directions engine-metal/
 	@# Apple's on-device model (macOS 26+): strata-afm for "engine": "afm" configs (make afm); skipped without FoundationModels
 	@swiftc -O -parse-as-library metal/afm/strata_afm.swift -o engine-metal/strata-afm 2>/dev/null || echo "strata-afm not built: Apple's on-device model needs macOS 26 or later"
 	@# "Hey Strata" (the chat's Voice button): Apple's on-device dictation; its Info.plist inside, for the microphone's prompt
