@@ -167,6 +167,21 @@ The M1 gains much less from writing several answers at once than the M5 Max (1.2
 Qwen3.6-35B there): its 8-core GPU is already busy with one. Three agents fit easily (LFM2.5's hybrid layers keep
 small caches: 1.6 GB for three 32K contexts), so on the M1 they are for working at the same time, not for more output.
 
+The agents bench (`strata-bench`, as above: each agent's own ~3,000-token conversation, a short side question each, then
+the conversation again plus a turn) on the M1, 2026-11-03, Sheared-LLaMA-2.7B (Q5_K_M, 1.9 GB; a 2023 base model with
+SentencePiece's tokenizer, which Strata reads since that day; its 4K context, 128-token answers):
+
+| Agents | Answer, tokens/s each | Follow-up's first token, no cache | ... with a 4 GB conversation cache | Memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 19.6-20.5 | 9.8 s | 0.6 s (99% of it from the cache) | 3.9 GB |
+| 2 | 15.0-17.5 | 15.0 s | 26.5 s (50%) | 6.7 GB |
+| 3 | 14.7-18.9 | 22.5 s | 45.3 s (0%) | 8.1 GB |
+| 4 | 15.9-18.8 | 37.7 s | 46.5 s (25%) | 9.4 GB |
+
+Its prompts read at 210-268 tokens/s. One agent's conversation fits the cache and comes back in 0.6 s; with 2-4 the
+cache holds too few of them and a follow-up waited longer than without one, so on the M1 keep
+`--conversation-cache-mib` for a single agent.
+
 On Linux the GPU sets the pace (the engine uses under 10% of the CPU; the GPU's clock is its firmware's, the same top
 1278 MHz as under macOS, with no Linux setting). What was measured on the M1, 2026-10-29:
 
