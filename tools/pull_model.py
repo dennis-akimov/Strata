@@ -9,7 +9,7 @@ Hugging Face revision; a stopped download continues when you run the same line a
   GPT-OSS-120B-DFLASH  z-lab's DFlash draft for gpt-oss-120b (1.6 GB, sha-256 checked), converted to one GGUF
                  (strata-metal --dflash; it needs metal/patches/core/0002)
   GPT-OSS-20B    gpt-oss-20b MXFP4 (12.1 GB, sha-256 checked) and its tokenizer pack
-  QWEN3.6-35B    Qwen3.6-35B-A3B MXFP4_MOE (21.7 GB, sha-256 checked) and its tokenizer pack
+  QWEN3.6-35B    Qwen3.6-35B-A3B MXFP4_MOE (21.7 GB, sha-256 checked), its vision encoder (0.9 GB) and tokenizer pack
   QWEN3-CODER-30B  Qwen3-Coder-30B-A3B-Instruct Q8_0 (32.5 GB, sha-256 checked) and its tokenizer pack
   QWEN3-CODER-30B-Q4  the same in Unsloth's Q4_K_M (18.6 GB, sha-256 checked): ~40% faster for one agent, 14 GB less
   LFM2.5-24B     LiquidAI's LFM2.5-24B-A2B (2.45B active, always thinks) in mradermacher's Q3_K_M (11.5 GB, sha-256
@@ -218,6 +218,9 @@ def pull(name: str, data: Path) -> None:
         g = get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
                 "2fdd20997c4d88ee25f70f500c61f8b999378d92ab055f9d450fc70d617158d3")
         tokenizer(g, data / "packs" / "qwen3.6-35b-a3b")
+        # its vision encoder (0.9 GB): pictures in the chat, with "vision" in the run config
+        get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/mmproj-F16.gguf",
+            "8971ee4f331ff0a4c609374f32984b3d4e6dc086c0aa35f1d637fad1829e887f")
     elif name == "QWEN3-CODER-30B":
         g = get(m / "Qwen3-Coder-30B-A3B-Instruct", "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/b17cb02dd882d5b6ab62fc777ad2995f19668350/Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf",
                 "4ff1cff607804037bf6d2168249c570baa4e1621292b159c0e06591e0d7c3066")
