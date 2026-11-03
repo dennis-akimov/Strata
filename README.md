@@ -78,13 +78,23 @@ It puts Strata's own config back with `--restore CONFIG.json`. M5 Max, 2026-11-0
 | | 4 | 32K | 16 GB | 1.1 s | 89 | 52 GB |
 | | 4 | 32K | 8 GB | 9 s (25% kept) | 44 | 51 GB |
 | | 4 | 128K | 16 GB | 19 s | 33 | 100 GB |
+| Qwen3-Coder-30B-A3B (Q4_K_M) | 1 | 16K-256K | 8-32 GB | 0.3-0.45 s | 90-105 | 22-48 GB |
+| | 2 | 32K-128K | 16 GB | 0.55-0.75 s | 95-103 | 31-61 GB |
+| | 3 | 64K | 16 GB | 0.8 s | 110 | 48 GB |
+| | 4 | 16K | 16-32 GB | 1.1 s | 99-107 | 29 GB |
+| | 3 | 256K | any | no answer | - | 110 GB |
 
 - Without the cache every follow-up reads its whole conversation again (6-15 s). With it the follow-up reads only the
   new message. 8 GB is enough for Qwen3.6 here, but Qwen3-Coder's larger cache per token needs 16 GB for 3-4 agents.
 - A longer context costs memory, not speed, until it no longer fits: Qwen3-Coder at 2 × 256K or 4 × 128K takes
-  100-113 GB and slows down, and 3-4 × 256K does not answer at all.
+  100-113 GB and slows down, and 3-4 × 256K does not answer at all (Q4_K_M too: 3 × 256K needs 110 GB, over the
+  107.5 GB macOS gives the GPU).
 - Qwen3-Coder (Q8_0) writes about 85-90 tokens/s together however many agents run: its weights are twice as heavy to
   read per token as Qwen3.6's MXFP4. For several agents at once, Qwen3.6 writes about twice as much.
+- Qwen3-Coder at Q4_K_M (measured on one requantized from the Q8_0 with `llama-quantize`, the same size and types as
+  Unsloth's that `make pull MODEL=QWEN3-CODER-30B-Q4` fetches) is about 40% faster than
+  Q8_0 for one agent and 20-30% for 3-4, and takes 14 GB less memory. Its conversation memory per token does not
+  shrink, so 3-4 agents still stop at about 110 tokens/s together.
 - Strata.app's default for Qwen3.6 is 4 agents, 64K each, 16 GB of cache.
 
 **How many agents, and how to set them up.** In the model's run config (`strata-<model>.json`), or the *agents* menu
@@ -108,6 +118,7 @@ The same bench at a 64K context each and 16 GB of cache, follow-up answers (toke
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Qwen3.6-35B-A3B (MXFP4_MOE) | 99 (2026-11-01) | 149 / 74 (2026-11-01) | 135 / 45 | 165 / 41 | 37 GB |
 | Qwen3-Coder-30B-A3B (Q8_0) | 68 | 86 / 43 | 82 / 27 | 68 / 17 (89 / 22 at 32K) | 87 GB |
+| Qwen3-Coder-30B-A3B (Q4_K_M) | 87 | 95 / 48 | 110 / 37 | 85 / 21 (91 / 23 at 32K) | 74 GB |
 | GPT-OSS 120B (MXFP4) * | 53 | 81 / 40 | 89 / 30 | not run | 86 GB |
 
 \* While the Mac checked a large download and Docker ran, so a floor: one agent wrote 96-99 tokens/s at a 16K context
@@ -116,7 +127,8 @@ in the same run.
 - For agents that mostly wait on tools (tests, builds, searches), 3-4 agents of Qwen3.6 keep the GPU busy; for one
   agent that has to be fast, one slot is quickest.
 - Qwen3-Coder and GPT-OSS 120B gain little past 2-3 agents and need much more memory per agent: 2-3 agents at
-  64-128K is their sweet spot on a 128 GB Mac.
+  64-128K is their sweet spot on a 128 GB Mac. For Qwen3-Coder take the Q4_K_M: 3 agents at 64K with 16 GB of cache
+  wrote the most (110 tokens/s together, first token in 0.8 s, 48 GB).
 - The follow-up's first token comes in 0.3-0.7 s with 1-2 agents and about 1 s with 3-4, while every agent's
   conversation stays in the cache.
 
@@ -260,6 +272,7 @@ in your browser.
 | GPT-OSS 20B | 12 GB | 19 GB (measured) | The fastest here (about 3.6B parameters active per token), less capable than the 120B. `make pull MODEL=GPT-OSS-20B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
 | Qwen3.6-35B-A3B | 22 GB | 29 GB (measured) | About 3B parameters active per token, but no faster than GPT-OSS 120B here. `make pull MODEL=QWEN3.6-35B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
 | Qwen3-Coder-30B-A3B (Q8_0) | 32.5 GB | 49 GB at 128K, 1 agent (measured) | Unsloth's, made for code, no thinking; about 80 tokens/s for one agent and no more for several ([above](#how-fast-is-it)). `make pull MODEL=QWEN3-CODER-30B` (it writes its run config) |
+| Qwen3-Coder-30B-A3B (Q4_K_M) | 18.6 GB | 35 GB at 128K, 1 agent (measured) | About 90-105 tokens/s for one agent, 110 together for three; the better pick of the two. `make pull MODEL=QWEN3-CODER-30B-Q4` (it writes its run config) |
 | Apple's on-device model (AFM 3 Core on macOS 27) | none (part of macOS) | macOS's own | 3B dense, 4,096-token context on M1/M2 (8,192 on M3 and later); about 30 tokens/s on the 16 GB M1. Small: on the M1's checks it got arithmetic, Russian and code right, Australia's capital and the r's in "strawberry" wrong, and it does not call tools through Strata yet. Needs macOS 26 or later and Apple Intelligence on. `make afm` (it writes `strata-apple-afm.json`), then pick it in Strata.app |
 | LFM2.5-8B-A1B | 9.0 GB | about 13 GB at 128K (measured) | LiquidAI's, 1.5B parameters active per token, thinks before answering; 22.9 tokens/s on the 16 GB M1 under Linux. `make pull MODEL=LFM2.5-8B` (it writes its run config) |
 | LFM2.5-24B-A2B | 11.5 GB | about 13 GB at 32K (measured) | LiquidAI's, 2.45B active, thinks before answering; 12.2 tokens/s on the M1 under Linux. `make pull MODEL=LFM2.5-24B` |
