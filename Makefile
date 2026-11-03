@@ -264,8 +264,10 @@ app-stop:
 	@if pkill -TERM -f '$(APP_PAT)'; then printf 'stopping Strata.app'; \
 	  while pgrep -f '$(APP_PAT)' >/dev/null; do printf .; sleep 1; done; echo ' stopped'; else echo 'Strata.app is not running'; fi
 
-app-run: app app-stop
-	open Strata.app
+# blue-green while the model is busy (app/src/deploy.rs): the new app's server takes the port, the old one finishes its
+# requests; idle, the old app quits and the new one opens
+app-run: app
+	Strata.app/Contents/MacOS/Strata --deploy
 
 # the server's tests: its unit and golden tests, then its answers against the Python server's recorded ones
 # (server/golden/e2e.py --replay; the packs it needs are the ones on this Mac, a missing one is skipped)

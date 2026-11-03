@@ -20,6 +20,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use wry::{WebView, WebViewBuilder};
 
 mod browser_mcp;
+mod deploy;
 mod google;
 mod mapfile;
 mod native_input;
@@ -734,6 +735,9 @@ struct State {
     last: Value,
     /// the model's browser (browser_mcp): its endpoint's port and key, for the server this app starts
     browser: Option<(u16, String)>,
+    /// started by `--deploy` for blue-green (deploy.rs): the first server start takes the port over (--handoff) from
+    /// the old app's server instead of stopping it (--replace)
+    handoff: bool,
 }
 
 impl State {
@@ -797,7 +801,7 @@ fn start(st: &Shared, proxy: &EventLoopProxy<Ev>) -> Result<(), String> {
     cmd
         .args(["--engine", "strata", "--config"])
         .arg(&cfg)
-        .args(["--port", &s.port.to_string(), "--replace"])
+        .args(["--port", &s.port.to_string(), if s.handoff { "--handoff" } else { "--replace" }])
         .current_dir(&s.root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -830,6 +834,7 @@ fn start(st: &Shared, proxy: &EventLoopProxy<Ev>) -> Result<(), String> {
     let port = s.port;
     s.push_log(format!("── started {} on port {} ──", cfg.file_name().unwrap_or_default().to_string_lossy(), port));
     s.child = Some(child);
+    s.handoff = false;
     s.phase = "starting";
     s.stopping_since = None;
     Ok(())
@@ -1217,7 +1222,13 @@ fn main() {
     let config = settings["config"].as_str().map(PathBuf::from).filter(|p| p.is_file()).or_else(|| configs(&root).into_iter().next());
     let config = config.filter(|c| runnable(&read_config(c))).or_else(|| configs(&root).into_iter().next());
     let port = config.as_deref().map(config_port).unwrap_or(8090);
-    let st: Shared = Arc::new(Mutex::new(State { root, config, port, child: None, phase: "stopped", stopping_since: None, log: VecDeque::new(), last: json!({}), browser: None }));
+    // make app-run: `Strata --deploy` puts this build in place of the running app (deploy.rs), with no window
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--deploy") {
+        std::process::exit(deploy::run(&root, config.as_deref()));
+    }
+    let handoff = argv.iter().any(|a| a == "--handoff");
+    let st: Shared = Arc::new(Mutex::new(State { root, config, port, child: None, phase: "stopped", stopping_since: None, log: VecDeque::new(), last: json!({}), browser: None, handoff }));
 
     // SIGTERM / Ctrl+C on the app = Quit (the server is stopped its own way, not orphaned); blocked before any thread
     // starts so only the waiter gets them (a spawned server starts with an empty mask)
@@ -1401,7 +1412,7 @@ fn main() {
         move || poll(st, p)
     });
     std::thread::spawn(keep_off); // what the System card's toggles keep off
-    if settings["autostart"].as_bool().unwrap_or(false) {
+    if handoff || settings["autostart"].as_bool().unwrap_or(false) {
         let _ = start(&st, &proxy);
     }
 
