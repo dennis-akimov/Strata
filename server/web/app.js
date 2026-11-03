@@ -138,11 +138,12 @@ const METRICS = [
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
+  {key: "clock", label: "GPU clock", icon: "gauge", unit: "MHz", series: "gpu_mhz", tone: "info"},
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
-  <div class="st-card metric-card"><div class="st-metric">
+  <div class="st-card metric-card" id="mc-${m.key}"><div class="st-metric">
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
       <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
@@ -277,8 +278,10 @@ function render(m) {
     setPill("idle", "Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, (m.failures || {}).recent || []);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderLatency(m.latency, m.failures);
+  if (tab === "monitor" && mcpLoaded) renderMcp();
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -308,6 +311,9 @@ function renderConvCache(c) {
     ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
     ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
+    // the state's copy out and back in (engines from 2026-11-03 on): a restore slower than reading the prompt again
+    // is the cache costing time
+    ["Park / restore time", c.enabled && (c.park_ms || c.restore_ms) ? `${c.parks ? ms(c.park_ms / c.parks) : "–"} / ${c.restores ? ms(c.restore_ms / c.restores) : "–"} each, on average` : null],
     ["Last switch", c.enabled ? event : null],
   ]);
   $("cc-note").textContent = c.enabled
@@ -324,7 +330,28 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+const ms = (x) => (x == null ? "–" : x < 1000 ? `${fmt(x)} ms` : `${fmt(x / 1000, 1)} s`);
+const secs = (x) => (x == null ? "–" : ms(x * 1000));
+// p50 / p95 of time to first token, queue, end to end and time per token over the kept requests; the failures by status
+function renderLatency(l, f) {
+  $("lat-card").hidden = !l && !f;                 // an older server
+  if (!l && !f) return;
+  const pair = (p) => (p ? `${secs(p.p50)} / ${secs(p.p95)}` : null);
+  const n = l && l.e2e_s ? l.e2e_s.n : 0;
+  $("lat-sum").textContent = n ? `p50 / p95 over the last ${fmt(n)} requests` : "no finished request yet";
+  const by = f && f.total ? f.by_status.map((b) => `${fmt(b.count)} × HTTP ${b.status}${b.type ? ` ${b.type}` : ""}`).join(", ") : "none";
+  facts($("lat-facts"), [
+    ["First token", l && pair(l.ttft_s)],
+    ["Queue wait", l && pair(l.queue_s)],
+    ["End to end", l && pair(l.e2e_s)],
+    ["Time per token", l && pair(l.tpot_s)],
+    ["Failed requests", f ? by : null],
+  ]);
+}
+
+const THERMAL = ["nominal", "moderate", "heavy", "trapping", "sleeping"];
+const PRESSURE = {1: "normal", 2: "warning", 4: "critical"};
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, failures) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
@@ -395,13 +422,20 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`))
+                  : hw.thermal_level != null ? `macOS thermal state: ${THERMAL[hw.thermal_level] || hw.thermal_level}`
                   : hw.gpu_unified && hw.gpu_temp != null ? "highest chip die sensor, not a GPU-only one" : "");
   spark("sp-temp", h.gpu_temp, 90);
-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power, hw.gpu_power < 10 ? 1 : 0), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
+  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power, hw.gpu_power < 10 ? 1 : 0), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit`
+            : hw.cpu_power != null ? `GPU · CPU ${fmt(hw.cpu_power, 1)} W · DRAM ${fmt(hw.dram_power, 1)} W` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  if (hw.gpu_unified) setMetric("pcie", "n/a", "", "integrated GPU: no PCIe link, it shares the system's memory");
-  else setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
+  // a Mac: no PCIe link; its GPU's clock instead (the P-states' time-weighted mean: decode waiting on memory runs low)
+  $("mc-pcie").hidden = Boolean(hw.gpu_unified);
+  $("mc-clock").hidden = hw.gpu_mhz_max == null;
+  setMetric("clock", hw.gpu_mhz == null ? (hw.gpu_mhz_max ? "idle" : null) : fmt(hw.gpu_mhz), hw.gpu_mhz == null ? "" : "MHz",
+            hw.gpu_mhz_max ? `top ${fmt(hw.gpu_mhz_max)} MHz` : "");
+  spark("sp-clock", h.gpu_mhz, hw.gpu_mhz_max);
+  if (!hw.gpu_unified) setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
             hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
             (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
@@ -416,34 +450,55 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context fill: the running request, else the last one
+  // context fill: the running request, else the last one; with agents, each agent's slot and the gauge its fullest
   const ctx = eng.max_context || 0;
   let used = 0;
   if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
   else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+  const perAgent = slots ? slots.map((s) => (s.state === "idle" ? s.held_tokens || 0 : (s.prompt_tokens || 0) + (s.generated || 0))) : [];
+  $("ctx-agents").hidden = !slots;
+  if (slots) {
+    used = Math.max(0, ...perAgent);
+    $("ctx-agents").innerHTML = slots.map((s, i) => `<div class="state-slot${s.state === "idle" ? " state-slot--idle" : ""}"><span>Agent ${s.slot + 1}</span>` +
+      `<div class="st-progress"${ctx && perAgent[i] / ctx > 0.9 ? ' data-tone="danger"' : ""}><div class="st-progress__bar" style="width:${ctx ? Math.min(100, (100 * perAgent[i]) / ctx) : 0}%"></div></div>` +
+      `<span>${esc(kfmt(perAgent[i]))}</span></div>`).join("");
+  }
   const frac = ctx ? Math.min(1, used / ctx) : 0;
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
   $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}${slots ? " · fullest agent" : ""}` : "–";
+  $("slots-row").hidden = $("slots-progress").hidden = !eng.expert_slots;     // a model whose experts all stay in memory
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
-  $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
+  $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` +
+    (hw.swap_used ? ` · swap ${gb(hw.swap_used)} GB` : "") + (hw.memory_pressure > 1 ? ` · pressure ${PRESSURE[hw.memory_pressure] || hw.memory_pressure}` : "") : "–";
   const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
   $("ram-bar").style.width = `${ramPct}%`;
-  if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
+  if (ramPct > 92 || hw.memory_pressure >= 4) $("ram-progress").dataset.tone = "danger";
+  else if (hw.memory_pressure === 2) $("ram-progress").dataset.tone = "warn";
+  else delete $("ram-progress").dataset.tone;
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
 
   // recent requests
   const body = $("req-body");
-  if (!requests.length) {
+  $("req-wrap").classList.toggle("no-hit", !requests.some((r) => r.hit_rate != null));
+  if (!requests.length && !failures.length) {
     body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
-    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
+    // the refused requests (HTTP >= 400) among them by time: they never reached the model, so only their status and why
+    const rows = requests.concat(failures.map((f) => ({...f, failed: true}))).sort((a, b) => b.time - a.time);
+    body.innerHTML = rows.slice(0, reqShowAll ? rows.length : 12).map((r) => {
+      if (r.failed) {
+        const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+        const why = `${r.path}: ${r.message || r.type || ""}`;
+        return `<tr class="failed"><td>${esc(t)}</td><td><span class="st-badge st-badge--error" title="${esc(r.type || "")}">Failed ${esc(r.status)}</span></td>` +
+               `<td colspan="7" title="${esc(why)}">${esc(why.length > 140 ? why.slice(0, 140) + "…" : why)}</td></tr>`;
+      }
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
@@ -455,7 +510,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+        <td class="num col-hit">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }
   const all = $("req-all");
@@ -546,7 +601,12 @@ function renderMcp() {
     return `<div class="mcp-server"><div class="mcp-server__head"><span class="st-badge ${cls}">${esc(text)}</span>` +
       `<strong>${esc(s.name)}</strong><span class="muted small">${esc(s.transport)} · ${fmt(s.tools.length)} tools${esc(info)}</span></div>` +
       (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") +
-      (s.tools.length ? `<div class="mcp-server__tools">${s.tools.map((t) => `<span class="chip" title="${esc(t.description || "")}">${esc(t.tool)}</span>`).join("")}</div>` : "") +
+      (s.tools.length ? `<div class="mcp-server__tools">${s.tools.map((t) => {
+        const u = ((lastMetrics || {}).mcp_tools || {})[t.name];       // its calls since the server started
+        const stat = u ? ` · ${fmt(u.calls)} call${u.calls === 1 ? "" : "s"}${u.errors ? `, ${fmt(u.errors)} failed` : ""}, ${ms(u.ms_mean)} each` : "";
+        const tip = (t.description || "") + (u ? `\n${t.tool}${stat}` : "") + (u && u.last_error ? `\nlast failure: ${u.last_error}` : "");
+        return `<span class="chip${u && u.errors ? " chip--err" : ""}" title="${esc(tip)}">${esc(t.tool)}${u ? ` <small class="muted">${fmt(u.calls)}×</small>` : ""}</span>`;
+      }).join("")}</div>` : "") +
       `</div>`;
   }).join("");
 }

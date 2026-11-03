@@ -114,7 +114,7 @@
       </div>
 
       <div class="metrics" id="metrics">
-        <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
+        <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe (a PC) or GPU clock (a Mac), CPU, Disk read -->
       </div>
 
       <div class="monitor-row">
@@ -129,8 +129,9 @@
             </svg>
             <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
           </div>
-          <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
-          <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
+          <div class="ctx-agents" id="ctx-agents" hidden></div>
+          <div class="bar-row" id="slots-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
+          <div class="st-progress" id="slots-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
           <div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
           <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
           <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
@@ -142,12 +143,18 @@
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">
               <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th><th class="num">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
+                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th><th class="num">Decode t/s</th><th class="num col-hit" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
               <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
             </table>
           </div>
           <p class="muted req-totals" id="req-totals"></p>
         </div>
+      </div>
+
+      <div class="st-card cc-card" id="lat-card" hidden>
+        <div class="req-head"><span class="card-title">Latency and failures</span><span class="muted small" id="lat-sum"></span></div>
+        <dl class="facts" id="lat-facts"></dl>
+        <p class="muted small cc-note">From the request's arrival: the wait for a turn (and a model load), then the first token. p95: 1 request in 20 is slower. Failures: every answer with an HTTP error, newest in Recent requests.</p>
       </div>
 
       <div class="st-card cc-card" id="cc-card">
