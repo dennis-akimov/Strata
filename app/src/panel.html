@@ -4,13 +4,10 @@
 :root{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mute:#6e6e73;--line:#d2d2d7;--acc:#0a84ff;--log:#1d1d1f;--logfg:#e5e5ea}
 @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--fg:#f5f5f7;--mute:#98989d;--line:#3a3a3c;--log:#000;--logfg:#d1d1d6}}
 *{box-sizing:border-box}[hidden]{display:none!important}html,body{height:100%}body{margin:0;font:12.5px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
-#bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:nowrap;white-space:nowrap;height:44px;overflow:visible}
+#bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:nowrap;white-space:nowrap;height:44px;overflow:visible;width:100%}
 #bar>*{flex-shrink:0}
-@media (max-width:1500px){#url{display:none}}
-/* a narrower window: the less used buttons go into More (the bar is one 44 px line: the page view sits under it) */
-#menu .narrow{display:none}
-@media (max-width:1400px){#load,#unload,.sep,#rate{display:none}#menu .narrow.n1{display:block}}
-@media (max-width:1250px){#webbtn,#sysbtn,#logbtn{display:none}#menu .narrow.n2{display:block}#mem{max-width:110px;overflow:hidden;text-overflow:ellipsis}}
+/* the bar is one 44 px line (the page view sits under it): fit() moves the less used items into More until it fits */
+#menu .narrow{display:none}#menu .narrow.shown{display:block}.folded{display:none!important}
 select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
 button{cursor:pointer}button:hover:not(:disabled){border-color:var(--acc)}button:disabled{opacity:.4;cursor:default}
 button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{border-color:var(--acc);color:var(--acc)}
@@ -66,15 +63,15 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   <span id="memwrap"><span id="mem" class="chip" title="what this model needs at this context, against what this Mac has">memory …</span>
     <div id="mempop"><div id="memsum"></div><div class="applist" id="popapps"></div></div></span>
   <button class="main" id="start">Start</button><button id="stop">Stop</button><button id="restart">Restart</button>
-  <span class="mute sep">|</span><button id="load">Load model</button><button id="unload">Unload</button>
+  <span class="mute sep" id="sep1">|</span><button id="load">Load model</button><button id="unload">Unload</button>
   <span id="rate" class="mute"></span><span style="flex:1"></span>
   <span class="mute" id="url"></span>
   <button id="webbtn" title="a browser beside the chat (Send page to chat puts the page you read into the message box)">Web</button>
   <button id="sysbtn" title="what macOS runs that the model would rather have the memory of">System</button>
   <button id="logbtn" title="the server's output">Log</button>
   <span id="more"><button id="morebtn">More ▾</button><div id="menu">
-    <button class="narrow n1" id="m_load">Load model</button><button class="narrow n1" id="m_unload">Unload model</button>
-    <button class="narrow n2" id="m_web">Web</button><button class="narrow n2" id="m_sys">System</button><button class="narrow n2" id="m_log">Log</button>
+    <button class="narrow" id="m_load">Load model</button><button class="narrow" id="m_unload">Unload model</button>
+    <button class="narrow" id="m_web">Web</button><button class="narrow" id="m_sys">System</button><button class="narrow" id="m_log">Log</button>
     <button id="browser">Open in browser</button><button id="edit_config">Edit config</button>
     <button id="reveal">Show config in Finder</button><button id="engine_log">Engine log in Console</button>
     <button id="copy_key">Copy API key</button>
@@ -124,6 +121,7 @@ function init(s){
   $('log').textContent='';(s.log||[]).forEach(log);
   $('where').textContent=s.server?`${s.root}`:'engine-metal/strata-server is missing: run `make server` in '+s.root;
   status({...s.status,phase:s.phase,running:s.running});
+  fit();
 }
 let cacheStat=null;
 function status(s){
@@ -141,6 +139,7 @@ function status(s){
   $('idle').hidden=up||!$('alert').hidden||!$('sys').hidden;document.body.classList.toggle('down',!up);layout();
   $('idletitle').textContent={starting:'Starting… loading the model',stopping:'Stopping… the engine frees its memory'}[ph]||'The server is stopped';
   if(ph!=='stopped')$('note').textContent='';
+  fit();
 }
 let full=null;function layout(){const f=!up||$('log').classList.contains('open')||!$('alert').hidden||!$('sys').hidden||$('mempop').classList.contains('open');if(f!==full){full=f;send('layout',{full:f});}}
 // the memory check of the selected config (the engine's --plan, and the memory free now)
@@ -293,6 +292,13 @@ $('mem').onclick=()=>{const p=$('mempop');if(p.classList.toggle('open')){memsum(
 $('par').onchange=()=>{send('set_parallel',{n:+$('par').value});$('mem').textContent='memory …';};
 $('cache').onchange=()=>send('set_cache',{mib:+$('cache').value});
 $('pool').onchange=()=>{send('set_pool',{tokens:+$('pool').value});$('mem').textContent='memory …';};
+// the bar fits its window: the least used items fold into More, one at a time, until nothing is cut off (and come back
+// when there is room); measured, not by width breakpoints, since what the bar holds (names, the memory chip) varies
+const FOLD=[['url'],['rate'],['sep1'],['load','m_load'],['unload','m_unload'],['webbtn','m_web'],['sysbtn','m_sys'],['logbtn','m_log']];
+function fit(){const bar=$('bar');for(const [b,m] of FOLD){$(b).classList.remove('folded');if(m)$(m).classList.remove('shown');}
+  for(const [b,m] of FOLD){if(bar.scrollWidth<=bar.clientWidth)break;$(b).classList.add('folded');if(m)$(m).classList.add('shown');}}
+addEventListener('resize',fit);
+new MutationObserver(()=>requestAnimationFrame(fit)).observe($('bar'),{subtree:true,childList:true,characterData:true});   // a name or the memory chip changed
 // the buttons a narrow window keeps in More
 for(const [m,b] of [['m_load','load'],['m_unload','unload'],['m_web','webbtn'],['m_sys','sysbtn'],['m_log','logbtn']])
   $(m).onclick=()=>{$('menu').classList.remove('open');$(b).click();};
