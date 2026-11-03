@@ -145,7 +145,7 @@ fn main() {
         .unwrap_or_else(|| root.join(format!("bench/results/{}-agents-matrix", chrono::Local::now().format("%Y-%m-%d"))));
     fs::create_dir_all(&out).unwrap();
     let server = Path::new(base_cfg["exe"].as_str().unwrap()).with_file_name("strata-server");
-    let (port, key, model) = (base_cfg["port"].as_u64().unwrap_or(8090), base_cfg["api_key"].as_str().unwrap_or("").to_string(),
+    let (port, key, model) = (base_cfg["port"].as_u64().unwrap_or(8090), server::api_key(&base_cfg),
                               base_cfg["model_name"].as_str().unwrap_or("").to_string());
     let base = format!("http://127.0.0.1:{port}");
     // ~3 chars per token for code; the real count comes back in usage.prompt_tokens

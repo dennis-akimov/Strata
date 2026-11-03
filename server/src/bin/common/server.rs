@@ -7,6 +7,12 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The config's "api_key", else the Strata folder's .env API_KEY (the server accepts both)
+pub fn api_key(cfg: &Value) -> String {
+    let env = strata_server::dotenv::load(&strata_server::root());
+    cfg["api_key"].as_str().or(strata_server::dotenv::get(&env, "API_KEY")).unwrap_or("").to_string()
+}
+
 pub fn get_json(url: &str, key: &str) -> Option<Value> {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(5))).build().into();
     let r = agent.get(url).header("Authorization", format!("Bearer {key}")).call().ok()?;

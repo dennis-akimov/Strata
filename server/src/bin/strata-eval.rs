@@ -585,7 +585,7 @@ fn main() {
     let mut server_exe = PathBuf::new();
     for cfg_path in &configs {
         let mut cfg: Value = serde_json::from_str(&fs::read_to_string(cfg_path).unwrap()).unwrap();
-        let key = cfg["api_key"].as_str().unwrap_or("").to_string();
+        let key = server::api_key(&cfg);
         let model = cfg["model_name"].as_str().unwrap_or("").to_string();
         port = cfg["port"].as_u64().unwrap_or(8090);
         server_exe = Path::new(cfg["exe"].as_str().unwrap()).with_file_name("strata-server");
