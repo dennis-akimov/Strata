@@ -678,10 +678,10 @@ mod tests {
 
     #[test]
     fn the_gpu_clock_comes_from_the_dvfs_table_and_the_residencies() {
-        // an M5 Max's pmgr, its first four states (off, then 338, 485, 635 MHz)
+        // an M5 Max's pmgr, its first four states (off, then 338, 486, 636 MHz)
         let t = dvfs_mhz(r#"| |   "voltage-states9" = <000000007d000000807825144e02000080c5f71c760200000097e825ad020000>"#);
-        assert_eq!(t, vec![0.0, 338.0, 485.0, 635.0]);
-        assert_eq!(gpu_mhz(&[50, 0, 300, 100], &t), Some((485.0 * 300.0 + 635.0 * 100.0) / 400.0)); // off left out
+        assert_eq!(t, vec![0.0, 338.0, 486.0, 636.0]);
+        assert_eq!(gpu_mhz(&[50, 0, 300, 100], &t), Some((486.0 * 300.0 + 636.0 * 100.0) / 400.0)); // off left out
         assert_eq!(gpu_mhz(&[80, 0, 0, 0], &t), None); // idle: no clock
         assert!(dvfs_mhz("no table").is_empty());
     }
