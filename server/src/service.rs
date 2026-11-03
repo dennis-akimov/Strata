@@ -1188,6 +1188,40 @@ impl Service {
     }
 
     /// -> (ids, thinking, max_new).  An unset or non-positive max_new means the rest of the context.
+    /// The answer's room: max_new when prompt (n tokens) + it fit the context, shortened to the room left with
+    /// "fit_max_tokens", else refused (requests are never truncated); none asked: all the room left
+    pub fn room_for(&self, n: i64, max_new: Option<i64>) -> Result<i64, Fail> {
+        let mut ctx = self.engine.max_context();
+        if ctx <= 0 {
+            if self.engine.starting() {
+                return Err(Fail::Starting("the engine is starting (a minute or two); try again shortly".into()));
+            }
+            ctx = self.engine.known_ctx();
+            if ctx <= 0 {
+                return Err(Fail::Starting("the engine is starting (a minute or two); try again shortly".into()));
+            }
+        }
+        let room = ctx - CTX_SLACK - n;
+        Ok(match max_new {
+            Some(m) if m > 0 && !(self.set.fit_max_tokens && room < 1) => {
+                if m > room {
+                    if !self.set.fit_max_tokens {
+                        return Err(Fail::Value(format!("request exceeds the context window: prompt ({n} tokens) + max tokens ({m}) exceeds the context ({ctx}); requests are never truncated. Send a smaller max_tokens (at most {} here), or add \"fit_max_tokens\": true to the model's strata-<model>.json to shorten it to the room left (#545)", room.max(0))));
+                    }
+                    room.max(1)
+                } else {
+                    m
+                }
+            }
+            _ => {
+                if room < 1 {
+                    return Err(Fail::Value(format!("request exceeds the context window: prompt ({n} tokens) leaves no room to answer in the context ({ctx}); requests are never truncated")));
+                }
+                room
+            }
+        })
+    }
+
     pub fn prepare(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &Map<String, Value>, max_new: Option<i64>, force: Option<&str>, req: Option<&mut Map<String, Value>>) -> Result<(Vec<u32>, bool, i64), Fail> {
         let mut messages = messages.to_vec();
         let fetched = self.note_unreadable_tool_images(&mut messages);
@@ -1269,36 +1303,7 @@ impl Service {
             }
             ids = out;
         }
-        let mut ctx = self.engine.max_context();
-        if ctx <= 0 {
-            if self.engine.starting() {
-                return Err(Fail::Starting("the engine is starting (a minute or two); try again shortly".into()));
-            }
-            ctx = self.engine.known_ctx();
-            if ctx <= 0 {
-                return Err(Fail::Starting("the engine is starting (a minute or two); try again shortly".into()));
-            }
-        }
-        let n = ids.len() as i64;
-        let room = ctx - CTX_SLACK - n;
-        let max_new = match max_new {
-            Some(m) if m > 0 && !(self.set.fit_max_tokens && room < 1) => {
-                if m > room {
-                    if !self.set.fit_max_tokens {
-                        return Err(Fail::Value(format!("request exceeds the context window: prompt ({n} tokens) + max tokens ({m}) exceeds the context ({ctx}); requests are never truncated. Send a smaller max_tokens (at most {} here), or add \"fit_max_tokens\": true to the model's strata-<model>.json to shorten it to the room left (#545)", room.max(0))));
-                    }
-                    room.max(1)
-                } else {
-                    m
-                }
-            }
-            _ => {
-                if room < 1 {
-                    return Err(Fail::Value(format!("request exceeds the context window: prompt ({n} tokens) leaves no room to answer in the context ({ctx}); requests are never truncated")));
-                }
-                room
-            }
-        };
+        let max_new = self.room_for(ids.len() as i64, max_new)?;
         if !images.is_empty() {
             let vision = self.vision.as_ref().unwrap();
             let size: u64 = encoded.iter().map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();

@@ -655,9 +655,35 @@ fn admin(shell: &str) -> bool {
 }
 
 /// Rewrite a config's --max-context (and --prefill-batch), keeping its key order and indentation.
+/// A shared pool keeps its share of context x agents when either changes (3/4 of 4 x 128K = 384K becomes 3/4 of
+/// 4 x 32K = 96K), whole K, at least one agent's context and at most all of them
+fn rescaled_pool(pool: u64, old: (u64, u64), new: (u64, u64)) -> u64 {
+    if pool == 0 || old.0 * old.1 == 0 {
+        return pool;
+    }
+    let share = pool as f64 / (old.0 * old.1) as f64;
+    let v = ((share * (new.0 * new.1) as f64 / 1024.0).round() as u64) * 1024;
+    v.clamp(new.0, new.0 * new.1.max(1))
+}
+
+/// The pool rescaled in `v` after its context or agents changed from `old`
+fn keep_pool_share(v: &mut Value, old: (u64, u64)) {
+    let (pool, ctx) = pool_of(v);
+    let n = v["parallel"].as_u64().unwrap_or(1).max(1);
+    let new = rescaled_pool(pool, old, (ctx, n));
+    if new != pool {
+        if let Some(args) = v["args"].as_array_mut() {
+            if let Some(i) = args.iter().position(|a| a == "--kv-pool") {
+                args[i + 1] = json!(new.to_string());
+            }
+        }
+    }
+}
+
 fn set_context(cfg_path: &Path, ctx: u64, batch: Option<u64>) -> Result<(), String> {
     let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
     let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let old = (pool_of(&v).1, v["parallel"].as_u64().unwrap_or(1).max(1));
     let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
     for (flag, val) in [("--max-context", Some(ctx)), ("--prefill-batch", batch)] {
         let Some(val) = val else { continue };
@@ -666,6 +692,7 @@ fn set_context(cfg_path: &Path, ctx: u64, batch: Option<u64>) -> Result<(), Stri
             _ => args.extend([json!(flag), json!(val.to_string())]),
         }
     }
+    keep_pool_share(&mut v, old);
     write_config(cfg_path, &text, &v)
 }
 
@@ -674,12 +701,14 @@ fn set_context(cfg_path: &Path, ctx: u64, batch: Option<u64>) -> Result<(), Stri
 fn set_parallel(cfg_path: &Path, n: u64) -> Result<(), String> {
     let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
     let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let old = (pool_of(&v).1, v["parallel"].as_u64().unwrap_or(1).max(1));
     let o = v.as_object_mut().ok_or("the config is not a JSON object")?;
     if n > 1 {
         o.insert("parallel".into(), json!(n.min(8)));
     } else {
         o.remove("parallel");
     }
+    keep_pool_share(&mut v, old);
     write_config(cfg_path, &text, &v)
 }
 
@@ -2452,6 +2481,10 @@ mod tests {
         assert_eq!(read_config(&p)["args"].as_array().unwrap().iter().filter(|a| *a == "--kv-unified").count(), 1);
         set_pool(&p, 0).unwrap();
         assert_eq!(pool_of(&read_config(&p)).0, 0);
+        assert_eq!(rescaled_pool(393216, (131072, 4), (32768, 4)), 98304); // 3/4 of 4 x 128K -> 3/4 of 4 x 32K
+        assert_eq!(rescaled_pool(393216, (131072, 4), (131072, 2)), 196608); // fewer agents: the same share
+        assert_eq!(rescaled_pool(131072, (131072, 4), (131072, 1)), 131072); // never below one agent's context
+        assert_eq!(rescaled_pool(0, (131072, 4), (32768, 4)), 0); // no pool stays none
         assert!(!read_config(&p)["args"].as_array().unwrap().iter().any(|a| a == "--kv-unified" || a == "--kv-pool"));
         set_cache_mib(&p, 0).unwrap();                                       // off: "0", or the server would size one
         assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "0"]));

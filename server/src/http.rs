@@ -3,7 +3,7 @@
 //! request monitor.  Each request runs on its own thread (as the Python server's), writing to the connection through
 //! a channel; a client that hangs up sets `gone`, which the request's watcher turns into its cancel.
 
-use crate::api::{self, anthropic_collect, anthropic_events, openai_chunks, openai_collect, structured_chunks, McpRun, Run};
+use crate::api::{self, anthropic_collect, anthropic_events, completion_body, completion_chunk, openai_chunks, openai_collect, structured_chunks, McpRun, Run};
 use crate::errors::Fail;
 use crate::frontend::{anthropic_to_messages, images_of, openai_to_messages};
 use crate::parser::{forced_call, tool_choice_of, CALL_START};
@@ -938,7 +938,7 @@ fn post_api(c: &mut Ctx, path: &str) -> Result<(), Fail> {
         }
         return Ok(());
     }
-    if ["/v1/chat/completions", "/v1/messages", "/v1/responses"].contains(&path) {
+    if ["/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"].contains(&path) {
         c.record = svc.begin_request(path, &rv);
     }
     match path {
@@ -949,6 +949,7 @@ fn post_api(c: &mut Ctx, path: &str) -> Result<(), Fail> {
             Ok(())
         }
         "/v1/chat/completions" => openai(c, req),
+        "/v1/completions" => completions(c, req),
         "/v1/messages" => anthropic(c, req),
         "/v1/messages/count_tokens" => {
             let req = svc.with_shared(&req, "anthropic");
@@ -1149,6 +1150,71 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
         }
         Ok(())
     }
+}
+
+/// OpenAI's legacy /v1/completions: the prompt as it is (no chat template; special tokens in it are tokens, as in
+/// llama-server), its continuation as `text`.  One prompt a request; max_tokens 16 when unset (OpenAI's default).
+fn completions(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
+    let svc = c.svc().clone();
+    let mut req = svc.with_shared(&req, "openai");
+    let rv = Value::Object(req.clone());
+    let prompt = match get(&rv, "prompt") {
+        Value::String(s) => s.clone(),
+        Value::Array(a) if a.len() == 1 && a[0].is_string() => a[0].as_str().unwrap_or("").to_string(),
+        _ => return Err(Fail::Value("prompt: one string (or a list of one string) per request".into())),
+    };
+    stop_strings(&rv)?;
+    check_request_sampling(&mut req)?;
+    svc.load()?;
+    let ids = svc.tok.encode(&prompt, true);
+    if ids.is_empty() {
+        return Err(Fail::Value("prompt is empty".into()));
+    }
+    let mt = get(&rv, "max_tokens");
+    let max_req = if mt.is_null() { 16 } else { int_of(mt)? };
+    let max_new = svc.room_for(ids.len() as i64, Some(max_req))?;
+    let cancel = Arc::new(Flag::new());
+    c.watch_client(&cancel);
+    let mut run = Run { svc: &svc, ids, thinking: false, tools: None, max_new, sampling: req, cancel: cancel.clone(), force: None, mcp: None };
+    if !truthy(get(&rv, "stream")) {
+        let mut chunks = vec![];
+        let mut keep = |ch: Option<Value>| -> Result<(), Closed> {
+            chunks.extend(ch);
+            Ok(())
+        };
+        return match openai_chunks(&rv, &mut run, &mut keep) {
+            Ok(()) => {
+                c.json(200, completion_body(&openai_collect(&chunks)));
+                Ok(())
+            }
+            Err(Stop::Closed) => Ok(()),
+            Err(Stop::Err(e)) => Err(e),
+        };
+    }
+    if c.sse().is_err() {
+        cancel.set();
+        return Ok(());
+    }
+    let mut send = |ch: Option<Value>| -> Result<(), Closed> {
+        let r = match &ch {
+            None => c.write(b": keep-alive\n\n"),
+            Some(v) => c.write(format!("data: {}\n\n", pyjson::dumps_u(&completion_chunk(v))).as_bytes()),
+        };
+        if r.is_err() {
+            cancel.set();
+        }
+        r
+    };
+    match openai_chunks(&rv, &mut run, &mut send) {
+        Ok(()) => {
+            let _ = c.write(b"data: [DONE]\n\n");
+        }
+        Err(Stop::Closed) => {}
+        Err(Stop::Err(e)) => {
+            let _ = c.write(format!("data: {}\n\ndata: [DONE]\n\n", pyjson::dumps(&json!({"error": {"type": "server_error", "message": e.to_string()}}))).as_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn anthropic(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
