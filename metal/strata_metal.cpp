@@ -662,6 +662,7 @@ struct Engine {
         size_t best = parked.size(), q = p;
         for (size_t i = 0; i < parked.size(); ++i) {
             const size_t m = prefix_of(parked[i].seq.keys, keys);
+            if (o.kv_unified && m < parked[i].seq.keys.size()) continue;   // as copy: none that a rollback would follow
             if (m > q + 16) { q = m; best = i; }
         }
         if (best == parked.size()) return p;
@@ -912,6 +913,9 @@ struct Engine {
             const bool busy = other > 0 && slots[other - 1].active;
             if ((llama_seq_id) other == sq || busy) continue;
             const size_t q = prefix(seqs[other]);
+            // one pool (--kv-unified): only a copy that needs no rollback after it - a copied sequence rolled back to
+            // a checkpoint broke a third one's state there (docs/CONTEXT_POOL.md)
+            if (o.kv_unified && q < seqs[other].live.size()) continue;
             if (q > p + 16 && copy_seq((llama_seq_id) other, sq)) {
                 TRACE("seq %d: copied idle seq %zu, which holds %zu of the prompt's start (this one %zu)", sq, other, q, p);
                 p = q;
