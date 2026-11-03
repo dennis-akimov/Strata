@@ -228,13 +228,17 @@ fn model_name_from_args(args: &[String]) -> String {
 }
 
 /// The conversation cache when the config sets no --conversation-cache-mib: by the RAM left beside the model's file.
-/// Measured (strata-bench): 16 GB kept 4 Qwen3.6 agents' conversations on the 128 GB M5 Max; on the 16 GB M1 4 GB
-/// brought one agent's conversation back in 0.6 s instead of 9.8, but slowed 2-4 agents' follow-ups (too few fit).
-fn auto_cache_mib(ram_gib: f64, model_gib: f64, agents: u64) -> u64 {
+/// Measured (strata-bench, 2026-11-03): 16 GB kept 4 Qwen3.6 agents' conversations on the 128 GB M5 Max; on the 16 GB
+/// M1, 2 GB brought 1-4 agents' 3,000-token conversations back (99%) for LFM2.5-8B / -24B and GPT-OSS-20B, follow-ups
+/// in 0.4-2 s instead of 4-32 s.  A model with a big state per token (Sheared-LLaMA: 1 GB a conversation) needs 4 GB
+/// for one agent's and is slower with 2-4 agents either way.
+// ponytail: by RAM only; sizing by the model's state per token (the engine knows it) when a model needs it
+fn auto_cache_mib(ram_gib: f64, model_gib: f64) -> u64 {
     match ram_gib - model_gib {
         f if f >= 64.0 => 16384,
         f if f >= 24.0 => 8192,
-        f if f >= 8.0 && agents <= 1 => 4096,
+        f if f >= 8.0 => 4096,
+        f if f >= 4.0 => 2048,
         _ => 0,
     }
 }
@@ -258,9 +262,8 @@ fn add_auto_cache(args: &mut Vec<String>) {
     let (_, total) = strata_server::telemetry::ram();
     let (Some(total), Some(model)) = (total, model_gib(args)) else { return };
     let ram = total as f64 / 1073741824.0;
-    let agents = args.iter().position(|a| a == "--batch").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(1);
-    let mib = auto_cache_mib(ram, model, agents);
-    say(&format!("conversation cache: {} (automatic: {ram:.0} GB of RAM, the model {model:.1} GB, {agents} agent(s); \"--conversation-cache-mib\" in the config's args sets it, 0 = off)",
+    let mib = auto_cache_mib(ram, model);
+    say(&format!("conversation cache: {} (automatic: {ram:.0} GB of RAM, the model {model:.1} GB; \"--conversation-cache-mib\" in the config's args sets it, 0 = off)",
                  if mib > 0 { format!("{} GB", mib / 1024) } else { "off".into() }));
     if mib > 0 {
         args.extend(["--conversation-cache-mib".into(), mib.to_string()]);
@@ -834,11 +837,12 @@ mod cache_tests {
 
     #[test]
     fn the_cache_follows_the_ram_beside_the_model() {
-        assert_eq!(auto_cache_mib(128.0, 22.0, 4), 16384); // M5 Max, Qwen3.6
-        assert_eq!(auto_cache_mib(128.0, 86.0, 2), 8192); // M5 Max, GLM-5.3
-        assert_eq!(auto_cache_mib(16.0, 1.8, 1), 4096); // M1, Sheared-LLaMA, one agent
-        assert_eq!(auto_cache_mib(16.0, 1.8, 3), 0); // ... several: measured slower with it
-        assert_eq!(auto_cache_mib(16.0, 8.4, 1), 0); // M1, LFM2.5-8B: no room
+        assert_eq!(auto_cache_mib(128.0, 22.0), 16384); // M5 Max, Qwen3.6
+        assert_eq!(auto_cache_mib(128.0, 86.0), 8192); // M5 Max, GLM-5.3
+        assert_eq!(auto_cache_mib(16.0, 1.8), 4096); // M1, Sheared-LLaMA
+        assert_eq!(auto_cache_mib(16.0, 8.4), 2048); // M1, LFM2.5-8B (measured: 99% reused with 2 GB)
+        assert_eq!(auto_cache_mib(16.0, 11.3), 2048); // M1, GPT-OSS-20B
+        assert_eq!(auto_cache_mib(16.0, 13.0), 0); // no room
     }
 
     #[test]

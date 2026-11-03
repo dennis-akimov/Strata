@@ -179,8 +179,21 @@ SentencePiece's tokenizer, which Strata reads since that day; its 4K context, 12
 | 4 | 15.9-18.8 | 37.7 s | 46.5 s (25%) | 9.4 GB |
 
 Its prompts read at 210-268 tokens/s. One agent's conversation fits the cache and comes back in 0.6 s; with 2-4 the
-cache holds too few of them and a follow-up waited longer than without one, so on the M1 keep
-`--conversation-cache-mib` for a single agent.
+cache holds too few of them (this 2023 model keeps a big state per token: about 1 GB a conversation) and a follow-up
+waited longer than without one.
+
+The newer models keep far smaller states, and there 2 GB of conversation cache holds every agent's conversation. The
+same bench, 8K context each, the follow-up's first token without the cache / with 2 GB (99% of it from the cache):
+
+| Model (M1, 16 GB) | 1 agent | 2 agents | 3 agents | 4 agents | Answer, tokens/s each |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| LFM2.5-8B-A1B (Q8_0) | 4.5 s / 0.44 s | 6.8 s / 0.70 s | 8.8 s / 1.2 s | 11.0 s / 1.2 s | 29-33 (one), 21-29 (several) |
+| LFM2.5-24B-A2B (Q3_K_M) | 10.1 s / 0.49 s | 15.2 s / 0.82 s | 20.3 s / 1.3 s | 32.1 s / 1.4 s | 31 (one), 15-25 (several) |
+| GPT-OSS 20B (MXFP4) | 20.7 s / 0.83 s | 21.4 s / 2.1 s | does not fit | does not fit | 20-23 (one) |
+
+So the server gives a cache when the config sets none, by the RAM beside the model: 2 GB on a 16 GB Mac for these,
+4 GB for Sheared-LLaMA, up to 16 GB on a 128 GB Mac (`"--conversation-cache-mib"` in the args sets it, `0` turns it
+off). GPT-OSS 20B with 3-4 agents at 8K is past the M1's GPU memory (13 GB) with or without the cache.
 
 On Linux the GPU sets the pace (the engine uses under 10% of the CPU; the GPU's clock is its firmware's, the same top
 1278 MHz as under macOS, with no Linux setting). What was measured on the M1, 2026-10-29:
