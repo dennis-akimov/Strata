@@ -662,6 +662,7 @@ impl Service {
                 "drafts_offered": g("drafts_offered"), "drafts_accepted": g("drafts_accepted")});
             {
                 let mut stt = self.state.lock().unwrap();
+                crate::observe::client_request(&rec);
                 stt.history.push_back(rec);
                 while stt.history.len() > 500 {
                     stt.history.pop_front();

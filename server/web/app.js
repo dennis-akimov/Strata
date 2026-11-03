@@ -85,14 +85,15 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "monitor", "firewall", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "monitor", "firewall", "clients", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "monitor", "firewall", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "monitor", "firewall", "clients", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
   if (tab === "about") loadConfig();
   if (tab === "firewall") loadFirewall();
+  if (tab === "clients") loadClients();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -258,6 +259,32 @@ function renderFwHistory(q) {
   $("fw-hist").innerHTML = hist.map((e) => row(e, false)).join("") || `<tr><td colspan="6" class="muted">${fwHist.kept ? "Nothing matches the filter" : "No outgoing activity yet"}</td></tr>`;
 }
 $("fw-filter").oninput = renderFirewall;
+
+// ------------------------------------------------------------------ clients
+// GET clients: per address and User-Agent, what each asked for since the server started
+let clTimer = 0;
+async function loadClients() {
+  clearTimeout(clTimer);
+  if (tab !== "clients") return;
+  try {
+    const r = await fetch("clients", {headers: headers(), cache: "no-store"});
+    if (r.status === 401) throw new Error("401");
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error?.message || `HTTP ${r.status}`);
+    const cs = d.clients || [];
+    const n = (x) => (x ?? 0).toLocaleString();
+    $("cl-sum").textContent = `${cs.length} client${cs.length === 1 ? "" : "s"} \u00b7 ${n(cs.reduce((t, c) => t + c.requests, 0))} requests`;
+    $("cl-body").innerHTML = cs.length ? cs.map((c) => `<tr><td class="when">${esc(fwWhen(c.last))}</td><td class="addr">${esc(c.peer)}</td>` +
+      `<td class="detail">${esc(c.agent || "\u2013")}</td><td class="addr">${esc(c.path || "\u2013")}</td><td class="num">${n(c.requests)}</td>` +
+      `<td class="num${c.errors ? " fw-bad" : ""}">${n(c.errors)}</td><td class="num">${n(c.prompt_tokens)}</td><td class="num">${n(c.reused)}</td>` +
+      `<td class="num">${n(c.output_tokens)}</td><td class="num">${c.ttft_s == null ? "\u2013" : c.ttft_s.toFixed(2) + " s"}</td>` +
+      `<td class="num">${c.decode_tok_s == null ? "\u2013" : c.decode_tok_s + " tok/s"}</td></tr>`).join("")
+      : `<tr><td colspan="11" class="muted">No requests yet</td></tr>`;
+  } catch (e) {
+    $("cl-sum").textContent = e.message === "401" ? "API key needed: add it under About > Settings." : `Could not read the clients: ${e.message}`;
+  }
+  clTimer = setTimeout(loadClients, 3000);
+}
 $("fw-all").onchange = loadFirewall;
 
 function setPill(state, text) {

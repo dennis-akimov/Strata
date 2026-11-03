@@ -3,6 +3,7 @@
 //! tool's calls.  Process-wide: a refusal can come before there is a Service to hold it.
 
 use serde_json::{json, Map, Value};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -41,6 +42,7 @@ pub static FAILURES: Mutex<Failures> = Mutex::new(Failures { counts: Vec::new(),
 pub fn failed(path: &str, status: u16, typ: &str, message: &str) {
     crate::say(&format!("HTTP {status} {path}: {}{message}", if typ.is_empty() { String::new() } else { format!("{typ}: ") }));
     FAILURES.lock().unwrap().add(crate::sync::now(), path, status, typ, message);
+    client_failed();
 }
 
 /// p50 / p95 (nearest rank) of the values, rounded to ms
@@ -98,6 +100,87 @@ pub fn tools_view() -> Map<String, Value> {
         "ms_mean": if s.calls > 0 { s.ms / s.calls } else { 0 }, "last_error": s.last_error}))).collect()
 }
 
+/// A client: the address a request came from and its User-Agent (Claude Code, a script, a browser)
+#[derive(Default, Clone)]
+struct ClientStat {
+    requests: u64,
+    errors: u64,
+    prompt_tokens: i64,
+    reused: i64,
+    output_tokens: i64,
+    ttft_s: f64,
+    ttft_n: u64,
+    decode_ms: f64,
+    generated: i64,
+    first: f64,
+    last: f64,
+    path: String,
+}
+
+// ponytail: kept in memory until the server restarts, unbounded by client (one row per address and User-Agent)
+static CLIENTS: Mutex<Vec<((String, String), ClientStat)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// The client of the request this thread serves (http.rs dispatch sets it; a request runs on one thread)
+    static CLIENT: RefCell<Option<((String, String), String)>> = const { RefCell::new(None) };
+}
+
+pub fn set_client(peer: &str, agent: Option<&str>, path: &str) {
+    let agent: String = agent.unwrap_or("").chars().take(120).collect();
+    CLIENT.with(|c| *c.borrow_mut() = Some(((peer.to_string(), agent), path.to_string())));
+}
+
+fn with_client(f: impl FnOnce(&mut ClientStat)) {
+    let Some((key, path)) = CLIENT.with(|c| c.borrow().clone()) else { return };
+    let mut cs = CLIENTS.lock().unwrap();
+    let i = match cs.iter().position(|(k, _)| *k == key) {
+        Some(i) => i,
+        None => {
+            cs.push((key, ClientStat { first: crate::sync::now(), ..Default::default() }));
+            cs.len() - 1
+        }
+    };
+    let s = &mut cs[i].1;
+    s.last = crate::sync::now();
+    s.path = path;
+    f(s);
+}
+
+/// A finished generation (run.rs settle's request record) for this thread's client
+pub fn client_request(rec: &Value) {
+    let i = |k: &str| rec.get(k).and_then(Value::as_i64).unwrap_or(0);
+    with_client(|s| {
+        s.requests += 1;
+        s.prompt_tokens += i("prompt_tokens");
+        s.reused += i("reused");
+        s.output_tokens += i("output_tokens");
+        if let Some(t) = rec.get("ttft_s").and_then(Value::as_f64) {
+            s.ttft_s += t;
+            s.ttft_n += 1;
+        }
+        if let (Some(g), Some(d)) = (rec.get("engine_generated").and_then(Value::as_i64), rec.get("decode_ms").and_then(Value::as_f64)) {
+            s.generated += g;
+            s.decode_ms += d;
+        }
+    });
+}
+
+fn client_failed() {
+    with_client(|s| s.errors += 1);
+}
+
+/// One row per client, the most recently seen first
+pub fn clients_view() -> Value {
+    let mut cs = CLIENTS.lock().unwrap().clone();
+    cs.sort_by(|a, b| b.1.last.total_cmp(&a.1.last));
+    let r = |x: f64, d: f64| (x * d).round() / d;
+    Value::Array(cs.into_iter().map(|((peer, agent), s)| json!({"peer": peer, "agent": agent, "requests": s.requests, "errors": s.errors,
+        "prompt_tokens": s.prompt_tokens, "reused": s.reused, "output_tokens": s.output_tokens,
+        "ttft_s": if s.ttft_n > 0 { json!(r(s.ttft_s / s.ttft_n as f64, 1000.0)) } else { Value::Null },
+        "decode_tok_s": if s.decode_ms > 0.0 { json!(r(s.generated as f64 / (s.decode_ms / 1000.0), 10.0)) } else { Value::Null },
+        "first": s.first, "last": s.last, "path": s.path})).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +226,26 @@ mod tests {
         tool_call("t_test__a", false, 300, Some("timeout"));
         let v = tools_view();
         assert_eq!(v["t_test__a"], json!({"calls": 2, "errors": 1, "ms_mean": 200, "last_error": "timeout"}));
+    }
+
+    #[test]
+    fn clients_add_up_per_address_and_agent() {
+        let mine = |v: &Value, agent: &str| v.as_array().unwrap().iter().find(|c| c["peer"] == "10.9.9.9" && c["agent"] == agent).cloned();
+        set_client("10.9.9.9", Some("test-a/1"), "/v1/messages");
+        client_request(&json!({"prompt_tokens": 100, "reused": 60, "output_tokens": 10, "ttft_s": 0.5, "engine_generated": 10, "decode_ms": 500.0}));
+        client_request(&json!({"prompt_tokens": 50, "reused": 0, "output_tokens": 20, "ttft_s": 1.5, "engine_generated": 20, "decode_ms": 1000.0}));
+        set_client("10.9.9.9", Some("test-a/1"), "/v1/chat/completions");
+        failed("/v1/chat/completions", 400, "invalid_request_error", "too long");
+        set_client("10.9.9.9", Some("test-b/1"), "/v1/completions");
+        client_request(&json!({"prompt_tokens": 7, "output_tokens": 1}));
+        let v = clients_view();
+        let a = mine(&v, "test-a/1").unwrap();
+        assert_eq!((a["requests"].as_u64(), a["errors"].as_u64(), a["prompt_tokens"].as_i64(), a["reused"].as_i64(), a["output_tokens"].as_i64()), (Some(2), Some(1), Some(150), Some(60), Some(30)));
+        assert_eq!((a["ttft_s"].as_f64(), a["decode_tok_s"].as_f64(), a["path"].as_str()), (Some(1.0), Some(20.0), Some("/v1/chat/completions")));
+        let b = mine(&v, "test-b/1").unwrap();
+        assert_eq!((b["requests"].as_u64(), b["ttft_s"].clone(), b["decode_tok_s"].clone()), (Some(1), Value::Null, Value::Null));
+        CLIENT.with(|c| *c.borrow_mut() = None);
+        client_request(&json!({"prompt_tokens": 1})); // no client on this thread: not counted anywhere
+        assert_eq!(mine(&clients_view(), "test-b/1").unwrap()["requests"], 1);
     }
 }

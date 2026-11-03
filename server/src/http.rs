@@ -434,6 +434,7 @@ impl Ctx {
 }
 
 fn dispatch(mut c: Ctx) {
+    crate::observe::set_client(&c.peer, c.header("user-agent").as_deref(), &c.path());
     // the Host check (DNS rebinding) before anything, unless there is an API key
     let host = c.header("host");
     let any = c.svc().set.allowed_hosts.iter().any(|h| h == "*");
@@ -527,6 +528,12 @@ fn get_(c: &mut Ctx) {
         if c.authorized() {
             let limit = c.query_param("limit").and_then(|v| v.parse().ok()).unwrap_or(500);
             c.json(200, crate::firewall::history(limit));
+        }
+        return;
+    }
+    if path == "/clients" {
+        if c.authorized() {
+            c.json(200, json!({"clients": crate::observe::clients_view(), "time": crate::sync::now()}));
         }
         return;
     }

@@ -27,6 +27,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
     <button class="st-tab" role="tab" id="tab-btn-firewall" aria-controls="view-firewall" aria-selected="false" data-tab="firewall">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-shield"/></svg>Firewall</button>
+    <button class="st-tab" role="tab" id="tab-btn-clients" aria-controls="view-clients" aria-selected="false" data-tab="clients">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-link"/></svg>Clients</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
   </nav>
@@ -226,6 +228,25 @@
           attempt the kernel refused a jailed process (from its sandbox log, so even a DNS lookup or a ping that lasts
           microseconds), every tool call Strata ran for the model and every tool call the model handed to an API client.
           Kept across restarts in <span id="fw-file"></span>.  The same event within 10 minutes is one row &times;N.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ Clients ============================ -->
+  <section class="view view--clients" id="view-clients" role="tabpanel" aria-labelledby="tab-btn-clients" hidden>
+    <div class="monitor">
+      <div class="st-card req-card">
+        <div class="req-head"><span class="card-title">Clients</span><span class="muted small" id="cl-sum"></span></div>
+        <div class="table-wrap">
+          <table class="st-table fw-table">
+            <thead><tr><th>Last seen</th><th>Address</th><th>Client (User-Agent)</th><th>Last API</th><th class="num">Requests</th><th class="num">Errors</th>
+              <th class="num">Prompt tokens</th><th class="num">Reused</th><th class="num">Output tokens</th><th class="num">First token</th><th class="num">Writes</th></tr></thead>
+            <tbody id="cl-body"><tr><td colspan="11" class="muted">Loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+        <p class="muted small fw-note">One row per address and User-Agent since the server started.  Requests are finished
+          answers; errors are refused requests (HTTP 400 and up).  First token: the mean from arrival; writes: output tokens a
+          second while writing.  Refreshes every 3 s while this tab is open.</p>
       </div>
     </div>
   </section>
