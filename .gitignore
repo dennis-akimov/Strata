@@ -80,3 +80,6 @@ tui/target
 bench/results
 # refusal-ablation design notes: local only
 docs/ABLATION.md
+
+# the editor's compile flags (clangd, VS Code): a link to the build's, which has the patched llama.cpp
+compile_commands.json
