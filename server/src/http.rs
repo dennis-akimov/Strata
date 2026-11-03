@@ -446,7 +446,11 @@ fn dispatch(mut c: Ctx) {
     }
     match c.method.as_str() {
         "GET" => get_(&mut c),
-        "POST" => post(&mut c),
+        "POST" => {
+            crate::observe::client_begin();
+            post(&mut c);
+            crate::observe::client_end();
+        }
         "DELETE" => delete(&mut c),
         "OPTIONS" => {
             let mut h = c.cors();

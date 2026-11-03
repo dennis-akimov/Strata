@@ -273,13 +273,13 @@ async function loadClients() {
     if (!r.ok) throw new Error(d.error?.message || `HTTP ${r.status}`);
     const cs = d.clients || [];
     const n = (x) => (x ?? 0).toLocaleString();
-    $("cl-sum").textContent = `${cs.length} client${cs.length === 1 ? "" : "s"} \u00b7 ${n(cs.reduce((t, c) => t + c.requests, 0))} requests`;
+    $("cl-sum").textContent = `${cs.length} client${cs.length === 1 ? "" : "s"} \u00b7 ${n(cs.reduce((t, c) => t + c.active, 0))} active \u00b7 ${n(cs.reduce((t, c) => t + c.requests, 0))} requests`;
     $("cl-body").innerHTML = cs.length ? cs.map((c) => `<tr><td class="when">${esc(fwWhen(c.last))}</td><td class="addr">${esc(c.peer)}</td>` +
-      `<td class="detail">${esc(c.agent || "\u2013")}</td><td class="addr">${esc(c.path || "\u2013")}</td><td class="num">${n(c.requests)}</td>` +
+      `<td class="detail">${esc(c.agent || "\u2013")}</td><td class="addr">${esc(c.path || "\u2013")}</td><td class="num${c.active ? " fw-ok" : ""}">${n(c.active)}</td><td class="num">${n(c.requests)}</td>` +
       `<td class="num${c.errors ? " fw-bad" : ""}">${n(c.errors)}</td><td class="num">${n(c.prompt_tokens)}</td><td class="num">${n(c.reused)}</td>` +
       `<td class="num">${n(c.output_tokens)}</td><td class="num">${c.ttft_s == null ? "\u2013" : c.ttft_s.toFixed(2) + " s"}</td>` +
       `<td class="num">${c.decode_tok_s == null ? "\u2013" : c.decode_tok_s + " tok/s"}</td></tr>`).join("")
-      : `<tr><td colspan="11" class="muted">No requests yet</td></tr>`;
+      : `<tr><td colspan="12" class="muted">No requests yet</td></tr>`;
   } catch (e) {
     $("cl-sum").textContent = e.message === "401" ? "API key needed: add it under About > Settings." : `Could not read the clients: ${e.message}`;
   }

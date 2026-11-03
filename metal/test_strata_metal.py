@@ -515,6 +515,31 @@ class TestStrataMetal(unittest.TestCase):
         finally:
             b.close()
 
+    def test_a_prompt_read_lets_decoding_slots_go_on(self):
+        # a slot decoding while another slot's long prompt is read gets tokens during the read (a window between
+        # --prefill-share pieces), not only after it
+        b = Engine("--batch", "2", "--prefill-share", "64")
+        try:
+            b.admit(0, self.m1 + self.m2, 400)
+            b.send("BGEN 1 4 " + ",".join(str(300 + i % 40) for i in range(1500)))
+            during, reading = 0, False
+            while True:
+                line = b.line()
+                if line.startswith("RESUME "):
+                    reading = True
+                elif line.startswith("BT 0 ") and reading:
+                    during += 1
+                elif line.startswith("BADM ") or line.startswith("ERR"):
+                    break
+            self.assertTrue(line.startswith("BADM 1 1"), line)
+            self.assertGreaterEqual(during, 1500 // 64 - 1)              # a token a piece
+            b.send("BSTOP 0")
+            b.send("BSTOP 1")
+            b.admitted = 2
+            b.slots()
+        finally:
+            b.close()
+
     def test_refusals_stay_in_step(self):
         for cmd in ("GEN x", "GENI 4 1,2", "VRAM 100", "HELLO"):
             self.e.send(cmd)

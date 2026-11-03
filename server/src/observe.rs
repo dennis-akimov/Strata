@@ -103,6 +103,7 @@ pub fn tools_view() -> Map<String, Value> {
 /// A client: the address a request came from and its User-Agent (Claude Code, a script, a browser)
 #[derive(Default, Clone)]
 struct ClientStat {
+    active: u64,
     requests: u64,
     errors: u64,
     prompt_tokens: i64,
@@ -165,6 +166,15 @@ pub fn client_request(rec: &Value) {
     });
 }
 
+/// A POST arrived (http.rs dispatch): the client shows from now, active until `client_end`
+pub fn client_begin() {
+    with_client(|s| s.active += 1);
+}
+
+pub fn client_end() {
+    with_client(|s| s.active = s.active.saturating_sub(1));
+}
+
 fn client_failed() {
     with_client(|s| s.errors += 1);
 }
@@ -174,7 +184,7 @@ pub fn clients_view() -> Value {
     let mut cs = CLIENTS.lock().unwrap().clone();
     cs.sort_by(|a, b| b.1.last.total_cmp(&a.1.last));
     let r = |x: f64, d: f64| (x * d).round() / d;
-    Value::Array(cs.into_iter().map(|((peer, agent), s)| json!({"peer": peer, "agent": agent, "requests": s.requests, "errors": s.errors,
+    Value::Array(cs.into_iter().map(|((peer, agent), s)| json!({"peer": peer, "agent": agent, "active": s.active, "requests": s.requests, "errors": s.errors,
         "prompt_tokens": s.prompt_tokens, "reused": s.reused, "output_tokens": s.output_tokens,
         "ttft_s": if s.ttft_n > 0 { json!(r(s.ttft_s / s.ttft_n as f64, 1000.0)) } else { Value::Null },
         "decode_tok_s": if s.decode_ms > 0.0 { json!(r(s.generated as f64 / (s.decode_ms / 1000.0), 10.0)) } else { Value::Null },
@@ -242,8 +252,14 @@ mod tests {
         let a = mine(&v, "test-a/1").unwrap();
         assert_eq!((a["requests"].as_u64(), a["errors"].as_u64(), a["prompt_tokens"].as_i64(), a["reused"].as_i64(), a["output_tokens"].as_i64()), (Some(2), Some(1), Some(150), Some(60), Some(30)));
         assert_eq!((a["ttft_s"].as_f64(), a["decode_tok_s"].as_f64(), a["path"].as_str()), (Some(1.0), Some(20.0), Some("/v1/chat/completions")));
+        assert_eq!(a["active"], 0);
         let b = mine(&v, "test-b/1").unwrap();
         assert_eq!((b["requests"].as_u64(), b["ttft_s"].clone(), b["decode_tok_s"].clone()), (Some(1), Value::Null, Value::Null));
+        set_client("10.9.9.9", Some("test-c/1"), "/v1/messages");
+        client_begin(); // still reading its prompt: shown, active
+        assert_eq!((mine(&clients_view(), "test-c/1").unwrap()["active"].as_u64(), mine(&clients_view(), "test-c/1").unwrap()["requests"].as_u64()), (Some(1), Some(0)));
+        client_end();
+        assert_eq!(mine(&clients_view(), "test-c/1").unwrap()["active"], 0);
         CLIENT.with(|c| *c.borrow_mut() = None);
         client_request(&json!({"prompt_tokens": 1})); // no client on this thread: not counted anywhere
         assert_eq!(mine(&clients_view(), "test-b/1").unwrap()["requests"], 1);
