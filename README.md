@@ -60,6 +60,66 @@ directly:
   pauses are usually short.
 - Each agent's context gets its own cache (here 128K each); the memory column is the engine's own measure (`--plan`).
 
+**Agents, context and the conversation cache.** `server/target/release/strata-bench CONFIG.json --agents 1,2,3,4`
+restarts the config's server for every mix of agents, context (16K-256K each) and `--conversation-cache-mib`
+(0-32 GB), and has each agent write three 128-token answers through the OpenAI API: one to a new 8K-token
+conversation, one to a second, short conversation (which pushes the first out of the GPU), and a follow-up in the first.
+It puts Strata's own config back with `--restore CONFIG.json`. M5 Max, 2026-11-02, Docker running (results in
+`bench/results/2026-11-02-agents-matrix*`, about 20% apart from run to run):
+
+| Model | Agents | Context each | Cache | Follow-up: first token | Tokens/s together | GPU memory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.6-35B-A3B (MXFP4_MOE) | 3 | 16K-256K | 0 | 6-8 s | 65-92 | 27-48 GB |
+| | 3 | 16K-256K | 8-32 GB | 0.33-0.5 s | 115-155 | 27-48 GB |
+| | 4 | 64K | 16 GB | 0.42 s | 165 | 33 GB |
+| | 4 | 256K | 8-32 GB | 0.5-0.6 s | 149-153 | 54 GB |
+| Qwen3-Coder-30B-A3B (Q8_0) | 1 | 128K-256K | 16 GB | 0.35-0.4 s | 80 | 49-62 GB |
+| | 2 | 64K | 16 GB | 0.7 s | 86 | 54 GB |
+| | 4 | 32K | 16 GB | 1.1 s | 89 | 52 GB |
+| | 4 | 32K | 8 GB | 9 s (25% kept) | 44 | 51 GB |
+| | 4 | 128K | 16 GB | 19 s | 33 | 100 GB |
+
+- Without the cache every follow-up reads its whole conversation again (6-15 s). With it the follow-up reads only the
+  new message. 8 GB is enough for Qwen3.6 here, but Qwen3-Coder's larger cache per token needs 16 GB for 3-4 agents.
+- A longer context costs memory, not speed, until it no longer fits: Qwen3-Coder at 2 × 256K or 4 × 128K takes
+  100-113 GB and slows down, and 3-4 × 256K does not answer at all.
+- Qwen3-Coder (Q8_0) writes about 85-90 tokens/s together however many agents run: its weights are twice as heavy to
+  read per token as Qwen3.6's MXFP4. For several agents at once, Qwen3.6 writes about twice as much.
+- Strata.app's default for Qwen3.6 is 4 agents, 64K each, 16 GB of cache.
+
+**How many agents, and how to set them up.** In the model's run config (`strata-<model>.json`), or the *agents* menu
+in Strata.app:
+
+```
+"parallel": 4,
+"args": [..., "--max-context", "65536", "--conversation-cache-mib", "16384"]
+```
+
+All agents use the same port, API key and model name; point each coding agent (or each subagent) at it as usual.
+A request beyond the N slots waits in the server's queue, it is not refused. `--max-context` is per agent and is held
+in memory from the start, so agents × context must fit in what macOS lets the GPU use (`make check`). The
+conversation cache is shared by all agents: it keeps the conversations they are not working on right now, so a
+subagent's side question does not cost the main conversation its place. More in [docs/BATCHING.md](docs/BATCHING.md)
+and [docs/DETAILS.md](docs/DETAILS.md).
+
+The same bench at a 64K context each and 16 GB of cache, follow-up answers (tokens/s together / each):
+
+| Model | 1 agent | 2 agents | 3 agents | 4 agents | Memory, 3 agents at 128K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.6-35B-A3B (MXFP4_MOE) | 99 (2026-11-01) | 149 / 74 (2026-11-01) | 135 / 45 | 165 / 41 | 37 GB |
+| Qwen3-Coder-30B-A3B (Q8_0) | 68 | 86 / 43 | 82 / 27 | 68 / 17 (89 / 22 at 32K) | 87 GB |
+| GPT-OSS 120B (MXFP4) * | 53 | 81 / 40 | 89 / 30 | not run | 86 GB |
+
+\* While the Mac checked a large download and Docker ran, so a floor: one agent wrote 96-99 tokens/s at a 16K context
+in the same run.
+
+- For agents that mostly wait on tools (tests, builds, searches), 3-4 agents of Qwen3.6 keep the GPU busy; for one
+  agent that has to be fast, one slot is quickest.
+- Qwen3-Coder and GPT-OSS 120B gain little past 2-3 agents and need much more memory per agent: 2-3 agents at
+  64-128K is their sweet spot on a 128 GB Mac.
+- The follow-up's first token comes in 0.3-0.7 s with 1-2 agents and about 1 s with 3-4, while every agent's
+  conversation stays in the cache.
+
 On a 16 GB Mac: a 13-inch MacBook Pro with the M1 (2020), 2026-10-29/30, short answers, on macOS and on Linux on the
 same Mac:
 
@@ -199,6 +259,7 @@ in your browser.
 | GPT-OSS 120B + DFlash draft | 1.6 GB more | about 72 GB (estimate) | Faster on math and step-by-step answers (about +35%), slower on chat (about -20%). `make pull MODEL=GPT-OSS-120B-DFLASH`, then [steps](docs/MACOS.md#gpt-oss-120b-with-a-dflash-draft) |
 | GPT-OSS 20B | 12 GB | 19 GB (measured) | The fastest here (about 3.6B parameters active per token), less capable than the 120B. `make pull MODEL=GPT-OSS-20B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
 | Qwen3.6-35B-A3B | 22 GB | 29 GB (measured) | About 3B parameters active per token, but no faster than GPT-OSS 120B here. `make pull MODEL=QWEN3.6-35B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
+| Qwen3-Coder-30B-A3B (Q8_0) | 32.5 GB | 49 GB at 128K, 1 agent (measured) | Unsloth's, made for code, no thinking; about 80 tokens/s for one agent and no more for several ([above](#how-fast-is-it)). `make pull MODEL=QWEN3-CODER-30B` (it writes its run config) |
 | Apple's on-device model (AFM 3 Core on macOS 27) | none (part of macOS) | macOS's own | 3B dense, 4,096-token context on M1/M2 (8,192 on M3 and later); about 30 tokens/s on the 16 GB M1. Small: on the M1's checks it got arithmetic, Russian and code right, Australia's capital and the r's in "strawberry" wrong, and it does not call tools through Strata yet. Needs macOS 26 or later and Apple Intelligence on. `make afm` (it writes `strata-apple-afm.json`), then pick it in Strata.app |
 | LFM2.5-8B-A1B | 9.0 GB | about 13 GB at 128K (measured) | LiquidAI's, 1.5B parameters active per token, thinks before answering; 22.9 tokens/s on the 16 GB M1 under Linux. `make pull MODEL=LFM2.5-8B` (it writes its run config) |
 | LFM2.5-24B-A2B | 11.5 GB | about 13 GB at 32K (measured) | LiquidAI's, 2.45B active, thinks before answering; 12.2 tokens/s on the M1 under Linux. `make pull MODEL=LFM2.5-24B` |
