@@ -90,11 +90,6 @@ fn child_config(cfg: &Value, name: &str, max_context: i64, parallel: i64, cache_
     Value::Object(c)
 }
 
-/// Whether the main engine runs with --vip: any client engine that takes the GPU first
-pub fn any_vip(cfg: &Value) -> bool {
-    parse(cfg, 0).map(|r| r.iter().any(|r| r.vip)).unwrap_or(false)
-}
-
 /// The route for a request, the first entry that matches its path and User-Agent
 pub fn pick<'a>(routes: &'a [Route], path: &str, user_agent: Option<&str>) -> Option<&'a Route> {
     let ua = user_agent?.to_lowercase();
@@ -261,8 +256,6 @@ mod tests {
         assert!(parse(&json!({"clients": [{"user_agent": "z", "port": 70000}]}), 1).unwrap_err().contains("not a port"));
         assert!(parse(&json!({"clients": [{"user_agent": "z", "vip": "yes"}]}), 1).unwrap_err().contains("vip"));
         assert!(parse(&json!({"clients": [{"user_agent": "z"}]}), 1).unwrap()[0].vip);         // on by default
-        assert!(!any_vip(&json!({"clients": [{"user_agent": "z", "vip": false}]})));
-        assert!(any_vip(&json!({"clients": [{"user_agent": "z"}]})) && !any_vip(&json!({})));
         assert_eq!(parse(&json!({}), 1).unwrap(), vec![]);
         let r = parse(&json!({"clients": [{"user_agent": "z", "parallel": 2, "cache_mib": 512}]}), 8000).unwrap();
         let (c, _) = r[0].spawn.clone().unwrap();

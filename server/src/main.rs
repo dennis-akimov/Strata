@@ -128,10 +128,6 @@ fn engine_args(cfg: &Value) -> Vec<String> {
             }
         }
     }
-    // a client engine that takes the GPU first (docs/CLIENT_ENGINES.md): prompts always in pieces, so it waits at most one
-    if strata_server::clients::any_vip(cfg) && !args.iter().any(|a| a == "--vip") {
-        args.push("--vip".into());
-    }
     // #465 (opt-in): "parallel": N
     if !args.iter().any(|a| a == "--batch" || a == "--slots") {
         match get(cfg, "parallel") {

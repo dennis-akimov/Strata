@@ -42,6 +42,26 @@ or gone: HTTP 503 with `Retry-After`, so the client's limit is never lifted by f
 **The Clients tab:** the routed requests count for their client as usual: tokens from the answer's `usage` (and
 Strata's `timings`), plus an Engine column (`main`, or the entry's name).
 
+## VIP: the client first
+
+`"vip"` (default `true`): while any of the client's requests runs, the main server sends its engine `VIP 1` and
+the engine gives way between its passes (prompt pieces, batch windows, solo decode steps) until `VIP 0`.  This is
+capped at 30 s a wait, so a lost `VIP 0` never hangs it.  Only while `VIP 1` holds does it read prompts in
+`--prefill-share` pieces (512); otherwise in whole 2,048-token chunks, so a client that arrives mid-chunk waits for
+that chunk's end (about 1 s deep into a long prompt) and then has the GPU.
+macOS has no GPU priority between processes; this is the main engine stepping aside.
+
+Measured 2026-11-03 on the M5 Max, Qwen3.6 main engine, Zed's `/v1/completions` (a ~1.5K-token prompt, 24 tokens),
+while the main engine read a new 34K-token prompt:
+
+| | Zed alone | Zed during the main read | The main read alone |
+| --- | ---: | ---: | ---: |
+| `"vip": false` | 0.24 s | 1.1-1.6 s | 17.2 s |
+| `"vip": true` | 0.29-0.36 s | 0.27-0.64 s | 27 s (512-token pieces) |
+
+The "vip: true" row read every prompt in pieces (the first version); pieces always cost Qwen3.6 a third of its
+prompt speed, so now they are used only while the client's request runs.  `"vip": false` turns all of it off.
+
 ## Limits
 
 - The two engines do not share a batch: each reads the weights for its own tokens.  A busy small engine slows the main
