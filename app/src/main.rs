@@ -744,6 +744,32 @@ fn set_pool(cfg_path: &Path, tokens: u64) -> Result<(), String> {
     write_config(cfg_path, &text, &v)
 }
 
+/// Prompt sharing (docs/CONTEXT_POOL.md): while a new prompt is read, the agents already writing get `share` of the
+/// time (`--decode-share`, the engine's default 0.25); 0 turns it off (`--prefill-share 0`: the prompt read whole)
+fn set_share(cfg_path: &Path, share: f64) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
+    for k in ["--prefill-share", "--decode-share"] {
+        if let Some(i) = args.iter().position(|a| a == k) {
+            args.drain(i..(i + 2).min(args.len()));
+        }
+    }
+    if share <= 0.0 {
+        args.extend([json!("--prefill-share"), json!("0")]);
+    } else if (share - 0.25).abs() > 1e-9 {
+        args.extend([json!("--decode-share"), json!(share.to_string())]);
+    }
+    write_config(cfg_path, &text, &v)
+}
+
+/// The config's prompt sharing: the writing agents' share of the time while a prompt is read (0: off)
+fn share_of(c: &Value) -> f64 {
+    let a = c["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let val = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).and_then(Value::as_str).and_then(|n| n.parse::<f64>().ok());
+    if val("--prefill-share") == Some(0.0) { 0.0 } else { val("--decode-share").unwrap_or(0.25) }
+}
+
 /// The config's shared pool in tokens (0: none) and its per-agent context
 fn pool_of(c: &Value) -> (u64, u64) {
     let a = c["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -1211,7 +1237,7 @@ fn snapshot(st: &Shared) -> Value {
             let c = read_config(p);
             json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"], "problem": problem(&c),
                 "parallel": c["parallel"].as_u64().filter(|n| *n > 1).map(|n| n.min(8)).unwrap_or(1), "cache_mib": cache_mib(&c),
-                "pool": pool_of(&c).0, "ctx": pool_of(&c).1})
+                "pool": pool_of(&c).0, "ctx": pool_of(&c).1, "share": share_of(&c)})
         })
         .collect();
     let settings = load_settings();
@@ -1615,6 +1641,30 @@ fn main() {
                             }
                         }
                         check_memory(&st2, &p2, None);
+                    });
+                }
+                "set_share" => {
+                    // prompt sharing in the config; a running server restarts with it
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let share = v["share"].as_f64().unwrap_or(0.25);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let name = cfg.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        let msg = match set_share(&cfg, share) {
+                            Ok(()) if share > 0.0 => format!("── while a prompt is read, the writing agents get {}% of the time in {name} ──", (share * 100.0).round()),
+                            Ok(()) => format!("── prompt sharing off in {name}: a new prompt is read whole first ──"),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        if running {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
                     });
                 }
                 "set_cache" => {
@@ -2486,6 +2536,13 @@ mod tests {
         assert_eq!(rescaled_pool(131072, (131072, 4), (131072, 1)), 131072); // never below one agent's context
         assert_eq!(rescaled_pool(0, (131072, 4), (32768, 4)), 0); // no pool stays none
         assert!(!read_config(&p)["args"].as_array().unwrap().iter().any(|a| a == "--kv-unified" || a == "--kv-pool"));
+        assert_eq!(share_of(&read_config(&p)), 0.25);                        // the engine's default: nothing in args
+        set_share(&p, 0.0).unwrap();
+        assert_eq!(share_of(&read_config(&p)), 0.0);
+        set_share(&p, 0.5).unwrap();                                          // off -> 50%: the 0 is gone, once
+        assert_eq!(share_of(&read_config(&p)), 0.5);
+        set_share(&p, 0.25).unwrap();
+        assert!(!read_config(&p)["args"].as_array().unwrap().iter().any(|a| a == "--prefill-share" || a == "--decode-share"));
         set_cache_mib(&p, 0).unwrap();                                       // off: "0", or the server would size one
         assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "0"]));
         assert_eq!(cache_mib(&read_config(&p)), 0);

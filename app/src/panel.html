@@ -59,6 +59,7 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   <select id="cache" title="conversation cache: RAM that keeps conversations another one displaced, so they come back without being read again (RAM, not the GPU's share; a running server restarts)"></select>
   <select id="par" title="agents: requests answered at once by one engine and one copy of the weights, each with its own context (more needs more memory; a running server restarts)"></select>
   <select id="pool" title="K/V pool: off = each agent holds its own context from the start; a pool = one pool all agents draw from, each up to the context (less memory for agents of different sizes; a running server restarts)"></select>
+  <select id="share" title="prompt sharing: while one agent's new prompt is read, the agents already writing get this share of the time (off: they wait until it is read; a running server restarts)"></select>
   <button id="refresh" title="look for models again (a new run config, a download that finished)">↻</button>
   <span id="memwrap"><span id="mem" class="chip" title="what this model needs at this context, against what this Mac has">memory …</span>
     <div id="mempop"><div id="memsum"></div><div class="applist" id="popapps"></div></div></span>
@@ -113,10 +114,14 @@ function init(s){
   const cx=cur?cur.ctx||0:0,full=cx*pn,pv=cur?cur.pool||0:0,poolv=[0,...(pn>1&&cx?[full/2,full*3/4,full]:[])].concat(pv&&![0,full/2,full*3/4,full].includes(pv)?[pv]:[]);
   $('pool').hidden=pn<2&&!pv;
   $('pool').innerHTML=poolv.map(v=>`<option value="${v}"${v===pv?' selected':''} data-s="${v?'pool '+k(v):'pool off'}" data-l="${v?`one pool of ${k(v)} tokens for the ${pn} agents, each up to ${k(cx)}`:`each agent its own ${k(cx)} context, held from the start`}"></option>`).join('');
+  // prompt sharing: the writing agents' share of the time while a new prompt is read (docs/CONTEXT_POOL.md)
+  const sv=cur&&cur.share!=null?cur.share:0.25,sharev=[0,0.1,0.25,0.5].concat([0,0.1,0.25,0.5].includes(sv)?[]:[sv]).sort((a,b)=>a-b);
+  $('share').hidden=pn<2&&sv===0.25;
+  $('share').innerHTML=sharev.map(v=>`<option value="${v}"${v===sv?' selected':''} data-s="${v?'sharing '+Math.round(v*100)+'%':'sharing off'}" data-l="${v?`while a new prompt is read, the agents already writing get ${Math.round(v*100)}% of the time${v===0.25?' (default)':''}`:'sharing off: a new prompt is read whole while the other agents wait'}"></option>`).join('');
   $('par').innerHTML=[1,2,3,4,5,6,7,8].map(n=>`<option value="${n}"${n===pn?' selected':''} data-s="${n===1?'1 agent':n+' agents'}" data-l="${n===1?'1 agent: one request at a time':n+' agents at once, each with its own context'}"></option>`).join('');
   const bad=s.configs.filter(c=>c.problem);
   $('notready').innerHTML=bad.length?'<b>Not ready yet:</b>'+bad.map(c=>`<div>${esc(name(c))}: ${esc(c.problem)}</div>`).join(''):'';
-  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;shorten($('cfg'));shorten($('par'));shorten($('cache'));shorten($('pool'));
+  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;shorten($('cfg'));shorten($('par'));shorten($('cache'));shorten($('pool'));shorten($('share'));
   base=`http://127.0.0.1:${s.port}`;$('url').textContent=`127.0.0.1:${s.port}`;
   $('log').textContent='';(s.log||[]).forEach(log);
   $('where').textContent=s.server?`${s.root}`:'engine-metal/strata-server is missing: run `make server` in '+s.root;
@@ -292,6 +297,7 @@ $('mem').onclick=()=>{const p=$('mempop');if(p.classList.toggle('open')){memsum(
 $('par').onchange=()=>{send('set_parallel',{n:+$('par').value});$('mem').textContent='memory …';};
 $('cache').onchange=()=>send('set_cache',{mib:+$('cache').value});
 $('pool').onchange=()=>{send('set_pool',{tokens:+$('pool').value});$('mem').textContent='memory …';};
+$('share').onchange=()=>send('set_share',{share:+$('share').value});
 // the bar fits its window: the least used items fold into More, one at a time, until nothing is cut off (and come back
 // when there is room); measured, not by width breakpoints, since what the bar holds (names, the memory chip) varies
 const FOLD=[['url'],['rate'],['sep1'],['load','m_load'],['unload','m_unload'],['webbtn','m_web'],['sysbtn','m_sys'],['logbtn','m_log']];
@@ -305,7 +311,7 @@ for(const [m,b] of [['m_load','load'],['m_unload','unload'],['m_web','webbtn'],[
 // a picker shows the short name when closed and the whole line in its list (its width held while the list is open)
 function shorten(sel){sel.style.width='';for(const o of sel.options)if(o.dataset.s!=null)o.textContent=o.dataset.s;}
 function lengthen(sel){if(sel.style.width)return;sel.style.width=sel.offsetWidth+'px';for(const o of sel.options)if(o.dataset.l!=null)o.textContent=o.dataset.l;}
-for(const id of ['cfg','ctx','par','cache','pool']){const sel=$(id);sel.addEventListener('mousedown',()=>lengthen(sel));sel.addEventListener('keydown',()=>lengthen(sel));
+for(const id of ['cfg','ctx','par','cache','pool','share']){const sel=$(id);sel.addEventListener('mousedown',()=>lengthen(sel));sel.addEventListener('keydown',()=>lengthen(sel));
   sel.addEventListener('change',()=>shorten(sel));sel.addEventListener('blur',()=>shorten(sel));}
 $('ctx').onchange=()=>{const o=mem&&mem.options.find(o=>o.ctx===+$('ctx').value);if(o)setCtx(o);};
 $('autostart').onchange=e=>send('autostart',{on:e.target.checked});
