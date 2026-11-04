@@ -83,6 +83,10 @@ MODELS = {
                       mem_min=10.0, mem_full=12, how="pull", gguf="LFM2.5-8B-A1B/LFM2.5-8B-A1B-Q8_0.gguf",
                       pack="lfm2.5-8b-a1b", name="lfm2.5-8b-a1b", context=131072,
                       sampling={"temperature": 0.2, "top_k": 64, "repetition_penalty": 1.05}),  # LiquidAI: top_k 80; the engine's sampler takes up to 64
+    "QWEN3-4B": dict(title="Qwen3-4B-Instruct-2507", about="small and quick, calls tools (web search); Q8_0", download=4.3,
+                     mem_min=5.0, mem_full=8, how="pull", gguf="Qwen3-4B-Instruct-2507/Qwen3-4B-Instruct-2507-Q8_0.gguf",
+                     pack="qwen3-4b-instruct-2507", name="qwen3-4b-instruct-2507", context=32768,
+                     sampling={"temperature": 0.7, "top_p": 0.8, "top_k": 20}),  # Qwen's settings for the 2507 Instruct
     "Q2_0": dict(title="Qwen3.8-Flash-Next Q2_0", about="the default and the most tested on a Mac", download=66.4,
                  mem_min=52, mem_full=60, how="setup"),
     "GPT-OSS-120B": dict(title="GPT-OSS 120B", about="about 5B active per token", download=63.4, mem_min=62,

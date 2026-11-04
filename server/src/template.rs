@@ -157,6 +157,8 @@ impl ChatTemplate {
         let harmony = self.source.contains("<|channel|>");
         let glm = self.source.contains("<arg_key>");
         let lfm = self.source.contains("<|tool_call_start|>");
+        // Hermes' JSON calls (Qwen3-4B-Instruct-2507, Qwen2.5): `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`
+        let hermes = !harmony && !glm && !lfm && self.source.contains("<tool_call>") && !self.source.contains("<function=");
         let calls_supported = |count: usize| -> bool {
             let calls: Vec<Value> = (0..count).map(|i| json!({"name": format!("strata_caps_call_{i}"), "arguments": {"arg": format!("strata_caps_arg_{i}")}})).collect();
             let mut messages = vec![user.clone(), json!({"role": "assistant", "content": "", "tool_calls": calls.iter().map(|c| json!({"function": c})).collect::<Vec<_>>()})];
@@ -175,6 +177,19 @@ impl ChatTemplate {
                     .map(|c| PyLit::new(&c[1]).calls())
                     .collect::<Option<Vec<_>>>()
                     .map(|v| v.into_iter().flatten().map(|(n, a)| ToolCall::new(n, a)).collect())
+            } else if hermes {
+                // the system prompt's own example (`{"name": <function-name>, ...}`) is no JSON: skipped, not a failure
+                let re = regex::Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").unwrap();
+                Some(re.captures_iter(&prompt)
+                    .filter_map(|c| {
+                        let v: Value = serde_json::from_str(&c[1]).ok()?;
+                        let args = match &v["arguments"] {
+                            Value::String(a) => serde_json::from_str::<Value>(a).ok()?,
+                            a => a.clone(),
+                        };
+                        Some(ToolCall::new(v["name"].as_str()?, args.as_object()?.clone()))
+                    })
+                    .collect())
             } else if glm {
                 let re = regex::Regex::new(r"(?s)<tool_call>strata_caps_call_\d+<arg_key>.*?</tool_call>").unwrap();
                 re.find_iter(&prompt)
@@ -192,7 +207,7 @@ impl ChatTemplate {
             let got: Vec<Value> = parsed.iter().map(|c| json!({"name": c.name, "arguments": Value::Object(c.arguments.clone())})).collect();
             got == calls && replies.iter().all(|r| prompt.contains(r.as_str()))
         };
-        let marks: &[&str] = if harmony { &["namespace functions"] } else if lfm { &["List of tools:"] } else if glm { &["<tools>", "<arg_key>"] } else { &["<tool_call>", "<function="] };
+        let marks: &[&str] = if harmony { &["namespace functions"] } else if lfm { &["List of tools:"] } else if hermes { &["<tool_call>"] } else if glm { &["<tools>", "<arg_key>"] } else { &["<tool_call>", "<function="] };
         let history = [user.clone(), json!({"role": "assistant", "content": "strata_caps_answer", "reasoning_content": "strata_caps_reasoning"}), user.clone()];
         Caps {
             supports_tools: ["strata_caps_call_0", "strata_caps_description"].iter().chain(marks).all(|s| tool_prompt.contains(s)),
@@ -230,6 +245,33 @@ List of tools: [{%- for t in tools -%}{{ t | tojson }}{% if not loop.last %}, {%
 {% endfor -%}"#;
         let t = ChatTemplate::from_source(src.into()).unwrap();
         assert!(t.caps.supports_tools && t.caps.supports_tool_calls && t.caps.supports_parallel_tool_calls, "{:?}", t.caps);
+    }
+
+    #[test]
+    fn hermes_json_tool_calls_round_trip_through_its_template() {
+        // Qwen3-4B-Instruct-2507's tool list and call rendering, the rest cut down
+        let src = r#"{%- if tools %}<|im_start|>system
+# Tools
+<tools>{%- for tool in tools %}
+{{ tool | tojson }}{%- endfor %}
+</tools>
+For each function call, return a json object within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+{% endif %}
+{%- for m in messages %}<|im_start|>{{ m.role }}
+{{ m.content }}
+{%- if m.tool_calls %}{%- for tc in m.tool_calls %}{%- set tc = tc.function if tc.function else tc %}
+<tool_call>
+{"name": "{{ tc.name }}", "arguments": {{ tc.arguments | tojson if tc.arguments is not string else tc.arguments }}}
+</tool_call>{%- endfor %}{%- endif %}<|im_end|>
+{% endfor %}"#;
+        let t = ChatTemplate::from_source(src.into()).unwrap();
+        assert!(t.caps.supports_tools && t.caps.supports_tool_calls && t.caps.supports_parallel_tool_calls, "{:?}", t.caps);
+        // the plain base-model template stays without tools
+        let plain = ChatTemplate::from_source("{% for m in messages %}User: {{ m.content }}\n{% endfor %}Assistant:".into()).unwrap();
+        assert!(!plain.caps.supports_tools && !plain.caps.supports_tool_calls);
     }
 
     #[test]

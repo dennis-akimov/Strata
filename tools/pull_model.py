@@ -17,6 +17,8 @@ Hugging Face revision; a stopped download continues when you run the same line a
                  decode at 1.3 tok/s on Linux's Apple GPU driver (that mat-vec runs 15-30x slower there)
   LFM2.5-8B      LiquidAI's LFM2.5-8B-A1B (1.5B active, thinks) in their Q8_0 (9.0 GB, sha-256 checked) and its
                  tokenizer pack
+  QWEN3-4B       Qwen3-4B-Instruct-2507 in Unsloth's Q8_0 (4.3 GB, sha-256 checked): small, calls tools (web search on
+                 an 8-16 GB Mac); and its tokenizer pack
   NUCLEUS        Nucleus-Image: ~50 GB downloaded, converted to 3 GGUFs (~21 GB), the downloads deleted
   HUNYUAN        HunyuanImage-3.0-Instruct-Distil: 169 GB streamed shard by shard into one 54 GB GGUF
   WAN2.2         Wan 2.2 T2V A14B for videos: both experts (Q4_K_M), UMT5 (Q8_0), the VAE, the Lightning LoRAs (29 GB),
@@ -45,7 +47,7 @@ os.chdir(ROOT)
 PY = ROOT / ".venv" / "bin" / "python"
 MTP_PY = ROOT / ".venv-mtp" / "bin" / "python"
 NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "QWEN3-CODER-30B", "QWEN3-CODER-30B-Q4", "LFM2.5-24B", "LFM2.5-8B",
-         "NUCLEUS", "HUNYUAN", "WAN2.2")
+         "QWEN3-4B", "NUCLEUS", "HUNYUAN", "WAN2.2")
 
 
 def die(msg: str) -> None:
@@ -237,6 +239,10 @@ def pull(name: str, data: Path) -> None:
         g = get(m / "LFM2.5-8B-A1B", "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q8_0.gguf",
                 "33ab3b8ce6a964fb8ebac89360c9b3cf72c4fa418d5e4c0a94d46883124d5c02")
         tokenizer(g, data / "packs" / "lfm2.5-8b-a1b")
+    elif name == "QWEN3-4B":
+        g = get(m / "Qwen3-4B-Instruct-2507", "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q8_0.gguf",
+                "391c1e410fd9f4cf2de2b510273b56a84c19ce18f4fa3bfb3774031dac4ef068")
+        tokenizer(g, data / "packs" / "qwen3-4b-instruct-2507")
     elif name == "NUCLEUS":
         d = m / "Nucleus-Image"
         outs = [d / "nucleus-dit-q4_0.gguf", d / "nucleus-vae.gguf", d / "qwen3vl-8b-text-q8_0.gguf"]
