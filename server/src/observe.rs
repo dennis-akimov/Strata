@@ -139,7 +139,7 @@ fn with_client(f: impl FnOnce(&mut ClientStat)) {
     let i = match cs.iter().position(|(k, _)| *k == key) {
         Some(i) => i,
         None => {
-            cs.push((key, ClientStat { first: crate::sync::now(), ..Default::default() }));
+            cs.push((key, ClientStat { first: crate::sync::now(), engine: "main".into(), ..Default::default() }));
             cs.len() - 1
         }
     };
@@ -172,6 +172,11 @@ pub fn client_request(rec: &Value) {
 /// A POST arrived (http.rs dispatch): the client shows from now, active until `client_end`
 pub fn client_begin() {
     with_client(|s| s.active += 1);
+}
+
+/// This request goes to the client's own engine (http.rs route_to): the row says so from now, errors too
+pub fn client_routed(engine: &str) {
+    with_client(|s| s.engine = engine.to_string());
 }
 
 pub fn client_end() {
@@ -258,6 +263,11 @@ mod tests {
         assert_eq!((a["active"].as_u64(), a["engine"].as_str()), (Some(0), Some("main")));
         let b = mine(&v, "test-b/1").unwrap();
         assert_eq!((b["requests"].as_u64(), b["ttft_s"].clone(), b["decode_tok_s"].clone(), b["engine"].as_str()), (Some(1), Value::Null, Value::Null, Some("zed")));
+        set_client("10.9.9.9", Some("test-d/1"), "/v1/messages");
+        client_routed("zed");
+        failed("/v1/messages", 503, "overloaded_error", "loading");
+        let d = mine(&clients_view(), "test-d/1").unwrap();
+        assert_eq!((d["errors"].as_u64(), d["engine"].as_str()), (Some(1), Some("zed")));
         set_client("10.9.9.9", Some("test-c/1"), "/v1/messages");
         client_begin(); // still reading its prompt: shown, active
         assert_eq!((mine(&clients_view(), "test-c/1").unwrap()["active"].as_u64(), mine(&clients_view(), "test-c/1").unwrap()["requests"].as_u64()), (Some(1), Some(0)));

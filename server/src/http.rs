@@ -476,6 +476,7 @@ fn route_to(c: &mut Ctx, r: &crate::clients::Route) {
     if !c.authorized() {
         return;
     }
+    crate::observe::client_routed(&r.name);
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     let agent = AGENT.get_or_init(|| ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(3))).http_status_as_error(false).build().into());
     let body = c.body.as_ref().map(|b| b.to_vec()).unwrap_or_default();
