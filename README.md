@@ -204,6 +204,13 @@ Its prompts read at 210-268 tokens/s. One agent's conversation fits the cache an
 cache holds too few of them (this 2023 model keeps a big state per token: about 1 GB a conversation) and a follow-up
 waited longer than without one.
 
+**No tools: `supports_tools: false`.** Sheared-LLaMA is a base model: it continues text and was never trained to
+follow instructions or call tools, and its chat template (`User:` / `Assistant:`) has no place for tools (`/props`
+says `"chat_template_caps": {"supports_tools": false, ...}`).  Asked to "use the web to find today's news" it writes
+more made-up `User:` and `Assistant:` turns.  The web page's tools (MCP) are refused with an HTTP 400 that says so; a
+client's own tools are dropped, and the server log says so once.  For tools on a small Mac take LFM2.5-8B or
+GPT-OSS-20B.
+
 The newer models keep far smaller states, and there 2 GB of conversation cache holds every agent's conversation. The
 same bench, 8K context each, the follow-up's first token without the cache / with the automatic one (2 GB here; 99% of
 the prompt from the cache), 2026-11-03:
