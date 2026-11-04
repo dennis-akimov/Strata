@@ -45,7 +45,9 @@ pub fn parts(text: &str, n: usize, task: &str) -> Vec<(String, String)> {
             let mut f = l.split('|').map(str::trim);
             let focus = f.next().unwrap_or(l).to_string();
             let q = f.next().unwrap_or(l).trim_start_matches("search for").trim_start_matches("query").replace('"', "");
-            (focus, q.trim().to_string())
+            // "financial news search today": the word "search" in a query only narrows Google to search pages
+            let q = q.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("search")).collect::<Vec<_>>().join(" ");
+            (focus, q)
         })
         .take(n).collect();
     while out.len() < n {
@@ -126,6 +128,13 @@ pub fn dedupe(lists: Vec<Vec<Found>>) -> (Vec<Vec<Found>>, usize) {
     (out, dropped)
 }
 
+/// An ad or a sign-up offer, not an item: a small model lists a page's newsletter boxes as news.
+// ponytail: word list; widen it when other ads get through
+fn ad(line: &str) -> bool {
+    let l = line.to_lowercase();
+    ["newsletter", "subscribe", "subscription", "inbox", "sign up", "sponsored", "advertis", "promo code", "free trial"].iter().any(|w| l.contains(w))
+}
+
 /// The site of an address (its host without "www."): an item counts when its site is on a page the agent read.
 fn site(url: &str) -> String {
     page_key(url).split('/').next().unwrap_or("").to_string()
@@ -156,8 +165,8 @@ fn ask(svc: &Service, prompt: &str, kw: &Map<String, Value>, max: i64, sampling:
 fn agent(svc: &Service, i: usize, n: usize, task: &str, focus: &str, query: &str, others: &str, tools: Vec<Value>, kw: &Map<String, Value>, max_req: i64, sampling: &Map<String, Value>, cancel: &Arc<Flag>, tx: &mpsc::Sender<Value>) -> (Vec<Found>, String) {
     let prompt = format!("You are agent {} of {n} on this task: {task}\nToday is {}. Your part only: {focus}. Leave to the others: {others}.\n\
         Your browser searched \"{query}\" (below). browser_click the two or three most relevant results to read them.\n\
-        Then answer with only a list, one item per line: - [headline](address) - one sentence. Only items from pages you read, \
-        each with its own address; the newest first.", i + 1, chrono::Local::now().format("%Y-%m-%d"));
+        Then answer with only a list, one item per line: - [headline](address) - one sentence. Only news items from pages you read, \
+        each with its own address; the newest first; no ads, newsletters or tables.", i + 1, chrono::Local::now().format("%Y-%m-%d"));
     // the first search run here, not left to the model: told to search, two of three agents made their lists up
     let search = format!("agent{}__browser_search", i + 1);
     let args = json!({"query": query});
@@ -177,7 +186,7 @@ fn agent(svc: &Service, i: usize, n: usize, task: &str, focus: &str, query: &str
     ];
     let Ok((ids, thinking, max_new)) = svc.prepare(&messages, Some(&tools), kw, Some(max_req), None, None) else { return (vec![], String::new()) };
     let names = tools.iter().filter_map(|t| t["name"].as_str().map(String::from)).collect();
-    let run = McpRun { messages, kw: kw.clone(), max_req, names, team: 0, rounds: Some(5) };
+    let run = McpRun { messages, kw: kw.clone(), max_req, names, team: 0, rounds: Some(3) };
     let (mut text, mut read) = (String::new(), found.clone());
     let r = run_with_mcp(svc, run, ids, thinking, Some(tools), max_new, sampling, cancel, &mut |item| {
         match item {
@@ -203,10 +212,12 @@ fn agent(svc: &Service, i: usize, n: usize, task: &str, focus: &str, query: &str
     let read = read.to_lowercase();
     let all: Vec<Found> = items(&text).into_iter().map(|(t, u, l)| {
         let u = if u.is_empty() { address_from(&t, &shown).unwrap_or_default() } else { u };
+        // a Chrome text fragment (#:~:text=...) marks a spot on the page, not a page
+        let (u, l) = match u.find("#:~:") { Some(k) => (u[..k].to_string(), l.replace(&u, &u[..k])), None => (u, l) };
         let l = if l.contains(&u) || u.is_empty() { l } else { format!("[{}]({u}) - {}", t.replace(['[', ']'], ""), l.strip_prefix(t.as_str()).unwrap_or(&l).trim_start_matches([' ', '-', '–', '—', ':']).trim()) };
         (t, u, l)
     }).collect();
-    let kept: Vec<Found> = all.iter().filter(|f| !site(&f.1).is_empty() && read.contains(&site(&f.1))).cloned().collect();
+    let kept: Vec<Found> = all.iter().filter(|f| !site(&f.1).is_empty() && read.contains(&site(&f.1)) && !ad(&f.2)).cloned().collect();
     crate::say(&format!("team agent {}: {} items, {} from sites its browser showed", i + 1, all.len(), kept.len()));
     (kept, text)
 }
@@ -215,8 +226,13 @@ fn agent(svc: &Service, i: usize, n: usize, task: &str, focus: &str, query: &str
 #[allow(clippy::too_many_arguments)]
 pub fn run(svc: &Service, n: usize, task: &str, m: McpRun, tools: Vec<Value>, sampling: &Map<String, Value>, cancel: &Arc<Flag>, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(), Stop<Fail>> {
     let say = |emit: &mut dyn FnMut(Item) -> Result<(), Closed>, t: String| emit(Item::Event(Event::text(Kind::Content, t)));
-    // agent i's browser: the MCP server agent{i}
-    let own = |i: usize| -> Vec<Value> { tools.iter().filter(|t| t["name"].as_str().unwrap_or("").starts_with(&format!("agent{}__", i + 1))).cloned().collect() };
+    // agent i's browser: the MCP server agent{i}; open and click only.  A click answers with the page's first part
+    // (browser_read of parts 2 and 3 was a round each of prefill on the M1, for page footers); the search is the
+    // server's (given it, two of three agents spent every round searching again and read no page)
+    let own = |i: usize| -> Vec<Value> {
+        let p = format!("agent{}__", i + 1);
+        tools.iter().filter(|t| t["name"].as_str().and_then(|n| n.strip_prefix(&p)).is_some_and(|n| matches!(n, "browser_open" | "browser_click"))).cloned().collect()
+    };
     if (0..n).any(|i| own(i).is_empty()) {
         return Err(Stop::Err(Fail::Value(format!("/team needs a browser for each of its {n} agents: Strata.app gives them (agent1-agent4); this server runs without the app"))));
     }
@@ -305,6 +321,9 @@ mod tests {
         assert_eq!(p[0], ("Stocks".into(), "stock market news".into()));
         assert_eq!(p[1].1, "bitcoin news");
         assert_eq!(p[2].1, "news");
+        assert_eq!(parts("News | financial news search today", 1, "x")[0].1, "financial news today");
+        assert!(ad("Free Money Insights From SoFi, Delivered Straight to Your Inbox") && ad("Briefings, Goldman Sachs' weekly newsletter"));
+        assert!(!ad("Stock futures fall as Democrats win big in midterms"));
     }
 
     #[test]
