@@ -684,8 +684,10 @@ function renderMcpConns(servers) {
 }
 // The page's connections are also kept in this browser (localStorage "strata.mcpConns": {name: {url, header, key}}),
 // so a server started with another run config gets them back (they were in that model's config only).  The key is
-// AES-GCM sealed with a browser key kept non-extractable in IndexedDB "strata-keys": a copy of localStorage alone
-// doesn't reveal it.  ponytail: a script on this page can still decrypt it; nothing in a browser stops that.
+// AES-GCM sealed with a browser key kept as raw bytes in IndexedDB "strata-keys": a copy of localStorage alone
+// doesn't reveal it.  Raw bytes, not a CryptoKey: WebKit seals a stored CryptoKey with the login keychain's "WebCrypto
+// Master Key", and macOS asks for it again after every rebuild of Strata.app.  ponytail: a script on this page can
+// still decrypt it; nothing in a browser stops that.
 const mcpVault = (() => {
   let k = null;
   const cryptoKey = () => k || (k = new Promise((res) => {
@@ -694,14 +696,15 @@ const mcpVault = (() => {
       r.onupgradeneeded = () => r.result.createObjectStore("keys");
       r.onerror = r.onblocked = () => res(null);
       r.onsuccess = () => {
-        const d = r.result, get = d.transaction("keys").objectStore("keys").get("mcp");
+        const d = r.result, get = d.transaction("keys").objectStore("keys").get("mcp-raw");
         get.onerror = () => res(null);
         get.onsuccess = async () => {
-          if (get.result) return res(get.result);
           try {               // no crypto.subtle (plain http from another computer): throws, nothing is kept
-            const key = await crypto.subtle.generateKey({name: "AES-GCM", length: 256}, false, ["encrypt", "decrypt"]);
+            const use = (raw) => crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+            if (get.result) return res(await use(get.result));
+            const raw = crypto.getRandomValues(new Uint8Array(32)), key = await use(raw);
             const t = d.transaction("keys", "readwrite");
-            t.objectStore("keys").put(key, "mcp");
+            t.objectStore("keys").put(raw, "mcp-raw");
             t.oncomplete = () => res(key);
             t.onerror = t.onabort = () => res(null);
           } catch (e) { res(null); }

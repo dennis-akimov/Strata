@@ -62,7 +62,7 @@ def die(msg: str) -> None:
 
 def sh(*cmd, quiet: bool = False, cwd=None) -> None:
     out = subprocess.DEVNULL if quiet else None
-    if subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=out).returncode != 0:
+    if subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=out, check=False).returncode != 0:
         die(f"failed: {' '.join(map(str, cmd))}")
 
 
@@ -158,7 +158,7 @@ def ensure_venv() -> None:
     if not PY.exists():
         print("making .venv (Python packages for the tokenizer pack) ...", flush=True)
         sh(sys.executable, "-m", "venv", ".venv")
-    if subprocess.run([str(PY), "-c", "import regex, numpy, jinja2"], stderr=subprocess.DEVNULL).returncode != 0:
+    if subprocess.run([str(PY), "-c", "import regex, numpy, jinja2"], stderr=subprocess.DEVNULL, check=False).returncode != 0:
         print("installing the Python packages into .venv (requirements.txt) ...", flush=True)
         sh(PY, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", "requirements.txt")
 
@@ -304,9 +304,9 @@ def pull(name: str, data: Path) -> None:
         patch = "../../metal/video/sdcpp-metal-conv3d.patch"
         if not (b / "src" / ".git").exists():
             sh("git", "clone", "-q", "https://github.com/leejet/stable-diffusion.cpp", b / "src")
-        head = subprocess.run(["git", "-C", str(b / "src"), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        head = subprocess.run(["git", "-C", str(b / "src"), "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
         patched = subprocess.run(["git", "-C", str(b / "src"), "apply", "--reverse", "--check", patch],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
         if head != sdc or not patched:
             sh("git", "-C", b / "src", "fetch", "-q", "origin")
             sh("git", "-C", b / "src", "checkout", "-q", "-f", sdc)
