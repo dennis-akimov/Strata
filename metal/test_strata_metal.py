@@ -540,6 +540,25 @@ class TestStrataMetal(unittest.TestCase):
         finally:
             b.close()
 
+    def test_vip_holds_the_engine_until_released(self):
+        # VIP 1 (a client engine's request runs): this engine gives way between passes until VIP 0
+        import select
+        self.e.send("VIP 1")
+        self.e.send("GEN 8 " + ",".join(map(str, self.m1)))
+        ready, _, _ = select.select([self.e.p.stdout], [], [], 1.0)
+        held = []
+        while ready:                                  # RESUME may come; no token while held
+            line = self.e.line()
+            held.append(line)
+            self.assertFalse(line.startswith(("T ", "DONE")), held)
+            ready, _, _ = select.select([self.e.p.stdout], [], [], 0.5)
+        self.e.send("VIP 0")
+        while True:
+            line = self.e.line()
+            if line.startswith("DONE"):
+                break
+        self.assertEqual(len(self.e.gen(self.m1, max_new=2)[0]), 2)   # still in step
+
     def test_refusals_stay_in_step(self):
         for cmd in ("GEN x", "GENI 4 1,2", "VRAM 100", "HELLO"):
             self.e.send(cmd)
