@@ -83,6 +83,13 @@ void out(const char* fmt, ...) {
 // STOP has to reach a running request, so stdin is read on its own thread.  A GEN line clears the stop flag before
 // it is queued: a STOP the server sent for an earlier request (after that one's DONE) cannot cancel the next.
 std::atomic<bool> g_stop{false};
+// VIP 1 / VIP 0 (the server: a client with an engine of its own is being answered, docs/CLIENT_ENGINES.md): this
+// engine gives the GPU way between its passes until VIP 0.  ponytail: at most 30 s a wait, so a lost VIP 0 never hangs it
+std::atomic<bool> g_vip{false};
+void vip_wait() {
+    const auto t = Clock::now();
+    while (g_vip && ms_since(t) < 30000) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+}
 // STRATA_TRACE=1: why a prompt is read again or not (each checkpoint taken or skipped, each rollback) on stderr, the
 // run config's log.  Off by default: debug-level lines (RFC 5424 severity 7); llama.cpp hides its own "full prompt
 // re-processing" line the same way, at trace verbosity.
@@ -103,6 +110,7 @@ void read_stdin() {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (c == EOF && line.empty()) line = "QUIT";      // the server is gone
         if (line == "STOP") { g_stop = true; continue; }
+        if (line.rfind("VIP ", 0) == 0) { g_vip = line.size() > 4 && line[4] == '1'; continue; }
         if (line.rfind("BSTOP ", 0) == 0) {
             const int b = std::atoi(line.c_str() + 6);
             if (b >= 0 && b < g_slots) g_bstop[(size_t) b] = true;
@@ -140,6 +148,7 @@ struct Options {
     int n_batch = 2048;
     int checkpoints = 8;
     int checkpoint_tail = 0;                           // --checkpoint-tail N: the prompt's last N tokens in small chunks
+    bool vip = false;                                  // --vip: a client engine may take the GPU: prompts in pieces always
     int prefill_share = 512;                           // --prefill-share N: while slots decode, a prompt in N-token pieces, windows between (0: whole)
     double decode_share = 0.25;                        // --decode-share F: after each piece, windows for F x the piece's time
     int64_t cache_mib = 0;                             // --conversation-cache-mib N: displaced conversations kept in RAM
@@ -198,6 +207,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--kv") o.kv = val("--kv");
         else if (a == "--prefill-batch") o.n_batch = std::atoi(val("--prefill-batch"));
         else if (a == "--checkpoints") o.checkpoints = std::max(0, std::atoi(val("--checkpoints")));
+        else if (a == "--vip") o.vip = true;
         else if (a == "--prefill-share") o.prefill_share = std::max(0, std::atoi(val("--prefill-share")));
         else if (a == "--decode-share") o.decode_share = std::max(0.0, std::atof(val("--decode-share")));
         else if (a == "--checkpoint-tail") o.checkpoint_tail = std::max(0, std::atoi(val("--checkpoint-tail")));
@@ -959,7 +969,8 @@ struct Engine {
             // the whole prompt (Qwen3-Coder, a 34K prompt read beside a writing agent: 0 tokens in 79 s before).  Text
             // only: an image's rows go in whole.
             for (size_t s0 = at; s0 < end;) {
-                const size_t s1 = !geni && o.prefill_share > 0 && decoding() ? std::min(end, s0 + (size_t) o.prefill_share) : end;
+                const size_t s1 = !geni && o.prefill_share > 0 && (decoding() || o.vip) ? std::min(end, s0 + (size_t) o.prefill_share) : end;
+                vip_wait();
                 const auto tp = Clock::now();
                 if (!feed(sq, P, s0, s1, false, err, !geni)) { clear(sq); return refuse(err); }
                 s0 = s1;
@@ -1001,6 +1012,7 @@ struct Engine {
             std::vector<llama_token> draft;
             bool first = true, done = false;
             while (!done) {
+                vip_wait();
                 draft.clear();
                 const int64_t room = std::min<int64_t>(limit - produced - 1, o.max_context - (int64_t) S.live.size() - 2);
                 if (drafts && room > 0) {
@@ -1115,6 +1127,7 @@ struct Engine {
 
     // One batch window: every decoding slot's pending token in one pass, a token each (BT <slot> <id>), BDONE at its end.
     void window() {
+        vip_wait();
         std::vector<int> who;
         for (int b = 0; b < (int) slots.size(); ++b) {
             if (!slots[(size_t) b].active) continue;

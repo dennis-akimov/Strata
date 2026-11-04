@@ -477,6 +477,23 @@ fn route_to(c: &mut Ctx, r: &crate::clients::Route) {
         return;
     }
     crate::observe::client_routed(&r.name);
+    // a VIP client: the main engine yields the GPU while any such request runs (counted: several at once)
+    struct Vip(Option<Arc<crate::engine::StrataEngine>>);
+    static VIPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    impl Drop for Vip {
+        fn drop(&mut self) {
+            if let Some(e) = &self.0 {
+                if VIPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    e.vip(false);
+                }
+            }
+        }
+    }
+    let _vip = Vip(c.svc().engine.strata().filter(|_| r.vip).cloned().inspect(|e| {
+        if VIPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            e.vip(true);
+        }
+    }));
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     let agent = AGENT.get_or_init(|| ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(3))).http_status_as_error(false).build().into());
     let body = c.body.as_ref().map(|b| b.to_vec()).unwrap_or_default();

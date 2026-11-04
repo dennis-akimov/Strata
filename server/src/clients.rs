@@ -13,6 +13,8 @@ pub struct Route {
     pub user_agent: String,
     pub paths: Vec<String>,
     pub url: String,
+    /// "vip" (default true): while its requests run, the main engine gives this client the GPU (docs/CLIENT_ENGINES.md)
+    pub vip: bool,
     /// the child server's config and port (None: "url", a server already running)
     pub spawn: Option<(Value, u16)>,
 }
@@ -49,7 +51,12 @@ pub fn parse(cfg: &Value, port: u16) -> Result<Vec<Route>, String> {
                 (format!("http://127.0.0.1:{p}"), Some((child, p)))
             }
         };
-        out.push(Route { name, user_agent: ua.to_lowercase(), paths, url, spawn });
+        let vip = match e.get("vip") {
+            None => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(format!("\"clients\" {name}: \"vip\" must be true or false")),
+        };
+        out.push(Route { name, user_agent: ua.to_lowercase(), paths, url, vip, spawn });
     }
     Ok(out)
 }
@@ -81,6 +88,11 @@ fn child_config(cfg: &Value, name: &str, max_context: i64, parallel: i64, cache_
         c.insert("log".into(), json!(log));
     }
     Value::Object(c)
+}
+
+/// Whether the main engine runs with --vip: any client engine that takes the GPU first
+pub fn any_vip(cfg: &Value) -> bool {
+    parse(cfg, 0).map(|r| r.iter().any(|r| r.vip)).unwrap_or(false)
 }
 
 /// The route for a request, the first entry that matches its path and User-Agent
@@ -247,6 +259,10 @@ mod tests {
         assert!(parse(&json!({"clients": [{"max_context": 6144}]}), 1).unwrap_err().contains("user_agent"));
         assert!(parse(&json!({"clients": [{"user_agent": "z", "max_context": 10}]}), 1).unwrap_err().contains("max_context"));
         assert!(parse(&json!({"clients": [{"user_agent": "z", "port": 70000}]}), 1).unwrap_err().contains("not a port"));
+        assert!(parse(&json!({"clients": [{"user_agent": "z", "vip": "yes"}]}), 1).unwrap_err().contains("vip"));
+        assert!(parse(&json!({"clients": [{"user_agent": "z"}]}), 1).unwrap()[0].vip);         // on by default
+        assert!(!any_vip(&json!({"clients": [{"user_agent": "z", "vip": false}]})));
+        assert!(any_vip(&json!({"clients": [{"user_agent": "z"}]})) && !any_vip(&json!({})));
         assert_eq!(parse(&json!({}), 1).unwrap(), vec![]);
         let r = parse(&json!({"clients": [{"user_agent": "z", "parallel": 2, "cache_mib": 512}]}), 8000).unwrap();
         let (c, _) = r[0].spawn.clone().unwrap();

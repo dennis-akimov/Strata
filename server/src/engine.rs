@@ -925,6 +925,11 @@ impl StrataEngine {
         self.send(&format!("{verb} {d}"))
     }
 
+    /// `VIP 1` / `VIP 0`: give a client engine's request the GPU, or take it back (the engine reads it at once)
+    pub fn vip(&self, on: bool) {
+        let _ = self.send(if on { "VIP 1" } else { "VIP 0" });
+    }
+
     fn send(&self, text: &str) -> Result<(), Fail> {
         btrace(&format!("send> {}", py::chars_prefix(text, 60)));
         let ok = {
