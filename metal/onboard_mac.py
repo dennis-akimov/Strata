@@ -87,6 +87,10 @@ MODELS = {
                      mem_min=5.0, mem_full=8, how="pull", gguf="Qwen3-4B-Instruct-2507/Qwen3-4B-Instruct-2507-Q8_0.gguf",
                      pack="qwen3-4b-instruct-2507", name="qwen3-4b-instruct-2507", context=32768,
                      sampling={"temperature": 0.7, "top_p": 0.8, "top_k": 20}),  # Qwen's settings for the 2507 Instruct
+    "QWEN3-4B-Q4": dict(title="Qwen3-4B-Instruct-2507 Q4", about="small and quicker, calls tools; Q4_K_M, room for 3-4 agents",
+                        download=2.5, mem_min=3.5, mem_full=6, how="pull",
+                        gguf="Qwen3-4B-Instruct-2507/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", pack="qwen3-4b-instruct-2507",
+                        name="qwen3-4b-instruct-2507-q4", context=32768, sampling={"temperature": 0.7, "top_p": 0.8, "top_k": 20}),
     "Q2_0": dict(title="Qwen3.8-Flash-Next Q2_0", about="the default and the most tested on a Mac", download=66.4,
                  mem_min=52, mem_full=60, how="setup"),
     "GPT-OSS-120B": dict(title="GPT-OSS 120B", about="about 5B active per token", download=63.4, mem_min=62,
