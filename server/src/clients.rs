@@ -17,6 +17,10 @@ pub struct Route {
     pub vip: bool,
     /// the child server's config and port (None: "url", a server already running)
     pub spawn: Option<(Value, u16)>,
+    /// its context ("max_context"), and whether it shortens max_tokens to the room left ("fit_max_tokens"): a request
+    /// larger than that goes to the main engine instead (None: a "url" with no "max_context", everything goes)
+    pub max_context: Option<i64>,
+    pub fit: bool,
 }
 
 static ROUTES: OnceLock<Vec<Route>> = OnceLock::new();
@@ -42,6 +46,10 @@ pub fn parse(cfg: &Value, port: u16) -> Result<Vec<Route>, String> {
                 Some(v) => v.as_i64().filter(|n| *n >= lo).ok_or_else(|| format!("\"clients\" {name}: \"{k}\" must be a whole number >= {lo}")),
             }
         };
+        let max_context = match e.get("url") {
+            Some(_) if e.get("max_context").is_none() => None,
+            _ => Some(num("max_context", 8192, 256)?),
+        };
         let (url, spawn) = match e.get("url").and_then(Value::as_str) {
             Some(u) => (u.trim_end_matches('/').to_string(), None),
             None => {
@@ -56,7 +64,8 @@ pub fn parse(cfg: &Value, port: u16) -> Result<Vec<Route>, String> {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err(format!("\"clients\" {name}: \"vip\" must be true or false")),
         };
-        out.push(Route { name, user_agent: ua.to_lowercase(), paths, url, vip, spawn });
+        let fit = cfg.get("fit_max_tokens").and_then(Value::as_bool).unwrap_or(false);
+        out.push(Route { name, user_agent: ua.to_lowercase(), paths, url, vip, spawn, max_context, fit });
     }
     Ok(out)
 }
@@ -94,6 +103,18 @@ fn child_config(cfg: &Value, name: &str, max_context: i64, parallel: i64, cache_
 pub fn pick<'a>(routes: &'a [Route], path: &str, user_agent: Option<&str>) -> Option<&'a Route> {
     let ua = user_agent?.to_lowercase();
     routes.iter().find(|r| r.paths.iter().any(|p| p == path) && ua.contains(&r.user_agent))
+}
+
+impl Route {
+    /// A request this engine can answer: its prompt (`tokens`, the body's JSON counted whole: a little over the
+    /// prompt) and room to answer within its context - max_tokens, or 256 when the engine shortens max_tokens to fit.
+    /// Zed's chat requests (2.8K tokens, 19 written) waited 9 s for a first token in the main engine behind agents;
+    /// its long agent threads still go there instead of failing here with a 400.
+    pub fn fits(&self, tokens: usize, max_tokens: Option<i64>) -> bool {
+        let Some(ctx) = self.max_context else { return true };
+        let answer = if self.fit { 256 } else { max_tokens.unwrap_or(256) };
+        tokens as i64 + answer <= ctx
+    }
 }
 
 pub fn set(routes: Vec<Route>) {
@@ -273,6 +294,16 @@ mod tests {
         assert_eq!(pick(&r, "/v1/completions", Some("curl/8.7")).map(|r| r.name.as_str()), Some("client2"));
         assert_eq!(pick(&r, "/v1/chat/completions", None), None);
         assert_eq!(pick(&r, "/v1/chat/completions", Some("claude-cli/2")), None);
+    }
+
+    #[test]
+    fn a_request_too_big_for_the_engine_goes_to_the_main_one() {
+        let r = &parse(&cfg(), 8090).unwrap();
+        assert!(r[0].fits(5000, Some(800)) && !r[0].fits(6000, Some(800)));      // 6,144: prompt + 256 or max_tokens
+        assert!(!r[0].fits(5000, Some(2000)));
+        let fit = &parse(&json!({"fit_max_tokens": true, "clients": [{"user_agent": "z", "max_context": 6144}]}), 1).unwrap()[0];
+        assert!(fit.fits(5800, Some(8192)));                                    // max_tokens shortened to the room
+        assert!(r[1].fits(1_000_000, None));                                    // a "url" without "max_context"
     }
 
     #[test]

@@ -449,7 +449,7 @@ fn dispatch(mut c: Ctx) {
         "POST" => {
             crate::observe::client_begin();
             match crate::clients::pick(crate::clients::routes(), &c.path(), c.header("user-agent").as_deref()) {
-                Some(r) if c.body.is_ok() => route_to(&mut c, r),
+                Some(r) if c.body.as_ref().is_ok_and(|b| client_fits(&c, r, b)) => route_to(&mut c, r),
                 _ => post(&mut c),
             }
             crate::observe::client_end();
@@ -467,6 +467,21 @@ fn dispatch(mut c: Ctx) {
             let _ = c.write(body);
         }
     }
+}
+
+/// The request fits the client's engine (Route::fits): its body counted with the model's tokenizer.
+fn client_fits(c: &Ctx, r: &crate::clients::Route, body: &[u8]) -> bool {
+    if r.max_context.is_none() {
+        return true;
+    }
+    let text = String::from_utf8_lossy(body);
+    let max = serde_json::from_slice::<Value>(body).ok()
+        .and_then(|v| ["max_tokens", "max_completion_tokens", "max_output_tokens", "n_predict"].iter().find_map(|k| v[k].as_i64()));
+    let ok = r.fits(c.svc().tok.encode(&text, false).len(), max);
+    if !ok {
+        crate::say(&format!("client engine {}: a request too big for its context goes to the main engine", r.name));
+    }
+    ok
 }
 
 /// A client with an engine of its own (docs/CLIENT_ENGINES.md): the request as sent to that engine, its answer
