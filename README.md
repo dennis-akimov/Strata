@@ -260,6 +260,19 @@ call) all pass at Q8_0, Q4_K_M and Q4_0 alike, writing 32.9 / 50.5 / 52.6 tokens
 On the M1 the Q4_K_M is the one to take: 1.3-2.7x the writing speed, a faster read, 4 GB less memory, the same
 answers on these checks.
 
+**LFM2.5-24B in i1-IQ3_XXS** (`make pull MODEL=LFM2.5-24B-IQ3`, mradermacher's, 9.3 GB against the Q3_K_M's 11.5;
+macOS only, see ‖) on the M1, 2026-11-03, the same six checks, one run each:
+
+| Quant | Size | Checks | Writing, tok/s |
+| --- | ---: | ---: | ---: |
+| Q3_K_M | 11.5 GB | 6/6 | 30.1 |
+| **i1-IQ3_XXS** | 9.3 GB | 6/6 | **36.2** |
+| UD-Q2_K_XL (Unsloth) | 8.0 GB | 6/6 | 35.6 |
+| i1-Q2_K | 8.8 GB | 6/6 | 29.5 (rambles: 2.6x the tokens) |
+
+The model is bound more by its compute than by reading its weights, so the smaller files gain little; i1-IQ3_XXS is
+the M1's 24B.
+
 Apple's on-device model (`make afm`, `"engine": "afm"`) took about 1.5 GB loaded and 3.2 GB while answering on the
 M1, estimated from the Mac's wired memory (its system service's own memory is readable by root only); the Monitor
 shows the same estimate.

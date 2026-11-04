@@ -15,6 +15,8 @@ Hugging Face revision; a stopped download continues when you run the same line a
   LFM2.5-24B     LiquidAI's LFM2.5-24B-A2B (2.45B active, always thinks) in mradermacher's Q3_K_M (11.5 GB, sha-256
                  checked): fits a 16 GB Mac; and its tokenizer pack.  Not Unsloth's UD-Q3_K_XL: its IQ3_XXS experts
                  decode at 1.3 tok/s on Linux's Apple GPU driver (that mat-vec runs 15-30x slower there)
+  LFM2.5-24B-IQ3  the same in mradermacher's i1-IQ3_XXS (9.3 GB, sha-256 checked), macOS only: on the M1 1.2x the
+                 Q3_K_M's writing speed, 2.2 GB less, the same answers on the setup checks
   LFM2.5-8B      LiquidAI's LFM2.5-8B-A1B (1.5B active, thinks) in their Q8_0 (9.0 GB, sha-256 checked) and its
                  tokenizer pack
   LFM2.5-8B-Q4   the same in their Q4_K_M (5.2 GB, sha-256 checked): on the M1 1.5-2.7x the Q8_0's writing speed, 4 GB
@@ -49,8 +51,8 @@ ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 PY = ROOT / ".venv" / "bin" / "python"
 MTP_PY = ROOT / ".venv-mtp" / "bin" / "python"
-NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "QWEN3-CODER-30B", "QWEN3-CODER-30B-Q4", "LFM2.5-24B", "LFM2.5-8B",
-         "LFM2.5-8B-Q4", "QWEN3-4B", "QWEN3-4B-Q4", "NUCLEUS", "HUNYUAN", "WAN2.2")
+NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "QWEN3-CODER-30B", "QWEN3-CODER-30B-Q4", "LFM2.5-24B", "LFM2.5-24B-IQ3",
+         "LFM2.5-8B",          "LFM2.5-8B-Q4", "QWEN3-4B", "QWEN3-4B-Q4", "NUCLEUS", "HUNYUAN", "WAN2.2")
 
 
 def die(msg: str) -> None:
@@ -237,6 +239,10 @@ def pull(name: str, data: Path) -> None:
     elif name == "LFM2.5-24B":
         g = get(m / "LFM2.5-24B-A2B", "https://huggingface.co/mradermacher/LFM2.5-24B-A2B-GGUF/resolve/38c24e5c182245615c52f66a4d6e58ea430ba7c5/LFM2.5-24B-A2B.Q3_K_M.gguf",
                 "5d91897ff9357e9ecb2a1be7134be78eb1d9fb3c07909427605f0aada665069b")
+        tokenizer(g, data / "packs" / "lfm2.5-24b-a2b")
+    elif name == "LFM2.5-24B-IQ3":
+        g = get(m / "LFM2.5-24B-A2B", "https://huggingface.co/mradermacher/LFM2.5-24B-A2B-i1-GGUF/resolve/b558210203487f7b6768c5cf879cc7f4928830b9/LFM2.5-24B-A2B.i1-IQ3_XXS.gguf",
+                "cb78a1116f2330dd06b9c5b3050212f1045db64e8af12ba1dd82eac811906352")
         tokenizer(g, data / "packs" / "lfm2.5-24b-a2b")
     elif name == "LFM2.5-8B":
         g = get(m / "LFM2.5-8B-A1B", "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q8_0.gguf",
