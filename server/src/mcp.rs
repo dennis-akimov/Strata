@@ -737,6 +737,19 @@ impl McpHub {
         }
     }
 
+    /// Servers that failed to start over 30 s ago: started again (a chat's tools then come back on their own; the M1
+    /// once failed bible's at start, its .local name resolving to an IPv6 address not reachable yet, and kept it off).
+    pub fn retry_failed(&self) {
+        let all: Vec<_> = self.servers.lock().unwrap().values().cloned().collect();
+        for s in all {
+            let again = { let st = s.st.lock().unwrap(); st.status == "failed" && st.last_start.elapsed() > Duration::from_secs(30) };
+            if again {
+                say(&format!("MCP server {} failed to start before: trying again", py::py_repr(&json!(s.name))));
+                self.spawn_start(s);
+            }
+        }
+    }
+
     /// Wait (up to `timeout` s in all) for servers that are still starting.
     pub fn wait(&self, timeout: Option<f64>) {
         let end = timeout.map(|t| Instant::now() + Duration::from_secs_f64(t));

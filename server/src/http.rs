@@ -1188,6 +1188,7 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
             return Ok(());
         }
         let hub = svc.mcp.clone().unwrap();
+        hub.retry_failed();
         hub.wait(Some(10.0));
         extra = hub.template_tools(&own);
         if team > 0 {
