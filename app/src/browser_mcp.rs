@@ -14,6 +14,8 @@ use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Job {
+    /// 0: the pane people see (/mcp); 1-4: a team agent's own browser (/mcp/N, main.rs AgentPane)
+    pub pane: usize,
     pub tool: String,
     pub args: Value,
     pub reply: mpsc::Sender<Result<String, String>>,
@@ -25,6 +27,19 @@ pub fn caller_args(args: &Value) -> Value {
     match args.as_object() {
         Some(m) => Value::Object(m.iter().filter(|(k, _)| !k.starts_with("__")).map(|(k, v)| (k.clone(), v.clone())).collect()),
         None => json!({}),
+    }
+}
+
+/// What an agent's browser (/mcp/N) offers: browsing only (typing waits for a person's Allow, the Google tools act in
+/// the pane people see).
+pub const AGENT_TOOLS: [&str; 6] = ["browser_search", "browser_open", "browser_read", "browser_click", "browser_scroll", "browser_back"];
+
+/// The pane a request is for: "POST /mcp" 0, "POST /mcp/2" 2 (agents 1-4); None: no such endpoint.
+pub fn pane_of(line: &str) -> Option<usize> {
+    let path = line.strip_prefix("POST ")?.split_whitespace().next()?;
+    match path.strip_prefix("/mcp")? {
+        "" => Some(0),
+        n => n.strip_prefix('/')?.parse().ok().filter(|n| (1..=4).contains(n)),
     }
 }
 
@@ -323,10 +338,10 @@ fn handle(mut s: TcpStream, key: &str, stopped: &AtomicBool, to_loop: &dyn Fn(Jo
     let respond = |s: &mut TcpStream, code: &str, body: &str| {
         let _ = write!(s, "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
     };
-    if !line.starts_with("POST /mcp") {
+    let Some(pane) = pane_of(&line) else {
         respond(&mut s, "404 Not Found", "{}");
         return Ok(());
-    }
+    };
     if auth != format!("Bearer {key}") {
         respond(&mut s, "401 Unauthorized", r#"{"error":"a key is needed"}"#);
         return Ok(());
@@ -339,6 +354,7 @@ fn handle(mut s: TcpStream, key: &str, stopped: &AtomicBool, to_loop: &dyn Fn(Jo
     let result = match m["method"].as_str().unwrap_or("") {
         "initialize" => json!({"protocolVersion": m["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                                "capabilities": {"tools": {}}, "serverInfo": {"name": "strata-browser", "version": "1"}}),
+        "tools/list" if pane > 0 => json!({"tools": tools().as_array().into_iter().flatten().filter(|t| AGENT_TOOLS.contains(&t["name"].as_str().unwrap_or(""))).cloned().collect::<Vec<_>>()}),
         "tools/list" => json!({"tools": tools()}),
         "ping" => json!({}),
         "tools/call" => {
@@ -347,7 +363,7 @@ fn handle(mut s: TcpStream, key: &str, stopped: &AtomicBool, to_loop: &dyn Fn(Jo
             } else {
                 let (tx, rx) = mpsc::channel();
                 let tool = m["params"]["name"].as_str().unwrap_or("").to_string();
-                to_loop(Job { tool: tool.clone(), args: caller_args(&m["params"]["arguments"]), reply: tx });
+                to_loop(Job { pane, tool: tool.clone(), args: caller_args(&m["params"]["arguments"]), reply: tx });
                 // a typed text waits for the person's Allow: up to 2 minutes
                 rx.recv_timeout(Duration::from_secs(150)).unwrap_or_else(|_| {
                     // what it did in the end goes to the log (an Allow clicked late ran a tool no one heard back from)
@@ -401,6 +417,19 @@ mod tests {
         assert!(post("Bearer k1", r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).0.contains("202"));
         assert_eq!(caller_args(&json!({"url": "u", "__allowed": true, "__phase": 2})), json!({"url": "u"}), "the app's own flags never come from a caller");
         assert_eq!(caller_args(&Value::Null), json!({}));
+        // an agent's browser: its own endpoint, browsing tools only
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#;
+        write!(c, "POST /mcp/2 HTTP/1.1\r\nAuthorization: Bearer k1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        let v: Value = serde_json::from_str(out.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let names: Vec<&str> = v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, AGENT_TOOLS);
+        assert_eq!(pane_of("POST /mcp HTTP/1.1"), Some(0));
+        assert_eq!(pane_of("POST /mcp/3 HTTP/1.1"), Some(3));
+        assert_eq!(pane_of("POST /mcp/9 HTTP/1.1"), None);
+        assert_eq!(pane_of("GET /mcp HTTP/1.1"), None);
         stopped.store(true, Ordering::SeqCst);                 // the browser's Stop: every call refused
         let (_, b) = post("Bearer k1", r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_read","arguments":{}}}"#);
         assert_eq!(serde_json::from_str::<Value>(&b).unwrap()["result"]["isError"], true);

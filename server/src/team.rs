@@ -2,11 +2,11 @@
 //! that do not overlap; each agent then runs the usual MCP tool loop on its part in its own engine slot (the run config's
 //! "parallel" sets how many write at once); their lists are merged here, duplicates dropped by address and by headline.
 //!
-//! The agents search with the stateless tools only: the browser tools drive the one pane people see, so three agents
-//! there would click on each other's pages.
+//! Each agent browses in a browser of its own: Strata.app serves them beside the pane people see (/mcp/1-4, the MCP
+//! servers agent1-agent4); agent i gets only agent{i}'s tools, so no two click on each other's pages.
 // ponytail: a fixed plan -> agents -> merge; agents that talk to each other mid-run if a task ever needs it
 
-use crate::api::McpRun;
+use crate::api::{run_with_mcp, McpRun};
 use crate::errors::Fail;
 use crate::parser::{Event, Kind};
 use crate::run::Item;
@@ -57,10 +57,34 @@ pub fn parts(text: &str, n: usize, task: &str) -> Vec<(String, String)> {
 /// One line of an agent's list: (headline, address, the line).
 pub type Found = (String, String, String);
 
-/// The "[headline](address)" lines of an agent's answer.
+/// The list lines of an agent's answer: "- [headline](address) - ...", "- headline (address) - ...", or a headline
+/// with no address (then "" : `address_from` finds it among the links its browser showed).
 pub fn items(answer: &str) -> Vec<Found> {
-    let re = regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)\s]+)\)").unwrap();
-    answer.lines().filter_map(|l| re.captures(l).map(|c| (c[1].trim().to_string(), c[2].to_string(), l.trim().trim_start_matches(['-', '*', ' ']).to_string()))).collect()
+    let md = regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)\s]+)\)").unwrap();
+    let bare = regex::Regex::new(r"https?://[^)\s\]]+").unwrap();
+    let cut = regex::Regex::new(r"\s+(\(|[-–—:]\s)").unwrap();
+    answer.lines().map(str::trim).filter(|l| l.starts_with(['-', '*', '•']) || l.starts_with(|c: char| c.is_ascii_digit())).filter_map(|l| {
+        let line = l.trim_start_matches(|c: char| matches!(c, '-' | '*' | '•' | '.' | ')' | ' ') || c.is_ascii_digit()).to_string();
+        if let Some(c) = md.captures(&line) {
+            return Some((c[1].trim().to_string(), c[2].to_string(), line.clone()));
+        }
+        let url = bare.find(&line).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let title = cut.split(&line).next().unwrap_or(&line).trim().trim_matches(['*', '"']).to_string();
+        (title.split_whitespace().count() >= 3).then_some((title, url, line))
+    }).collect()
+}
+
+/// The links the agent's browser showed ('[n] link "headline" -> host/path'): (headline, address).
+pub fn links(read: &str) -> Vec<(String, String)> {
+    let re = regex::Regex::new(r#"link "([^"]{12,})" -> (\S+)"#).unwrap();
+    re.captures_iter(read).map(|c| (c[1].to_string(), format!("https://{}", &c[2]))).collect()
+}
+
+/// A headline's address among those links: the one sharing most of its words (6 in 10 at least).
+fn address_from(title: &str, links: &[(String, String)]) -> Option<String> {
+    let w = words(title);
+    links.iter().map(|(t, u)| (w.intersection(&words(t)).count(), u)).filter(|(k, _)| *k >= 3 && k * 10 >= w.len() * 6)
+        .max_by_key(|(k, _)| *k).map(|(_, u)| u.clone())
 }
 
 /// An address without what does not change the page: scheme, "www.", query, fragment, a trailing slash.
@@ -102,16 +126,9 @@ pub fn dedupe(lists: Vec<Vec<Found>>) -> (Vec<Vec<Found>>, usize) {
     (out, dropped)
 }
 
-/// The pages a web search gave ("[k] web://... · headline · address · ..."), each once.
-pub fn pages(result: &str) -> Vec<(String, String)> {
-    let re = regex::Regex::new(r"(?m)^\[\d+\] web://\S+ · (.+?) · (https?://\S+) · ").unwrap();
-    let mut out: Vec<(String, String)> = vec![];
-    for c in re.captures_iter(result) {
-        if !out.iter().any(|(_, u)| page_key(u) == page_key(&c[2])) {
-            out.push((c[1].trim().to_string(), c[2].to_string()));
-        }
-    }
-    out
+/// The site of an address (its host without "www."): an item counts when its site is on a page the agent read.
+fn site(url: &str) -> String {
+    page_key(url).split('/').next().unwrap_or("").to_string()
 }
 
 /// The model's whole answer to one prompt, no tools and no thinking (its think closed for it: a plan and a list need
@@ -133,64 +150,90 @@ fn ask(svc: &Service, prompt: &str, kw: &Map<String, Value>, max: i64, sampling:
     Ok(text)
 }
 
-/// One agent: its search (run here, not left to the model: a small model listed made-up example.com news without
-/// one), then the model's list from what it found.  Only pages the search gave are kept; the ones the list left
-/// out are added as they are ("all" was asked).
+/// One agent: the usual tool loop with its own browser, then its list; only items from sites its browser showed are
+/// kept (a small model listed made-up example.com news without searching).
 #[allow(clippy::too_many_arguments)]
-fn agent(svc: &Service, i: usize, n: usize, task: &str, focus: &str, query: &str, others: &str, tool: &str, kw: &Map<String, Value>, sampling: &Map<String, Value>, cancel: &Arc<Flag>, tx: &mpsc::Sender<Value>) -> Vec<Found> {
-    let hub = svc.mcp.clone().expect("hub");
-    let id = format!("team{}-{}", i + 1, uuid::Uuid::new_v4().simple());
-    // the search engines only: "papers" answered news questions with research papers
-    let args = json!({"query": format!("web: {query}; engines=google,bing,duckduckgo; fresh=day; n=8")});
-    let _ = tx.send(json!({"event": "call", "id": id, "name": tool, "arguments": args, "round": 1, "agent": i + 1}));
-    let r = hub.call(tool, &args, Some(cancel)).unwrap_or_default();
-    let text = r.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+fn agent(svc: &Service, i: usize, n: usize, task: &str, focus: &str, query: &str, others: &str, tools: Vec<Value>, kw: &Map<String, Value>, max_req: i64, sampling: &Map<String, Value>, cancel: &Arc<Flag>, tx: &mpsc::Sender<Value>) -> (Vec<Found>, String) {
+    let prompt = format!("You are agent {} of {n} on this task: {task}\nToday is {}. Your part only: {focus}. Leave to the others: {others}.\n\
+        Your browser searched \"{query}\" (below). browser_click the two or three most relevant results to read them.\n\
+        Then answer with only a list, one item per line: - [headline](address) - one sentence. Only items from pages you read, \
+        each with its own address; the newest first.", i + 1, chrono::Local::now().format("%Y-%m-%d"));
+    // the first search run here, not left to the model: told to search, two of three agents made their lists up
+    let search = format!("agent{}__browser_search", i + 1);
+    let args = json!({"query": query});
+    let id = format!("team{}-search", i + 1);
+    let _ = tx.send(json!({"event": "call", "id": id, "name": search, "arguments": args, "round": 0, "agent": i + 1}));
+    let r = svc.mcp.as_ref().map(|h| h.call(&search, &args, Some(cancel)).unwrap_or_default()).unwrap_or_default();
+    let found = r.get("text").and_then(Value::as_str).unwrap_or("").to_string();
     let mut ev = json!({"event": "result", "id": id, "agent": i + 1});
     for k in ["ok", "text", "chars", "truncated", "ms"] {
         ev[k] = r.get(k).cloned().unwrap_or(Value::Null);
     }
     let _ = tx.send(ev);
-    let found = pages(&text);
-    crate::say(&format!("team agent {}: {} pages for {query:?}", i + 1, found.len()));
-    if found.is_empty() || cancel.is_set() {
-        return vec![];
-    }
-    let room: String = text.chars().take(12000).collect();
-    let prompt = format!("You are agent {} of {n} on this task: {task}\nYour part: {focus}. The others cover: {others}.\n\n\
-        Your web search found:\n{room}\n\nList every item of your part from these results, one per line: - [headline](address) - \
-        one sentence from the result. Only these results' addresses; nothing else.", i + 1);
-    let said = ask(svc, &prompt, kw, 1200, sampling, cancel).unwrap_or_default();
-    let mut list: Vec<Found> = items(&said).into_iter().filter(|f| found.iter().any(|(_, u)| page_key(u) == page_key(&f.1))).collect();
-    for (t, u) in &found {
-        if !list.iter().any(|f| page_key(&f.1) == page_key(u)) {
-            list.push((t.clone(), u.clone(), format!("[{}]({u})", t.replace(['[', ']'], ""))));
+    let messages = vec![
+        json!({"role": "user", "content": prompt}),
+        json!({"role": "assistant", "content": "", "tool_calls": [{"function": {"name": search, "arguments": args}}]}),
+        json!({"role": "tool", "content": found}),
+    ];
+    let Ok((ids, thinking, max_new)) = svc.prepare(&messages, Some(&tools), kw, Some(max_req), None, None) else { return (vec![], String::new()) };
+    let names = tools.iter().filter_map(|t| t["name"].as_str().map(String::from)).collect();
+    let run = McpRun { messages, kw: kw.clone(), max_req, names, team: 0, rounds: Some(5) };
+    let (mut text, mut read) = (String::new(), found.clone());
+    let r = run_with_mcp(svc, run, ids, thinking, Some(tools), max_new, sampling, cancel, &mut |item| {
+        match item {
+            Item::Mcp(mut v) => {
+                if v["event"] == "result" {
+                    read.push_str(v["text"].as_str().unwrap_or(""));
+                }
+                v["agent"] = json!(i + 1);
+                let _ = tx.send(v);
+            }
+            Item::Ping => {
+                let _ = tx.send(Value::Null);
+            }
+            Item::Event(ev) if ev.kind == Kind::Content => text.push_str(&ev.text),
+            _ => {}
         }
+        Ok(())
+    });
+    if let Err(Stop::Err(e)) = r {
+        crate::say(&format!("team agent {}: {e}", i + 1));
     }
-    list
+    let shown = links(&read);
+    let read = read.to_lowercase();
+    let all: Vec<Found> = items(&text).into_iter().map(|(t, u, l)| {
+        let u = if u.is_empty() { address_from(&t, &shown).unwrap_or_default() } else { u };
+        let l = if l.contains(&u) || u.is_empty() { l } else { format!("[{}]({u}) - {}", t.replace(['[', ']'], ""), l.strip_prefix(t.as_str()).unwrap_or(&l).trim_start_matches([' ', '-', '–', '—', ':']).trim()) };
+        (t, u, l)
+    }).collect();
+    let kept: Vec<Found> = all.iter().filter(|f| !site(&f.1).is_empty() && read.contains(&site(&f.1))).cloned().collect();
+    crate::say(&format!("team agent {}: {} items, {} from sites its browser showed", i + 1, all.len(), kept.len()));
+    (kept, text)
 }
 
 /// The team's run: the plan, the agents at once, their merged list; emitted as one answer.
 #[allow(clippy::too_many_arguments)]
 pub fn run(svc: &Service, n: usize, task: &str, m: McpRun, tools: Vec<Value>, sampling: &Map<String, Value>, cancel: &Arc<Flag>, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(), Stop<Fail>> {
     let say = |emit: &mut dyn FnMut(Item) -> Result<(), Closed>, t: String| emit(Item::Event(Event::text(Kind::Content, t)));
-    // ponytail: the web search is bible's find_skill("web: ..."); another stateless search tool would need its own call
-    let Some(tool) = tools.iter().filter_map(|t| t["name"].as_str()).find(|n| n.ends_with("__find_skill")).map(String::from) else {
-        return Err(Stop::Err(Fail::Value("/team searches with bible's web search (find_skill \"web: ...\"); no MCP server has it".into())));
-    };
+    // agent i's browser: the MCP server agent{i}
+    let own = |i: usize| -> Vec<Value> { tools.iter().filter(|t| t["name"].as_str().unwrap_or("").starts_with(&format!("agent{}__", i + 1))).cloned().collect() };
+    if (0..n).any(|i| own(i).is_empty()) {
+        return Err(Stop::Err(Fail::Value(format!("/team needs a browser for each of its {n} agents: Strata.app gives them (agent1-agent4); this server runs without the app"))));
+    }
     let t0 = std::time::Instant::now();
     let plan = format!("Today is {}. Split this research task among {n} agents so that no two of them look for the same \
-        things.\nThe task: {task}\n\nReply with exactly {n} lines and nothing else. Each line: a short focus, then \" | \", then a web \
+        things. Each gets a Google search of a few words (what a person types, not a site's name).\nThe task: {task}\n\nReply with exactly {n} lines and nothing else. Each line: a short focus, then \" | \", then a web \
         search query for it. For example:\nStock markets | stock market news today\nCentral banks | central bank interest rate news", chrono::Local::now().format("%Y-%m-%d"));
     let plan = ask(svc, &plan, &m.kw, 300, sampling, cancel)?;
     crate::say(&format!("team plan: {plan:?}"));
     let parts = parts(&plan, n, task);
     say(emit, format!("**A team of {n}:**\n{}\n\n", parts.iter().enumerate().map(|(i, (f, q))| format!("{}. {f} (\"{q}\")", i + 1)).collect::<Vec<_>>().join("\n")))?;
-    let (tx, rx) = mpsc::channel::<Value>();
-    let lists: Vec<Vec<Found>> = std::thread::scope(|s| {
+    let (tx, rx) = mpsc::channel::<Value>();     // Null: a keep-alive
+    let done: Vec<(Vec<Found>, String)> = std::thread::scope(|s| {
         let handles: Vec<_> = parts.iter().enumerate().map(|(i, (focus, query))| {
             let others = parts.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| p.0.as_str()).collect::<Vec<_>>().join("; ");
-            let (tx, tool, kw) = (tx.clone(), tool.clone(), m.kw.clone());
-            s.spawn(move || agent(svc, i, n, task, focus, query, &others, &tool, &kw, sampling, cancel, &tx))
+            let (tx, tools, kw) = (tx.clone(), own(i), m.kw.clone());
+            s.spawn(move || agent(svc, i, n, task, focus, query, &others, tools, &kw, m.max_req, sampling, cancel, &tx))
         }).collect();
         drop(tx);
         // the agents' searches go out as they happen (the page shows them); keep-alives while they write; a client
@@ -198,7 +241,7 @@ pub fn run(svc: &Service, n: usize, task: &str, m: McpRun, tools: Vec<Value>, sa
         loop {
             match rx.recv_timeout(std::time::Duration::from_secs(5)) {
                 Ok(v) => {
-                    if emit(Item::Mcp(v)).is_err() {
+                    if emit(if v.is_null() { Item::Ping } else { Item::Mcp(v) }).is_err() {
                         cancel.set();
                     }
                 }
@@ -215,6 +258,7 @@ pub fn run(svc: &Service, n: usize, task: &str, m: McpRun, tools: Vec<Value>, sa
     if cancel.is_set() {
         return Err(Stop::Closed);
     }
+    let (lists, said): (Vec<Vec<Found>>, Vec<String>) = done.into_iter().unzip();
     let found: usize = lists.iter().map(Vec::len).sum();
     let (lists, dropped) = dedupe(lists);
     crate::say(&format!("team of {n}: {found} items, {dropped} duplicates dropped, {:.0} s", t0.elapsed().as_secs_f64()));
@@ -222,7 +266,9 @@ pub fn run(svc: &Service, n: usize, task: &str, m: McpRun, tools: Vec<Value>, sa
     for (i, ((focus, _), list)) in parts.iter().zip(&lists).enumerate() {
         out.push_str(&format!("### {}. {focus}\n", i + 1));
         if list.is_empty() {
-            out.push_str("(nothing new found)\n");
+            // what it said, marked: none of it is from a page its browser showed
+            let raw: String = said[i].trim().chars().take(800).collect();
+            out.push_str(&if raw.is_empty() { "(nothing found)\n".to_string() } else { format!("(unchecked: no item named a page its browser showed)\n> {}\n", raw.replace('\n', "\n> ")) });
         }
         for (_, _, line) in list {
             out.push_str(&format!("- {line}\n"));
@@ -262,6 +308,18 @@ mod tests {
     }
 
     #[test]
+    fn list_lines_with_and_without_addresses() {
+        let it = items("Here:\n- [Fed holds rates](https://a.com/f) - x\n- AI stocks slide as Texas result raises risks (Yahoo Finance) – y\n2. Oil rises on supply fears https://b.com/o\nno list line");
+        assert_eq!(it.len(), 3);
+        assert_eq!(it[1].0, "AI stocks slide as Texas result raises risks");
+        assert_eq!(it[1].1, "");
+        assert_eq!(it[2].1, "https://b.com/o");
+        let shown = links(r#"[3] link "AI stocks slide as Texas governor result raises data center risks" -> finance.yahoo.com/news/ai-stocks-1.html"#);
+        assert_eq!(address_from(&it[1].0, &shown).as_deref(), Some("https://finance.yahoo.com/news/ai-stocks-1.html"));
+        assert_eq!(address_from("Gold at a record high today", &shown), None);
+    }
+
+    #[test]
     fn duplicates_by_page_and_by_headline() {
         let a = items("- [Fed holds interest rates steady in November meeting](https://www.reuters.com/a?x=1) - x\n- [Oil rises](https://b.com/o)");
         let b = items("* [Fed holds interest rates steady at November meeting](https://cnbc.com/f) - y\n- [Oil rises](http://b.com/o/)\n- [Gold at a record](https://c.com/g)");
@@ -269,11 +327,5 @@ mod tests {
         assert_eq!(dropped, 2);
         assert_eq!(lists[1].len(), 1);
         assert_eq!(lists[1][0].0, "Gold at a record");
-    }
-
-    #[test]
-    fn the_pages_of_a_web_search() {
-        let r = "web: x · 3 pages\n[1] web://a/1 · Apple is the priciest · https://finance.yahoo.com/v.html · google · fetched\n<<<\ntext\n>>>\n[2] web://a/1 · Apple is the priciest · https://finance.yahoo.com/v.html · google\n[3] web://a/2 · Oil · https://b.com/o · bing";
-        assert_eq!(pages(r), vec![("Apple is the priciest".into(), "https://finance.yahoo.com/v.html".into()), ("Oil".into(), "https://b.com/o".into())]);
     }
 }

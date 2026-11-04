@@ -64,6 +64,9 @@ enum Ev {
     Native(browser_mcp::Job, &'static str, String),
     /// a Google tool's script past its time: told to change nothing more
     StopScript(u64),
+    /// a team agent's browser (pane 1-4, AgentPane): a load finished there; its page read for a waiting call
+    AgentWeb(usize, String),
+    AgentRead(usize, std::sync::mpsc::Sender<Result<String, String>>, bool),
     Quit,
 }
 
@@ -1272,6 +1275,27 @@ fn save_map_export(args: &Value, kml: &str, title: &str, page: &Value) -> Result
                places.len(), if without > 0 { format!(", {without} with none") } else { String::new() }, kml_path.display(), gj.display()))
 }
 
+/// A team agent's own browser (/mcp/N; the server's "/team"): a web view of its own, stacked with the others in the
+/// browser's half while they run, so the agents never click on each other's pages.  Browsing only.
+// ponytail: clicks by the page's script, not the mouse (the pane people see clicks natively); typing not offered
+struct AgentPane {
+    web: WebView,
+    seen: Arc<Mutex<std::collections::HashSet<String>>>,
+    last: Arc<Mutex<String>>,
+    searched: Option<Instant>,
+    load_waiters: Vec<std::sync::mpsc::Sender<Result<String, String>>>,
+    search_waiters: Vec<std::sync::mpsc::Sender<Result<String, String>>>,
+}
+
+/// An agent pane's page read `ms` from now as the call's answer.
+fn agent_read_later(i: usize, reply: std::sync::mpsc::Sender<Result<String, String>>, proxy: &EventLoopProxy<Ev>, ms: u64, search: bool) {
+    let p = Mutex::new(proxy.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(ms));
+        let _ = p.lock().unwrap().send_event(Ev::AgentRead(i, reply, search));
+    });
+}
+
 /// The page read `ms` from now as the call's answer (what a click or typing led to).
 fn read_later(reply: std::sync::mpsc::Sender<Result<String, String>>, proxy: &EventLoopProxy<Ev>, ms: u64) {
     let p = Mutex::new(proxy.clone());
@@ -1424,6 +1448,9 @@ fn main() {
     let last_read: std::sync::Arc<Mutex<String>> = Default::default();
     let searched: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None); // the last search (the check holds 10 min)
     let next_ask = std::cell::Cell::new(0u64);
+    // the team agents' browsers (made at their first call) and whether they hold the browser's half
+    let agents: std::cell::RefCell<Vec<Option<AgentPane>>> = std::cell::RefCell::new((0..4).map(|_| None).collect());
+    let agents_shown = std::cell::Cell::new(false);
     {
         let p = proxy.clone();
         MenuEvent::set_event_handler(Some(move |e| {
@@ -1578,6 +1605,21 @@ fn main() {
             let _ = web.set_bounds(rect(left, BAR + WEB_BAR, sz.width - left, (sz.height - BAR - WEB_BAR).max(0.0)));
             let _ = web_bar.set_visible(split);
             let _ = web.set_visible(split);
+            // a team's agents: their browsers stacked in the browser's half, in the place of the pane people use
+            let ags = agents.borrow();
+            let live: Vec<&AgentPane> = ags.iter().flatten().collect();
+            let stacked = split && agents_shown.get() && !live.is_empty();
+            if stacked {
+                let _ = web_bar.set_visible(false);
+                let _ = web.set_visible(false);
+                let h = ((sz.height - BAR) / live.len() as f64).floor();
+                for (k, a) in live.iter().enumerate() {
+                    let _ = a.web.set_bounds(rect(left, BAR + h * k as f64, sz.width - left, (h - 2.0).max(0.0)));
+                }
+            }
+            for a in &live {
+                let _ = a.web.set_visible(stacked);
+            }
         };
         let act = |cmd: &str, v: &Value| {
             let note = |msg: &str| js_call(&control_view, "note", &json!(msg));
@@ -1843,6 +1885,7 @@ fn main() {
                 }
                 "browser" => open(&[&format!("{}/", st.lock().unwrap().base())]),
                 "web" => {
+                    agents_shown.set(false);
                     web_open.set(!web_open.get());
                     if web_open.get() && web.url().map(|u| u == "about:blank").unwrap_or(true) {
                         nav_epoch.set(nav_epoch.get() + 1);
@@ -2002,7 +2045,131 @@ fn main() {
                     Ok(browser_mcp::loaded_text(&v, search))
                 });
             }
+            Event::UserEvent(Ev::Tool(job)) if job.pane > 0 => {
+                let i = job.pane;
+                if agents.borrow()[i - 1].is_none() {
+                    let p = proxy.clone();
+                    let w = WebViewBuilder::new()
+                        .with_url("about:blank")
+                        .with_user_agent(safari_user_agent(&safari_version()))
+                        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+                        .with_bounds(rect(640.0, BAR, 640.0, 300.0))
+                        .with_visible(false)
+                        .with_on_page_load_handler(move |e, url| {
+                            if matches!(e, wry::PageLoadEvent::Finished) {
+                                let _ = p.send_event(Ev::AgentWeb(i, url));
+                            }
+                        })
+                        .build_as_child(&control_win)
+                        .expect("webview");
+                    agents.borrow_mut()[i - 1] = Some(AgentPane { web: w, seen: Default::default(), last: Default::default(), searched: None, load_waiters: vec![], search_waiters: vec![] });
+                }
+                if !web_open.get() {
+                    web_open.set(true);
+                    js_call(&control_view, "webOpen", &json!(true));
+                    js_call(&page, "strataWeb", &json!(true));
+                }
+                if !agents_shown.get() {
+                    agents_shown.set(true);
+                }
+                layout(full.get());
+                let mut ags = agents.borrow_mut();
+                let a = ags[i - 1].as_mut().unwrap();
+                let n = job.args["element"].as_i64().unwrap_or(0);
+                let wait_load = |a: &mut AgentPane, reply: std::sync::mpsc::Sender<Result<String, String>>, secs: u64| {
+                    let late = reply.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(secs));
+                        let _ = late.send(Ok(format!("still loading after {secs} s: browser_read it in a moment")));
+                    });
+                    a.load_waiters.push(reply);
+                };
+                match job.tool.as_str() {
+                    "browser_search" => {
+                        a.searched = Some(Instant::now());
+                        let _ = a.web.load_url(&web_url(&format!("{} ", job.args["query"].as_str().unwrap_or("")).replace('.', " ")));
+                        let late = job.reply.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(15));
+                            let _ = late.send(Ok("the results did not load in 15 s: browser_read the page".into()));
+                        });
+                        a.search_waiters.push(job.reply);
+                    }
+                    "browser_open" => {
+                        let url = web_url(job.args["url"].as_str().unwrap_or(""));
+                        if a.searched.is_some_and(|t| t.elapsed() < Duration::from_secs(600)) && !link_seen(&a.seen.lock().unwrap(), &url) {
+                            let _ = job.reply.send(Ok(format!("not opened: {} is a site none of the results or pages you read showed (guessed addresses are usually 404s). Use browser_click with a result's number, or browser_search again.", site_of(&url))));
+                        } else {
+                            let _ = a.web.load_url(&url);
+                            wait_load(a, job.reply, 20);
+                        }
+                    }
+                    "browser_back" => {
+                        let _ = a.web.evaluate_script("history.back()");
+                        wait_load(a, job.reply, 8);
+                    }
+                    "browser_read" => {
+                        let (seen, last) = (a.seen.clone(), a.last.clone());
+                        eval_reply(&a.web, &browser_mcp::read_js(job.args["part"].as_i64().unwrap_or(1)), job.reply, move |v| {
+                            remember_links(&seen, &v);
+                            Ok(browser_mcp::once(&mut last.lock().unwrap(), browser_mcp::page_text(&v)))
+                        });
+                    }
+                    "browser_click" | "browser_scroll" => {
+                        let (js, ms) = if job.tool == "browser_click" {
+                            (browser_mcp::click_js(n), 2000)
+                        } else {
+                            (format!("window.scrollBy(0, {}innerHeight * 0.8); JSON.stringify({{y: Math.round(scrollY)}})", if job.args["direction"] == "up" { "-" } else { "" }), 800)
+                        };
+                        if job.tool == "browser_click" {
+                            a.load_waiters.push(job.reply.clone());
+                        }
+                        let (reply, p) = (job.reply, proxy.clone());
+                        let _ = a.web.evaluate_script_with_callback(&js, move |r| {
+                            if let Some(e) = js_value(&r)["error"].as_str() {
+                                let _ = reply.send(Err(e.to_string()));
+                            } else {
+                                agent_read_later(i, reply.clone(), &p, ms, false);
+                            }
+                        });
+                    }
+                    other => {
+                        let _ = job.reply.send(Err(format!("{other}: an agent's browser only browses (browser_search, browser_open, browser_read, browser_click, browser_scroll, browser_back)")));
+                    }
+                }
+            }
+            Event::UserEvent(Ev::AgentWeb(i, url)) => {
+                let mut ags = agents.borrow_mut();
+                let Some(a) = ags[i - 1].as_mut() else { return };
+                if url.contains("google.") && (url.contains("/search") || url.contains("/sorry/")) {
+                    for w in a.search_waiters.drain(..) {
+                        if url.contains("/sorry/") {
+                            let _ = w.send(Err("Google asks to prove this is a person (the browser shows it): the user can do that, then search again".into()));
+                        } else {
+                            agent_read_later(i, w, &proxy, 800, true);
+                        }
+                    }
+                }
+                for w in a.load_waiters.drain(..) {
+                    agent_read_later(i, w, &proxy, 800, false);
+                }
+            }
+            Event::UserEvent(Ev::AgentRead(i, w, search)) => {
+                let ags = agents.borrow();
+                let Some(a) = ags[i - 1].as_ref() else { return };
+                let (seen, last) = (a.seen.clone(), a.last.clone());
+                eval_reply(&a.web, &browser_mcp::read_js(1), w, move |v| {
+                    remember_links(&seen, &v);
+                    *last.lock().unwrap() = browser_mcp::page_text(&v);
+                    Ok(browser_mcp::loaded_text(&v, search))
+                });
+            }
             Event::UserEvent(Ev::Tool(job)) => {
+                // the pane people see is theirs again (a team's browsers step back)
+                if agents_shown.get() {
+                    agents_shown.set(false);
+                    layout(full.get());
+                }
                 // the model's browser tools work in the pane people see: it opens for them
                 if !web_open.get() {
                     web_open.set(true);

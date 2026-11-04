@@ -50,6 +50,8 @@ pub struct McpRun {
     pub names: HashSet<String>,
     /// "/team": how many agents (0: none, the usual loop)
     pub team: usize,
+    /// the tool rounds an answer may take (None: the MCP settings' max_rounds); a team's agents take fewer
+    pub rounds: Option<i64>,
 }
 
 impl Run<'_> {
@@ -215,7 +217,7 @@ pub fn announces(text: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: bool, tools: Option<Vec<Value>>, mut max_new: i64, sampling: &Map<String, Value>, cancel: &Arc<Flag>, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(), Stop<Fail>> {
     let hub = svc.mcp.clone().expect("hub");
-    let mut max_rounds = hub.settings["max_rounds"].as_i64().unwrap_or(8);
+    let mut max_rounds = m.rounds.unwrap_or_else(|| hub.settings["max_rounds"].as_i64().unwrap_or(8));
     // an answer that said what it would do and did nothing is told once to do it; one that changed something checks
     // its work (up to twice: a fix is checked too)
     let (mut nudged, mut checks, mut changed) = (false, 0, false);
@@ -925,7 +927,7 @@ mod loop_tests {
         let messages = vec![json!({"role": "user", "content": "find events"})];
         let kw = Map::new();
         let (ids, thinking, max_new) = svc.prepare(&messages, Some(&tools), &kw, Some(200), None, None).unwrap();
-        let m = McpRun { messages, kw, max_req: 200, names, team: 0 };
+        let m = McpRun { messages, kw, max_req: 200, names, team: 0, rounds: None };
         let (mut mcp, mut text) = (vec![], String::new());
         run_with_mcp(&svc, m, ids, thinking, Some(tools), max_new, &Map::new(), &Arc::new(Flag::new()), &mut |item| {
             match item {

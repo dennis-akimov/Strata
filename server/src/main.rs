@@ -490,6 +490,10 @@ fn main() {
     }
     if let (false, Ok(u), Ok(k)) = (client_engine, std::env::var("STRATA_BROWSER_MCP_URL"), std::env::var("STRATA_BROWSER_MCP_KEY")) {
         env_mcp.insert("browser".into(), json!({"url": u, "headers": {"Authorization": format!("Bearer {k}")}}));
+        // a "/team"'s agents: a browser each, beside the pane people see (team.rs)
+        for i in 1..=4 {
+            env_mcp.insert(format!("agent{i}"), json!({"url": format!("{u}/{i}"), "headers": {"Authorization": format!("Bearer {k}")}}));
+        }
     }
     if !env_mcp.is_empty() {
         say(&format!("MCP servers from .env or Strata.app (its browser): {}", env_mcp.keys().cloned().collect::<Vec<_>>().join(", ")));

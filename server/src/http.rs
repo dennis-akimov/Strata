@@ -1191,13 +1191,9 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
         hub.retry_failed();
         hub.wait(Some(10.0));
         extra = hub.template_tools(&own);
-        if team > 0 {
-            // the browser is the one pane people see: agents at once search with the other tools
-            extra.retain(|t| !get(t, "name").as_str().unwrap_or("").starts_with("browser__"));
-            if extra.is_empty() {
-                return Err(Fail::Value("/team needs a search tool other than the browser (an MCP server such as bible's web search): the browser is one pane, its agents would click on each other's pages".into()));
-            }
-        }
+        // the team agents' own browsers (agent1-agent4, Strata.app): a team's only, the usual chat never sees them
+        let agent_tool = |t: &Value| { let n = get(t, "name").as_str().unwrap_or(""); n.starts_with("agent") && n[5..].split_once("__").is_some_and(|(k, _)| k.parse::<u8>().is_ok()) };
+        if team > 0 { extra.retain(agent_tool) } else { extra.retain(|t| !agent_tool(t)) }
         use_mcp = !extra.is_empty();
         let mut all = tools.clone().unwrap_or_default();
         all.extend(extra.iter().cloned());
@@ -1214,7 +1210,7 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     debug_req("openai", &Value::Object(req.clone()), &messages, tools.as_deref(), max_new, thinking, ids.len());
     let cancel = Arc::new(Flag::new());
     c.watch_client(&cancel);
-    let mcp = if use_mcp { Some(McpRun { messages: messages.clone(), kw: kw.clone(), max_req, names: extra.iter().filter_map(|t| get(t, "name").as_str().map(String::from)).collect(), team }) } else { None };
+    let mcp = if use_mcp { Some(McpRun { messages: messages.clone(), kw: kw.clone(), max_req, names: extra.iter().filter_map(|t| get(t, "name").as_str().map(String::from)).collect(), team, rounds: None }) } else { None };
     let rv = Value::Object(req.clone());
     let mut run = Run { svc: &svc, ids, thinking, tools, max_new, sampling: req, cancel: cancel.clone(), force, mcp };
     let stream = truthy(get(&rv, "stream"));
