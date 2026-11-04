@@ -20,10 +20,18 @@ agent's next request read its whole prompt again (10-30 s at 10-30K tokens).  Wi
    agent's next request then finds its state on green (the same content keys that decide any cache hit) instead of
    reading its prompt again.  Same model file, same build of the state format: a state llama.cpp refuses is dropped and
    that agent reads its prompt as before (slower, never wrong).
-4. **The decision** (`Strata --deploy`): idle (or nothing runs) - restart as before; busy, blue shares its port and
-   a second engine fits (its contexts; the weights are the same mapped file) - blue-green; otherwise wait for idle.
-   Another Strata engine running beside it stops the deploy before anything quits (the new server would refuse to
-   start).  Done when the new server answers.
+4. **The decision** (`Strata --deploy`): one Strata.app at a time.  The running app switches its server, nginx's way
+   (HUP: new workers, the old ones drain): the deploy writes the mode to `$TMPDIR/strata-app-switch` and sends the
+   app SIGUSR1; the app starts the new server with `--handoff` beside its old one and keeps the old one until it has
+   finished its requests and stopped (a new server that dies first leaves the old one serving), then answers in
+   `$TMPDIR/strata-app-switch.done`.  When the old server cannot share its port or a second engine does not fit (its
+   contexts; the weights are the same mapped file): after the model is idle, a stop and a start in the same app.
+   When the app's own code changed (the fingerprint it writes at its start to `~/Library/Application
+   Support/Strata/running.json` differs from the build on disk; an unchanged rebuild has the same one): after the
+   model is idle, the app quits and the new one opens.  Another Strata engine running beside it stops the deploy
+   before anything quits (the new server would refuse to start).  Done when the new server answers.
+
+   Measured 2026-11-03: a busy Qwen3.6 server (and its client engine) handed over in 46 s, one Strata.app throughout.
 
 ## Limits
 

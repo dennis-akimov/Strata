@@ -1,27 +1,15 @@
-//! `Strata --deploy` (make app-run): put the Strata.app just built in place of the running one without cutting off a
-//! request.  Idle (or nothing running): the old app quits and the new one opens, as before.  Busy: blue-green - the new
-//! app starts its server with --handoff beside the old one (one port, SO_REUSEPORT: macOS gives the newest listener the
-//! new connections); that server loads its model, takes the port and has the old server finish its requests and stop
-//! (SIGUSR2); then the old app quits.  When the old server cannot share its port (a server from before 2026-11-03) or
-//! a second engine does not fit in memory, it waits until the model is idle instead.  docs/OBSERVABILITY.md's sibling:
-//! the server half is strata-server --handoff.
+//! `Strata --deploy` (make app-run): put the build just made in place without cutting off a request, and with one
+//! Strata.app at a time.  The running app switches its server (SIGUSR1, main.rs switch_server, nginx's HUP way): the
+//! new server starts with --handoff beside the old one (one port, SO_REUSEPORT: macOS gives the newest listener the new
+//! connections), loads its model, takes the port and has the old server finish its requests and stop (SIGUSR2).  When
+//! the old server cannot share its port or a second engine does not fit in memory: after the model is idle, a stop
+//! and a start.  When the app's own code changed (its build's fingerprint, written at its start, differs from the one
+//! on disk): after the model is idle, the app quits and the new one opens.  docs/BLUE_GREEN.md.
 
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
-
-#[derive(Debug, PartialEq)]
-pub enum Plan {
-    /// no Strata.app runs: just open the new one
-    Open,
-    /// the model is idle (or its server does not answer): the old app quits, the new one opens
-    Restart,
-    /// busy: blue-green
-    Handoff,
-    /// busy and a handoff cannot be done: wait until it is idle, then restart
-    WaitIdle,
-}
 
 /// a request is being read or answered, or waits for its turn
 pub fn busy(m: &Value) -> bool {
@@ -39,14 +27,6 @@ pub fn fits(m: &Value, model_bytes: u64) -> bool {
     let ram_free = u(&h["ram_total"]).saturating_sub(u(&h["ram_used"])) as f64;
     let gpu_free = u(&h["gpu_mem_total"]).saturating_sub(u(&h["gpu_mem_used"])) as f64;
     need > 0.0 && need <= ram_free && need <= gpu_free
-}
-
-pub fn plan(old_app: bool, metrics: Option<&Value>, can_share: bool, fits: bool) -> Plan {
-    match metrics {
-        _ if !old_app => Plan::Open,
-        Some(m) if busy(m) => if can_share && fits { Plan::Handoff } else { Plan::WaitIdle },
-        _ => Plan::Restart,
-    }
 }
 
 /// Can a socket bind beside the server's: only when that one set SO_REUSEPORT too.  Bound, never listening, closed:
@@ -92,25 +72,67 @@ fn model_bytes(cfg: &Value) -> u64 {
         .filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
 }
 
+/// FNV-1a over a file: whether the app on disk is the build that runs (not a secret: a fingerprint)
+fn fingerprint(p: &Path) -> Option<u64> {
+    let b = std::fs::read(p).ok()?;
+    Some(b.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ *x as u64).wrapping_mul(0x100000001b3)))
+}
+
+fn running_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    Path::new(&home).join("Library/Application Support/Strata/running.json")
+}
+
+/// The request file a deploy writes before SIGUSR1 ("handoff" or "restart"), and the app's answer
+pub fn switch_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("strata-app-switch")
+}
+pub fn switch_done_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("strata-app-switch.done")
+}
+
+/// At the app's start: its pid and its build's fingerprint, so a deploy knows it can switch servers in it (an app
+/// from before this ends on SIGUSR1: it is never sent one) and whether its own code changed
+pub fn record_running() {
+    let exe = std::env::current_exe().ok();
+    let fp = exe.as_deref().and_then(fingerprint);
+    let p = running_path();
+    let _ = std::fs::create_dir_all(p.parent().unwrap());
+    let _ = std::fs::write(p, serde_json::json!({"pid": std::process::id(), "fingerprint": fp}).to_string());
+}
+
+/// The running app that can switch its server, when its build is the one on disk: its pid
+fn switchable(old: &[i32], bundle: &Path) -> Option<i32> {
+    let r: Value = serde_json::from_str(&std::fs::read_to_string(running_path()).ok()?).ok()?;
+    switchable_from(&r, old, bundle)
+}
+
+fn switchable_from(r: &Value, old: &[i32], bundle: &Path) -> Option<i32> {
+    let pid = r["pid"].as_i64()? as i32;
+    let same = r["fingerprint"].as_u64().is_some() && r["fingerprint"].as_u64() == fingerprint(&bundle.join("Contents/MacOS/Strata"));
+    (old.contains(&pid) && same).then_some(pid)
+}
+
 fn say(m: &str) {
     println!("strata-deploy: {m}");
 }
 
-/// make app-run: the decision, then its steps; the exit code says whether the new app runs
+/// How the running app switches to the new server: beside the old one when it can share the port and a second
+/// engine fits, else (after waiting until idle) a stop and a start
+pub fn mode(can_share: bool, fits: bool) -> &'static str {
+    if can_share && fits { "handoff" } else { "restart" }
+}
+
+/// make app-run: the decision, then its steps; the exit code says whether the new server runs.  One Strata.app at a
+/// time: the running app switches its server (SIGUSR1, main.rs switch_server); only when the app's own code changed
+/// does it restart, after the model is idle.
 pub fn run(root: &Path, config: Option<&Path>) -> i32 {
     let me = std::process::id() as i32;
     // an app a blue-green deploy started runs with --handoff: it is the old app the next deploy replaces too
     let old: Vec<i32> = pids("/usr/bin/pgrep", &["-f", "Strata.app/Contents/MacOS/Strata($| --handoff)"]).into_iter().filter(|p| *p != me).collect();
     let bundle = root.join("Strata.app");
     // -n always: right after the old app quits, LaunchServices may still count it and only "activate" it (2026-11-03)
-    let open = |extra: &[&str]| {
-        let mut c = Command::new("/usr/bin/open");
-        c.arg("-n").arg(&bundle);
-        if !extra.is_empty() {
-            c.arg("--args").args(extra);
-        }
-        c.status().map(|s| s.success()).unwrap_or(false)
-    };
+    let open = || Command::new("/usr/bin/open").arg("-n").arg(&bundle).status().map(|s| s.success()).unwrap_or(false);
     let quit_old = || {
         for p in &old {
             unsafe { libc::kill(*p, libc::SIGTERM) };
@@ -158,55 +180,60 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
         say(&format!("no server answers on port {port} after 10 min: see Strata.app's log"));
         1
     };
+    let wait_idle = |why: &str| {
+        let t = Instant::now();
+        let mut last = Instant::now();
+        while metrics().as_ref().is_some_and(busy) {
+            if last.elapsed() > Duration::from_secs(30) {
+                say(&format!("waiting for the model to be idle ({:.0} s so far; {why})", t.elapsed().as_secs_f64()));
+                last = Instant::now();
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    };
+    if old.is_empty() {
+        say("no Strata.app runs: opening it");
+        return if open() { up() } else { 1 };
+    }
     let m = metrics();
     let share = can_share(&host, port);
     let fit = m.as_ref().is_some_and(|m| fits(m, model_bytes(&cfg)));
-    let p = plan(!old.is_empty(), m.as_ref(), share, fit);
-    say(&format!("{p:?} (old app {old:?}, port {port}, {}, sharable {share}, a second engine fits {fit})",
+    let Some(pid) = switchable(&old, &bundle) else {
+        // the app's own code changed (or it predates switching servers in it): a restart, one app at a time
+        say(&format!("the app itself changed: it restarts (old app {old:?}, port {port}, {})", if m.as_ref().is_some_and(busy) { "busy" } else { "idle" }));
+        wait_idle("the app restarts when no request runs");
+        quit_old();
+        return if open() { up() } else { 1 };
+    };
+    let mode = mode(share, fit);
+    say(&format!("switching the server in the running app (pid {pid}): {mode} (port {port}, {}, sharable {share}, a second engine fits {fit})",
                  if m.as_ref().is_some_and(busy) { "busy" } else { "idle" }));
-    match p {
-        Plan::Open => return if open(&[]) { up() } else { 1 },
-        Plan::WaitIdle => {
-            let t = Instant::now();
-            let mut last = Instant::now();
-            while metrics().as_ref().is_some_and(busy) {
-                if last.elapsed() > Duration::from_secs(30) {
-                    say(&format!("waiting for the model to be idle ({:.0} s so far; {})", t.elapsed().as_secs_f64(),
-                                 if share { "a second engine would not fit in memory" } else { "the running server cannot share its port: it predates blue-green" }));
-                    last = Instant::now();
-                }
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        }
-        Plan::Handoff => {
-            let blue = pids("/usr/sbin/lsof", &["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"]);
-            if !open(&["--handoff"]) {
-                say("could not open the new Strata.app; the old one keeps running");
-                return 1;
-            }
-            say(&format!("the new app's server loads its model, then takes port {port}; pid {blue:?} finishes its requests"));
-            let t = Instant::now();
-            let mut last = Instant::now();
-            while blue.iter().any(|p| alive(*p)) {
-                // a new server that never takes the port (it failed to load) leaves the old one serving: say so, keep it
-                if t.elapsed() > Duration::from_secs(1800) {
-                    say("the old server still runs after 30 min: the new app's log says why; nothing was stopped");
-                    return 1;
-                }
-                if last.elapsed() > Duration::from_secs(30) {
-                    say(&format!("old server {blue:?} still finishing ({:.0} s)", t.elapsed().as_secs_f64()));
-                    last = Instant::now();
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            say(&format!("handed over in {:.0} s; the old app quits", t.elapsed().as_secs_f64()));
-            quit_old();
-            return 0;
-        }
-        Plan::Restart => {}
+    if mode == "restart" {
+        wait_idle(if share { "a second engine would not fit in memory" } else { "the running server cannot share its port: it predates blue-green" });
     }
-    quit_old();
-    if open(&[]) { up() } else { 1 }
+    let _ = std::fs::remove_file(switch_done_path());
+    if std::fs::write(switch_path(), mode).is_err() || unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
+        say("could not reach the running app; nothing was changed");
+        return 1;
+    }
+    let t = Instant::now();
+    let mut last = Instant::now();
+    loop {
+        if let Ok(r) = std::fs::read_to_string(switch_done_path()).map(|t| serde_json::from_str::<Value>(&t).unwrap_or(Value::Null)) {
+            let _ = std::fs::remove_file(switch_done_path());
+            say(r["message"].as_str().unwrap_or("done"));
+            return if r["ok"] == true { up() } else { 1 };
+        }
+        if !alive(pid) || t.elapsed() > Duration::from_secs(1900) {
+            say("the app did not finish the switch: its log says why");
+            return 1;
+        }
+        if last.elapsed() > Duration::from_secs(30) {
+            say(&format!("the old server is finishing its requests ({:.0} s)", t.elapsed().as_secs_f64()));
+            last = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 #[cfg(test)]
@@ -215,16 +242,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn the_plan_follows_the_model_and_the_machine() {
-        let idle = json!({"live": {"state": "idle", "queued": 0, "running": 0, "waiting": 0}});
-        let busy = json!({"live": {"state": "idle", "running": 2}});
-        assert_eq!(plan(false, Some(&busy), true, true), Plan::Open);
-        assert_eq!(plan(true, Some(&idle), true, true), Plan::Restart);
-        assert_eq!(plan(true, None, true, true), Plan::Restart); // its server does not answer
-        assert_eq!(plan(true, Some(&busy), true, true), Plan::Handoff);
-        assert_eq!(plan(true, Some(&busy), false, true), Plan::WaitIdle); // an old server: no SO_REUSEPORT
-        assert_eq!(plan(true, Some(&busy), true, false), Plan::WaitIdle);
+    fn the_switch_follows_the_machine() {
+        assert_eq!(mode(true, true), "handoff");
+        assert_eq!(mode(false, true), "restart"); // an old server: no SO_REUSEPORT
+        assert_eq!(mode(true, false), "restart"); // a second engine does not fit
         assert!(super::busy(&json!({"live": {"state": "reading"}})) && super::busy(&json!({"live": {"queued": 1}})));
+        assert!(!super::busy(&json!({"live": {"state": "idle", "queued": 0, "running": 0, "waiting": 0}})));
+    }
+
+    #[test]
+    fn a_running_app_switches_only_when_its_build_is_on_disk() {
+        let d = std::env::temp_dir().join(format!("strata-switchable-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("Contents/MacOS")).unwrap();
+        std::fs::write(d.join("Contents/MacOS/Strata"), b"build one").unwrap();
+        let fp = fingerprint(&d.join("Contents/MacOS/Strata")).unwrap();
+        let rec = |pid: i32, fp: Option<u64>| serde_json::json!({"pid": pid, "fingerprint": fp});
+        assert_eq!(switchable_from(&rec(42, Some(fp)), &[42], &d), Some(42));
+        assert_eq!(switchable_from(&rec(42, Some(fp)), &[7], &d), None);       // that app is gone
+        assert_eq!(switchable_from(&rec(42, Some(fp ^ 1)), &[42], &d), None);  // the app's code changed
+        assert_eq!(switchable_from(&rec(42, None), &[42], &d), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

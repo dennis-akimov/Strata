@@ -56,6 +56,8 @@ enum Ev {
     FrameSent(browser_mcp::Job, String, u64, String),
     /// its answer looked for again (the u32-th time)
     FrameCollect(browser_mcp::Job, String, u64, u32),
+    /// `Strata --deploy` asked this app to switch its server (SIGUSR1; deploy.rs): the new server beside the old one
+    Switch,
     /// a Google tool's script (google.rs) looked for its value (id, the u32-th time)
     AsyncCollect(browser_mcp::Job, u64, u32),
     /// a click or typing done with the mouse and keyboard (native_input): the element found by a script first
@@ -929,6 +931,64 @@ fn stop(st: &Shared) {
     }
 }
 
+/// `Strata --deploy` in the running app (deploy.rs): the new build's server takes over from the old one, nginx's way
+/// (HUP: new workers, the old ones drain): "handoff" starts it with --handoff beside the old one, which finishes its
+/// requests and quits once the new one has loaded and taken the port; a new server that dies first leaves the old one
+/// serving.  "restart" (a second engine does not fit; the deploy waited until idle): stop, then start.  The outcome
+/// goes to deploy::switch_done_path() for the deploy that asked.
+fn switch_server(st: &Shared, proxy: &EventLoopProxy<Ev>) {
+    let mode = std::fs::read_to_string(deploy::switch_path()).unwrap_or_default();
+    let _ = std::fs::remove_file(deploy::switch_path());
+    let done = |ok: bool, msg: String| {
+        let _ = proxy.send_event(Ev::Log(format!("── {msg} ──")));
+        let _ = std::fs::write(deploy::switch_done_path(), json!({"ok": ok, "message": msg}).to_string());
+    };
+    let old = st.lock().unwrap().child.take();
+    let Some(mut old) = old else {
+        // nothing ran: just start
+        return match start(st, proxy) {
+            Ok(()) => done(true, "the new server started".into()),
+            Err(e) => done(false, e),
+        };
+    };
+    if mode.trim() == "restart" {
+        st.lock().unwrap().child = Some(old);
+        stop_and_wait(st);
+        return match start(st, proxy) {
+            Ok(()) => done(true, "the server restarted with the new build".into()),
+            Err(e) => done(false, e),
+        };
+    }
+    st.lock().unwrap().handoff = true;
+    if let Err(e) = start(st, proxy) {
+        st.lock().unwrap().child = Some(old);
+        return done(false, format!("the new server could not start ({e}); the old one keeps serving"));
+    }
+    let _ = proxy.send_event(Ev::Log(format!("── handoff: the new server loads its model beside the old one (pid {}) ──", old.id())));
+    let t = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if matches!(old.try_wait(), Ok(Some(_)) | Err(_)) {
+            return done(true, format!("handed over in {:.0} s: the new server serves, the old one finished its requests", t.elapsed().as_secs_f64()));
+        }
+        let mut s = st.lock().unwrap();
+        let new_gone = match s.child.as_mut() {
+            None => true,
+            Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+        };
+        if new_gone {
+            s.child = Some(old); // its log readers never stopped: it goes on as the app's server
+            s.phase = "ready";
+            drop(s);
+            return done(false, "the new server stopped before it took over; the old one keeps serving (its log above says why)".into());
+        }
+        if t.elapsed() > Duration::from_secs(1800) {
+            drop(s);
+            return done(false, "the old server still runs after 30 min; both are left as they are".into());
+        }
+    }
+}
+
 /// Wait until the server has exited (quitting the app).
 fn stop_and_wait(st: &Shared) {
     stop(st);
@@ -1308,6 +1368,7 @@ fn main() {
     }
     let handoff = argv.iter().any(|a| a == "--handoff");
     let st: Shared = Arc::new(Mutex::new(State { root, config, port, child: None, phase: "stopped", stopping_since: None, log: VecDeque::new(), last: json!({}), browser: None, handoff }));
+    deploy::record_running();
 
     // SIGTERM / Ctrl+C on the app = Quit (the server is stopped its own way, not orphaned); blocked before any thread
     // starts so only the waiter gets them (a spawned server starts with an empty mask)
@@ -1316,6 +1377,7 @@ fn main() {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGUSR1); // `Strata --deploy`: switch the server (deploy.rs)
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         set
     };
@@ -1324,9 +1386,16 @@ fn main() {
     std::thread::spawn({
         let p = proxy.clone();
         move || {
-            let mut sig = 0;
-            unsafe { libc::sigwait(&sigs, &mut sig) };
-            let _ = p.send_event(Ev::Quit);
+            loop {
+                let mut sig = 0;
+                unsafe { libc::sigwait(&sigs, &mut sig) };
+                if sig == libc::SIGUSR1 {
+                    let _ = p.send_event(Ev::Switch);
+                    continue;
+                }
+                let _ = p.send_event(Ev::Quit);
+                return;
+            }
         }
     });
     // the model's browser: its MCP endpoint (after the signals are blocked: its threads must not take them)
@@ -2435,6 +2504,10 @@ fn main() {
                 } else if id == close_win.id() {
                     control_win.set_visible(false);
                 }
+            }
+            Event::UserEvent(Ev::Switch) => {
+                let (st2, p2) = (st.clone(), proxy.clone());
+                std::thread::spawn(move || switch_server(&st2, &p2));
             }
             Event::UserEvent(Ev::Quit) => {
                 if let Some(t) = &tray {
