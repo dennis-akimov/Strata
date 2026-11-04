@@ -14,7 +14,7 @@ The run config's `"clients"`: a list, each entry one client's engine.
 
 ```json
 "clients": [
-  {"name": "zed", "user_agent": "Zed/", "max_context": 6144}
+  {"name": "zed", "user_agent": "Zed/", "max_context": 6144, "parallel": 2}
 ]
 ```
 
@@ -24,7 +24,7 @@ The run config's `"clients"`: a list, each entry one client's engine.
 | `user_agent` | the requests whose User-Agent contains this text (case ignored) go to this engine | required |
 | `paths` | only these API paths | every generation path: `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses` |
 | `max_context` | the engine's context (prompt + answer): larger requests get the usual HTTP 400 there | 8192 |
-| `parallel` | its slots | 1 |
+| `parallel` | its slots (2 for Zed: its chat and its completions each keep their prompt) | 1 |
 | `cache_mib` | its conversation cache | 0 (off) |
 | `port` | its port (127.0.0.1) | the main port + 100 + its place in the list |
 | `url` | send to a server already running there instead of starting one | none |
@@ -36,7 +36,12 @@ are left out.  The weights are the same mapped file, so it costs its context and
 stops with the main server, and on its own when the main server is gone (it checks its parent every 2 s).
 
 **The routing** (http.rs): a POST to one of the entry's paths whose User-Agent matches goes through to that engine,
-headers and body as sent, and its answer streams back.  The first entry that matches wins.  The engine still loading,
+headers and body as sent, and its answer streams back.  The first entry that matches wins.  Only a request that fits
+the engine goes there: its body counted with the model's tokenizer (a little over the prompt), plus room to answer
+(`max_tokens`, or 256 when the run config has `"fit_max_tokens": true`), within `max_context`.  A bigger one (a long
+Zed agent thread) goes to the main engine instead of failing there with a 400.  Measured 2026-11-04: Zed's chat
+requests (`/v1/chat/completions`, 2.8K tokens, 19 written) waited 9 s on average for a first token in the main engine
+behind deep research and agents, when the entry routed only `/v1/completions`; leave `"paths"` out to route them all.  The engine still loading,
 or gone: HTTP 503 with `Retry-After`, so the client's limit is never lifted by falling back to the main engine.
 
 **The Clients tab:** the routed requests count for their client as usual: tokens from the answer's `usage` (and
