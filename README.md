@@ -228,6 +228,42 @@ reads.  Asked on Strata's page, with tools on, for today's top 3 technology head
 351 s; 120 s of that were two page clicks that timed out (60 s each).  It writes at about 40% of LFM2.5-8B's speed
 (30 tokens/s here: 1.5B parameters active a token against Qwen3-4B's 4B), and needs no thinking first.
 
+Several agents on the M1, `make pull MODEL=QWEN3-4B-Q4` (Q4_K_M, 2.5 GB; 1.6x the Q8_0's writing speed for one) against
+LFM2.5-8B (Q8_0): the agents bench (each agent's ~3,000-token conversation, a short side question, the conversation
+again plus a turn), 8K context each, no conversation cache, 2026-11-03:
+
+| Agents | Prompt read, tok/s: 4B Q4 / 8B | Follow-up's first token | Follow-up written together, tok/s | GPU memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 187 / 321 | 11.4 / 4.3 s | 20.3 / 19.7 | 5.3 / 10.5 GB |
+| 2 | 179 / 374 | 20.8 / 9.3 s | 18.7 / 19.9 | 7.7 / 10.7 GB |
+| 3 | 121 / 366 | 35.0 / 14.1 s | 17.3 / 25.1 | 8.9 / 10.8 GB |
+| 4 | 126 / 315 | 42.5 / 17.1 s | 22.4 / 23.5 | 10.1 / 10.9 GB |
+
+- LFM2.5-8B reads prompts 2-3x faster (a mixture of experts, 1.5B active) and so answers a follow-up 2.5x sooner;
+  both write about 20 tokens/s together. LFM2.5-8B thinks before it answers, Qwen3-4B does not.
+- Qwen3-4B keeps a large state per token (147 KB at f16), so its memory grows with the agents: 4 x 8K is about what
+  fits a 16 GB M1 (10.1 GB). LFM2.5-8B's hybrid layers keep its memory flat at about 10.5-11 GB for 1-4 agents.
+- With the cache on, a follow-up reuses its conversation instead of reading it again (see above).
+
+**LFM2.5-8B in Q4_K_M** (`make pull MODEL=LFM2.5-8B-Q4`, LiquidAI's own, 5.2 GB against the Q8_0's 9.0) on the M1,
+2026-11-03: six checks (17 x 23, a capital, the r's in strawberry, Russian, a Python function that is run, a tool
+call) all pass at Q8_0, Q4_K_M and Q4_0 alike, writing 32.9 / 50.5 / 52.6 tokens/s on them.  The same agents bench
+(8K each, no cache), Q4_K_M against Q8_0:
+
+| Agents | Prompt read, tok/s | Follow-up's first token | Follow-up written together, tok/s | GPU memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 510 / 321 | 4.5 / 4.3 s | 52.7 / 19.7 | 6.6 / 10.5 GB |
+| 2 | 440 / 374 | 7.5 / 9.3 s | 32.0 / 19.9 | 7.1 / 10.7 GB |
+| 3 | 420 / 366 | 10.5 / 14.1 s | 37.5 / 25.1 | 6.9 / 10.8 GB |
+| 4 | 412 / 315 | 13.6 / 17.1 s | 33.2 / 23.5 | 7.2 / 10.9 GB |
+
+On the M1 the Q4_K_M is the one to take: 1.3-2.7x the writing speed, a faster read, 4 GB less memory, the same
+answers on these checks.
+
+Apple's on-device model (`make afm`, `"engine": "afm"`) took about 1.5 GB loaded and 3.2 GB while answering on the
+M1, estimated from the Mac's wired memory (its system service's own memory is readable by root only); the Monitor
+shows the same estimate.
+
 The newer models keep far smaller states, and there 2 GB of conversation cache holds every agent's conversation. The
 same bench, 8K context each, the follow-up's first token without the cache / with the automatic one (2 GB here; 99% of
 the prompt from the cache), 2026-11-03:

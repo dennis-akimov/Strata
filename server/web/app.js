@@ -306,6 +306,10 @@ function render(m) {
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, (m.failures || {}).recent || []);
+  // Apple's on-device model: its memory, estimated from the Mac's wired memory (engine.rs AfmMem)
+  const am = eng.afm_memory;
+  $("afm-mem").hidden = !am;
+  if (am) $("afm-mem").textContent = `Apple's model: about ${fmt(am.now_mb / 1024, 1)} GB of memory now, ${fmt(am.peak_mb / 1024, 1)} GB at most (estimated)`;
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "monitor") renderClientEngines(m.client_engines);
   if (tab === "monitor") renderLatency(m.latency, m.failures);

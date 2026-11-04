@@ -393,6 +393,9 @@ mod other {
             _ => (None, None),
         }
     }
+    pub fn wired_bytes() -> Option<u64> {
+        None
+    }
     pub fn cpu_ticks() -> Option<(u64, u64)> {
         let t = std::fs::read_to_string("/proc/stat").ok()?;
         let f: Vec<u64> = t.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
@@ -409,7 +412,7 @@ mod other {
     }
 }
 #[cfg(not(target_os = "macos"))]
-pub use other::{cpu_ticks, metal_working_set_bytes, ram};
+pub use other::{cpu_ticks, metal_working_set_bytes, ram, wired_bytes};
 #[cfg(not(target_os = "macos"))]
 use other::{sysctl_u64, MacSensors};
 
@@ -498,6 +501,19 @@ pub fn ram() -> (Option<u64>, Option<u64>) {
     let avail = (info[0] as u32 as u64 + info[2] as u32 as u64) * page;
     let total = total.unwrap();
     (Some(total.saturating_sub(avail)), Some(total))
+}
+
+/// Wired memory in bytes: memory the kernel keeps in RAM for drivers and the GPU (Apple's on-device model's weights
+/// land here, in a system service no other user may read: engine.rs AfmMem)
+#[cfg(target_os = "macos")]
+pub fn wired_bytes() -> Option<u64> {
+    let mut info = [0i32; 64];
+    let mut count: u32 = 38; // HOST_VM_INFO64_COUNT
+    if unsafe { host_statistics64(mach_host_self(), 4, info.as_mut_ptr(), &mut count) } != 0 {
+        return None;
+    }
+    // vm_statistics64: free_count, active_count, inactive_count, wire_count (natural_t words)
+    Some(info[3] as u32 as u64 * sysctl_u64("hw.pagesize").unwrap_or(16384))
 }
 
 /// RAM available in MiB (session_save_retry), None when unreadable.

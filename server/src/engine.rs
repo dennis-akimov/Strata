@@ -2194,13 +2194,42 @@ pub struct AfmEngine {
     exe: String,
     proc: Mutex<Option<AfmProc>>,
     pub max_context: i64,
+    mem: Mutex<AfmMem>,
+}
+
+/// Apple's model's memory, estimated: it runs in a system service (user _modelmanagerd) whose memory macOS lets only
+/// root read, so this is the system's wired memory above what it was before the model loaded.  Anything else that
+/// wires memory meanwhile (another engine loading) counts too: an estimate, best on an otherwise quiet Mac.
+#[derive(Default, Debug)]
+pub struct AfmMem {
+    base: Option<u64>,
+    now: u64,
+    peak: u64,
+}
+
+impl AfmMem {
+    pub fn start(wired: Option<u64>) -> Self {
+        AfmMem { base: wired, ..Default::default() }
+    }
+    pub fn sample(&mut self, wired: Option<u64>) {
+        if let (Some(b), Some(w)) = (self.base, wired) {
+            self.now = w.saturating_sub(b);
+            self.peak = self.peak.max(self.now);
+        }
+    }
+    /// {"now_mb", "peak_mb"}: None before a reading
+    pub fn view(&self) -> Option<Value> {
+        self.base.map(|_| json!({"now_mb": self.now >> 20, "peak_mb": self.peak >> 20}))
+    }
 }
 
 impl AfmEngine {
     pub fn new(exe: &str) -> Result<Self, String> {
+        let mut mem = AfmMem::start(crate::telemetry::wired_bytes());
         let (p, ctx) = Self::spawn(exe)?;
+        mem.sample(crate::telemetry::wired_bytes());
         // the server counts the prompt in bytes: about 4 to Apple's token
-        Ok(AfmEngine { exe: exe.to_string(), proc: Mutex::new(Some(p)), max_context: ctx * 4 })
+        Ok(AfmEngine { exe: exe.to_string(), proc: Mutex::new(Some(p)), max_context: ctx * 4, mem: Mutex::new(mem) })
     }
 
     fn spawn(exe: &str) -> Result<(AfmProc, i64), String> {
@@ -2247,6 +2276,7 @@ impl AfmEngine {
                     return if died { Err(Stop::Err(Fail::Died("Apple's model helper (strata-afm) stopped".into()))) } else { Ok(()) };
                 }
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                me.mem.lock().unwrap().sample(crate::telemetry::wired_bytes());
                 if let Some(d) = v["delta"].as_str() {
                     y.yield_(Some(chunk_id(d.to_string())))?;
                     n += 1;
@@ -2310,6 +2340,11 @@ impl Engine {
         self.strata().map(|s| s.batch()).unwrap_or(0)
     }
     pub fn info(&self) -> Map<String, Value> {
+        if let Engine::Afm(a) = self {
+            let mut m = a.mem.lock().unwrap();
+            m.sample(crate::telemetry::wired_bytes());
+            return m.view().map(|v| Map::from_iter([("afm_memory".to_string(), v)])).unwrap_or_default();
+        }
         self.strata().map(|s| s.info.lock().unwrap().clone()).unwrap_or_default()
     }
     pub fn live(&self) -> Live {
@@ -2323,6 +2358,20 @@ impl Engine {
 #[cfg(test)]
 mod engine_err_tests {
     use super::*;
+
+    #[test]
+    fn afm_memory_is_wired_memory_above_its_start() {
+        let mut m = AfmMem::start(Some(10 << 30));
+        assert_eq!(m.view(), Some(json!({"now_mb": 0, "peak_mb": 0})));
+        m.sample(Some(12 << 30)); // answering: +2 GB
+        m.sample(Some(11 << 30)); // settled: +1 GB, the peak kept
+        assert_eq!(m.view(), Some(json!({"now_mb": 1024, "peak_mb": 2048})));
+        m.sample(Some(9 << 30)); // less than at the start (something else let go): 0, never negative
+        assert_eq!(m.view().unwrap()["now_mb"], 0);
+        m.sample(None);
+        assert_eq!(m.view().unwrap()["now_mb"], 0);
+        assert_eq!(AfmMem::start(None).view(), None); // no reading (not a Mac): nothing shown
+    }
 
     #[test]
     fn oom_is_said_with_a_fix() {

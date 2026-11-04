@@ -83,6 +83,10 @@ MODELS = {
                       mem_min=10.0, mem_full=12, how="pull", gguf="LFM2.5-8B-A1B/LFM2.5-8B-A1B-Q8_0.gguf",
                       pack="lfm2.5-8b-a1b", name="lfm2.5-8b-a1b", context=131072,
                       sampling={"temperature": 0.2, "top_k": 64, "repetition_penalty": 1.05}),  # LiquidAI: top_k 80; the engine's sampler takes up to 64
+    "LFM2.5-8B-Q4": dict(title="LFM2.5-8B-A1B Q4", about="LiquidAI's, 1.5B active per token, thinks; Q4_K_M: faster, 4 GB less",
+                         download=5.2, mem_min=6.0, mem_full=8, how="pull", gguf="LFM2.5-8B-A1B/LFM2.5-8B-A1B-Q4_K_M.gguf",
+                         pack="lfm2.5-8b-a1b", name="lfm2.5-8b-a1b-q4", context=131072,
+                         sampling={"temperature": 0.2, "top_k": 64, "repetition_penalty": 1.05}),
     "QWEN3-4B": dict(title="Qwen3-4B-Instruct-2507", about="small and quick, calls tools (web search); Q8_0", download=4.3,
                      mem_min=5.0, mem_full=8, how="pull", gguf="Qwen3-4B-Instruct-2507/Qwen3-4B-Instruct-2507-Q8_0.gguf",
                      pack="qwen3-4b-instruct-2507", name="qwen3-4b-instruct-2507", context=32768,

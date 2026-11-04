@@ -17,6 +17,8 @@ Hugging Face revision; a stopped download continues when you run the same line a
                  decode at 1.3 tok/s on Linux's Apple GPU driver (that mat-vec runs 15-30x slower there)
   LFM2.5-8B      LiquidAI's LFM2.5-8B-A1B (1.5B active, thinks) in their Q8_0 (9.0 GB, sha-256 checked) and its
                  tokenizer pack
+  LFM2.5-8B-Q4   the same in their Q4_K_M (5.2 GB, sha-256 checked): on the M1 1.5-2.7x the Q8_0's writing speed, 4 GB
+                 less memory, the same answers on the setup checks
   QWEN3-4B       Qwen3-4B-Instruct-2507 in Unsloth's Q8_0 (4.3 GB, sha-256 checked): small, calls tools (web search on
                  an 8-16 GB Mac); and its tokenizer pack
   QWEN3-4B-Q4    the same in Unsloth's Q4_K_M (2.5 GB, sha-256 checked): faster, room for 3-4 agents on a 16 GB Mac
@@ -48,7 +50,7 @@ os.chdir(ROOT)
 PY = ROOT / ".venv" / "bin" / "python"
 MTP_PY = ROOT / ".venv-mtp" / "bin" / "python"
 NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "QWEN3-CODER-30B", "QWEN3-CODER-30B-Q4", "LFM2.5-24B", "LFM2.5-8B",
-         "QWEN3-4B", "QWEN3-4B-Q4", "NUCLEUS", "HUNYUAN", "WAN2.2")
+         "LFM2.5-8B-Q4", "QWEN3-4B", "QWEN3-4B-Q4", "NUCLEUS", "HUNYUAN", "WAN2.2")
 
 
 def die(msg: str) -> None:
@@ -239,6 +241,10 @@ def pull(name: str, data: Path) -> None:
     elif name == "LFM2.5-8B":
         g = get(m / "LFM2.5-8B-A1B", "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q8_0.gguf",
                 "33ab3b8ce6a964fb8ebac89360c9b3cf72c4fa418d5e4c0a94d46883124d5c02")
+        tokenizer(g, data / "packs" / "lfm2.5-8b-a1b")
+    elif name == "LFM2.5-8B-Q4":
+        g = get(m / "LFM2.5-8B-A1B", "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q4_K_M.gguf",
+                "4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0")
         tokenizer(g, data / "packs" / "lfm2.5-8b-a1b")
     elif name == "QWEN3-4B":
         g = get(m / "Qwen3-4B-Instruct-2507", "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q8_0.gguf",
