@@ -36,11 +36,13 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent.parent
 LINUX = platform.system() == "Linux"     # Linux on Apple Silicon (Asahi): the same engine on Vulkan, no Strata.app
 sys.path.insert(0, str(ROOT))
-from bootstrap import apple_silicon  # stdlib only: what this machine is, read on the fly
+# stdlib only: what this machine is, read on the fly
+from bootstrap import apple_silicon
 
 # what onboarding installs on Linux (Debian / Ubuntu names): the compiler and make, cmake / ninja, llama.cpp's Vulkan
 # backend (headers, glslc, SPIR-V headers), Mesa's Apple GPU driver (Honeykrisp), downloads, the Firewall tab's lsof
@@ -136,7 +138,7 @@ def warn(msg: str) -> None:
     print(f"  {AMBER}!{END} {msg}", flush=True)
 
 
-def fail(msg: str, fix: str = "") -> None:
+def fail(msg: str, fix: str = "") -> NoReturn:
     print(f"\n{RED}✗ {msg}{END}" + (f"\n  {fix}" if fix else ""), flush=True)
     sys.exit(1)
 
@@ -183,7 +185,7 @@ def free_now() -> float:
     if LINUX:
         return meminfo("MemAvailable")
     out = subprocess.run(["vm_stat"], capture_output=True, text=True, check=False).stdout
-    page = int(re.search(r"page size of (\d+)", out).group(1)) if "page size" in out else 16384
+    page = int(m.group(1)) if (m := re.search(r"page size of (\d+)", out)) else 16384
     pages = {m[0]: int(m[1]) for m in re.findall(r"Pages (free|inactive|speculative|purgeable):\s+(\d+)", out)}
     return float(sum(pages.values()) * page)
 
@@ -350,11 +352,11 @@ def tools(yes: bool) -> dict:
     if not shutil.which("aria2c") and not brew and \
             ask("Install Homebrew (https://brew.sh) for aria2, faster downloads? It asks for your password (y/n)",
                 "y" if sys.stdin.isatty() else "n", yes).lower() == "y":
-            note("Homebrew's installer says what it does, then asks for your password ...")
-            script = subprocess.run(["curl", "-fsSL", "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"],
-                                    capture_output=True, text=True, check=False).stdout
-            if script and subprocess.run(["/bin/bash", "-c", script], check=False).returncode == 0:
-                brew = brew_path()
+        note("Homebrew's installer says what it does, then asks for your password ...")
+        script = subprocess.run(["curl", "-fsSL", "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"],
+                                capture_output=True, text=True, check=False).stdout
+        if script and subprocess.run(["/bin/bash", "-c", script], check=False).returncode == 0:
+            brew = brew_path()
     if brew:
         ok("Homebrew")
         env["PATH"] = f"{Path(brew).parent}{os.pathsep}{env['PATH']}"
