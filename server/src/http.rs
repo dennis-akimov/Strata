@@ -1142,6 +1142,17 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     let max_req = int_of(if truthy(mt) { mt } else { &Value::Null })?;
     let info_bias = svc.engine.info().get("logit_bias").and_then(Value::as_i64);
     crate::bias::validate_request(&req, info_bias, svc.engine.batch(), vocab)?;
+    // a chat template with no tool format (a base model: Sheared-LLaMA) drops the tools unseen; the model then answers
+    // from memory as if it had none.  The page's own tools: say so; a client's: once in the log
+    if !svc.template.caps.supports_tools {
+        if get(&rv, "strata_mcp") == &json!(true) && svc.mcp.is_some() {
+            return Err(Fail::Value(format!("{} cannot use tools: its chat template has no tool format (a base model, not trained to follow instructions or call tools). Switch tools off in Sampling, or pick a model that calls tools (LFM2.5, GPT-OSS, Qwen3.6)", svc.model)));
+        }
+        static SAID: std::sync::Once = std::sync::Once::new();
+        if tools.is_some() {
+            SAID.call_once(|| say(&format!("a request sent tools, but {}'s chat template has no tool format: the model does not see them", svc.model)));
+        }
+    }
     let mut use_mcp = get(&rv, "strata_mcp") == &json!(true) && svc.mcp.is_some();
     let own: Vec<String> = tools.iter().flatten().filter_map(|t| get(t, "name").as_str().map(String::from)).collect();
     let mut extra = vec![];
