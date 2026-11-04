@@ -22,6 +22,7 @@ pub mod schedules;
 pub mod service;
 pub mod structured;
 pub mod sync;
+pub mod team;
 pub mod telemetry;
 pub mod template;
 pub mod tokenizer;

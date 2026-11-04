@@ -1130,8 +1130,10 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     let vocab = Some(svc.tok.vocab_size());
     crate::bias::normalize(req.get("logit_bias"), vocab)?;
     let rv = Value::Object(req.clone());
-    let (messages, tools, kw) = openai_to_messages(&rv)?;
+    let (mut messages, tools, kw) = openai_to_messages(&rv)?;
     no_local_images(c, &messages)?;
+    // "/team TASK" from the page: agents on the task at once (team.rs)
+    let team = if get(&rv, "strata_mcp") == &json!(true) { crate::team::command(&mut messages).map(|t| t.0).unwrap_or(0) } else { 0 };
     let prompt_tools = tools.clone();
     let mut tools = tools;
     if tool_choice_of(get(&rv, "tool_choice")).0 == "none" {
@@ -1188,6 +1190,13 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
         let hub = svc.mcp.clone().unwrap();
         hub.wait(Some(10.0));
         extra = hub.template_tools(&own);
+        if team > 0 {
+            // the browser is the one pane people see: agents at once search with the other tools
+            extra.retain(|t| !get(t, "name").as_str().unwrap_or("").starts_with("browser__"));
+            if extra.is_empty() {
+                return Err(Fail::Value("/team needs a search tool other than the browser (an MCP server such as bible's web search): the browser is one pane, its agents would click on each other's pages".into()));
+            }
+        }
         use_mcp = !extra.is_empty();
         let mut all = tools.clone().unwrap_or_default();
         all.extend(extra.iter().cloned());
@@ -1204,7 +1213,7 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     debug_req("openai", &Value::Object(req.clone()), &messages, tools.as_deref(), max_new, thinking, ids.len());
     let cancel = Arc::new(Flag::new());
     c.watch_client(&cancel);
-    let mcp = if use_mcp { Some(McpRun { messages: messages.clone(), kw: kw.clone(), max_req, names: extra.iter().filter_map(|t| get(t, "name").as_str().map(String::from)).collect() }) } else { None };
+    let mcp = if use_mcp { Some(McpRun { messages: messages.clone(), kw: kw.clone(), max_req, names: extra.iter().filter_map(|t| get(t, "name").as_str().map(String::from)).collect(), team }) } else { None };
     let rv = Value::Object(req.clone());
     let mut run = Run { svc: &svc, ids, thinking, tools, max_new, sampling: req, cancel: cancel.clone(), force, mcp };
     let stream = truthy(get(&rv, "stream"));

@@ -48,11 +48,17 @@ pub struct McpRun {
     pub kw: Map<String, Value>,
     pub max_req: i64,
     pub names: HashSet<String>,
+    /// "/team": how many agents (0: none, the usual loop)
+    pub team: usize,
 }
 
 impl Run<'_> {
     pub fn go(&mut self, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(), Stop<Fail>> {
         match self.mcp.take() {
+            Some(m) if m.team > 1 => {
+                let task = m.messages.iter().rev().find(|x| x["role"] == "user").map(|x| crate::py::py_str(&x["content"])).unwrap_or_default();
+                crate::team::run(self.svc, m.team, &task, m, self.tools.clone().unwrap_or_default(), &self.sampling, &self.cancel, emit)
+            }
             Some(m) => run_with_mcp(self.svc, m, self.ids.clone(), self.thinking, self.tools.clone(), self.max_new, &self.sampling, &self.cancel, emit),
             None => self.svc.run(&self.ids, self.thinking, self.tools.as_deref(), self.max_new, &self.sampling, &self.cancel, self.force.clone(), emit),
         }
@@ -919,7 +925,7 @@ mod loop_tests {
         let messages = vec![json!({"role": "user", "content": "find events"})];
         let kw = Map::new();
         let (ids, thinking, max_new) = svc.prepare(&messages, Some(&tools), &kw, Some(200), None, None).unwrap();
-        let m = McpRun { messages, kw, max_req: 200, names };
+        let m = McpRun { messages, kw, max_req: 200, names, team: 0 };
         let (mut mcp, mut text) = (vec![], String::new());
         run_with_mcp(&svc, m, ids, thinking, Some(tools), max_new, &Map::new(), &Arc::new(Flag::new()), &mut |item| {
             match item {

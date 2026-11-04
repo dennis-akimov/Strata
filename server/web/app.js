@@ -1446,7 +1446,7 @@ function assistantMessages(m) {
 function setBusy(on) {
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = on;
-  $("composer-hint").textContent = on ? "" : ["Shift+Enter: new line", health.image_generation && "/image: a picture",
+  $("composer-hint").textContent = on ? "" : ["Shift+Enter: new line", "/team: 3 agents at once", health.image_generation && "/image: a picture",
                                                health.video_generation && "/video: a clip"].filter(Boolean).join(" · ");
 }
 
