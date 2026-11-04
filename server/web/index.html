@@ -115,6 +115,18 @@
         <div class="state-slots" id="state-slots" hidden></div>
       </div>
 
+      <div class="st-card req-card" id="ce-card" hidden>
+        <div class="req-head"><span class="card-title">Client engines</span><span class="muted small" id="ce-sum"></span></div>
+        <div class="table-wrap">
+          <table class="st-table fw-table">
+            <thead><tr><th>Engine</th><th>Clients (User-Agent)</th><th>APIs</th><th class="num">Context</th><th>State</th><th class="num">Queued</th><th>Since it started</th></tr></thead>
+            <tbody id="ce-body"></tbody>
+          </table>
+        </div>
+        <p class="muted small fw-note">Engines of their own for the clients in the run config's "clients" (docs/CLIENT_ENGINES.md): their
+          requests go there, everything above is the main engine's.</p>
+      </div>
+
       <div class="metrics" id="metrics">
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe (a PC) or GPU clock (a Mac), CPU, Disk read -->
       </div>

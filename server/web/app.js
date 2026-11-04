@@ -307,6 +307,7 @@ function render(m) {
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, (m.failures || {}).recent || []);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderClientEngines(m.client_engines);
   if (tab === "monitor") renderLatency(m.latency, m.failures);
   if (tab === "monitor" && mcpLoaded) renderMcp();
   if (tab === "about") renderAbout(eng, hw, st);
@@ -348,6 +349,28 @@ function renderConvCache(c) {
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
 }
 
+// the config's "clients": each client engine's state from its own /metrics (absent: no such engines, the card hides)
+function renderClientEngines(list) {
+  $("ce-card").hidden = !list || !list.length;
+  if (!list || !list.length) return;
+  $("ce-sum").textContent = `${list.filter((e) => e.up).length} of ${list.length} answering`;
+  $("ce-body").innerHTML = list.map((e) => {
+    const l = e.live || {};
+    let state = `<span class="st-badge st-badge--error">Not answering</span> <span class="muted small">loading, or stopped</span>`;
+    if (e.up && l.state === "reading") {
+      const pct = l.prompt_total ? ` ${Math.round((100 * l.prompt_read) / l.prompt_total)}%` : "";
+      state = `<span class="st-badge st-badge--reading">Reading${pct}</span>`;
+    } else if (e.up && l.state === "generating") {
+      state = `<span class="st-badge st-badge--generating">Generating</span> <span class="muted small">${fmt(l.tok_s, 1)} tok/s</span>`;
+    } else if (e.up) {
+      state = `<span class="st-badge">${l.state === "unloaded" ? "Unloaded" : "Idle"}</span>`;
+    }
+    return `<tr><td><b>${esc(e.name)}</b><div class="muted small addr">${esc(e.url)}</div></td><td class="addr">${esc(e.user_agent)}</td>` +
+      `<td class="addr">${e.paths.map(esc).join("<br>")}</td><td class="num">${e.max_context ? fmt(e.max_context) : "\u2013"}</td>` +
+      `<td>${state}</td><td class="num">${e.up ? fmt(l.queued || 0) : "\u2013"}</td>` +
+      `<td class="small">${e.up ? (renderTotals(e.totals) || "No requests yet") : "\u2013"}</td></tr>`;
+  }).join("");
+}
 function renderTotals(t) {
   if (!t || !t.requests) return "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});

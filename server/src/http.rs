@@ -593,7 +593,10 @@ fn get_(c: &mut Ctx) {
             return;
         }
         if c.authorized() {
-            let m = svc.metrics(c.raw_path.contains("requests=all"));
+            let mut m = svc.metrics(c.raw_path.contains("requests=all"));
+            if !crate::clients::routes().is_empty() {
+                m["client_engines"] = crate::clients::status(svc.set.api_key.first().map(String::as_str));
+            }
             c.json(200, m);
         }
         return;

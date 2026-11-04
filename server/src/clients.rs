@@ -148,6 +148,32 @@ pub fn watch_parent() -> bool {
     true
 }
 
+/// The Monitor's view of the client engines (GET /metrics "client_engines"): each one's route and its own /metrics'
+/// state, totals and newest requests; `up: false` while it loads or when it is gone
+pub fn status(key: Option<&str>) -> Value {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    let agent = AGENT.get_or_init(|| ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_millis(1500))).http_status_as_error(false).build().into());
+    Value::Array(routes().iter().map(|r| {
+        let mut q = agent.get(format!("{}/metrics", r.url));
+        if let Some(k) = key {
+            q = q.header("Authorization", format!("Bearer {k}"));
+        }
+        let m = q.call().ok().filter(|x| x.status() == 200).and_then(|mut x| x.body_mut().read_to_string().ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        view(r, m.as_ref())
+    }).collect())
+}
+
+fn view(r: &Route, m: Option<&Value>) -> Value {
+    let mut v = json!({"name": r.name, "user_agent": r.user_agent, "paths": r.paths, "url": r.url, "up": m.is_some()});
+    if let Some(m) = m {
+        v["max_context"] = m.pointer("/engine/max_context").cloned().unwrap_or(Value::Null);
+        v["live"] = m.get("live").cloned().unwrap_or(Value::Null);
+        v["totals"] = m.get("totals").cloned().unwrap_or(Value::Null);
+        v["requests"] = json!(m.get("requests").and_then(Value::as_array).map(|a| a.iter().take(5).cloned().collect::<Vec<_>>()).unwrap_or_default());
+    }
+    v
+}
+
 /// A routed answer's numbers for the Clients tab (observe::client_request's record): OpenAI's or Anthropic's usage,
 /// Strata's timings
 pub fn record_from(answer: &Value, ttft_s: Option<f64>) -> Value {
@@ -238,6 +264,20 @@ mod tests {
         assert_eq!(pick(&r, "/v1/completions", Some("curl/8.7")).map(|r| r.name.as_str()), Some("client2"));
         assert_eq!(pick(&r, "/v1/chat/completions", None), None);
         assert_eq!(pick(&r, "/v1/chat/completions", Some("claude-cli/2")), None);
+    }
+
+    #[test]
+    fn the_monitor_sees_an_engine_up_or_not() {
+        let r = &parse(&cfg(), 8090).unwrap()[0];
+        let down = view(r, None);
+        assert_eq!((down["name"].as_str(), down["up"].as_bool(), down.get("live")), (Some("zed"), Some(false), None));
+        let m = json!({"engine": {"max_context": 6144}, "live": {"state": "generating"}, "totals": {"requests": 3},
+                       "requests": [1, 2, 3, 4, 5, 6, 7]});
+        let up = view(r, Some(&m));
+        assert_eq!((up["up"].as_bool(), up["max_context"].as_i64(), up["live"]["state"].as_str(), up["totals"]["requests"].as_i64()),
+                   (Some(true), Some(6144), Some("generating"), Some(3)));
+        assert_eq!(up["requests"].as_array().unwrap().len(), 5);
+        assert_eq!(up["paths"], json!(GENERATION_PATHS));
     }
 
     #[test]
