@@ -215,8 +215,10 @@ impl ChatTemplate {
             supports_system_role: self.probe(&[json!({"role": "system", "content": "strata_caps_system"}), user.clone()], None).contains("strata_caps_system"),
             supports_parallel_tool_calls: calls_supported(2),
             supports_preserve_reasoning: self.probe(&history, None).contains("strata_caps_reasoning"),
-            // ponytail: a word in the source, not a probe; Qwen3-Coder's and the plain base-model template have none
-            thinks: self.source.contains("think") || harmony,
+            // ponytail: a word in the source, not a probe.  "thinking" (enable_thinking, keep_past_thinking: every thinking
+            // model's template here), not "think": Qwen3-4B-Instruct-2507's only strips old `</think>` from history, and
+            // its answers then all went to reasoning_content (its tool calls never ran)
+            thinks: self.source.contains("thinking") || harmony,
         }
     }
 }
@@ -229,6 +231,8 @@ mod tests {
     fn a_template_without_thinking_marks_a_model_that_does_not_think() {
         let plain = ChatTemplate::from_source("{% for m in messages %}User: {{ m.content }}\n{% endfor %}Assistant:".into()).unwrap();
         assert!(!plain.caps.thinks);
+        let cleanup = ChatTemplate::from_source("{% for m in messages %}{% if '</think>' in m.content %}{{ m.content.split('</think>')|last }}{% else %}{{ m.content }}{% endif %}{% endfor %}".into()).unwrap();
+        assert!(!cleanup.caps.thinks);                     // Qwen3-4B-Instruct-2507: </think> only in history cleanup
         assert!(ChatTemplate::load(&crate::root().join("server/chat_template.jinja")).unwrap().caps.thinks);
     }
 

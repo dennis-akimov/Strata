@@ -1144,7 +1144,15 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     crate::bias::validate_request(&req, info_bias, svc.engine.batch(), vocab)?;
     // a chat template with no tool format (a base model: Sheared-LLaMA) drops the tools unseen; the model then answers
     // from memory as if it had none.  The page's own tools: say so; a client's: once in the log
-    if !svc.template.caps.supports_tools {
+    // Apple's on-device model (strata-afm) gets the conversation as text: no tools reach it yet, and its chat goes on
+    // without them (the page has them on by default; refusing here broke its chat)
+    // ponytail: FoundationModels has its own Tool protocol; strata-afm could take MCP tools through it
+    let afm = matches!(svc.engine, crate::engine::Engine::Afm(_));
+    if afm && tools.is_some() {
+        static AFM_SAID: std::sync::Once = std::sync::Once::new();
+        AFM_SAID.call_once(|| say("Apple's on-device model answers without tools: strata-afm does not pass them on yet"));
+    }
+    if !svc.template.caps.supports_tools && !afm {
         if get(&rv, "strata_mcp") == &json!(true) && svc.mcp.is_some() {
             return Err(Fail::Value(format!("{} cannot use tools: its chat template has no tool format (a base model, not trained to follow instructions or call tools). Switch tools off in Sampling, or pick a model that calls tools (LFM2.5, GPT-OSS, Qwen3.6)", svc.model)));
         }

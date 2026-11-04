@@ -209,7 +209,24 @@ follow instructions or call tools, and its chat template (`User:` / `Assistant:`
 says `"chat_template_caps": {"supports_tools": false, ...}`).  Asked to "use the web to find today's news" it writes
 more made-up `User:` and `Assistant:` turns.  The web page's tools (MCP) are refused with an HTTP 400 that says so; a
 client's own tools are dropped, and the server log says so once.  For tools on a small Mac take LFM2.5-8B or
-GPT-OSS-20B.
+Qwen3-4B.
+
+**Qwen3-4B-Instruct-2507 on the M1** (`make pull MODEL=QWEN3-4B`: Unsloth's Q8_0, 4.3 GB; a 32K context, about 11 GB
+in all), 2026-11-03, one agent:
+
+| Prompt | Read, tokens/s | Answer, tokens/s |
+| ---: | ---: | ---: |
+| 26 tokens | - | 12.6 |
+| 1.9K | 189 | 11.2 |
+| 4.5K | 112 | 8.5 |
+| 15K (12.7K of it reused) | 65 (the 2.2K new) | 8.7 |
+| 19K | 107 | - |
+
+It calls tools in Hermes' JSON form (`<tool_call>{"name": ..., "arguments": {...}}</tool_call>`), which the server
+reads.  Asked on Strata's page, with tools on, for today's top 3 technology headlines with sources, it searched
+(Strata.app's browser), opened Reuters pages in 8 rounds and answered with three dated headlines and their links in
+351 s; 120 s of that were two page clicks that timed out (60 s each).  It writes at about 40% of LFM2.5-8B's speed
+(30 tokens/s here: 1.5B parameters active a token against Qwen3-4B's 4B), and needs no thinking first.
 
 The newer models keep far smaller states, and there 2 GB of conversation cache holds every agent's conversation. The
 same bench, 8K context each, the follow-up's first token without the cache / with the automatic one (2 GB here; 99% of

@@ -517,7 +517,7 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(engine: Engine, tok: Arc<dyn Tokenize>, template: ChatTemplate, model: String, vision: Option<Arc<Vision>>, set: Settings) -> Self {
+    pub fn new(engine: Engine, tok: Arc<dyn Tokenize>, template: ChatTemplate, model: String, vision: Option<Arc<Vision>>, mut set: Settings) -> Self {
         let controls = tok.control_tokens();
         let literals = literal_tags(&controls);
         let special = |s: &str| tok.encode(s, true).len() == 1;
@@ -525,6 +525,11 @@ impl Service {
         let harmony = special("<|channel|>") && is_special(&*tok, "<|channel|>");
         let glm = is_special(&*tok, "<|observation|>");
         let lfm = !glm && is_special(&*tok, crate::parser::LFM_CALL_START);
+        // Hermes' JSON calls (`<tool_call>{"name": ..., "arguments": ...}</tool_call>`: Qwen3-4B-Instruct-2507) are the
+        // parser's recovery path for Qwen-Coder's XML form; for these templates they are the format, so always on
+        if !harmony && !glm && !lfm && template.source.contains("<tool_call>") && !template.source.contains("<function=") {
+            set.tool_call_recovery = true;
+        }
         let ends: Vec<&str> = if harmony { vec!["<|return|>", "<|call|>", "<|endoftext|>"] } else if glm { vec!["<|endoftext|>", "<|user|>", "<|observation|>"] } else { vec![IM_END, "<|endoftext|>"] };
         let mut stop_ids = vec![];
         for s in ends {
