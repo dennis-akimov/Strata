@@ -131,7 +131,14 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
     let metrics = || crate::get_json(&format!("http://127.0.0.1:{port}/metrics"), &key);
     // an engine the old app did not start (another config, a test) makes the new server refuse to start ("another
     // Strata engine is running"): say so before anything is stopped
-    let ours: Vec<i32> = old.iter().flat_map(|p| pids("/usr/bin/pgrep", &["-P", &p.to_string()])).flat_map(|s| { let mut v = pids("/usr/bin/pgrep", &["-P", &s.to_string()]); v.push(s); v }).collect();
+    // every process under the old app: its server, the engine, and a client's own server and engine (docs/CLIENT_ENGINES.md)
+    let mut ours: Vec<i32> = old.clone();
+    let mut i = 0;
+    while i < ours.len() {
+        let kids = pids("/usr/bin/pgrep", &["-P", &ours[i].to_string()]);
+        ours.extend(kids);
+        i += 1;
+    }
     let foreign: Vec<i32> = pids("/usr/bin/pgrep", &["-f", "strata-metal --serve"]).into_iter().filter(|p| !ours.contains(p)).collect();
     if !foreign.is_empty() {
         say(&format!("another Strata engine runs (pid {foreign:?}): the new app's server would refuse to start beside it. Stop it first; nothing was changed"));
