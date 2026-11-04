@@ -99,8 +99,9 @@ const COLORS={ready:'#34c759',busy:'#0a84ff',starting:'#ff9f0a',stopping:'#ff9f0
 let base='',up=false;
 const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const gb=b=>b==null?'–':(b/1e9).toFixed(1)+' GB', k=c=>c>=1048576&&c%1048576===0?c/1048576+'M':c>=1024?Math.round(c/1024)+'K':c;
-let mem=null,running=false;
+let mem=null,running=false,snap=null;
 function init(s){
+  snap=s;
   const name=c=>{const n=c.name.replace(/^strata-|\.json$/g,'');return n==='apple-afm'?"Apple's on-device model (apple-afm)":n+(c.model&&c.model!==n?' — '+c.model:'');};
   // the closed picker's name: the size dropped (qwen3.6-35b -> qwen3.6) when no other config would read the same
   const bare=c=>c.name.replace(/^strata-|\.json$/g,''),cut=c=>bare(c).replace(/-\d+(\.\d+)?b(?=-|$)/i,'');
@@ -108,8 +109,7 @@ function init(s){
   $('cfg').innerHTML=s.configs.map(c=>{const l=name(c)+(c.problem?' (not ready)':''),sh=short(c);
     return `<option value="${esc(c.path)}"${c.problem?' disabled':''} data-s="${esc(sh)}" data-l="${esc(l)}">${esc(l)}</option>`;}).join('')||'<option>no run config yet: make setup</option>';
   const cur=s.configs.find(c=>c.path===s.config),pn=cur?cur.parallel||1:1;
-  const cm=cur&&cur.cache_mib!=null?cur.cache_mib:-1,cachev=[-1,0,205,512,1024,2048,4096,8192,16384,32768].concat([-1,0,205,512,1024,2048,4096,8192,16384,32768].includes(cm)?[]:[cm]).sort((a,b)=>a-b);
-  $('cache').innerHTML=cachev.map(v=>{const g=Math.round(v/1024*10)/10;return `<option value="${v}"${v===cm?' selected':''} data-s="${v<0?'cache auto':v?'cache '+g+' GB':'no cache'}" data-l="${v<0?'conversation cache sized for this Mac (its RAM beside the model; the server log says how much)':v?`conversation cache ${g} GB of RAM: displaced conversations come back without reading them again`:'no conversation cache: a displaced conversation is read again'}"></option>`;}).join('');
+  cacheMenu(cur);
   // the pool: off, or half / three quarters / all of context x agents (the A/B: docs/CONTEXT_POOL.md)
   const cx=cur?cur.ctx||0:0,full=cx*pn,pv=cur?cur.pool||0:0,poolv=[0,...(pn>1&&cx?[full/2,full*3/4,full]:[])].concat(pv&&![0,full/2,full*3/4,full].includes(pv)?[pv]:[]);
   $('pool').hidden=pn<2&&!pv;
@@ -147,9 +147,18 @@ function status(s){
   fit();
 }
 let full=null;function layout(){const f=!up||$('log').classList.contains('open')||!$('alert').hidden||!$('sys').hidden||$('mempop').classList.contains('open');if(f!==full){full=f;send('layout',{full:f});}}
+// the conversation cache's sizes: up to what this Mac holds beside the model (mem.cache_max_mib, the memory check's;
+// the engine caps a larger one to it), that largest one offered as "max"
+function cacheMenu(cur){
+  const cm=cur&&cur.cache_mib!=null?cur.cache_mib:-1,max=mem&&cur&&mem.config===cur.path&&mem.cache_max_mib!=null?mem.cache_max_mib:null,std=[-1,0,205,512,1024,2048,4096,8192,16384,32768];
+  const cachev=[...new Set(std.concat([cm],max>0?[max]:[]))].sort((a,b)=>a-b);
+  $('cache').innerHTML=cachev.map(v=>{const g=Math.round(v/1024*10)/10,over=max!=null&&v>max,top=v>0&&v===max;
+    return `<option value="${v}"${v===cm?' selected':''}${over&&v!==cm?' disabled':''} data-s="${v<0?'cache auto':v?'cache '+g+' GB'+(over?' ⚠':''):'no cache'}" data-l="${v<0?'conversation cache sized for this Mac (its RAM beside the model; the server log says how much)':!v?'no conversation cache: a displaced conversation is read again':over?`conversation cache ${g} GB: more than this Mac holds beside the model (the engine uses ${Math.round(max/1024*10)/10} GB)`:`conversation cache ${g} GB of RAM${top?' · max for this Mac':''}: displaced conversations come back without reading them again`}"></option>`;}).join('');
+  shorten($('cache'));
+}
 // the memory check of the selected config (the engine's --plan, and the memory free now)
 function memory(m){
-  mem=m;const chip=$('mem');
+  mem=m;const chip=$('mem');if(snap)cacheMenu(snap.configs.find(c=>c.path===snap.config));
   if(m.afm){chip.className='chip green';chip.textContent="Apple's on-device model";chip.title=m.advice;$('ctx').innerHTML='';
     $('memcard').hidden=false;$('memcard').innerHTML=`<h3>Memory</h3><div class="verdict green">✓ ${esc(m.advice)}</div>`;return;}
   if(m.error){chip.className='chip red';chip.textContent='memory ?';chip.title=m.error;$('ctx').innerHTML='';$('memcard').hidden=false;

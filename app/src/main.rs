@@ -454,8 +454,18 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
         "avail": if running { Value::Null } else { json!(avail) }, "running": running,
         "weights": n(&g["model"]) + n(&h["model"]), "cache": n(&g["context"]) + n(&h["context"]), "work": n(&g["compute"]) + n(&h["compute"]),
         "state": state, "advice": advice, "options": options, "recommended": best.map(|i| options[i].clone()),
+        "cache_max_mib": cache_max_mib(Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output().ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0), need),
         "wired_mb": wired_mb, "suggest_limit_mb": if suggest_mb > 0 && gpu_need > limit { json!(suggest_mb) } else { Value::Null },
         "power": power()})
+}
+
+/// The largest conversation cache this Mac holds beside the model (`need`: weights, K/V, work buffers): the memory less
+/// that and macOS's share (15%, 3 GB at least), in 256 MiB steps.  The engine caps --conversation-cache-mib the same way
+/// (strata_metal.cpp, its measured GPU memory): a 16 GB M1 with LFM2.5-8B had 8 GB set and room for about 5.
+fn cache_max_mib(ram: u64, need: f64) -> u64 {
+    let ram_mib = ram >> 20;
+    ram_mib.saturating_sub((need / 1048576.0) as u64 + (ram_mib * 15 / 100).max(3072)) / 256 * 256
 }
 
 /// What the GPU may really hold: iogpu.wired_limit_mb when it is set; else macOS's default, which on Macs up to 36 GB
@@ -2762,6 +2772,8 @@ mod tests {
         let p = d.join("strata-x.json");
         std::fs::write(&p, "{\n \"args\": [\"--gguf\", \"m\", \"--conversation-cache-mib\", \"4096\", \"--kv\", \"f16\"]\n}\n").unwrap();
         assert_eq!(cache_mib(&read_config(&p)), 4096);
+        assert_eq!(cache_max_mib(16 << 30, 9.1e9), 4608);                   // the M1, LFM2.5-8B at 64K: not 8 GB
+        assert_eq!(cache_max_mib(16 << 30, 15e9), 0);
         set_cache_mib(&p, 16384).unwrap();                                   // replaced, never added twice
         assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "16384"]));
         assert_eq!(cache_mib(&read_config(&p)), 16384);

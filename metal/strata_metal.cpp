@@ -1370,6 +1370,19 @@ int main(int argc, char** argv) {
     // own weights are then the closest measure of what it holds
     size_t gpu_used = gpu_total - gpu_free;
     if (gpu_used == 0 && e.model) gpu_used = (size_t) llama_model_size(e.model);
+    // the conversation cache is plain RAM beside what the GPU holds: at most the memory less that and macOS's share
+    // (15%, 3 GB at least - the app's rule for iogpu.wired_limit_mb), or a full cache swaps everything else out (a
+    // 16 GB M1 with LFM2.5-8B: 8 GB asked, 5 GB fit)
+    if (e.o.cache_mib > 0) {
+        const int64_t ram = (int64_t) sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE) >> 20;
+        const int64_t held = (int64_t) std::max(gpu_used, e.model ? (size_t) llama_model_size(e.model) : 0) >> 20;
+        const int64_t cap = std::max<int64_t>(0, (ram - held - std::max<int64_t>(ram * 15 / 100, 3072)) / 256 * 256);
+        if (ram > 0 && e.o.cache_mib > cap) {
+            std::fprintf(stderr, "strata-metal: conversation cache: %lld MiB asked, %lld MiB fit (%lld MiB of RAM, %lld held by the model)\n",
+                         (long long) e.o.cache_mib, (long long) cap, (long long) ram, (long long) held);
+            e.o.cache_mib = cap;
+        }
+    }
 #ifdef __APPLE__
     const char* backend = "metal";
 #else
