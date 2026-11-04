@@ -99,7 +99,8 @@ fn say(m: &str) {
 /// make app-run: the decision, then its steps; the exit code says whether the new app runs
 pub fn run(root: &Path, config: Option<&Path>) -> i32 {
     let me = std::process::id() as i32;
-    let old: Vec<i32> = pids("/usr/bin/pgrep", &["-f", "Strata.app/Contents/MacOS/Strata$"]).into_iter().filter(|p| *p != me).collect();
+    // an app a blue-green deploy started runs with --handoff: it is the old app the next deploy replaces too
+    let old: Vec<i32> = pids("/usr/bin/pgrep", &["-f", "Strata.app/Contents/MacOS/Strata($| --handoff)"]).into_iter().filter(|p| *p != me).collect();
     let bundle = root.join("Strata.app");
     // -n always: right after the old app quits, LaunchServices may still count it and only "activate" it (2026-11-03)
     let open = |extra: &[&str]| {
