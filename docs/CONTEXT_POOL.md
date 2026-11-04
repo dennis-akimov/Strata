@@ -21,6 +21,14 @@ PagedAttention and llama-server work: one pool of N cells all sequences draw fro
 conversation to another slot) shares its cells (llama_memory_seq_cp) instead of writing a state.  When the pool is
 full a batch window fails and its requests end (ponytail: no admission against the pool yet).
 
+## Reading a prompt beside agents that write
+
+A new request's prompt used to be read whole before any other slot's next token: a 34K-token prompt (Qwen3-Coder,
+~450 tok/s beside another engine) stopped a writing agent for 79 s.  strata-metal now reads it in `--prefill-share`
+pieces (512 tokens) while slots decode, and after each piece runs their windows for `--decode-share` (0.25) of the
+piece's time.  Measured the same way, the writing agent got 19.7 tok/s during the read (141 alone); the read itself
+took 74 s.  Pieces of 256 were slower for both.  `--prefill-share 0` reads whole chunks as before.
+
 ## The "unified cache reads wrong" note, resolved
 
 strata-metal kept own cells per sequence since a copied sequence rolled back to a checkpoint "read wrong in the

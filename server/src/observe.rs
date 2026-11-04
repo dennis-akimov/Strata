@@ -116,6 +116,8 @@ struct ClientStat {
     first: f64,
     last: f64,
     path: String,
+    /// "main", or the name of the client's own engine (docs/CLIENT_ENGINES.md)
+    engine: String,
 }
 
 // ponytail: kept in memory until the server restarts, unbounded by client (one row per address and User-Agent)
@@ -151,6 +153,7 @@ fn with_client(f: impl FnOnce(&mut ClientStat)) {
 pub fn client_request(rec: &Value) {
     let i = |k: &str| rec.get(k).and_then(Value::as_i64).unwrap_or(0);
     with_client(|s| {
+        s.engine = rec.get("engine").and_then(Value::as_str).unwrap_or("main").to_string();
         s.requests += 1;
         s.prompt_tokens += i("prompt_tokens");
         s.reused += i("reused");
@@ -188,7 +191,7 @@ pub fn clients_view() -> Value {
         "prompt_tokens": s.prompt_tokens, "reused": s.reused, "output_tokens": s.output_tokens,
         "ttft_s": if s.ttft_n > 0 { json!(r(s.ttft_s / s.ttft_n as f64, 1000.0)) } else { Value::Null },
         "decode_tok_s": if s.decode_ms > 0.0 { json!(r(s.generated as f64 / (s.decode_ms / 1000.0), 10.0)) } else { Value::Null },
-        "first": s.first, "last": s.last, "path": s.path})).collect())
+        "first": s.first, "last": s.last, "path": s.path, "engine": s.engine})).collect())
 }
 
 #[cfg(test)]
@@ -247,14 +250,14 @@ mod tests {
         set_client("10.9.9.9", Some("test-a/1"), "/v1/chat/completions");
         failed("/v1/chat/completions", 400, "invalid_request_error", "too long");
         set_client("10.9.9.9", Some("test-b/1"), "/v1/completions");
-        client_request(&json!({"prompt_tokens": 7, "output_tokens": 1}));
+        client_request(&json!({"prompt_tokens": 7, "output_tokens": 1, "engine": "zed"}));
         let v = clients_view();
         let a = mine(&v, "test-a/1").unwrap();
         assert_eq!((a["requests"].as_u64(), a["errors"].as_u64(), a["prompt_tokens"].as_i64(), a["reused"].as_i64(), a["output_tokens"].as_i64()), (Some(2), Some(1), Some(150), Some(60), Some(30)));
         assert_eq!((a["ttft_s"].as_f64(), a["decode_tok_s"].as_f64(), a["path"].as_str()), (Some(1.0), Some(20.0), Some("/v1/chat/completions")));
-        assert_eq!(a["active"], 0);
+        assert_eq!((a["active"].as_u64(), a["engine"].as_str()), (Some(0), Some("main")));
         let b = mine(&v, "test-b/1").unwrap();
-        assert_eq!((b["requests"].as_u64(), b["ttft_s"].clone(), b["decode_tok_s"].clone()), (Some(1), Value::Null, Value::Null));
+        assert_eq!((b["requests"].as_u64(), b["ttft_s"].clone(), b["decode_tok_s"].clone(), b["engine"].as_str()), (Some(1), Value::Null, Value::Null, Some("zed")));
         set_client("10.9.9.9", Some("test-c/1"), "/v1/messages");
         client_begin(); // still reading its prompt: shown, active
         assert_eq!((mine(&clients_view(), "test-c/1").unwrap()["active"].as_u64(), mine(&clients_view(), "test-c/1").unwrap()["requests"].as_u64()), (Some(1), Some(0)));

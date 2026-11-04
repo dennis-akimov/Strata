@@ -448,7 +448,10 @@ fn dispatch(mut c: Ctx) {
         "GET" => get_(&mut c),
         "POST" => {
             crate::observe::client_begin();
-            post(&mut c);
+            match crate::clients::pick(crate::clients::routes(), &c.path(), c.header("user-agent").as_deref()) {
+                Some(r) if c.body.is_ok() => route_to(&mut c, r),
+                _ => post(&mut c),
+            }
             crate::observe::client_end();
         }
         "DELETE" => delete(&mut c),
@@ -463,6 +466,72 @@ fn dispatch(mut c: Ctx) {
             let _ = c.send_head(501, vec![("Content-Type".into(), "text/html;charset=utf-8".into()), ("Content-Length".into(), body.len().to_string())]);
             let _ = c.write(body);
         }
+    }
+}
+
+/// A client with an engine of its own (docs/CLIENT_ENGINES.md): the request as sent to that engine, its answer
+/// streamed back and counted for the client
+fn route_to(c: &mut Ctx, r: &crate::clients::Route) {
+    use std::io::Read;
+    if !c.authorized() {
+        return;
+    }
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = AGENT.get_or_init(|| ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(3))).http_status_as_error(false).build().into());
+    let body = c.body.as_ref().map(|b| b.to_vec()).unwrap_or_default();
+    let mut b = ureq::http::Request::builder().method("POST").uri(format!("{}{}", r.url, c.raw_path));
+    for (k, v) in c.headers.iter().filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length" | "connection" | "transfer-encoding")) {
+        b = b.header(k.as_str(), v.as_bytes());
+    }
+    let t0 = Instant::now();
+    let resp = match b.body(body).map_err(|e| e.to_string()).and_then(|q| agent.run(q).map_err(|e| e.to_string())) {
+        Ok(resp) => resp,
+        Err(e) => {
+            let msg = format!("this client's engine ({}, {}) is not answering: {e} (still loading? retry shortly)", r.name, r.url);
+            return c.json_h(503, &json!({"error": {"type": "overloaded_error", "message": msg}}), vec![("Retry-After".into(), "10".into())]);
+        }
+    };
+    let status = resp.status().as_u16();
+    let sse = resp.headers().get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+    let mut h: Vec<(String, String)> = resp.headers().iter().filter(|(k, _)| !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection"))
+        .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect();
+    h.push(("X-Strata-Engine".into(), r.name.clone()));
+    if c.send_head(status, h).is_err() {
+        return;
+    }
+    let (mut ttft, mut acc, mut whole, mut line) = (None, Map::new(), vec![], vec![]);
+    let mut rd = resp.into_body().into_reader();
+    let mut buf = vec![0u8; 16384];
+    loop {
+        let n = match rd.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        ttft.get_or_insert(t0.elapsed().as_secs_f64());
+        if sse {
+            for &ch in &buf[..n] {
+                if ch == b'\n' {
+                    crate::clients::merge_event(&mut acc, &String::from_utf8_lossy(&line));
+                    line.clear();
+                } else {
+                    line.push(ch);
+                }
+            }
+        } else if whole.len() < 64 << 20 {
+            whole.extend_from_slice(&buf[..n]);
+        }
+        if c.write(&buf[..n]).is_err() {
+            return; // the client went away; dropping the reader closes the engine's connection
+        }
+    }
+    let answer = if sse { Value::Object(acc) } else { serde_json::from_slice(&whole).unwrap_or(Value::Null) };
+    if status >= 400 {
+        let msg = answer.pointer("/error/message").and_then(Value::as_str).unwrap_or("");
+        crate::observe::failed(&c.path(), status, answer.pointer("/error/type").and_then(Value::as_str).unwrap_or(""), &format!("{} engine: {msg}", r.name));
+    } else {
+        let mut rec = crate::clients::record_from(&answer, ttft);
+        rec["engine"] = json!(r.name);
+        crate::observe::client_request(&rec);
     }
 }
 

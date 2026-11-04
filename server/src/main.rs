@@ -424,7 +424,11 @@ fn main() {
         unsafe { std::env::set_var("STRATA_TRACE", "1") };
         say("trace on (\"trace\": true): slot choices here, the engine's reuse in this config's log");
     }
-    strata_server::firewall::start(get(&cfgv, "firewall"), a.engine == "strata"); // history, connection sampler, the kernel's sandbox log
+    // a client's own engine (docs/CLIENT_ENGINES.md): this server routes by User-Agent ("clients"), or it is one
+    // (STRATA_PARENT_PID: the main server runs the firewall history, voice, schedules and MCP servers)
+    strata_server::clients::set(strata_server::clients::parse(&cfgv, a.port).unwrap_or_else(|e| exit_msg(&format!("[strata] {e}"))));
+    let client_engine = strata_server::clients::watch_parent();
+    strata_server::firewall::start(get(&cfgv, "firewall"), a.engine == "strata" && !client_engine); // history, connection sampler, the kernel's sandbox log
     let host = a.host.clone().or_else(|| get(&cfgv, "host").as_str().filter(|h| !h.is_empty()).map(String::from)).unwrap_or_else(|| "127.0.0.1".into());
     // before the minutes of loading: is the port free?
     let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.clone() }, a.port);
@@ -481,7 +485,10 @@ fn main() {
     let dotenv = strata_server::dotenv::load(&root());
     let mut env_mcp = strata_server::dotenv::mcp_servers(&dotenv);
     // Strata.app's browser for the model (app/src/browser_mcp.rs): its endpoint and key, made at each app start
-    if let (Ok(u), Ok(k)) = (std::env::var("STRATA_BROWSER_MCP_URL"), std::env::var("STRATA_BROWSER_MCP_KEY")) {
+    if client_engine {
+        env_mcp.clear();
+    }
+    if let (false, Ok(u), Ok(k)) = (client_engine, std::env::var("STRATA_BROWSER_MCP_URL"), std::env::var("STRATA_BROWSER_MCP_KEY")) {
         env_mcp.insert("browser".into(), json!({"url": u, "headers": {"Authorization": format!("Bearer {k}")}}));
     }
     if !env_mcp.is_empty() {
@@ -804,8 +811,11 @@ fn main() {
     svc.start_idle_unload();
     let here = if ["0.0.0.0", "", "::"].contains(&host.as_str()) { "127.0.0.1".to_string() } else { host.clone() };
     println!("ready: http://{here}:{}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context {} tokens{}{})", a.port, engine.max_context(), if vision.is_some() { ", images on" } else { "" }, if svc.set.api_key.is_empty() { "" } else { ", API key required" });
-    strata_server::voice::autostart(a.port, svc.set.api_key.first().map(String::as_str)); // "Hey ...": on again if it was on
-    strata_server::schedules::start(a.port, svc.set.api_key.first().cloned()); // scheduled prompts (missed ones run once)
+    if !client_engine {
+        strata_server::voice::autostart(a.port, svc.set.api_key.first().map(String::as_str)); // "Hey ...": on again if it was on
+        strata_server::schedules::start(a.port, svc.set.api_key.first().cloned()); // scheduled prompts (missed ones run once)
+    }
+    strata_server::clients::spawn_all(a.port, !handoff_from.is_empty());
     let args = str_args(&cfgv);
     let gguf = args[..args.len().saturating_sub(1)].iter().position(|x| x == "--gguf").map(|i| Path::new(&args[i + 1]).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
     println!("       model: {}{}", svc.model, if gguf.is_empty() { String::new() } else { format!("  ({gguf})") });
@@ -843,6 +853,9 @@ fn main() {
     });
     println!();
     say("stopping (Ctrl+C again to end the engine at once) ...");
+    // ponytail: after a handoff the old clients' engines stop here too, cutting what they still answer; their
+    // replacements took their ports already
+    strata_server::clients::stop_all();
     if handing.load(std::sync::atomic::Ordering::SeqCst) {
         if let Some(e) = engine.strata() {
             let _ = e.handoff("EXPORT", &handoff_dir(a.port)); // the last ones, before QUIT (the engine reads in order)

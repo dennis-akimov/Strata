@@ -140,7 +140,8 @@ struct Options {
     int n_batch = 2048;
     int checkpoints = 8;
     int checkpoint_tail = 0;                           // --checkpoint-tail N: the prompt's last N tokens in small chunks
-    int prefill_share = 512;                           // --prefill-share N: while slots decode, a prompt in N-token pieces, a window between (0: whole)
+    int prefill_share = 512;                           // --prefill-share N: while slots decode, a prompt in N-token pieces, windows between (0: whole)
+    double decode_share = 0.25;                        // --decode-share F: after each piece, windows for F x the piece's time
     int64_t cache_mib = 0;                             // --conversation-cache-mib N: displaced conversations kept in RAM
     int cache_slots = 16;                              // --conversation-cache-slots K: at most K of them
     int64_t cache_min_tokens = 0;                      // --conversation-cache-min-tokens N: none shorter than N
@@ -198,6 +199,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--prefill-batch") o.n_batch = std::atoi(val("--prefill-batch"));
         else if (a == "--checkpoints") o.checkpoints = std::max(0, std::atoi(val("--checkpoints")));
         else if (a == "--prefill-share") o.prefill_share = std::max(0, std::atoi(val("--prefill-share")));
+        else if (a == "--decode-share") o.decode_share = std::max(0.0, std::atof(val("--decode-share")));
         else if (a == "--checkpoint-tail") o.checkpoint_tail = std::max(0, std::atoi(val("--checkpoint-tail")));
         else if (a == "--conversation-cache-mib") o.cache_mib = std::max(0LL, std::atoll(val("--conversation-cache-mib")));
         else if (a == "--conversation-cache-slots") o.cache_slots = std::max(1, std::atoi(val("--conversation-cache-slots")));
@@ -952,13 +954,20 @@ struct Engine {
             while (b < end && P.ids[b] != im_start) ++b;
             const bool boundary = b < end;
             if (boundary) end = b;
-            // while other slots decode, the chunk in --prefill-share pieces with a batch window between: their agents go on
-            // writing (a token a piece) instead of waiting for the whole prompt.  Text only: an image's rows go in whole.
+            // while other slots decode, the chunk in --prefill-share pieces, and after each the decoding slots' windows
+            // for --decode-share of the piece's time (at least one): their agents go on writing instead of waiting for
+            // the whole prompt (Qwen3-Coder, a 34K prompt read beside a writing agent: 0 tokens in 79 s before).  Text
+            // only: an image's rows go in whole.
             for (size_t s0 = at; s0 < end;) {
                 const size_t s1 = !geni && o.prefill_share > 0 && decoding() ? std::min(end, s0 + (size_t) o.prefill_share) : end;
+                const auto tp = Clock::now();
                 if (!feed(sq, P, s0, s1, false, err, !geni)) { clear(sq); return refuse(err); }
                 s0 = s1;
-                window();
+                if (!decoding()) continue;
+                llama_synchronize(ctx);
+                const auto tw = Clock::now();
+                const double budget = ms_since(tp) * o.decode_share;
+                do window(); while (decoding() && ms_since(tw) < budget);
             }
             at = end;
             // only where seq_rm from the cut's position keeps every held cell (an M-RoPE image's rows share one

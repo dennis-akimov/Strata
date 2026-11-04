@@ -239,14 +239,14 @@
         <div class="req-head"><span class="card-title">Clients</span><span class="muted small" id="cl-sum"></span></div>
         <div class="table-wrap">
           <table class="st-table fw-table">
-            <thead><tr><th>Last seen</th><th>Address</th><th>Client (User-Agent)</th><th>Last API</th><th class="num">Active</th><th class="num">Requests</th><th class="num">Errors</th>
+            <thead><tr><th>Last seen</th><th>Address</th><th>Client (User-Agent)</th><th>Last API</th><th>Engine</th><th class="num">Active</th><th class="num">Requests</th><th class="num">Errors</th>
               <th class="num">Prompt tokens</th><th class="num">Reused</th><th class="num">Output tokens</th><th class="num">First token</th><th class="num">Writes</th></tr></thead>
-            <tbody id="cl-body"><tr><td colspan="12" class="muted">Loading&hellip;</td></tr></tbody>
+            <tbody id="cl-body"><tr><td colspan="13" class="muted">Loading&hellip;</td></tr></tbody>
           </table>
         </div>
         <p class="muted small fw-note">One row per address and User-Agent since the server started.  Active: requests in progress
           (waiting, reading or writing); requests are finished answers; errors are refused requests (HTTP 400 and up).  First token: the mean from arrival; writes: output tokens a
-          second while writing.  Refreshes every 3 s while this tab is open.</p>
+          second while writing.  Engine: main, or the client's own (the config's "clients", docs/CLIENT_ENGINES.md).  Refreshes every 3 s while this tab is open.</p>
       </div>
     </div>
   </section>
