@@ -75,3 +75,7 @@ prompt speed, so now they are used only while the client's request runs.  `"vip"
   child drains like the old main server.
 - The match is a User-Agent substring: a client that hides its User-Agent cannot be routed.  The research found no
   better fixed signal; LiteLLM and Envoy's AI gateway route by configured header matches the same way.
+- A client engine that stops is started again after 5 s (doubling while it keeps stopping within a minute, 5 min at
+  most), except once its main server has handed its port over.  Its messages go to its own log
+  (`strata-<model>-<name>.log`), so a refused start is still there after a deploy.  2026-11-05: Zed's engine quit at
+  a deploy ("port 8190 is already in use") and nothing started it again; Zed got "connection refused" until it was started by hand.

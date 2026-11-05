@@ -57,6 +57,17 @@ fn pids(cmd: &str, args: &[&str]) -> Vec<i32> {
     Command::new(cmd).args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().filter_map(|p| p.parse().ok()).collect()).unwrap_or_default()
 }
 
+/// An exclusive lock on a file in Strata's folder, held while the returned file is open (the kernel drops it when the
+/// process ends): `wait` blocks until it is free, else None when another process holds it
+pub fn lock(name: &str, wait: bool) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let p = running_path().with_file_name(name);
+    let _ = std::fs::create_dir_all(p.parent()?);
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(p).ok()?;
+    let op = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
+    (unsafe { libc::flock(f.as_raw_fd(), op) } == 0).then_some(f)
+}
+
 fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
@@ -123,10 +134,38 @@ pub fn mode(can_share: bool, fits: bool) -> &'static str {
     if can_share && fits { "handoff" } else { "restart" }
 }
 
+/// The client engines (docs/CLIENT_ENGINES.md) answer too, within 5 min: the main server's answer alone said a deploy
+/// was done while Zed's engine had refused to start (2026-11-05)
+fn clients_up(metrics: &dyn Fn() -> Option<Value>, limit: Duration, pause: Duration) -> i32 {
+    let t = Instant::now();
+    loop {
+        let down: Vec<String> = metrics().and_then(|m| m["client_engines"].as_array().cloned()).unwrap_or_default().iter()
+            .filter(|c| c["up"] != true).map(|c| c["name"].as_str().unwrap_or("?").to_string()).collect();
+        if down.is_empty() {
+            return 0;
+        }
+        if t.elapsed() >= limit {
+            say(&format!("client engine not answering after {:.0} s: {} (its log: strata-<model>-<name>.log)", limit.as_secs_f64(), down.join(", ")));
+            return 1;
+        }
+        std::thread::sleep(pause);
+    }
+}
+
 /// make app-run: the decision, then its steps; the exit code says whether the new server runs.  One Strata.app at a
 /// time: the running app switches its server (SIGUSR1, main.rs switch_server); only when the app's own code changed
 /// does it restart, after the model is idle.
 pub fn run(root: &Path, config: Option<&Path>) -> i32 {
+    // one deploy at a time: two at once each quit the old app and opened a new one (2026-11-04 23:03: two Strata.app,
+    // two servers sharing port 8090 and two engines in memory all night)
+    let _one = match lock("deploy.lock", false) {
+        Some(f) => f,
+        None => {
+            say("another deploy runs: waiting for it to finish");
+            let Some(f) = lock("deploy.lock", true) else { return 1 };
+            f
+        }
+    };
     let me = std::process::id() as i32;
     // an app a blue-green deploy started runs with --handoff: it is the old app the next deploy replaces too
     let old: Vec<i32> = pids("/usr/bin/pgrep", &["-f", "Strata.app/Contents/MacOS/Strata($| --handoff)"]).into_iter().filter(|p| *p != me).collect();
@@ -173,7 +212,7 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
         while t.elapsed() < Duration::from_secs(600) {
             if crate::get_json(&format!("http://127.0.0.1:{port}/health"), &key).is_some_and(|h| h["loaded"] == true) {
                 say(&format!("the new server answers on port {port} ({:.0} s)", t.elapsed().as_secs_f64()));
-                return 0;
+                return clients_up(&metrics, Duration::from_secs(300), Duration::from_secs(3));
             }
             std::thread::sleep(Duration::from_secs(2));
         }
@@ -280,5 +319,28 @@ mod tests {
         assert!(!can_share("127.0.0.1", l.local_addr().unwrap().port()));
         let free = { let t = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); t.local_addr().unwrap().port() };
         assert!(can_share("127.0.0.1", free));
+    }
+
+    #[test]
+    fn the_deploy_waits_for_every_client_engine() {
+        let z = Duration::ZERO;
+        let m = |v: Value| move || Some(v.clone());
+        assert_eq!(clients_up(&m(json!({"client_engines": [{"name": "zed", "up": true}]})), z, z), 0);
+        assert_eq!(clients_up(&m(json!({})), z, z), 0);                       // no client engines
+        assert_eq!(clients_up(&m(json!({"client_engines": [{"name": "zed", "up": false}]})), z, z), 1);
+        // down at first, then up
+        let n = std::cell::Cell::new(0);
+        let later = || { n.set(n.get() + 1); Some(json!({"client_engines": [{"name": "zed", "up": n.get() > 2}]})) };
+        assert_eq!(clients_up(&later, Duration::from_secs(5), z), 0);
+    }
+
+    #[test]
+    fn one_deploy_and_one_app_at_a_time() {
+        let name = format!("test-{}.lock", std::process::id());
+        let held = lock(&name, false).expect("a free lock");
+        assert!(lock(&name, false).is_none(), "a second holder while the first holds it");
+        drop(held);
+        assert!(lock(&name, false).is_some(), "free again once the holder is gone");
+        let _ = std::fs::remove_file(running_path().with_file_name(&name));
     }
 }

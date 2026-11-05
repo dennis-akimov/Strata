@@ -96,6 +96,10 @@ void vip_wait() {
 // re-processing" line the same way, at trace verbosity.
 static const bool g_trace = [] { const char* v = std::getenv("STRATA_TRACE"); return v && *v && std::strcmp(v, "0") != 0; }();
 #define TRACE(...) do { if (g_trace) { std::fprintf(stderr, "strata-metal: trace " __VA_ARGS__); std::fputc('\n', stderr); } } while (0)
+// a compute pass failed (llama.cpp's -3: on a Mac, Metal ran out of memory): its backend stays in that error state and
+// every later pass fails at once ("recreate the backend to recover"; 2026-11-05: each request answered 503 in 0 s until
+// the server was stopped), so the engine ends after this request and the server starts a fresh one at the next
+static bool g_gpu_failed = false;
 std::unique_ptr<std::atomic<bool>[]> g_bstop;   // BSTOP <slot>: that slot ends at its next window
 int g_slots = 0;
 std::mutex g_mu;
@@ -757,7 +761,7 @@ struct Engine {
                 }
             }
             const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-            if (rc != 0) { err = "llama_process failed (" + std::to_string(rc) + ")"; return false; }
+            if (rc != 0) { g_gpu_failed |= rc == -3; err = "llama_process failed (" + std::to_string(rc) + ")"; return false; }
             if (spec && sq == 0 && drafter && !common_speculative_process(spec, batch)) {
                 err = "the draft model could not follow the batch";
                 return false;
@@ -1029,7 +1033,9 @@ struct Engine {
                 batch.add(pending, pending_pos, sq, true);
                 for (size_t i = 0; i < draft.size(); ++i) batch.add(draft[i], next + (llama_pos) i, sq, true);
                 const auto tv = Clock::now();
-                const bool fail_tgt = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0;
+                const int rc_tgt = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                const bool fail_tgt = rc_tgt != 0;
+                g_gpu_failed |= rc_tgt == -3;
                 if (g_phases && !fail_tgt) { llama_synchronize(ctx); ph[1] += ms_since(tv); }
                 const auto tc = Clock::now();
                 if (fail_tgt || (drafts && !common_speculative_process(spec, batch))) {
@@ -1146,6 +1152,7 @@ struct Engine {
         const int rc = llama_decode(ctx, batch);
         llama_batch_free(batch);
         if (rc != 0) {
+            g_gpu_failed |= rc == -3;
             std::fprintf(stderr, "strata-metal: a batch window failed; its slots end\n");
             for (int b : who) { clear(b + 1); slot_done(b, "cancel"); }
             return;
@@ -1407,6 +1414,10 @@ int main(int argc, char** argv) {
     std::thread(read_stdin).detach();
     for (;;) {
         std::string line;
+        if (g_gpu_failed) {
+            std::fprintf(stderr, "strata-metal: the GPU's compute failed (out of memory?): the engine ends, the server starts a fresh one\n");
+            break;
+        }
         if (!next_line(line, !e.decoding())) {         // slots decoding and no command: one batch window
             e.window();
             continue;
@@ -1440,5 +1451,5 @@ int main(int argc, char** argv) {
     e.spec_init.reset();
     e.init.reset();
     llama_backend_free();
-    return 0;
+    return g_gpu_failed ? 3 : 0;
 }

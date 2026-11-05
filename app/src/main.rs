@@ -1438,6 +1438,11 @@ fn main() {
     if argv.iter().any(|a| a == "--deploy") {
         std::process::exit(deploy::run(&root, config.as_deref()));
     }
+    // one Strata.app: a second one would start a second server on the same port and a second engine
+    let Some(_one_app) = deploy::lock("app.lock", false) else {
+        eprintln!("strata-app: Strata.app is already running: this one quits");
+        std::process::exit(0);
+    };
     let handoff = argv.iter().any(|a| a == "--handoff");
     let st: Shared = Arc::new(Mutex::new(State { root, config, port, child: None, phase: "stopped", stopping_since: None, log: VecDeque::new(), last: json!({}), browser: None, handoff }));
     deploy::record_running();

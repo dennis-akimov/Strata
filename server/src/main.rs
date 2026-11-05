@@ -328,12 +328,39 @@ fn port_holders(port: u16) -> Vec<(i32, String)> {
     let Ok(o) = std::process::Command::new("lsof").args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"]).output() else { return vec![] };
     let mut pids: Vec<i32> = String::from_utf8_lossy(&o.stdout).split_whitespace().filter_map(|p| p.parse().ok()).collect();
     pids.dedup();
-    pids.into_iter()
-        .map(|p| {
-            let cmd = std::process::Command::new("ps").args(["-o", "command=", "-p", &p.to_string()]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-            (p, cmd)
+    let found = pids.into_iter()
+        .filter_map(|p| {
+            let o = std::process::Command::new("ps").args(["-o", "ppid=,command=", "-p", &p.to_string()]).output().ok()?;
+            let line = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let (ppid, cmd) = line.split_once(char::is_whitespace)?;   // gone since lsof: not a holder
+            Some((p, ppid.parse().unwrap_or(0), cmd.trim().to_string()))
         })
-        .collect()
+        .collect();
+    servers_holding(found)
+}
+
+/// The holders that are not a Strata server's own child: a child between fork and exec holds a copy of its server's
+/// socket ("(lsof)", "(ioreg)"), for milliseconds, and for seconds once `make build` replaced the binary under the
+/// running server (macOS checks the new file at every spawn).  Counted as another program, it stopped the Zed engine
+/// in a deploy (2026-11-05: "port 8190 is already in use ... (held by pid 59122: )") and Zed's requests were refused.
+fn servers_holding(found: Vec<(i32, i32, String)>) -> Vec<(i32, String)> {
+    let servers: Vec<i32> = found.iter().filter(|(_, _, c)| is_strata_server(c)).map(|(p, _, _)| *p).collect();
+    found.into_iter().filter(|(_, ppid, c)| is_strata_server(c) || !servers.contains(ppid)).map(|(p, _, c)| (p, c)).collect()
+}
+
+/// The port check again while the port is in use and no process listens on it (a server stopping), up to `tries` times
+fn port_settled(mut check: impl FnMut() -> std::io::Result<()>, mut nobody: impl FnMut() -> bool, tries: usize, pause: std::time::Duration) -> std::io::Result<()> {
+    let mut r = check();
+    for _ in 0..tries {
+        match &r {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && nobody() => {
+                std::thread::sleep(pause);
+                r = check();
+            }
+            _ => break,
+        }
+    }
+    r
 }
 
 fn is_strata_server(cmd: &str) -> bool {
@@ -447,7 +474,10 @@ fn main() {
     // before the minutes of loading: is the port free?
     let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.clone() }, a.port);
     let mut handoff_from: Vec<i32> = vec![];
-    if let Err(e) = port_free(&host, a.port) {
+    // a server that is stopping holds its port a moment after its listener is gone: in use, held by no one (a client
+    // engine started while the previous run's one stopped quit "port 8190 is already in use", 2026-11-05)
+    let busy = port_settled(|| port_free(&host, a.port), || port_holders(a.port).is_empty(), 10, std::time::Duration::from_millis(500));
+    if let Err(e) = busy {
         let holders = if e.kind() == std::io::ErrorKind::AddrInUse { port_holders(a.port) } else { vec![] };
         let ours: Vec<&(i32, String)> = holders.iter().filter(|(_, c)| is_strata_server(c)).collect();
         if ours.is_empty() || ours.len() != holders.len() {
@@ -801,6 +831,7 @@ fn main() {
             let drain = async move {
                 usr2.recv().await;
                 say("handed over: no new requests here; finishing the ones in flight, then stopping");
+                strata_server::clients::stop_restarts();
                 handing.store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Some(e) = eng {
                     // now, and again each time a slot's request ends: those agents' state goes over one by one
@@ -920,6 +951,35 @@ fn main() {
         v.shutdown();
     }
     say("stopped");
+}
+
+#[cfg(test)]
+mod port_holder_tests {
+    use super::servers_holding;
+
+    #[test]
+    fn a_servers_half_started_child_is_not_another_program() {
+        let srv = "/x/engine-metal/strata-server --engine strata --port 8190";
+        let found = vec![(10, 1, srv.to_string()), (11, 10, "(lsof)".to_string()), (12, 99, "nginx: master".to_string())];
+        assert_eq!(servers_holding(found), vec![(10, srv.to_string()), (12, "nginx: master".to_string())]);
+    }
+
+    #[test]
+    fn a_port_held_by_no_one_is_checked_again_until_it_is_free() {
+        use std::io::{Error, ErrorKind};
+        let z = std::time::Duration::ZERO;
+        let mut n = 0;
+        let r = super::port_settled(|| { n += 1; if n < 3 { Err(Error::from(ErrorKind::AddrInUse)) } else { Ok(()) } }, || true, 10, z);
+        assert!(r.is_ok() && n == 3);
+        // held by a process: no retry, the caller looks at who holds it
+        let mut m = 0;
+        let r = super::port_settled(|| { m += 1; Err(Error::from(ErrorKind::AddrInUse)) }, || false, 10, z);
+        assert!(r.is_err() && m == 1);
+        // never free: gives up after the tries
+        let mut k = 0;
+        assert!(super::port_settled(|| { k += 1; Err(Error::from(ErrorKind::AddrInUse)) }, || true, 3, z).is_err());
+        assert_eq!(k, 4);
+    }
 }
 
 #[cfg(test)]

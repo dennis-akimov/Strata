@@ -24,7 +24,16 @@ pub struct Route {
 }
 
 static ROUTES: OnceLock<Vec<Route>> = OnceLock::new();
-static CHILDREN: Mutex<Vec<std::process::Child>> = Mutex::new(Vec::new());
+/// Each running client engine: its route's index, the process, when it started and how often it stopped early
+static CHILDREN: Mutex<Vec<Kid>> = Mutex::new(Vec::new());
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct Kid {
+    route: usize,
+    child: Option<std::process::Child>,
+    started: std::time::Instant,
+    early: u32,
+}
 
 /// The config's "clients": each entry's route, and for one without "url" the child server's config.
 pub fn parse(cfg: &Value, port: u16) -> Result<Vec<Route>, String> {
@@ -126,41 +135,95 @@ pub fn routes() -> &'static [Route] {
     ROUTES.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
-/// Start each entry's server (this binary, its config in the temp folder); `handoff`: beside an old one on that port
+/// Start each entry's server (this binary, its config in the temp folder); `handoff`: beside an old one on that port.
+/// A watcher starts one again when it stops (5 s later; up to 5 min apart while it keeps stopping within a minute).
 pub fn spawn_all(main_port: u16, handoff: bool) {
-    let exe = std::env::current_exe().unwrap_or_else(|_| "strata-server".into());
-    for r in routes() {
-        let Some((cfg, port)) = &r.spawn else { continue };
-        let path = std::env::temp_dir().join(format!("strata-client-{main_port}-{}.json", r.name));
-        if let Err(e) = std::fs::write(&path, cfg.to_string()) {
-            crate::say(&format!("client engine {}: could not write its config ({e}); its requests get HTTP 503", r.name));
-            continue;
+    let mut kids = CHILDREN.lock().unwrap();
+    for (i, r) in routes().iter().enumerate() {
+        if r.spawn.is_some() {
+            kids.push(Kid { route: i, child: start(r, main_port, handoff), started: std::time::Instant::now(), early: 0 });
         }
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["--engine", "strata", "--config"]).arg(&path).args(["--port", &port.to_string(), "--host", "127.0.0.1"]);
-        cmd.arg(if handoff { "--handoff" } else { "--replace" });
-        cmd.env("STRATA_ALLOW_SECOND_ENGINE", "1").env("STRATA_PARENT_PID", std::process::id().to_string());
-        cmd.stdin(std::process::Stdio::null());
-        match cmd.spawn() {
-            Ok(c) => {
-                crate::say(&format!("client engine {}: User-Agent \"{}\" -> {} (pid {})", r.name, r.user_agent, r.url, c.id()));
-                CHILDREN.lock().unwrap().push(c);
+    }
+    if kids.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        for k in CHILDREN.lock().unwrap().iter_mut() {
+            let r = &routes()[k.route];
+            if let Some(c) = k.child.as_mut() {
+                let Ok(Some(status)) = c.try_wait() else { continue };
+                k.early = if k.started.elapsed().as_secs() < 60 { k.early + 1 } else { 0 };
+                k.child = None;
+                k.started = std::time::Instant::now();
+                crate::say(&format!("client engine {} stopped ({status}): starting it again in {} s (its log: why)", r.name, restart_wait(k.early)));
+            } else if k.started.elapsed().as_secs() >= restart_wait(k.early) {
+                // --handoff: an older one may still hold the port (the main server's previous run, finishing)
+                k.child = start(r, main_port, true);
+                k.started = std::time::Instant::now();
             }
-            Err(e) => crate::say(&format!("client engine {}: could not start ({e}); its requests get HTTP 503", r.name)),
+        }
+    });
+}
+
+/// Seconds before a stopped client engine starts again: 5, doubling while it keeps stopping within a minute, 5 min at most
+fn restart_wait(early: u32) -> u64 {
+    (5u64 << early.saturating_sub(1).min(6)).min(300)
+}
+
+/// One client engine: this binary with its config; its messages and its engine's go to the config's "log" (else the
+/// main server's output), so a refused start is still there after the deploy
+fn start(r: &Route, main_port: u16, handoff: bool) -> Option<std::process::Child> {
+    let (cfg, port) = r.spawn.as_ref()?;
+    let exe = std::env::current_exe().unwrap_or_else(|_| "strata-server".into());
+    let path = std::env::temp_dir().join(format!("strata-client-{main_port}-{}.json", r.name));
+    if let Err(e) = std::fs::write(&path, cfg.to_string()) {
+        crate::say(&format!("client engine {}: could not write its config ({e}); its requests get HTTP 503", r.name));
+        return None;
+    }
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["--engine", "strata", "--config"]).arg(&path).args(["--port", &port.to_string(), "--host", "127.0.0.1"]);
+    cmd.arg(if handoff { "--handoff" } else { "--replace" });
+    cmd.env("STRATA_ALLOW_SECOND_ENGINE", "1").env("STRATA_PARENT_PID", std::process::id().to_string());
+    cmd.stdin(std::process::Stdio::null());
+    let log = cfg.get("log").and_then(Value::as_str).and_then(|l| std::fs::OpenOptions::new().create(true).append(true).open(l).ok());
+    if let Some(f) = log {
+        if let Ok(g) = f.try_clone() {
+            cmd.stdout(f).stderr(g);
+        }
+    }
+    match cmd.spawn() {
+        Ok(c) => {
+            crate::say(&format!("client engine {}: User-Agent \"{}\" -> {} (pid {})", r.name, r.user_agent, r.url, c.id()));
+            Some(c)
+        }
+        Err(e) => {
+            crate::say(&format!("client engine {}: could not start ({e}); its requests get HTTP 503", r.name));
+            None
         }
     }
 }
 
+/// No more restarts: this main server handed its port over, and the new one's client engines take theirs over (an
+/// old one started again would take its port back)
+pub fn stop_restarts() {
+    STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// SIGTERM to every client engine, then wait for them (they QUIT their own engines)
 pub fn stop_all() {
-    let mut cs = CHILDREN.lock().unwrap();
-    for c in cs.iter() {
+    STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut kids = CHILDREN.lock().unwrap();
+    for c in kids.iter().filter_map(|k| k.child.as_ref()) {
         unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
     }
-    for c in cs.iter_mut() {
+    for c in kids.iter_mut().filter_map(|k| k.child.as_mut()) {
         let _ = c.wait();
     }
-    cs.clear();
+    kids.clear();
 }
 
 /// In a client engine (STRATA_PARENT_PID): stop when the main server is gone (SIGTERM to self: the usual way out)
@@ -341,5 +404,10 @@ mod tests {
         merge_event(&mut acc, r#"data: {"type":"message_delta","usage":{"output_tokens":9}}"#);
         let r = record_from(&Value::Object(acc), None);
         assert_eq!((r["prompt_tokens"].as_i64(), r["output_tokens"].as_i64()), (Some(30), Some(9)));
+    }
+
+    #[test]
+    fn a_stopped_engine_waits_longer_each_time_it_stops_early() {
+        assert_eq!([0, 1, 2, 3, 7, 30].map(restart_wait), [5, 5, 10, 20, 300, 300]);
     }
 }
