@@ -744,7 +744,7 @@ fn set_cache_mib(cfg_path: &Path, mib: i64) -> Result<(), String> {
 }
 
 /// Sharing on the network: "host" "0.0.0.0" (every device that reaches this Mac) or "127.0.0.1" (this Mac only).  On,
-/// with no key in the config or .env, a new random "api_key" too: the server refuses the network without one.
+/// with no key in the config or .env, a new random API_KEY in .env too: the server refuses the network without one.
 fn set_shared(cfg_path: &Path, on: bool) -> Result<(), String> {
     let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
     let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
@@ -754,12 +754,26 @@ fn set_shared(cfg_path: &Path, on: bool) -> Result<(), String> {
         Value::Array(a) => !a.is_empty(),
         _ => false,
     };
-    if on && !has_key && env_api_key(&v).is_empty() {
-        let mut b = [0u8; 24];
-        std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b)).map_err(|e| e.to_string())?;
-        v["api_key"] = json!(format!("sk-strata-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>()));
+    let env = cfg_path.parent().unwrap_or(Path::new(".")).join(".env");
+    let env_has = std::fs::read_to_string(&env).unwrap_or_default().lines().any(|l| l.trim().strip_prefix("export ").unwrap_or(l.trim()).starts_with("API_KEY="));
+    if on && !has_key && !env_has && env_api_key(&v).is_empty() {
+        new_env_key(&env)?;
     }
     write_config(cfg_path, &text, &v)
+}
+
+/// A new random API_KEY added to the Strata folder's .env (the server's root, where the run configs are; created
+/// with mode 600 when it is not there): the key stays out of the config the user edits and shares.
+fn new_env_key(env: &Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut b = [0u8; 24];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|e| e.to_string())?;
+    let old = std::fs::read_to_string(env).unwrap_or_default();
+    let sep = if old.is_empty() || old.ends_with('\n') { "" } else { "\n" };
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(env).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(env, std::os::unix::fs::PermissionsExt::from_mode(0o600)).map_err(|e| e.to_string())?;
+    write!(f, "{sep}# made by Strata.app for sharing on the network (More > Copy API key)\nAPI_KEY=sk-strata-{}\n",
+           b.iter().map(|x| format!("{x:02x}")).collect::<String>()).map_err(|e| e.to_string())
 }
 
 /// The config shares this server beyond this Mac ("host" other than the loopback; none set: 127.0.0.1).
@@ -2826,6 +2840,17 @@ mod tests {
         assert_eq!(cache_mib(&read_config(&p)), 4096);
         assert_eq!(cache_max_mib(16 << 30, 9.1e9), 4608);                   // the M1, LFM2.5-8B at 64K: not 8 GB
         assert_eq!(cache_max_mib(16 << 30, 15e9), 0);
+        let env = p.with_file_name(".env");
+        let _ = std::fs::remove_file(&env);
+        assert!(!shared(&read_config(&p)));
+        set_shared(&p, true).unwrap();                                       // on: 0.0.0.0, and a key in .env
+        assert!(shared(&read_config(&p)) && read_config(&p).get("api_key").is_none());
+        let text = std::fs::read_to_string(&env).unwrap();
+        assert!(text.contains("API_KEY=sk-strata-") && text.lines().filter(|l| l.starts_with("API_KEY=")).count() == 1);
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&env).unwrap().permissions()) & 0o777, 0o600);
+        set_shared(&p, false).unwrap();
+        set_shared(&p, true).unwrap();                                       // the key kept, never a second one
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), text);
         set_cache_mib(&p, 16384).unwrap();                                   // replaced, never added twice
         assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "16384"]));
         assert_eq!(cache_mib(&read_config(&p)), 16384);

@@ -852,7 +852,10 @@ print(r.choices[0].message.content)
   editable there.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run setup with `START-HERE.bat --setup --host 0.0.0.0 --api-key some-long-secret` (or add `"host": "0.0.0.0"` and
-  `"api_key": "..."` to `strata-<model>.json`). The server window then prints this PC's addresses
+  `"api_key": "..."` to `strata-<model>.json`). On a Mac, Strata.app's **More > Share on the network** sets
+  `"host": "0.0.0.0"` in the run config and, when there is no key in it or in `.env`, adds a random `API_KEY` to the
+  Strata folder's `.env` (mode 600; **More > Copy API key** copies it). The server refuses to start on any address
+  but `127.0.0.1` without a key. The server window then prints this PC's addresses
   (`from other devices: http://192.168.x.x:8080/`); open that on the other device, or use `.../v1` as an API base URL.
   On Windows the firewall blocks it until you allow it: accept its prompt for Python (private networks), or run
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
