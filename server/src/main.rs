@@ -640,6 +640,11 @@ fn main() {
     if set.api_key.is_empty() && cfg.contains_key("api_key") {
         eprintln!("{}", strata_server::engine::stamp("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can use it); set one, or leave api_key out"));
     }
+    // on the network (0.0.0.0, a LAN address) only with a key: anyone who reaches it could use the model, read the
+    // request monitor and drive its MCP tools
+    if set.api_key.is_empty() && !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
+        exit_msg(&format!("[strata] \"host\": \"{host}\" shares this server with other devices, so it needs an API key: add \"api_key\" to the run config (Strata.app: More > Share on the network makes one), API_KEY in .env or --api-key"));
+    }
     set.cors_origins = net::origins_of(get(&cfgv, "cors_origins"), "cors_origins", true).unwrap_or_else(|e| exit_msg(&e));
     set.trusted_origins = net::origins_of(get(&cfgv, "trusted_origins"), "trusted_origins", false).unwrap_or_else(|e| exit_msg(&e));
     set.allowed_hosts = net::allowed_hosts_of(get(&cfgv, "allowed_hosts"), &std::env::var("STRATA_ALLOWED_HOSTS").unwrap_or_default()).unwrap_or_else(|e| exit_msg(&format!("[strata] config {e}")));

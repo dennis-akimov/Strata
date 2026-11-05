@@ -77,6 +77,7 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
     <button id="reveal">Show config in Finder</button><button id="engine_log">Engine log in Console</button>
     <button id="copy_key">Copy API key</button>
     <label><input type="checkbox" id="autostart"> Start the server when the app opens</label>
+    <label title="other devices on your network use the model at http://THIS-MAC.local:PORT/v1 with the API key (one is made when there is none); the server restarts"><input type="checkbox" id="shared"> Share on the network</label>
   </div></span>
 </div>
 <div id="main">
@@ -121,7 +122,7 @@ function init(s){
   $('par').innerHTML=[1,2,3,4,5,6,7,8].map(n=>`<option value="${n}"${n===pn?' selected':''} data-s="${n===1?'1 agent':n+' agents'}" data-l="${n===1?'1 agent: one request at a time':n+' agents at once, each with its own context'}"></option>`).join('');
   const bad=s.configs.filter(c=>c.problem);
   $('notready').innerHTML=bad.length?'<b>Not ready yet:</b>'+bad.map(c=>`<div>${esc(name(c))}: ${esc(c.problem)}</div>`).join(''):'';
-  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;shorten($('cfg'));shorten($('par'));shorten($('cache'));shorten($('pool'));shorten($('share'));
+  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;$('shared').checked=!!(cur&&cur.shared);shorten($('cfg'));shorten($('par'));shorten($('cache'));shorten($('pool'));shorten($('share'));
   base=`http://127.0.0.1:${s.port}`;$('url').textContent=`127.0.0.1:${s.port}`;
   $('log').textContent='';(s.log||[]).forEach(log);
   $('where').textContent=s.server?`${s.root}`:'engine-metal/strata-server is missing: run `make server` in '+s.root;
@@ -325,6 +326,7 @@ for(const id of ['cfg','ctx','par','cache','pool','share']){const sel=$(id);sel.
   sel.addEventListener('change',()=>shorten(sel));sel.addEventListener('blur',()=>shorten(sel));}
 $('ctx').onchange=()=>{const o=mem&&mem.options.find(o=>o.ctx===+$('ctx').value);if(o)setCtx(o);};
 $('autostart').onchange=e=>send('autostart',{on:e.target.checked});
+$('shared').onchange=e=>send('set_shared',{on:e.target.checked});
 $('start2').onclick=()=>send('start');$('showlog').onclick=e=>{e.preventDefault();$('logbtn').click();};
 $('logbtn').onclick=()=>{$('log').classList.toggle('open');$('logbtn').classList.toggle('on');$('log').scrollTop=1e9;layout();};
 $('morebtn').onclick=e=>{e.stopPropagation();$('menu').classList.toggle('open');};

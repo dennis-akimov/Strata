@@ -743,6 +743,30 @@ fn set_cache_mib(cfg_path: &Path, mib: i64) -> Result<(), String> {
     write_config(cfg_path, &text, &v)
 }
 
+/// Sharing on the network: "host" "0.0.0.0" (every device that reaches this Mac) or "127.0.0.1" (this Mac only).  On,
+/// with no key in the config or .env, a new random "api_key" too: the server refuses the network without one.
+fn set_shared(cfg_path: &Path, on: bool) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    v["host"] = json!(if on { "0.0.0.0" } else { "127.0.0.1" });
+    let has_key = match &v["api_key"] {
+        Value::String(k) => !k.trim().is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        _ => false,
+    };
+    if on && !has_key && env_api_key(&v).is_empty() {
+        let mut b = [0u8; 24];
+        std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b)).map_err(|e| e.to_string())?;
+        v["api_key"] = json!(format!("sk-strata-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>()));
+    }
+    write_config(cfg_path, &text, &v)
+}
+
+/// The config shares this server beyond this Mac ("host" other than the loopback; none set: 127.0.0.1).
+fn shared(c: &Value) -> bool {
+    c["host"].as_str().is_some_and(|h| !["", "127.0.0.1", "localhost", "::1"].contains(&h))
+}
+
 /// The shared K/V pool (docs/CONTEXT_POOL.md): `--kv-unified --kv-pool N` in "args" (N tokens all agents draw from,
 /// each up to its --max-context); 0 takes both out (each agent its own context).  A running server restarts with it.
 fn set_pool(cfg_path: &Path, tokens: u64) -> Result<(), String> {
@@ -1331,7 +1355,7 @@ fn snapshot(st: &Shared) -> Value {
             let c = read_config(p);
             json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"], "problem": problem(&c),
                 "parallel": c["parallel"].as_u64().filter(|n| *n > 1).map(|n| n.min(8)).unwrap_or(1), "cache_mib": cache_mib(&c),
-                "pool": pool_of(&c).0, "ctx": pool_of(&c).1, "share": share_of(&c)})
+                "pool": pool_of(&c).0, "ctx": pool_of(&c).1, "share": share_of(&c), "shared": shared(&c)})
         })
         .collect();
     let settings = load_settings();
@@ -1781,6 +1805,34 @@ fn main() {
                             Err(e) => format!("── the config could not be changed: {e} ──"),
                         };
                         let _ = p2.send_event(Ev::Log(msg));
+                        if running {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                    });
+                }
+                "set_shared" => {
+                    // other devices may use the model (with the API key); a running server restarts with it
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let on = v["on"].as_bool().unwrap_or(false);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let name = cfg.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        let host = Command::new("/usr/sbin/scutil").args(["--get", "LocalHostName"]).output().ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|h| !h.is_empty()).unwrap_or_else(|| "this-mac".into());
+                        let port = read_config(&cfg)["port"].as_u64().unwrap_or(8090);
+                        let msg = match set_shared(&cfg, on) {
+                            Ok(()) if on => format!("── shared on the network in {name}: other devices use http://{host}.local:{port}/v1 with the API key (More > Copy API key) ──"),
+                            Ok(()) => format!("── this Mac only in {name} ──"),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        let _ = p2.send_event(Ev::Ipc(json!({"cmd": "init"})));   // the switch shows the new state
                         if running {
                             if let Err(e) = start(&st2, &p2) {
                                 let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
