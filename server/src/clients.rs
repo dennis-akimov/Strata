@@ -70,7 +70,8 @@ pub fn parse(cfg: &Value, port: u16) -> Result<Vec<Route>, String> {
     Ok(out)
 }
 
-/// The main config for a client's engine: its context, slots and cache; no pool, vision, MCP or "clients"
+/// The main config for a client's engine: its context, slots and cache; no pool, vision, MCP, "clients" or
+/// "system_prompt" (the client sends its own)
 fn child_config(cfg: &Value, name: &str, max_context: i64, parallel: i64, cache_mib: i64) -> Value {
     let mut c: Map<String, Value> = cfg.as_object().cloned().unwrap_or_default();
     let args: Vec<String> = c.get("args").and_then(Value::as_array).map(|a| a.iter().map(crate::py::py_str).collect()).unwrap_or_default();
@@ -85,7 +86,7 @@ fn child_config(cfg: &Value, name: &str, max_context: i64, parallel: i64, cache_
     }
     kept.extend(["--max-context".into(), max_context.to_string(), "--conversation-cache-mib".into(), cache_mib.to_string()]);
     c.insert("args".into(), json!(kept));
-    for k in ["clients", "vision", "mcp", "port", "parallel", "open_browser"] {
+    for k in ["clients", "vision", "mcp", "port", "parallel", "open_browser", "system_prompt"] {
         c.remove(k);
     }
     if parallel > 1 {
@@ -248,7 +249,7 @@ mod tests {
     fn cfg() -> Value {
         json!({"args": ["--gguf", "m.gguf", "--max-context", "32768", "--kv-unified", "--kv-pool", "98304", "--conversation-cache-mib", "16384", "--kv", "f16"],
                "parallel": 4, "log": "/x/strata-q.log", "vision": {"exe": "v"}, "mcp": {"a": {}}, "model_name": "q",
-               "clients": [{"name": "zed", "user_agent": "Zed/", "max_context": 6144},
+               "system_prompt": "prompts/q.md", "clients": [{"name": "zed", "user_agent": "Zed/", "max_context": 6144},
                            {"user_agent": "curl", "paths": ["/v1/completions"], "url": "http://10.0.0.2:9000/"}]})
     }
 
@@ -261,7 +262,7 @@ mod tests {
         let (c, port) = r[0].spawn.clone().unwrap();
         assert_eq!(port, 8190);
         assert_eq!(c["args"], json!(["--gguf", "m.gguf", "--kv", "f16", "--max-context", "6144", "--conversation-cache-mib", "0"]));
-        for k in ["clients", "vision", "mcp", "parallel"] {
+        for k in ["clients", "vision", "mcp", "parallel", "system_prompt"] {
             assert!(c.get(k).is_none(), "{k} left in");
         }
         assert_eq!((c["log"].as_str(), c["model_name"].as_str(), c["open_browser"].as_bool()), (Some("/x/strata-q-zed.log"), Some("q"), Some(false)));

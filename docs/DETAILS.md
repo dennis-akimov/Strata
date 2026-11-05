@@ -842,6 +842,11 @@ print(r.choices[0].message.content)
 - **Model aliases** (0.1.32). `"aliases": ["qwen", "local-model"]` in `strata-<model>.json` lists the model under
   those names too in `/v1/models` (each with its own `id`, and in the model's `aliases`), like llama-server's
   `--alias`; a request naming one is answered under that name. Any other name is still served, as before.
+- **The model's own rules.** `"system_prompt": "prompts/qwen3.6.md"` in `strata-<model>.json` (a path from the
+  config's folder) puts that file's text at the start of every request's first system message, or adds one: the
+  same start in every request, so the cache keeps it (Qwen3.6, 160 tokens). Keep it to a few rules about the model's
+  habits, with no tool names, dates or app-specific steps: every app on the server gets it, and apps send their own.
+  Client engines (`"clients"`) get none. A template without a system role gets none. Off when the key is absent.
 - **Model settings in the web page (0.1.39, #564).** The About tab's Model settings card shows and changes a few of
   the keys above in `strata-<model>.json`: the `sampling` defaults (temperature, top_p, top_k, min_p),
   `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`,

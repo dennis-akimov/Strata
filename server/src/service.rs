@@ -439,6 +439,23 @@ pub fn sampling_defaults_from_config(cfg: &Value) -> Result<Map<String, Value>, 
     Ok(out)
 }
 
+/// The model's own rules (the config's "system_prompt") at the start of the first system message, or as one: the same
+/// start in every request, so the conversation cache keeps it.  A template without a system role gets none.
+pub fn with_system_prompt(messages: &mut Vec<Value>, prompt: &str, system_role: bool) {
+    if !system_role {
+        return;
+    }
+    match messages.first_mut() {
+        Some(m) if m["role"] == "system" => match &mut m["content"] {
+            Value::String(s) if s.trim().is_empty() => *s = prompt.to_string(),
+            Value::String(s) => *s = format!("{prompt}\n\n{s}"),
+            Value::Array(parts) => parts.insert(0, json!({"type": "text", "text": format!("{prompt}\n\n")})),
+            c => *c = json!(prompt),
+        },
+        _ => messages.insert(0, json!({"role": "system", "content": prompt})),
+    }
+}
+
 /// The settings the Service runs with (the run config's keys, set once at the start).
 #[derive(Default)]
 pub struct Settings {
@@ -448,6 +465,8 @@ pub struct Settings {
     pub codex_compaction_cache: bool,
     pub codex_thread_titles: bool,
     pub sampling_defaults: Map<String, Value>,
+    /// The config's "system_prompt" file's text: the model's own short rules, ahead of each request's system text
+    pub system_prompt: Option<String>,
     pub config_effort: Option<String>,
     pub slot_save_path: Option<String>,
     pub api_key: Vec<String>,
@@ -1229,6 +1248,9 @@ impl Service {
 
     pub fn prepare(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &Map<String, Value>, max_new: Option<i64>, force: Option<&str>, req: Option<&mut Map<String, Value>>) -> Result<(Vec<u32>, bool, i64), Fail> {
         let mut messages = messages.to_vec();
+        if let Some(p) = &self.set.system_prompt {
+            with_system_prompt(&mut messages, p, self.template.caps.supports_system_role);
+        }
         let fetched = self.note_unreadable_tool_images(&mut messages);
         let mut kwargs = kwargs.clone();
         let mut force = force.map(String::from);
@@ -1492,5 +1514,28 @@ mod thinking_cap_tests {
         // reasoning_budget_tokens: 0 said on purpose, or no max_tokens: no budget
         assert_eq!(thinking_cap(None, true, 1500), None);
         assert_eq!(thinking_cap(None, false, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::with_system_prompt;
+    use serde_json::{json, Value};
+
+    fn with(mut m: Vec<Value>, role: bool) -> Vec<Value> {
+        with_system_prompt(&mut m, "R", role);
+        m
+    }
+
+    #[test]
+    fn the_rules_go_first_in_one_system_message() {
+        let user = json!({"role": "user", "content": "hi"});
+        assert_eq!(with(vec![user.clone()], true), vec![json!({"role": "system", "content": "R"}), user.clone()]);
+        assert_eq!(with(vec![json!({"role": "system", "content": "S"}), user.clone()], true)[0]["content"], "R\n\nS");
+        assert_eq!(with(vec![json!({"role": "system", "content": " "})], true)[0]["content"], "R");
+        assert_eq!(with(vec![json!({"role": "system", "content": [{"type": "text", "text": "S"}]})], true)[0]["content"],
+                   json!([{"type": "text", "text": "R\n\n"}, {"type": "text", "text": "S"}]));
+        // a template without a system role: nothing added
+        assert_eq!(with(vec![user.clone()], false), vec![user]);
     }
 }

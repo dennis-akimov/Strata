@@ -88,6 +88,20 @@ fn exit_msg(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+/// The config's "system_prompt": a text file (a relative path: from the config's folder), e.g. "prompts/lfm2.5-8b.md"
+fn system_prompt(cfg: &Value, config: Option<&str>) -> Result<Option<String>, String> {
+    let p = match get(cfg, "system_prompt") {
+        Value::Null => return Ok(None),
+        Value::String(p) if !p.trim().is_empty() => p,
+        v => return Err(format!("[strata] config \"system_prompt\" must be a file's path, not {}", py::py_repr(v))),
+    };
+    let dir = config.and_then(|c| Path::new(c).parent()).unwrap_or(Path::new("."));
+    let text = std::fs::read_to_string(dir.join(p)).map_err(|e| format!("[strata] config \"system_prompt\" {p}: {e}"))?;
+    let text = text.trim();
+    say(&format!("system prompt: {p} ({} characters) ahead of each request's system text", text.len()));
+    Ok((!text.is_empty()).then(|| text.to_string()))
+}
+
 /// #1641: "--reasoning-effort high" in a config's args is the config's "reasoning_effort".
 fn lift_reasoning_effort_arg(cfg: &mut Map<String, Value>) {
     let Some(args) = cfg.get("args").and_then(Value::as_array).cloned() else { return };
@@ -597,6 +611,7 @@ fn main() {
     // ------------------------------------------------------------------ the settings
     let mut set = Settings { sampling_defaults, fit_max_tokens: a.fit_max_tokens || get(&cfgv, "fit_max_tokens") == &json!(true), ..Default::default() };
     set.reasoning_close_retry = get(&cfgv, "reasoning_close_retry") == &json!(true);
+    set.system_prompt = system_prompt(&cfgv, a.config.as_deref()).unwrap_or_else(|e| exit_msg(&e));
     if !get(&cfgv, "prevent_sleep").is_null() && !get(&cfgv, "prevent_sleep").is_boolean() {
         exit_msg(&format!("[strata] config \"prevent_sleep\" must be true or false, not {}", py::py_repr(get(&cfgv, "prevent_sleep"))));
     }
