@@ -1349,6 +1349,14 @@ int main(int argc, char** argv) {
     Engine e;
     if (!parse_args(argc, argv, e.o)) return 2;
     llama_backend_init();
+    // llama.cpp's debug lines only under STRATA_TRACE: its default logger prints them all, and a lazy grammar writes
+    // one per token while it waits for its trigger (the M1's log: 309,663 of them in 12 hours)
+    if (!g_trace)
+        llama_log_set([](ggml_log_level level, const char* text, void*) {
+            static bool debug = false;
+            if (level != GGML_LOG_LEVEL_CONT) debug = level == GGML_LOG_LEVEL_DEBUG;
+            if (!debug) std::fputs(text, stderr);
+        }, nullptr);
     std::string err;
     if (!e.load(err)) {
         out("ERR %s\n", err.c_str());
