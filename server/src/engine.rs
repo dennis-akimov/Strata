@@ -450,6 +450,11 @@ impl ConvCacheLog {
 /// An engine ERR line as a failure.  llama_process failed (-3) is llama.cpp's GGML_STATUS_FAILED: on a Mac, Metal ran
 /// out of memory (the engine log says kIOGPUCommandBufferCallbackErrorOutOfMemory) - not the request's fault (503),
 /// said with what to change (Strata.app finds this line in the server's output and offers a context that fits).
+/// The engine's refusal of a BGEN into a slot it still runs (strata_metal.cpp, the CUDA and SYCL engines alike).
+fn slot_still_running(f: &Fail) -> bool {
+    matches!(f, Fail::Value(why) if why.starts_with("BGEN: no such free slot"))
+}
+
 pub fn engine_err(line: &str, context: i64) -> Fail {
     let why = py::strip(line.get(4..).unwrap_or("")).to_string();
     if why.contains("llama_process failed (-3)") {
@@ -1484,7 +1489,7 @@ impl StrataEngine {
         let mut reserved: Option<usize> = None;
         let mut phase = "none";
         let mut stop_sent = false;
-        let (mut yields, mut solo_again) = (0usize, 0usize);
+        let (mut yields, mut solo_again, mut busy_retries) = (0usize, 0usize, 0usize);
         let (mut admit_wait, mut admit_since, mut admit_said) = (false, Instant::now(), false);
         let emb = embeddings.is_some();
         let ids_line = |p: &[u32]| p.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
@@ -1653,12 +1658,27 @@ impl StrataEngine {
                         c.erred = false;
                     }
                     let mut asked = false;
-                    self.control(y, &cancel, &mut out, None, &stats, &mut |me2: &Self| {
+                    let admitted = self.control(y, &cancel, &mut out, None, &stats, &mut |me2: &Self| {
                         if !asked && !emb && yields < YIELDS_MAX && me2.shorter_waiting(prompt.len()) {
                             let _ = me2.send(&format!("BYIELD {b}"));
                             asked = true;
                         }
-                    })?;
+                    });
+                    // the engine still runs this slot though this server had it free (a slot freed before its BDONE:
+                    // a release that gave up waiting): stop what it runs there, free it at its BDONE, take another
+                    // one - never a 400 to the client (it was one, "BGEN: no such free slot", 2026-11-04)
+                    if let Err(Stop::Err(f)) = &admitted && slot_still_running(f) && busy_retries < 3 {
+                        busy_retries += 1;
+                        say(&format!("parallel: the engine was still running slot {b}, which this server had free: stopped there, the request takes another slot"));
+                        self.ctl_state.lock().unwrap().erred = false;
+                        self.slots.lock().unwrap().live[b] = None;
+                        self.release_slot_when_done(b, None);
+                        self.slots.lock().unwrap().claims.remove(&b);
+                        slot = None;
+                        phase = "none";
+                        continue;
+                    }
+                    admitted?;
                     cont = self.ctl_state.lock().unwrap().result.as_ref().map(|r| r.1).unwrap_or(false);
                     phase = if cont { "slot" } else { "none" };
                     let yielded = self.ctl_state.lock().unwrap().yielded;
@@ -2376,6 +2396,12 @@ mod engine_err_tests {
         m.sample(None);
         assert_eq!(m.view().unwrap()["now_mb"], 0);
         assert_eq!(AfmMem::start(None).view(), None); // no reading (not a Mac): nothing shown
+    }
+
+    #[test]
+    fn a_bgen_into_a_running_slot_is_known_by_its_error() {
+        assert!(slot_still_running(&engine_err("ERR BGEN: no such free slot (--batch 4) or a bad max_new", 65536)));
+        assert!(!slot_still_running(&engine_err("ERR unknown command: X", 65536)));
     }
 
     #[test]

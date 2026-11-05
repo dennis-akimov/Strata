@@ -1412,6 +1412,9 @@ int main(int argc, char** argv) {
             char* e2 = nullptr;
             const long long mn = std::strtoll(e1, &e2, 10);
             if (b < 0 || b >= e.o.batch || e.slots[(size_t) b].active || mn < 1 || e2 == e1) {
+                // the log says which (the server takes another slot when this one is still running)
+                std::fprintf(stderr, "strata-metal: BGEN refused: slot %ld (of %d)%s, max_new %lld\n", b, e.o.batch,
+                             b >= 0 && b < e.o.batch && e.slots[(size_t) b].active ? " still running" : "", mn);
                 out("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", e.o.batch);
                 continue;
             }
