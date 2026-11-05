@@ -304,7 +304,8 @@ $('refresh').onclick=()=>send('init');
 $('mem').onclick=()=>{const p=$('mempop');if(p.classList.toggle('open')){memsum();send('apps');
   p.style.left='0px';const r=p.getBoundingClientRect();if(r.right>innerWidth-8)p.style.left=Math.min(0,innerWidth-8-r.right)+'px';}layout();};   // kept inside the window
 $('par').onchange=()=>{send('set_parallel',{n:+$('par').value});$('mem').textContent='memory …';};
-$('cache').onchange=()=>send('set_cache',{mib:+$('cache').value});
+// the pick kept in the panel's copy of the configs: the memory check that follows redraws the menu from it
+$('cache').onchange=()=>{const c=snap&&snap.configs.find(c=>c.path===snap.config);if(c)c.cache_mib=+$('cache').value;send('set_cache',{mib:+$('cache').value});};
 $('pool').onchange=()=>{send('set_pool',{tokens:+$('pool').value});$('mem').textContent='memory …';};
 $('share').onchange=()=>send('set_share',{share:+$('share').value});
 // the bar fits its window: the least used items fold into More, one at a time, until nothing is cut off (and come back
