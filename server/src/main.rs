@@ -517,6 +517,21 @@ fn main() {
         if cfg.is_empty() {
             die("strata-server: error: --engine strata needs --config");
         }
+        // on the network (0.0.0.0, a LAN address) only with a key - before the model loads: anyone who reaches it
+        // could use the model, read the request monitor and drive its MCP tools
+        let some_key = |v: &Value| match v {
+            Value::String(k) => !k.trim().is_empty(),
+            Value::Array(a) => !a.is_empty(),
+            _ => false,
+        };
+        let keyed = a.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+            || std::env::var("STRATA_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+            || some_key(get(&cfgv, "api_key"))
+            || strata_server::dotenv::get(&dotenv, "API_KEY").is_some_and(|k| !k.trim().is_empty());
+        if !keyed && !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
+            exit_msg(&format!("[strata] \"host\": \"{host}\" shares this server with other devices, so it needs an API key: \
+                Strata.app's More > Share on the network puts one in .env; or API_KEY in .env, \"api_key\" in the run config, or --api-key"));
+        }
         let env = child_env(&cfgv);
         sampling_defaults = sampling_defaults_from_config(&cfgv).unwrap_or_else(|e| exit_msg(&e));
         if !sampling_defaults.is_empty() {
@@ -639,11 +654,6 @@ fn main() {
     }
     if set.api_key.is_empty() && cfg.contains_key("api_key") {
         eprintln!("{}", strata_server::engine::stamp("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can use it); set one, or leave api_key out"));
-    }
-    // on the network (0.0.0.0, a LAN address) only with a key: anyone who reaches it could use the model, read the
-    // request monitor and drive its MCP tools
-    if set.api_key.is_empty() && !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
-        exit_msg(&format!("[strata] \"host\": \"{host}\" shares this server with other devices, so it needs an API key: add \"api_key\" to the run config (Strata.app: More > Share on the network makes one), API_KEY in .env or --api-key"));
     }
     set.cors_origins = net::origins_of(get(&cfgv, "cors_origins"), "cors_origins", true).unwrap_or_else(|e| exit_msg(&e));
     set.trusted_origins = net::origins_of(get(&cfgv, "trusted_origins"), "trusted_origins", false).unwrap_or_else(|e| exit_msg(&e));
