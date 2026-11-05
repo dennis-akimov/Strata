@@ -802,6 +802,15 @@ fn main() {
                     });
                 }
             };
+            // TCP keepalive on every connection: a non-streaming answer is minutes of silence, and a client
+            // whose connection died on the way (2026-11-04: deep research in Docker to the M1's LAN address,
+            // "connection closed before message completed" 226 s in) left its generation running to the end
+            // while its retry ran beside it; the probes keep such paths open and find a dead peer, which
+            // ends the request as a hang-up does
+            let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+                let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(30)).with_interval(std::time::Duration::from_secs(10));
+                let _ = socket2::SockRef::from(&*tcp).set_tcp_keepalive(&ka);
+            });
             let _ = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(drain).await;
             drained.notify_one();
         }

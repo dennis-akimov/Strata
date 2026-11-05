@@ -79,6 +79,11 @@ target_compile_features(strata-metal PRIVATE cxx_std_17)
 target_compile_definitions(strata-metal PRIVATE STRATA_VERSION="${PROJECT_VERSION}"
                            STRATA_LLAMA_COMMIT="${STRATA_LLAMA_COMMIT}")
 target_link_libraries(strata-metal PRIVATE llama llama-common)
+# hardened as strata-image (bible's C++ skill, Apple clang on arm64), and libc++'s fast hardening: slot and sequence
+# numbers come over the protocol, and an index past a vector's end traps (SIGTRAP) instead of writing past it
+target_compile_options(strata-metal PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero
+                       -mbranch-protection=standard)
+target_compile_definitions(strata-metal PRIVATE _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST)
 
 # the residual stream and next-token log-probabilities for strata-ablate (docs/ABLATION.md)
 add_executable(strata-directions strata_directions.cpp)
