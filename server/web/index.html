@@ -29,6 +29,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-shield"/></svg>Firewall</button>
     <button class="st-tab" role="tab" id="tab-btn-clients" aria-controls="view-clients" aria-selected="false" data-tab="clients">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-link"/></svg>Clients</button>
+    <button class="st-tab" role="tab" id="tab-btn-hub" aria-controls="view-hub" aria-selected="false" data-tab="hub">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-layers"/></svg>Hub</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
   </nav>
@@ -260,6 +262,33 @@
         <p class="muted small fw-note">One row per address and User-Agent since the server started.  Active: requests in progress
           (waiting, reading or writing); requests are finished answers; errors are refused requests (HTTP 400 and up).  First token: the mean from arrival; writes: output tokens a
           second while writing.  Engine: main, or the client's own (the config's "clients", docs/CLIENT_ENGINES.md).  Refreshes every 3 s while this tab is open.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ Hub ============================ -->
+  <section class="view view--about" id="view-hub" role="tabpanel" aria-labelledby="tab-btn-hub" hidden>
+    <div class="about">
+      <div class="st-card">
+        <div class="req-head"><span class="card-title">AI-cluster</span><span class="muted small" id="hub-state" role="status" aria-live="polite"></span></div>
+        <p class="muted">Offer this server's models to an AI-cluster (bible's AI-cluster page). The cluster sends requests here over
+          one connection and this server answers them as its own API would; they show on the Clients tab as "strata-hub".</p>
+        <div class="st-field">
+          <label class="st-label" for="hub-url">Address <output>from the AI-cluster page, ws:// or wss://</output></label>
+          <input class="st-input" id="hub-url" type="url" autocomplete="off" placeholder="ws://localhost:3460/hub/ws">
+        </div>
+        <div class="st-field">
+          <label class="st-label" for="hub-key">Node key <output id="hub-key-saved">made on the AI-cluster page (New node key)</output></label>
+          <input class="st-input" id="hub-key" type="password" autocomplete="off" placeholder="hub_…">
+        </div>
+        <div class="st-field">
+          <label class="st-label" for="hub-name">Node name <output>empty: this computer's name</output></label>
+          <input class="st-input" id="hub-name" type="text" autocomplete="off">
+        </div>
+        <div class="cfg-actions"><button class="st-btn st-btn--primary" id="hub-connect" type="button">Connect</button>
+          <button class="st-btn" id="hub-disconnect" type="button">Disconnect</button>
+          <span class="muted small" id="hub-msg" role="status"></span></div>
+        <p class="muted small">The key is kept on this computer (.strata-hub.json, readable only by you) and is not shown again.</p>
       </div>
     </div>
   </section>

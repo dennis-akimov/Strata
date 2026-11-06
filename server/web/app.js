@@ -85,15 +85,16 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "monitor", "firewall", "clients", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "monitor", "firewall", "clients", "hub", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "monitor", "firewall", "clients", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "monitor", "firewall", "clients", "hub", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
   if (tab === "about") loadConfig();
   if (tab === "firewall") loadFirewall();
   if (tab === "clients") loadClients();
+  if (tab === "hub") loadHub(true);
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -286,6 +287,46 @@ async function loadClients() {
   clTimer = setTimeout(loadClients, 3000);
 }
 $("fw-all").onchange = loadFirewall;
+
+// ------------------------------------------------------------------ hub
+// GET/POST hub: this server's connection to an AI-cluster (server/src/hub.rs); the state is read every 3 s while open
+let hubTimer = 0;
+async function loadHub(fill = false) {
+  clearTimeout(hubTimer);
+  if (tab !== "hub") return;
+  try {
+    const r = await fetch("hub", {headers: headers(), cache: "no-store"});
+    if (r.status === 401) throw new Error("401");
+    const d = await r.json();
+    if (fill) {
+      $("hub-url").value = d.url || "";
+      $("hub-name").value = d.name || "";
+      $("hub-key").value = "";
+    }
+    $("hub-key-saved").textContent = d.key ? `saved: ${d.key} (leave empty to keep it)` : "made on the AI-cluster page (New node key)";
+    const words = {off: "off", connecting: "connecting\u2026", connected: "connected", error: "not connected"};
+    $("hub-state").textContent = `${words[d.state] || d.state}${d.detail ? ` \u00b7 ${d.detail}` : ""}${d.state === "connected" ? ` \u00b7 ${d.active} active \u00b7 ${d.served} served` : ""}`;
+    $("hub-disconnect").disabled = !d.enabled;
+  } catch (e) {
+    $("hub-state").textContent = e.message === "401" ? "API key needed: add it under About > Settings." : `Could not read the hub: ${e.message}`;
+  }
+  hubTimer = setTimeout(loadHub, 3000);
+}
+async function saveHub(enabled) {
+  const body = {enabled};
+  if (enabled) Object.assign(body, {url: $("hub-url").value.trim(), key: $("hub-key").value.trim(), name: $("hub-name").value.trim()});
+  try {
+    const r = await fetch("hub", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error?.message || `HTTP ${r.status}`);
+    $("hub-msg").textContent = enabled ? "Saved: connecting" : "Disconnected";
+    loadHub(true);
+  } catch (e) {
+    $("hub-msg").textContent = e.message;
+  }
+}
+$("hub-connect").onclick = () => saveHub(true);
+$("hub-disconnect").onclick = () => saveHub(false);
 
 function setPill(state, text) {
   $("pill").dataset.state = state === "error" ? "queued" : state;
