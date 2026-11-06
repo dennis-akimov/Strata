@@ -114,6 +114,13 @@ if (store.get("draft", "")) { $("input").value = store.get("draft", ""); store.s
 $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
 
 let health = {model: "strata", images: false, max_context: 0};
+// a deploy changes the page's code: an open window kept the old page (no Hub tab, 2026-11-05) until a message was sent.
+// Every 10 s: a newer page on the server and nothing to lose here (no draft, attachment or answer) -> reload.
+setInterval(async () => {
+  if (!webVersion || busy || attachments.length || $("input").value) return;
+  const h = await fetch("health", {cache: "no-store"}).then((r) => r.json()).catch(() => null);
+  if (h && h.web && h.web !== webVersion) location.reload();
+}, 10000);
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
