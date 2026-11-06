@@ -367,6 +367,22 @@ fn run_job(j: wire::Job, port: u16, key: Option<&str>, cancel: &AtomicBool, tx: 
 mod tests {
     use super::*;
 
+    /// Live (cargo test --lib hub::tests::live_node -- --ignored): this test is a node for STRATA_HUB_SECS (60) s, the
+    /// running server on STRATA_PORT (8090, key STRATA_KEY) its local API, the AI-cluster at STRATA_HUB_URL with
+    /// STRATA_HUB_KEY.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_node() {
+        let env = |k: &str| std::env::var(k).unwrap_or_default();
+        let port = env("STRATA_PORT").parse().unwrap_or(8090);
+        let key = Some(env("STRATA_KEY")).filter(|k| !k.is_empty());
+        let secs = env("STRATA_HUB_SECS").parse().unwrap_or(60);
+        let (url, nkey) = (env("STRATA_HUB_URL"), env("STRATA_HUB_KEY"));
+        let run = session(&url, &nkey, "live-test", port, key.as_deref(), 0);
+        let r = tokio::time::timeout(Duration::from_secs(secs), run).await;
+        assert!(r.is_err(), "the session ended early: {r:?}");
+    }
+
     /// The bytes of a Job frame: bible's src/hub.rs asserts the same hex (the two sides of hub.proto).
     #[test]
     fn a_job_frame_has_the_bytes_both_sides_agree_on() {
