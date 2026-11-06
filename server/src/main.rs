@@ -469,6 +469,10 @@ fn main() {
     // (STRATA_PARENT_PID: the main server runs the firewall history, voice, schedules and MCP servers)
     strata_server::clients::set(strata_server::clients::parse(&cfgv, a.port).unwrap_or_else(|e| exit_msg(&format!("[strata] {e}"))));
     let client_engine = strata_server::clients::watch_parent();
+    // a client engine's stdout is its log already (clients::start)
+    if let (false, Some(l)) = (client_engine, get(&cfgv, "log").as_str()) {
+        strata_server::log_to(l);
+    }
     strata_server::firewall::start(get(&cfgv, "firewall"), a.engine == "strata" && !client_engine); // history, connection sampler, the kernel's sandbox log
     let host = a.host.clone().or_else(|| get(&cfgv, "host").as_str().filter(|h| !h.is_empty()).map(String::from)).unwrap_or_else(|| "127.0.0.1".into());
     // before the minutes of loading: is the port free?

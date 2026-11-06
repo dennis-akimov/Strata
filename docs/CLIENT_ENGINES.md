@@ -79,3 +79,8 @@ prompt speed, so now they are used only while the client's request runs.  `"vip"
   most), except once its main server has handed its port over.  Its messages go to its own log
   (`strata-<model>-<name>.log`), so a refused start is still there after a deploy.  2026-11-05: Zed's engine quit at
   a deploy ("port 8190 is already in use") and nothing started it again; Zed got "connection refused" until it was started by hand.
+- Size `max_context` for the client's longest request, not its typical one: a request over it goes to the main
+  engine at normal priority.  2026-11-06, Zed at 6,144: its 35 requests in the Zed engine took 1.5 s (p50), while a
+  7,535-token one waited 20 s for its first token behind four deep-research slots.  Zed now has 65,536 (as the main
+  engine; about 4 GB more) and `cache_mib` 4096 for its agent threads.  The main server's "too big for its context"
+  line is in its log now (say() writes there too).
