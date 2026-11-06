@@ -646,6 +646,12 @@ fn get_(c: &mut Ctx) {
         }
         return;
     }
+    if path == "/hub" {
+        if c.authorized() {
+            c.json(200, crate::hub::status());
+        }
+        return;
+    }
     if path == "/schedules" {
         if c.authorized() {
             c.json(200, crate::schedules::list());
@@ -892,6 +898,7 @@ fn post(c: &mut Ctx) {
         "/mcp/servers" => return mcp_put(c),
         "/mcp/reminders" => return reminders_post(c),
         "/schedules" => return schedules_post(c),
+        "/hub" => return hub_post(c),
         "/voice" => return voice_post(c),
         _ => {}
     }
@@ -1859,6 +1866,18 @@ fn schedules_post(c: &mut Ctx) {
     }
     match crate::schedules::put(&req) {
         Ok(_) => c.json(200, crate::schedules::list()),
+        Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
+    }
+}
+
+/// POST /hub {url, key, name, enabled}: the AI-cluster connection's settings (the Hub tab).
+fn hub_post(c: &mut Ctx) {
+    if !c.own_page("the AI-cluster connection can be changed") {
+        return;
+    }
+    let req: Value = c.body().ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    match crate::hub::put(&req) {
+        Ok(s) => c.json(200, s),
         Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
     }
 }

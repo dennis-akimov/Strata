@@ -7,6 +7,7 @@ pub mod errors;
 pub mod firewall;
 pub mod frontend;
 pub mod http;
+pub mod hub;
 pub mod imagegen;
 pub mod mcp;
 pub mod net;

@@ -26,6 +26,7 @@ libc = "0.2.191"
 minijinja = { version = "3.0.4", features = ["loop_controls", "json", "builtins", "preserve_order", "serde"] }
 minijinja-contrib = { version = "3.0.4", features = ["pycompat", "datetime"] }
 percent-encoding = "2.3.2"
+prost = "0.14"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
@@ -33,6 +34,7 @@ sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = "0.1.19"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1.44"
 ureq = "3.5.0"
 uuid = { version = "1.29.0", features = ["v4"] }

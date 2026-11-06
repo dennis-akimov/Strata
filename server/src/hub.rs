@@ -153,7 +153,7 @@ pub fn put(req: &Value) -> Result<Value, String> {
     let mut c = load();
     if let Some(u) = req["url"].as_str() {
         let u = u.trim();
-        if !u.is_empty() && !(u.starts_with("ws://") || u.starts_with("wss://")) {
+        if !(u.is_empty() || u.starts_with("ws://") || u.starts_with("wss://")) {
             return Err("the address starts with ws:// or wss:// (the AI-cluster page shows it)".into());
         }
         c["url"] = json!(u);
@@ -308,11 +308,11 @@ async fn session(url: &str, nkey: &str, name: &str, port: u16, key: Option<&str>
             }
             _ = refresh.tick() => {
                 let (k2, n2) = (key.map(String::from), name.to_string());
-                if let Ok(h) = tokio::task::spawn_blocking(move || hello(&n2, port, k2.as_deref())).await {
-                    if h != last {
-                        last = h.clone();
-                        if let Err(e) = sink.send(bin(Kind::Hello(h))).await { break Err(e.to_string()) }
-                    }
+                if let Ok(h) = tokio::task::spawn_blocking(move || hello(&n2, port, k2.as_deref())).await
+                    && h != last
+                {
+                    last = h.clone();
+                    if let Err(e) = sink.send(bin(Kind::Hello(h))).await { break Err(e.to_string()) }
                 }
             }
             _ = tick.tick() => {

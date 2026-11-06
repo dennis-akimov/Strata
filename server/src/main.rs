@@ -888,6 +888,7 @@ fn main() {
     if !client_engine {
         strata_server::voice::autostart(a.port, svc.set.api_key.first().map(String::as_str)); // "Hey ...": on again if it was on
         strata_server::schedules::start(a.port, svc.set.api_key.first().cloned()); // scheduled prompts (missed ones run once)
+        strata_server::hub::start(a.port, svc.set.api_key.first().cloned()); // the AI-cluster connection (Hub tab), when it is on
     }
     strata_server::clients::spawn_all(a.port, !handoff_from.is_empty());
     let args = str_args(&cfgv);
