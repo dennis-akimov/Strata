@@ -199,6 +199,10 @@ pub fn start(port: u16, key: Option<String>) {
                         Ok(()) => wait = Duration::from_secs(1),
                         Err(e) => {
                             say(&format!("hub: {e}"));
+                            // a connection that worked (bible redeploys: 1001) is dialled again at once, not after the last wait
+                            if STATE.lock().unwrap().state == "connected" {
+                                wait = Duration::from_millis(500);
+                            }
                             set("error", &e);
                         }
                     }
