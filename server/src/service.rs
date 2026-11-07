@@ -456,6 +456,10 @@ pub fn with_system_prompt(messages: &mut Vec<Value>, prompt: &str, system_role: 
     }
 }
 
+/// The thought a no-switch thinker (LFM2.5) gets when a request turns thinking off, in tokens (measured: 32 lost one
+/// of 10 answers, 64 none)
+pub const NO_SWITCH_THINK_BUDGET: i64 = 64;
+
 /// The settings the Service runs with (the run config's keys, set once at the start).
 #[derive(Default)]
 pub struct Settings {
@@ -1246,8 +1250,23 @@ impl Service {
         })
     }
 
-    pub fn prepare(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &Map<String, Value>, max_new: Option<i64>, force: Option<&str>, req: Option<&mut Map<String, Value>>) -> Result<(Vec<u32>, bool, i64), Fail> {
+    pub fn prepare(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &Map<String, Value>, max_new: Option<i64>, force: Option<&str>, mut req: Option<&mut Map<String, Value>>) -> Result<(Vec<u32>, bool, i64), Fail> {
         let mut messages = messages.to_vec();
+        // thinking off on a template that thinks with no switch for it (LFM2.5): a short thought instead.  Kept from
+        // thinking (an empty thought in the prompt, its tags banned) it scored 2 of 10 on short questions - the
+        // reasoning spilled into the answer, the question came back, a tool call with no tools - in 1,996 tokens;
+        // thinking within 64 tokens scored 10 of 10 in 864 (LFM2.5-8B-A1B, greedy, 2026-11-07).
+        let mut kwargs_own;
+        let kwargs = if kwargs.get("enable_thinking") == Some(&Value::Bool(false)) && self.template.thinks_without_switch() {
+            kwargs_own = kwargs.clone();
+            kwargs_own.remove("enable_thinking");
+            if let Some(r) = req.as_deref_mut() {
+                r.entry("reasoning_budget_tokens").or_insert(json!(NO_SWITCH_THINK_BUDGET));
+            }
+            &kwargs_own
+        } else {
+            kwargs
+        };
         if let Some(p) = &self.set.system_prompt {
             with_system_prompt(&mut messages, p, self.template.caps.supports_system_role);
         }

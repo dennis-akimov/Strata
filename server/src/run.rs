@@ -365,6 +365,12 @@ impl Service {
                 emit(Item::Event(ev))?;
             }
             loop {
+                // a segment after the thinking closed (the model's </think>, or this server's wrap-up written into the
+                // prompt): the schema's grammar from its first token - the trigger is in the prompt and never comes
+                // again, and the JSON ran on unchecked to max_tokens (2026-11-07: LFM2.5, budget 64, 1 email in 4)
+                if thinking && !matches!(parser.state(), "reasoning" | "rcall") {
+                    sampling.remove("strata_json_schema_from");
+                }
                 let mut g = self.engine.generate(prompt.clone(), max_new - n, sampling.clone(), cancel.clone(), emb.as_ref().map(|p| p.to_string_lossy().into_owned()));
                 let mut recover_prompt: Option<Vec<u32>> = None;
                 let mut seg: Vec<u32> = vec![];

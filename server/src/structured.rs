@@ -173,7 +173,10 @@ pub fn extract_json(text: &str) -> String {
     s[start..].to_string()
 }
 
-/// json.loads with duplicate keys refused (object_pairs_hook).
+/// json.loads: a name given twice in an object keeps its last value, as JSON.parse and Python's json do.  RFC 8259 §4:
+/// names SHOULD be unique - valid JSON, only not interoperable; the answer goes out re-written (dumps_compact) with
+/// each name once, so every client reads the same object.  Refused, it was a 502 that a greedy model repeated on every
+/// retry (LFM2.5 wrote "company" twice for one email, 2026-11-07).
 fn strict_parse(text: &str) -> Result<Value, String> {
     struct V;
     impl<'de> serde::de::Visitor<'de> for V {
@@ -212,9 +215,6 @@ fn strict_parse(text: &str) -> Result<Value, String> {
         fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
             let mut out = serde_json::Map::new();
             while let Some(k) = a.next_key::<String>()? {
-                if out.contains_key(&k) {
-                    return Err(serde::de::Error::custom(format!("duplicate JSON key: {k}")));
-                }
                 let v = a.next_value_seed(Seed)?;
                 out.insert(k, v);
             }
@@ -265,7 +265,7 @@ mod tests {
         let v = v.unwrap();
         assert_eq!(validated_json("```json\n{\"a\": 1, \"b\": \"é\"}\n```", &v, "stop").unwrap(), "{\"a\":1,\"b\":\"é\"}");
         assert!(validated_json("{\"b\": 1}", &v, "stop").is_err());
-        assert!(validated_json("{\"a\": 1, \"a\": 2}", &v, "stop").is_err());
+        assert_eq!(validated_json("{\"a\": 1, \"a\": 2}", &v, "stop").unwrap(), "{\"a\":2}");   // the last one, once
         assert!(validated_json("{\"a\": 1}", &v, "length").is_err());
         assert!(prepare_format(&json!({"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "array"}}}), vec![], false).is_err());
     }

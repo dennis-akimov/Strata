@@ -151,7 +151,7 @@ impl ChatTemplate {
     /// The template writes `<think>` but has no `enable_thinking` to turn it off (LFM2.5): "thinking off" was passed in
     /// and ignored, the model thought anyway - ~200 tokens per answer, and response_format answers cut off at max_tokens
     /// came back 502 structured_output_failed.  Such a template gets what Qwen3's writes for enable_thinking=false.
-    fn thinks_without_switch(&self) -> bool {
+    pub fn thinks_without_switch(&self) -> bool {
         // GLM 5.3 writes <think> too, but turns it with reasoning_effort: that is a switch
         self.source.contains("<think>") && !self.source.contains("enable_thinking") && !self.source.contains("reasoning_effort")
     }
