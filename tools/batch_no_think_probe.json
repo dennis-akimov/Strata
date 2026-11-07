@@ -1,0 +1,42 @@
+[
+ [
+  {
+   "role": "system",
+   "content": "You read one email for a job seeker and say what it means for the application named at the top. Go down these rules and use the FIRST that fits:\n1. A job alert, newsletter, survey, event, advert or \"X is hiring\" mail -> \"none\".\n2. They will not move forward, chose other candidates, it is not a match, or the role is filled or closed -> \"rejected\".\n3. It offers the job -> \"offer\".\n4. It asks you to complete an assessment, test, coding challenge or take-home (a few questions to answer by reply are not one) -> \"assessment\".\n5. It asks to schedule or book a call, screen or interview, or is a calendar invitation for one -> \"interview\".\n6. It only confirms the application was received or will be reviewed, or sends a code to verify you -> \"ack\".\n7. A person from the company asks you a question or for something about this application -> \"responded\".\n8. Anything else, including a different role or a sales pitch -> \"none\".\nThe evidence must be a sentence copied from the email that shows the status.\nReply with JSON only: {\"evidence\": \"<copied sentence, max 200 chars>\", \"status\": \"...\"}"
+  },
+  {
+   "role": "user",
+   "content": "Application: Senior Site Reliability Engineer at Northwind Labs, applied 2026-10-01.\n\nFrom: no-reply@careers.example.com\nDate: Oct 6\nSubject: Thank you for applying to Northwind Labs\n\nAlex,\nThank you for your interest in working at Northwind Labs. Your application has been received and will be reviewed by our recruitment team.\nShould you be chosen to proceed with the selection process, we will reach out to you through the contact details provided within your application."
+  }
+ ],
+ [
+  {
+   "role": "system",
+   "content": "You read one email for a job seeker and say what it means for the application named at the top. Go down these rules and use the FIRST that fits:\n1. A job alert, newsletter, survey, event, advert or \"X is hiring\" mail -> \"none\".\n2. They will not move forward, chose other candidates, it is not a match, or the role is filled or closed -> \"rejected\".\n3. It offers the job -> \"offer\".\n4. It asks you to complete an assessment, test, coding challenge or take-home (a few questions to answer by reply are not one) -> \"assessment\".\n5. It asks to schedule or book a call, screen or interview, or is a calendar invitation for one -> \"interview\".\n6. It only confirms the application was received or will be reviewed, or sends a code to verify you -> \"ack\".\n7. A person from the company asks you a question or for something about this application -> \"responded\".\n8. Anything else, including a different role or a sales pitch -> \"none\".\nThe evidence must be a sentence copied from the email that shows the status.\nReply with JSON only: {\"evidence\": \"<copied sentence, max 200 chars>\", \"status\": \"...\"}"
+  },
+  {
+   "role": "user",
+   "content": "Application: Senior Platform Engineer at Contoso, applied 2026-10-01.\n\nFrom: Contoso Talent <no-reply@jobs.example.org>\nDate: Oct 6\nSubject: Thank You From Contoso\n\nHi Alex,\nThank you for your interest in Contoso and for taking the time to apply. We don't think our Senior Platform Engineer role is the best match for you right now. We'll keep your information on file and encourage you to apply again in the future.\nBest,\nThe Contoso Talent Team"
+  }
+ ],
+ [
+  {
+   "role": "system",
+   "content": "You read one email for a job seeker and say what it means for the application named at the top. Go down these rules and use the FIRST that fits:\n1. A job alert, newsletter, survey, event, advert or \"X is hiring\" mail -> \"none\".\n2. They will not move forward, chose other candidates, it is not a match, or the role is filled or closed -> \"rejected\".\n3. It offers the job -> \"offer\".\n4. It asks you to complete an assessment, test, coding challenge or take-home (a few questions to answer by reply are not one) -> \"assessment\".\n5. It asks to schedule or book a call, screen or interview, or is a calendar invitation for one -> \"interview\".\n6. It only confirms the application was received or will be reviewed, or sends a code to verify you -> \"ack\".\n7. A person from the company asks you a question or for something about this application -> \"responded\".\n8. Anything else, including a different role or a sales pitch -> \"none\".\nThe evidence must be a sentence copied from the email that shows the status.\nReply with JSON only: {\"evidence\": \"<copied sentence, max 200 chars>\", \"status\": \"...\"}"
+  },
+  {
+   "role": "user",
+   "content": "Application: Staff DevOps Engineer at Acme, applied 2026-10-01.\n\nFrom: Acme Careers <careers@acme.example>\nDate: Oct 6\nSubject: Your application for Staff DevOps Engineer\n\nHello Alex,\nThank you for applying. We received a large number of applications and after careful consideration we have decided to pursue other candidates whose qualifications more closely align with the requirements of the role. We wish you the best in your search."
+  }
+ ],
+ [
+  {
+   "role": "system",
+   "content": "You read one email for a job seeker and say what it means for the application named at the top. Go down these rules and use the FIRST that fits:\n1. A job alert, newsletter, survey, event, advert or \"X is hiring\" mail -> \"none\".\n2. They will not move forward, chose other candidates, it is not a match, or the role is filled or closed -> \"rejected\".\n3. It offers the job -> \"offer\".\n4. It asks you to complete an assessment, test, coding challenge or take-home (a few questions to answer by reply are not one) -> \"assessment\".\n5. It asks to schedule or book a call, screen or interview, or is a calendar invitation for one -> \"interview\".\n6. It only confirms the application was received or will be reviewed, or sends a code to verify you -> \"ack\".\n7. A person from the company asks you a question or for something about this application -> \"responded\".\n8. Anything else, including a different role or a sales pitch -> \"none\".\nThe evidence must be a sentence copied from the email that shows the status.\nReply with JSON only: {\"evidence\": \"<copied sentence, max 200 chars>\", \"status\": \"...\"}"
+  },
+  {
+   "role": "user",
+   "content": "Application: Cloud Engineer at Fabrikam, applied 2026-10-01.\n\nFrom: Fabrikam <jobs@fabrikam.example>\nDate: Oct 6\nSubject: Update on your application\n\nHi Alex, thanks for your patience. The Cloud Engineer position has now been filled. We appreciate your interest and will keep your resume in our database for future openings."
+  }
+ ]
+]
