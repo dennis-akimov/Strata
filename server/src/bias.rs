@@ -71,10 +71,11 @@ pub fn engine_key(value: Option<&Value>) -> String {
 pub fn validate_request(req: &Map<String, Value>, engine_logit_bias: Option<i64>, batch: usize, vocab_size: Option<usize>) -> Result<BTreeMap<u64, f64>, Fail> {
     let n = normalize(req.get("logit_bias"), vocab_size)?;
     if !n.is_empty() {
-        if engine_logit_bias != Some(1) {
+        // INFO logit_bias=1: the engine's solo path; 2: its batch slots too (each slot has its own sampler: Metal)
+        if engine_logit_bias.unwrap_or(0) < 1 {
             return bad("this engine does not support token biases; use a supporting CUDA/HIP build");
         }
-        if batch > 0 {
+        if batch > 0 && engine_logit_bias != Some(2) {
             return bad("continuous batching is not supported; run without --batch");
         }
     }
@@ -93,5 +94,15 @@ mod tests {
         assert!(normalize(Some(&json!({"x": 1})), None).is_err());
         assert!(normalize(Some(&json!([[1, 1], [1, 2]])), None).is_err());
         assert!(normalize(Some(&json!({"1": true})), None).is_err());
+    }
+
+    #[test]
+    fn batch_slots_take_biases_only_from_an_engine_that_has_them_per_slot() {
+        let req = json!({"logit_bias": {"7": -100}});
+        let r = req.as_object().unwrap();
+        assert!(validate_request(r, Some(2), 4, None).is_ok());     // Metal: each slot its own sampler
+        assert!(validate_request(r, Some(1), 4, None).is_err());
+        assert!(validate_request(r, Some(1), 0, None).is_ok());
+        assert!(validate_request(r, None, 0, None).is_err());
     }
 }

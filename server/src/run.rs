@@ -4,7 +4,7 @@
 //! here: `emit` hands each item out, and its Err(Closed) is the consumer leaving (GeneratorExit).
 
 use crate::errors::Fail;
-use crate::parser::{Event, GlmParser, HarmonyParser, Kind, OutputParser, Parse, THINK_END};
+use crate::parser::{Event, GlmParser, HarmonyParser, Kind, OutputParser, Parse, THINK_END, THINK_START};
 use crate::py::{self, truthy};
 use crate::say;
 use crate::service::*;
@@ -160,6 +160,24 @@ impl Service {
                         sampling.insert("strata_json_schema_from".into(), json!(t));
                     }
                 }
+            }
+        }
+        // thinking off on a template that thinks: <think> and </think> are never sampled.  LFM2.5 has no switch for it
+        // (Liquid: it "opens the <think> channel for non-trivial problems"); asked not to think, it opened one anyway
+        // and wrote it into the answer, or closed the empty thought the template had put there with a stray </think>
+        // (2026-11-07, the M1: 6 of 12 short answers).  On an engine with token biases in its slots (INFO logit_bias=2;
+        // =1 without --batch); a client's own bias for those tokens stands.
+        if !thinking && self.template.caps.thinks {
+            let ok = self.engine.strata().map(|e| e.info.lock().unwrap().get("logit_bias").and_then(Value::as_i64)).flatten()
+                .is_some_and(|b| b == 2 || (b == 1 && self.engine.batch() == 0));
+            if ok {
+                let mut bias = crate::bias::normalize(sampling.get("logit_bias"), None).unwrap_or_default();
+                for tag in [THINK_START, THINK_END] {
+                    if let [t] = self.tok.encode(tag, true)[..] {
+                        bias.entry(t as u64).or_insert(-100.0);
+                    }
+                }
+                sampling.insert("logit_bias".into(), Value::Object(bias.iter().map(|(k, v)| (k.to_string(), json!(v))).collect()));
             }
         }
         let samp_v = Value::Object(sampling.clone());

@@ -515,6 +515,36 @@ class TestStrataMetal(unittest.TestCase):
         finally:
             b.close()
 
+    def test_a_banned_token_is_never_sampled(self):
+        # logit_bias=<id>:-100 (how the server keeps a model whose template has no thinking switch out of <think> when
+        # thinking is off): the token the prompt would start with is never the answer's, solo and in a batch slot
+        p = self.m1 + self.m3
+        first = self.e.gen(p, max_new=1)[0][0]
+        self.e.send(f"GEN 4 logit_bias={first}:-100 " + ",".join(map(str, p)))
+        toks = []
+        while True:
+            line = self.e.line()
+            if line.startswith("T "):
+                toks.append(int(line[2:]))
+            elif line.startswith("DONE ") or line.startswith("ERR"):
+                break
+        self.assertTrue(toks and first not in toks, (first, toks))
+        b = Engine("--batch", "2")
+        try:
+            self.assertEqual(b.info["logit_bias"], "2")
+            b.send(f"BGEN 0 4 logit_bias={first}:-100 " + ",".join(map(str, p)))
+            tok = None
+            while True:
+                line = b.line()
+                if line.startswith("T "):
+                    tok = int(line[2:])
+                elif line.startswith("BADM") or line.startswith("ERR"):
+                    break
+            self.assertIsNotNone(tok)
+            self.assertNotEqual(tok, first)
+        finally:
+            b.close()
+
     def test_four_slots_with_the_cache_each_say_what_they_say_alone(self):
         # the M1 (LFM2.5, --batch 4, a conversation cache, 2026-11-07): four requests at once came back mixed - "VC VOLANOC",
         # another request's words, JSON a grammar could not have allowed - while two at once and the M5 were right.  Four

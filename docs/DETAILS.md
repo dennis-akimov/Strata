@@ -842,6 +842,13 @@ print(r.choices[0].message.content)
 - **Model aliases** (0.1.32). `"aliases": ["qwen", "local-model"]` in `strata-<model>.json` lists the model under
   those names too in `/v1/models` (each with its own `id`, and in the model's `aliases`), like llama-server's
   `--alias`; a request naming one is answered under that name. Any other name is still served, as before.
+- **Thinking off means no thought.** With thinking off (`reasoning_effort: "none"`, `enable_thinking: false`) on a
+  template that thinks, the server bans the model's `<think>` and `</think>` tokens while it samples (a token bias;
+  a client's own bias for them stands).  LFM2.5 has no switch for thinking: told not to think it opened a thought
+  anyway, or closed the empty one the template put there with a stray `</think>` (6 of 12 short answers on the M1,
+  2026-11-07).  The Metal engine takes `logit_bias` in its batch slots too (INFO `logit_bias=2`).
+- **Which build runs.** `/health` has `"build"`: the git commit the server was built from, `-dirty` when tracked
+  files differed from it; the server's first log line says it too.
 - **The model's own rules.** Each model gets the profile for its name in `prompts/`: the `.md` whose name the
   config's `model_name` starts with, the longest one (`lfm2.5-8b-a1b-q4` -> `prompts/lfm2.5-8b.md`, `qwen3.6-35b-a3b`
   -> `prompts/qwen3.6.md`).  `"system_prompt": "path.md"` in `strata-<model>.json` names another file (from the

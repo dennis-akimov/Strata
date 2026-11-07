@@ -485,6 +485,7 @@ fn main() {
     // (STRATA_PARENT_PID: the main server runs the firewall history, voice, schedules and MCP servers)
     strata_server::clients::set(strata_server::clients::parse(&cfgv, a.port).unwrap_or_else(|e| exit_msg(&format!("[strata] {e}"))));
     let client_engine = strata_server::clients::watch_parent();
+    say(&format!("server build {} (git commit; -dirty: built with uncommitted changes)", env!("STRATA_BUILD")));
     // a client engine's stdout is its log already (clients::start)
     if let (false, Some(l)) = (client_engine, get(&cfgv, "log").as_str()) {
         strata_server::log_to(l);

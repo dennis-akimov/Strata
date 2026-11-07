@@ -710,7 +710,7 @@ fn get_(c: &mut Ctx) {
         return c.static_(&body, "text/html; charset=utf-8", "no-cache");
     }
     match path.as_str() {
-        "/health" | "/api/health" => c.json(200, json!({"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model, "images": svc.vision.is_some(), "api_key": !svc.set.api_key.is_empty(), "image_generation": svc.image.is_some(), "video_generation": svc.video.is_some(), "web": web_version(), "loaded": svc.loaded(), "service": "strata"})),
+        "/health" | "/api/health" => c.json(200, json!({"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model, "images": svc.vision.is_some(), "api_key": !svc.set.api_key.is_empty(), "image_generation": svc.image.is_some(), "video_generation": svc.video.is_some(), "web": web_version(), "loaded": svc.loaded(), "service": "strata", "build": env!("STRATA_BUILD")})),
         "/status" => {
             if !c.authorized() {
                 return;

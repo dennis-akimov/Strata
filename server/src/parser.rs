@@ -6,6 +6,7 @@ use crate::py::{self, find, find0, lstrip, strip};
 use crate::pyjson;
 use serde_json::{Map, Value};
 
+pub const THINK_START: &str = "<think>";
 pub const THINK_END: &str = "</think>";
 pub const CALL_START: &str = "<tool_call>";
 pub const CALL_END: &str = "</tool_call>";

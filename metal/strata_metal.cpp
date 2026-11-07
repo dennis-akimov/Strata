@@ -805,6 +805,20 @@ struct Engine {
             else if (k == "penalty_last_n") s.penalty_last_n = std::atoi(v);
             else if (k == "seed") s.seed = (uint32_t) std::strtoull(v, nullptr, 10);
             else if (k == "grammar_trigger") trigger = std::strtoll(v, nullptr, 10);
+            else if (k == "logit_bias") {                    // <id>:<bias>,... (the server's bias::engine_key); -100: never
+                const llama_token n_vocab = llama_vocab_n_tokens(vocab);
+                for (const char* q = v; *q;) {
+                    char* e = nullptr;
+                    const long id = std::strtol(q, &e, 10);
+                    if (e == q || *e != ':' || id < 0 || id >= n_vocab) {
+                        if (err) *err = "logit_bias: expected <token id>:<bias>,... within the vocabulary";
+                        return nullptr;
+                    }
+                    const float b = std::strtof(e + 1, &e);
+                    s.logit_bias.push_back({(llama_token) id, b <= -100.0f ? -INFINITY : b});
+                    q = *e == ',' ? e + 1 : e;
+                }
+            }
             else if (k == "grammar" || k == "json_schema") {   // hex: the line is split at spaces
                 const std::string h(v);
                 if (h.size() % 2 || h.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
@@ -1404,7 +1418,7 @@ int main(int argc, char** argv) {
     const char* backend = "vulkan";
 #endif
     out("INFO engine=" STRATA_VERSION "-metal backend=%s llama=" STRATA_LLAMA_COMMIT " context=%lld kv=%s "
-        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu grammar=1 json_schema=1 "
+        "batch_slots=%d checkpoints=%d im_start=%d n_embd=%d mtp=%d spec=%d gpu_used=%zu gpu_total=%zu grammar=1 json_schema=1 logit_bias=2 "
         "conversation_cache_mib=%lld conversation_cache_slots=%d\n", backend,
         (long long) e.o.max_context, e.o.kv.c_str(), e.o.batch, e.o.checkpoints, e.im_start, e.n_embd, e.spec ? 1 : 0,
         e.spec ? e.o.spec : 0, gpu_used, gpu_total, (long long) e.o.cache_mib, e.o.cache_mib > 0 ? e.o.cache_slots : 0);
