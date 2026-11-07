@@ -41,6 +41,9 @@ pub struct Caps {
     pub thinks: bool,
 }
 
+/// An answer that starts with an empty thought: Qwen3's template ends the prompt with it for enable_thinking=false.
+pub const EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
+
 pub struct ChatTemplate {
     env: Environment<'static>,
     pub source: String,
@@ -126,7 +129,10 @@ impl ChatTemplate {
             ctx.insert(k.clone(), v.clone());
         }
         let tmpl = self.env.get_template("chat").map_err(|e| TemplateError::Broken(e.to_string()))?;
-        tmpl.render(MjValue::from(minijinja::value::Serde(Value::Object(ctx)))).map_err(|e| {
+        let off = add_generation_prompt && kwargs.get("enable_thinking") == Some(&Value::Bool(false));
+        tmpl.render(MjValue::from(minijinja::value::Serde(Value::Object(ctx))))
+            .map(|p| if off && self.thinks_without_switch() { p + EMPTY_THINK } else { p })
+            .map_err(|e| {
             let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(&e);
             while let Some(err) = cur {
                 if let Some(mj) = err.downcast_ref::<Error>() {
@@ -140,6 +146,14 @@ impl ChatTemplate {
             }
             TemplateError::Broken(e.to_string())
         })
+    }
+
+    /// The template writes `<think>` but has no `enable_thinking` to turn it off (LFM2.5): "thinking off" was passed in
+    /// and ignored, the model thought anyway - ~200 tokens per answer, and response_format answers cut off at max_tokens
+    /// came back 502 structured_output_failed.  Such a template gets what Qwen3's writes for enable_thinking=false.
+    fn thinks_without_switch(&self) -> bool {
+        // GLM 5.3 writes <think> too, but turns it with reasoning_effort: that is a switch
+        self.source.contains("<think>") && !self.source.contains("enable_thinking") && !self.source.contains("reasoning_effort")
     }
 
     fn probe(&self, messages: &[Value], tools: Option<&[Value]>) -> String {
@@ -293,5 +307,44 @@ For each function call, return a json object within <tool_call></tool_call> XML 
         let t = ChatTemplate::from_source("{%- if tools is iterable and tools | length > 0 %}T{% endif %}{{ messages[0].content }}{{ 'ab' is iterable }}{{ 3 is iterable }}".into()).unwrap();
         assert_eq!(t.render(&[json!({"role": "user", "content": "hi"})], None, false, &Map::new()).unwrap(), "hiTrueFalse");
         assert_eq!(t.render(&[json!({"role": "user", "content": "hi"})], Some(&[json!({"name": "f"})]), false, &Map::new()).unwrap(), "ThiTrueFalse");
+    }
+}
+
+#[cfg(test)]
+mod empty_think_tests {
+    use super::*;
+
+    fn render(src: &str, kwargs: Value) -> String {
+        let t = ChatTemplate::from_source(src.to_string()).unwrap();
+        let msgs = [json!({"role": "user", "content": "hi"})];
+        t.render(&msgs, None, true, kwargs.as_object().unwrap()).unwrap()
+    }
+
+    // LFM2.5's shape: writes past thoughts as <think>..</think>, knows no enable_thinking
+    const NO_SWITCH: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{% if m.thinking %}<think>{{ m.thinking }}</think>{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+    // Qwen3's shape: the template turns thinking off itself
+    const SWITCH: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}";
+
+    #[test]
+    fn thinking_off_reaches_a_template_with_no_switch_for_it() {
+        let off = render(NO_SWITCH, json!({"enable_thinking": false}));
+        assert!(off.ends_with(&format!("<|im_start|>assistant\n{EMPTY_THINK}")), "{off:?}");
+        // not asked, or asked on: the model decides, as before
+        assert!(render(NO_SWITCH, json!({})).ends_with("<|im_start|>assistant\n"));
+        assert!(render(NO_SWITCH, json!({"enable_thinking": true})).ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn the_real_lfm25_template_gets_the_empty_thought() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/lfm2.5-chat_template.jinja")).unwrap();
+        let off = render(&src, json!({"enable_thinking": false}));
+        assert!(off.ends_with(&format!("<|im_start|>assistant\n{EMPTY_THINK}")), "{off:?}");
+        assert!(render(&src, json!({})).ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn a_template_with_its_own_switch_is_left_to_it() {
+        let off = render(SWITCH, json!({"enable_thinking": false}));
+        assert_eq!(off.matches("</think>").count(), 1, "{off:?}");
     }
 }
