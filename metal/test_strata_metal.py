@@ -515,6 +515,34 @@ class TestStrataMetal(unittest.TestCase):
         finally:
             b.close()
 
+    def test_four_slots_with_the_cache_each_say_what_they_say_alone(self):
+        # the M1 (LFM2.5, --batch 4, a conversation cache, 2026-11-07): four requests at once came back mixed - "VC VOLANOC",
+        # another request's words, JSON a grammar could not have allowed - while two at once and the M5 were right.  Four
+        # prompts with one shared start (an app's system prompt: the cache's parked start is restored into each slot),
+        # each admitted while the others decode, twice (the second time from the cache), each answer as it is alone.
+        s = self.e.im_start
+        shared = self.m1
+        prompts = [shared + message(s, list(range(1000 + 50 * i, 1030 + 50 * i))) for i in range(4)]
+        solo = Engine()
+        try:
+            alone = [solo.gen(p, max_new=16)[0] for p in prompts]
+        finally:
+            solo.close()
+        b = Engine("--batch", "4", "--conversation-cache-mib", "256")
+        try:
+            for order in ([0, 1, 2, 3], [3, 1, 0, 2]):
+                first = {}
+                for slot, i in enumerate(order):
+                    tok, _, cont = b.admit(slot, prompts[i], 16)
+                    self.assertTrue(cont)
+                    first[slot] = tok
+                b.admitted = 4
+                got = b.slots()
+                for slot, i in enumerate(order):
+                    self.assertEqual(first[slot] + got[slot][0], alone[i], f"slot {slot}, prompt {i}, order {order}")
+        finally:
+            b.close()
+
     def test_a_prompt_read_lets_decoding_slots_go_on(self):
         # a slot decoding while another slot's long prompt is read gets tokens during the read (a window between
         # --prefill-share pieces), not only after it
