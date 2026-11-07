@@ -94,7 +94,7 @@ fn exit_msg(msg: &str) -> ! {
 fn system_prompt(cfg: &Value, config: Option<&str>) -> Result<Option<String>, String> {
     let path = match get(cfg, "system_prompt") {
         Value::Bool(false) => return Ok(None),
-        Value::Null => match get(cfg, "model_name").as_str().and_then(|m| profile_for(m, &root().join("prompts"))) {
+        Value::Null => match profile_for(&get(cfg, "model_name").as_str().map(String::from).unwrap_or_else(|| model_name_from_args(&str_args(cfg))), &root().join("prompts")) {
             Some(p) => p,
             None => return Ok(None),
         },
