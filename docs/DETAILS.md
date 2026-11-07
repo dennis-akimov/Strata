@@ -842,11 +842,15 @@ print(r.choices[0].message.content)
 - **Model aliases** (0.1.32). `"aliases": ["qwen", "local-model"]` in `strata-<model>.json` lists the model under
   those names too in `/v1/models` (each with its own `id`, and in the model's `aliases`), like llama-server's
   `--alias`; a request naming one is answered under that name. Any other name is still served, as before.
-- **Thinking off means no thought.** With thinking off (`reasoning_effort: "none"`, `enable_thinking: false`) on a
-  template that thinks, the server bans the model's `<think>` and `</think>` tokens while it samples (a token bias;
-  a client's own bias for them stands).  LFM2.5 has no switch for thinking: told not to think it opened a thought
-  anyway, or closed the empty one the template put there with a stray `</think>` (6 of 12 short answers on the M1,
-  2026-11-07).  The Metal engine takes `logit_bias` in its batch slots too (INFO `logit_bias=2`).
+- **Thinking off.** On a template with a switch for it (Qwen3) the template turns thinking off.  On one that thinks
+  with no switch (LFM2.5) it becomes a short thought: 64 tokens (`reasoning_budget_tokens`; a request's own stands),
+  parsed out as reasoning.  Kept from thinking, LFM2.5-8B-A1B answered 2 of 10 short questions right (the reasoning
+  spilled into the answer, the question came back, a tool call with no tools); with a 64-token thought 10 of 10, in
+  fewer tokens.  When thinking is off on any thinking template, `<think>` and `</think>` are banned while it samples
+  (a token bias; the Metal engine takes `logit_bias` in its batch slots too, INFO `logit_bias=2`).  A JSON answer's
+  grammar starts at the first token after the thought, also when this server closed the thought at its budget.  A
+  JSON object that names a key twice keeps the last value and goes out with each name once (RFC 8259 §4: SHOULD be
+  unique).
 - **Which build runs.** `/health` has `"build"`: the git commit the server was built from, `-dirty` when tracked
   files differed from it; the server's first log line says it too.
 - **The model's own rules.** Each model gets the profile for its name in `prompts/`: the `.md` whose name the
