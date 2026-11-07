@@ -451,6 +451,14 @@ impl ConvCacheLog {
 /// out of memory (the engine log says kIOGPUCommandBufferCallbackErrorOutOfMemory) - not the request's fault (503),
 /// said with what to change (Strata.app finds this line in the server's output and offers a context that fits).
 /// The engine's refusal of a BGEN into a slot it still runs (strata_metal.cpp, the CUDA and SYCL engines alike).
+/// A request under a grammar (a response_format's schema, LFM's tool calls) stays where it starts: a move between the
+/// solo path and a slot sends its prompt and its answer so far again, and the engine's new sampler starts the grammar
+/// over in the middle of the answer.  2026-11-07, the M1: JSON a schema could not allow ("expected `:` at line 1
+/// column 12" under an enum of one value), 502 structured_output_failed, whenever a request came or went beside it.
+fn stays_in_one_place(keys: &str) -> bool {
+    keys.contains(" grammar=") || keys.contains(" json_schema=")
+}
+
 fn slot_still_running(f: &Fail) -> bool {
     matches!(f, Fail::Value(why) if why.starts_with("BGEN: no such free slot"))
 }
@@ -1474,6 +1482,7 @@ impl StrataEngine {
     fn generate_batched(self: &Arc<Self>, y: &Yielder<Option<u32>, Fail>, ids: Vec<u32>, max_new: i64, sampling: Map<String, Value>, cancel: Arc<Event>, embeddings: Option<String>, stats: Stats) -> Result<(), Stop<Fail>> {
         *self.live.lock().unwrap() = Live::default();
         let keys = sampling_keys(&sampling);
+        let fixed = stays_in_one_place(&keys);
         let mut out: Vec<u32> = vec![];
         let mut prompt: Vec<u32> = ids.clone();
         let mut left = max_new;
@@ -1508,7 +1517,7 @@ impl StrataEngine {
                     !s.busy.iter().any(|b| *b) && s.waiting == 0
                 };
                 let mut cont;
-                if alone && left > 1 {
+                if alone && left > 1 && !fixed {
                     let head = match &embeddings {
                         Some(e) => format!("GENI {left}{keys} {e}"),
                         None => format!("GEN {left}{keys}"),
@@ -1734,7 +1743,7 @@ impl StrataEngine {
                             continue;
                         }
                         y.yield_(Some(t))?;
-                        if !going_solo && !stop_sent && self.may_go_solo(max_new - out.len() as i64, solo_again, emb) {
+                        if !fixed && !going_solo && !stop_sent && self.may_go_solo(max_new - out.len() as i64, solo_again, emb) {
                             self.send(&format!("BSTOP {b}")).map_err(Stop::Err)?;
                             going_solo = true;
                         }
@@ -2457,6 +2466,14 @@ mod grammar_key_tests {
         assert_eq!(keys(json!({"strata_json_schema_hex": "{}"})), "", "only hex goes on the line");
         assert_eq!(keys(json!({"json_schema": "7b7d"})), "", "a client's json_schema field is not Strata's");
     }
+    #[test]
+    fn a_request_under_a_grammar_is_never_moved() {
+        let keys = |v: Value| sampling_keys(v.as_object().unwrap());
+        assert!(stays_in_one_place(&keys(json!({"strata_json_schema_hex": "7b7d"}))));
+        assert!(stays_in_one_place(&keys(json!({"strata_tool_grammar": "726f6f74", "strata_tool_grammar_from": 7}))));
+        assert!(!stays_in_one_place(&keys(json!({"temperature": 0.2}))));
+    }
+
 }
 
 #[cfg(test)]

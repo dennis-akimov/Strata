@@ -95,13 +95,14 @@ fn child_config(cfg: &Value, name: &str, max_context: i64, parallel: i64, cache_
     }
     kept.extend(["--max-context".into(), max_context.to_string(), "--conversation-cache-mib".into(), cache_mib.to_string()]);
     c.insert("args".into(), json!(kept));
-    for k in ["clients", "vision", "mcp", "port", "parallel", "open_browser", "system_prompt"] {
+    for k in ["clients", "vision", "mcp", "port", "parallel", "open_browser"] {
         c.remove(k);
     }
     if parallel > 1 {
         c.insert("parallel".into(), json!(parallel));
     }
     c.insert("open_browser".into(), json!(false));
+    c.insert("system_prompt".into(), json!(false));   // not the model's profile either
     if let Some(log) = c.get("log").and_then(Value::as_str).map(String::from) {
         let log = match log.strip_suffix(".log") { Some(b) => format!("{b}-{name}.log"), None => format!("{log}-{name}") };
         c.insert("log".into(), json!(log));
@@ -325,10 +326,11 @@ mod tests {
         let (c, port) = r[0].spawn.clone().unwrap();
         assert_eq!(port, 8190);
         assert_eq!(c["args"], json!(["--gguf", "m.gguf", "--kv", "f16", "--max-context", "6144", "--conversation-cache-mib", "0"]));
-        for k in ["clients", "vision", "mcp", "parallel", "system_prompt"] {
+        for k in ["clients", "vision", "mcp", "parallel"] {
             assert!(c.get(k).is_none(), "{k} left in");
         }
         assert_eq!((c["log"].as_str(), c["model_name"].as_str(), c["open_browser"].as_bool()), (Some("/x/strata-q-zed.log"), Some("q"), Some(false)));
+        assert_eq!(c["system_prompt"], json!(false));
         // "url": a server already running, nothing started
         assert_eq!((r[1].name.as_str(), r[1].url.as_str(), r[1].spawn.is_none()), ("client2", "http://10.0.0.2:9000", true));
     }

@@ -88,18 +88,34 @@ fn exit_msg(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-/// The config's "system_prompt": a text file (a relative path: from the config's folder), e.g. "prompts/lfm2.5-8b.md"
+/// The model's own rules: the config's "system_prompt" (a text file; a relative path: from the config's folder), else the
+/// profile for the model's name in prompts/ (the longest file name it starts with: "lfm2.5-8b-a1b-q4" ->
+/// prompts/lfm2.5-8b.md); `false`: none (a client engine: its app sends its own)
 fn system_prompt(cfg: &Value, config: Option<&str>) -> Result<Option<String>, String> {
-    let p = match get(cfg, "system_prompt") {
-        Value::Null => return Ok(None),
-        Value::String(p) if !p.trim().is_empty() => p,
-        v => return Err(format!("[strata] config \"system_prompt\" must be a file's path, not {}", py::py_repr(v))),
+    let path = match get(cfg, "system_prompt") {
+        Value::Bool(false) => return Ok(None),
+        Value::Null => match get(cfg, "model_name").as_str().and_then(|m| profile_for(m, &root().join("prompts"))) {
+            Some(p) => p,
+            None => return Ok(None),
+        },
+        Value::String(p) if !p.trim().is_empty() => config.and_then(|c| Path::new(c).parent()).unwrap_or(Path::new(".")).join(p),
+        v => return Err(format!("[strata] config \"system_prompt\" must be a file's path or false, not {}", py::py_repr(v))),
     };
-    let dir = config.and_then(|c| Path::new(c).parent()).unwrap_or(Path::new("."));
-    let text = std::fs::read_to_string(dir.join(p)).map_err(|e| format!("[strata] config \"system_prompt\" {p}: {e}"))?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("[strata] config \"system_prompt\" {}: {e}", path.display()))?;
     let text = text.trim();
-    say(&format!("system prompt: {p} ({} characters) ahead of each request's system text", text.len()));
+    say(&format!("system prompt: {} ({} characters) ahead of each request's system text", path.display(), text.len()));
     Ok((!text.is_empty()).then(|| text.to_string()))
+}
+
+/// The .md in `dir` whose name the model's name starts with, the longest such name
+fn profile_for(model: &str, dir: &Path) -> Option<PathBuf> {
+    let model = model.to_lowercase();
+    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .filter_map(|p| Some((p.file_stem()?.to_str()?.to_lowercase(), p.clone())))
+        .filter(|(stem, _)| !stem.is_empty() && model.starts_with(stem.as_str()))
+        .max_by_key(|(stem, _)| stem.len())
+        .map(|(_, p)| p)
 }
 
 /// #1641: "--reasoning-effort high" in a config's args is the config's "reasoning_effort".
@@ -956,6 +972,26 @@ fn main() {
         v.shutdown();
     }
     say("stopped");
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::profile_for;
+
+    #[test]
+    fn a_model_gets_the_profile_its_name_starts_with() {
+        let d = std::env::temp_dir().join(format!("strata-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for f in ["lfm2.5.md", "lfm2.5-8b.md", "qwen3.6.md", "notes.txt"] {
+            std::fs::write(d.join(f), "x").unwrap();
+        }
+        let name = |m: &str| profile_for(m, &d).map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+        assert_eq!(name("lfm2.5-8b-a1b-q4").as_deref(), Some("lfm2.5-8b.md"));   // the longest match
+        assert_eq!(name("LFM2.5-24B-A2B").as_deref(), Some("lfm2.5.md"));
+        assert_eq!(name("qwen3.6-35b-a3b").as_deref(), Some("qwen3.6.md"));
+        assert_eq!(name("gpt-oss-120b"), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]
