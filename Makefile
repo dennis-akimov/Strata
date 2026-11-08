@@ -62,7 +62,7 @@ AB_GGUF     ?=
 AB_PROMPTS  ?=
 AB_ROUNDS   ?= 7
 
-.PHONY: help setup pull check update run start stop status wait chat models build build-ab server afm app app-run app-stop tui tui-build test test-server test-engine ab clean
+.PHONY: help setup pull check update run start stop status wait chat models build build-ab server afm app app-run app-stop tui tui-build test test-server test-engine ab clean linux-package linux-deliver linux
 
 help:
 	@echo "Strata - make targets (variables: PORT=$(PORT) HOST=$(HOST) API_KEY=... MODEL=... SETUP_ARGS=...;"
@@ -92,6 +92,10 @@ help:
 	@echo "  make app-run       build it, stop a running Strata.app (and its server) and open the new one"
 	@echo "  make app-stop      quit Strata.app: its server sends QUIT to the engine and frees its memory first"
 	@echo "  make tui           Strata.app in a terminal (Linux on Apple Silicon, or over SSH): chat, monitor, memory, log"
+	@echo "  make linux-package the engine (CPU), server and app for an x86_64 Linux PC, built here in Docker for its CPU"
+	@echo "                     [LINUX_HOST=dadmin@vizio.local LINUX_DIR=/home/dadmin/Strata LINUX_CPU=ivybridge]"
+	@echo "  make linux-deliver that package into LINUX_DIR/engine-metal on LINUX_HOST, and Strata in its applications"
+	@echo "  make linux         push this commit there, package, deliver, and open (or switch) Strata on its desktop"
 	@echo "  make chat          one chat request: make chat PROMPT=\"Write a haiku\" [MAX_TOKENS=100 EFFORT=none|low|medium|high]"
 	@echo "                     REASONING_BUDGET=N: at most N tokens of thinking, then it answers (0: no cap; it counts"
 	@echo "                     toward MAX_TOKENS, so keep it 64+ below; EFFORT=none turns thinking off)"
@@ -213,14 +217,50 @@ else ifeq ($(APPLE_LINUX),1)
 	mkdir -p engine-metal && rm -f engine-metal/strata-metal engine-metal/strata-vision
 	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
 else ifeq ($(shell uname -s),Linux)
-	@# another Linux PC: the same engine on the CPU (llama.cpp's CPU backend, built for this CPU)
-	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON -DSTRATA_METAL_CPU=ON
+	@# another Linux PC: the same engine on the CPU (llama.cpp's CPU backend, built for this CPU; LINUX_CPU_ARGS for
+	@# another one: make linux-package builds for the target PC's instruction set, not the build machine's)
+	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON -DSTRATA_METAL_CPU=ON $(LINUX_CPU_ARGS)
 	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
 	mkdir -p engine-metal && rm -f engine-metal/strata-metal engine-metal/strata-vision
 	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
 else
 	@echo "on Windows setup builds or downloads the engine: make setup (or python3 bootstrap.py --setup --build)"
 endif
+
+# Strata for an x86_64 Linux PC, built here in Docker (linux/Dockerfile; on a Mac under Rosetta) at the path it runs
+# from there (the app and the server keep their folder's path from the build), for that PC's CPU, not this one's.
+# LINUX_DIR there is a git checkout of the same commit (make linux pushes it): the package is the binaries.
+LINUX_HOST ?= dadmin@vizio.local
+LINUX_DIR  ?= /home/dadmin/Strata
+LINUX_CPU  ?= ivybridge
+LINUX_WORK ?= $(abspath ../Strata-linux-build)
+# ivybridge (a 2012 i7): AVX and F16C, no AVX2 / FMA; anything else: the x86-64-v3 set (AVX2, FMA)
+LINUX_CPU_FLAGS = $(if $(filter ivybridge,$(LINUX_CPU)),-DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=ON -DGGML_BMI2=OFF,-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON)
+LINUX_SHA  = $(shell git rev-parse --short=8 HEAD)
+LINUX_PKG  = $(LINUX_WORK)/strata-linux-x86_64-$(LINUX_SHA).tar.gz
+LINUX_BINS = engine-metal/strata-metal engine-metal/strata-vision engine-metal/strata-server engine-metal/strata-files engine-metal/strata-app
+
+linux-package:
+	@test -z "$$(git status --porcelain --untracked-files=no)" || { echo "commit first: the package is built from HEAD (git archive)"; exit 1; }
+	docker build -q -t strata-linux-build linux
+	mkdir -p $(LINUX_WORK)/src $(LINUX_WORK)/cargo
+	git archive HEAD | tar -x -C $(LINUX_WORK)/src
+	docker run --rm --platform linux/amd64 -v $(LINUX_WORK)/src:$(LINUX_DIR) -v $(LINUX_WORK)/cargo:/opt/cargo/registry -w $(LINUX_DIR) \
+	  strata-linux-build sh -c 'make build LINUX_CPU_ARGS="-DGGML_NATIVE=OFF $(LINUX_CPU_FLAGS)" && make app'
+	tar -C $(LINUX_WORK)/src -czf $(LINUX_PKG) $(LINUX_BINS)
+	@echo "package: $(LINUX_PKG); make linux-deliver puts it on $(LINUX_HOST)"
+
+linux-deliver:
+	@test -f $(LINUX_PKG) || { echo "no $(LINUX_PKG): make linux-package first"; exit 1; }
+	@ssh $(LINUX_HOST) "cd $(LINUX_DIR) && git rev-parse --short=8 HEAD" | grep -qx $(LINUX_SHA) || { echo "$(LINUX_HOST):$(LINUX_DIR) is not at $(LINUX_SHA): make linux pushes it"; exit 1; }
+	scp -q $(LINUX_PKG) $(LINUX_HOST):/tmp/strata-linux.tar.gz
+	ssh $(LINUX_HOST) "cd $(LINUX_DIR) && mkdir -p engine-metal && rm -f $(LINUX_BINS) && tar -xzf /tmp/strata-linux.tar.gz && rm -f /tmp/strata-linux.tar.gz && ls -l engine-metal"
+	ssh $(LINUX_HOST) "mkdir -p ~/.local/share/applications && printf '[Desktop Entry]\nType=Application\nName=Strata\nComment=Local AI models\nExec=$(LINUX_DIR)/engine-metal/strata-app\nIcon=utilities-terminal\nTerminal=false\nCategories=Development;\n' > ~/.local/share/applications/strata.desktop"
+
+linux:
+	git push -q $(LINUX_HOST):$(notdir $(LINUX_DIR)) HEAD:mac3
+	$(MAKE) linux-package linux-deliver
+	ssh $(LINUX_HOST) "cd $(LINUX_DIR) && engine-metal/strata-app --deploy"
 
 # the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
 # the tool-call grammar against llama.cpp's own GBNF validator (the engine's llama.cpp, after make metal)
