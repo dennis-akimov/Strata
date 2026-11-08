@@ -238,7 +238,8 @@ LINUX_WORK ?= $(abspath ../Strata-linux-build)
 LINUX_CPU_FLAGS = $(if $(filter ivybridge,$(LINUX_CPU)),-DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=ON -DGGML_BMI2=OFF,-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON)
 LINUX_SHA  = $(shell git rev-parse --short=8 HEAD)
 LINUX_PKG  = $(LINUX_WORK)/strata-linux-x86_64-$(LINUX_SHA).tar.gz
-LINUX_BINS = engine-metal/strata-metal engine-metal/strata-vision engine-metal/strata-server engine-metal/strata-files engine-metal/strata-app
+# strata-metal-vulkan: the same engine on the PC's GPUs through Vulkan (Mesa's NVK, ANV/hasvk): a config's "exe" picks it
+LINUX_BINS = engine-metal/strata-metal engine-metal/strata-metal-vulkan engine-metal/strata-vision engine-metal/strata-server engine-metal/strata-files engine-metal/strata-app
 
 linux-package:
 	@test -z "$$(git status --porcelain --untracked-files=no)" || { echo "commit first: the package is built from HEAD (git archive)"; exit 1; }
@@ -246,7 +247,9 @@ linux-package:
 	mkdir -p $(LINUX_WORK)/src $(LINUX_WORK)/cargo
 	git archive HEAD | tar -x -C $(LINUX_WORK)/src
 	docker run --rm --platform linux/amd64 -v $(LINUX_WORK)/src:$(LINUX_DIR) -v $(LINUX_WORK)/cargo:/opt/cargo/registry -w $(LINUX_DIR) -e STRATA_BUILD_SHA=$(LINUX_SHA) \
-	  strata-linux-build sh -c 'make build LINUX_CPU_ARGS="-DGGML_NATIVE=OFF $(LINUX_CPU_FLAGS)" && make app'
+	  strata-linux-build sh -c 'make build LINUX_CPU_ARGS="-DGGML_NATIVE=OFF $(LINUX_CPU_FLAGS)" && make app \
+	  && cmake -S . -B build-metal-vk -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON -DGGML_NATIVE=OFF $(LINUX_CPU_FLAGS) \
+	  && cmake --build build-metal-vk --target strata-metal -j && cp build-metal-vk/metal/strata-metal engine-metal/strata-metal-vulkan'
 	tar -C $(LINUX_WORK)/src -czf $(LINUX_PKG) $(LINUX_BINS)
 	@echo "package: $(LINUX_PKG); make linux-deliver puts it on $(LINUX_HOST)"
 

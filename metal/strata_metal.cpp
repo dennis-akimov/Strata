@@ -161,6 +161,8 @@ struct Options {
     int threads = 0;
     int spec = 3;                                      // drafted tokens per pass with --mtp, --eagle3 or --dflash
     int batch = 0;                                     // --batch N: batch slots (the server's "parallel")
+    int gpu_layers = 999;                              // --gpu-layers N: layers on the GPU, the rest on the CPU (a GPU
+                                                       // smaller than the model: a 1 GB Kepler beside a 5 GB model)
     int poll = -1;                                     // --poll N: ggml's CPU busy-wait level (llama.cpp default 50)
     // --ablate <file>: directions projected out of every layer's output while the model runs (directional ablation;
     // the GGUF is not changed; metal/patches/core).  Raw float32, layers x k x n_embd, each layer's k rows orthogonal
@@ -208,6 +210,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--spec") o.spec = std::atoi(val("--spec"));
         else if (a == "--batch" || a == "--slots") o.batch = std::max(0, std::min(16, std::atoi(val("--batch"))));
         else if (a == "--max-context") o.max_context = std::atoll(val("--max-context"));
+        else if (a == "--gpu-layers") o.gpu_layers = std::max(0, std::atoi(val("--gpu-layers")));
         else if (a == "--kv") o.kv = val("--kv");
         else if (a == "--prefill-batch") o.n_batch = std::atoi(val("--prefill-batch"));
         else if (a == "--checkpoints") o.checkpoints = std::max(0, std::atoi(val("--checkpoints")));
@@ -437,7 +440,7 @@ struct Engine {
         p.n_ctx = (int32_t) (o.kv_unified && o.kv_pool > 0 ? o.kv_pool : o.max_context * p.n_parallel);
         p.n_batch = o.n_batch;
         p.n_ubatch = std::min(o.n_batch, 2048);   // 2048: prompts +9% on an M5 Max (llama-bench pp4096, 268 -> 293 tok/s)
-        p.n_gpu_layers = 999;                     // everything in unified memory
+        p.n_gpu_layers = o.gpu_layers;            // everything in unified memory (999), or --gpu-layers of them
         p.fit_params = false;
         p.warmup = false;
         p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
