@@ -88,8 +88,13 @@ target_compile_definitions(strata-metal PRIVATE STRATA_VERSION="${PROJECT_VERSIO
 target_link_libraries(strata-metal PRIVATE llama llama-common)
 # hardened as strata-image (bible's C++ skill, Apple clang on arm64), and libc++'s fast hardening: slot and sequence
 # numbers come over the protocol, and an index past a vector's end traps (SIGTRAP) instead of writing past it
-target_compile_options(strata-metal PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero
-                       -mbranch-protection=standard)
+# control-flow protection for this CPU: pointer auth + BTI on arm64, CET on x86_64 (a Linux PC's build)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+  set(STRATA_CFI -mbranch-protection=standard)
+else()
+  set(STRATA_CFI -fcf-protection=full)
+endif()
+target_compile_options(strata-metal PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero ${STRATA_CFI})
 target_compile_definitions(strata-metal PRIVATE _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST)
 
 # the residual stream and next-token log-probabilities for strata-ablate (docs/ABLATION.md)
@@ -103,8 +108,7 @@ add_executable(strata-image ${CMAKE_CURRENT_SOURCE_DIR}/image/strata_image.cpp $
                ${CMAKE_CURRENT_SOURCE_DIR}/image/text_encoder.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/hunyuan_image.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/image/gguf_weights.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/nucleus_vae.cpp)
 target_compile_features(strata-image PRIVATE cxx_std_17)
-target_compile_options(strata-image PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero
-                       -mbranch-protection=standard)
+target_compile_options(strata-image PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero ${STRATA_CFI})
 target_link_libraries(strata-image PRIVATE llama ggml z)
 # ggml-backend-impl.h (gguf_weights.cpp: a Metal mapping that failed is a buffer with no context, not a null buffer)
 get_target_property(STRATA_GGML_SRC ggml SOURCE_DIR)
