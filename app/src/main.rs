@@ -135,6 +135,10 @@ fn root() -> PathBuf {
     }
 }
 
+/// What the app calls the machine in what it says, and what the memory limit is on it
+const HERE: &str = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
+const LIMIT_WORD: &str = if cfg!(target_os = "macos") { "the GPU can use" } else { "RAM for the model" };
+
 /// The app's own folder: ~/Library/Application Support/Strata (macOS), $XDG_CONFIG_HOME/strata or ~/.config/strata
 /// (Linux and the rest): its settings, the running app's record, the deploy and app locks
 pub fn app_dir() -> PathBuf {
@@ -502,8 +506,8 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
         "green" => "fits".to_string(),
         "amber" => format!("fits the GPU, but only {} is free now: close other apps to free {}", gb(avail), gb(need - avail)),
         _ => match best {
-            Some(i) => format!("too big for this Mac at this context (the GPU can use {}): use a context of {}{}", gb(limit), options[i]["ctx"], if options[i]["batch512"] == true { " with a prefill batch of 512" } else { "" }),
-            None if n(&g["model"]) > limit => format!("the model alone ({}) is more than this Mac's GPU can use ({}): pick a smaller model", gb(n(&g["model"])), gb(limit)),
+            Some(i) => format!("too big for {HERE} at this context ({LIMIT_WORD} {}): use a context of {}{}", gb(limit), options[i]["ctx"], if options[i]["batch512"] == true { " with a prefill batch of 512" } else { "" }),
+            None if n(&g["model"]) > limit => format!("the model alone ({}) is more than {HERE} can hold ({}): pick a smaller model", gb(n(&g["model"])), gb(limit)),
             None => "no context size fits: close other apps or pick a smaller model".into(),
         },
     };
@@ -552,6 +556,9 @@ fn gpu_limit(recommended: f64) -> (f64, u64, u64) {
 /// The Mac's energy mode (pmset): Low Power slows the GPU; High Power (MacBook Pro with Max, 2024+ Pro, Mac mini Pro,
 /// Mac Studio 2026: their pmset has a `powermode` line, 0 automatic / 1 low / 2 high) lets its fans hold the clock.
 fn power() -> Value {
+    if !cfg!(target_os = "macos") {
+        return power_from("", "");   // no pmset: no energy modes to offer
+    }
     let g = Command::new("/usr/bin/pmset").arg("-g").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let batt = Command::new("/usr/bin/pmset").args(["-g", "batt"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     power_from(&g, &batt)
@@ -1939,7 +1946,7 @@ fn main() {
                         let port = read_config(&cfg)["port"].as_u64().unwrap_or(8090);
                         let msg = match set_shared(&cfg, on) {
                             Ok(()) if on => format!("── shared on the network in {name}: other devices use http://{host}.local:{port}/v1 with the API key (More > Copy API key) ──"),
-                            Ok(()) => format!("── this Mac only in {name} ──"),
+                            Ok(()) => format!("── {HERE} only in {name} ──"),
                             Err(e) => format!("── the config could not be changed: {e} ──"),
                         };
                         let _ = p2.send_event(Ev::Log(msg));
@@ -1963,7 +1970,7 @@ fn main() {
                         }
                         let msg = match set_cache_mib(&cfg, mib) {
                             Ok(()) if mib > 0 => format!("── conversation cache {} GB in RAM in {} ──", mib / 1024, cfg.file_name().unwrap_or_default().to_string_lossy()),
-                            Ok(()) if mib < 0 => format!("── conversation cache automatic (sized for this Mac) in {} ──", cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Ok(()) if mib < 0 => format!("── conversation cache automatic (sized for {HERE}) in {} ──", cfg.file_name().unwrap_or_default().to_string_lossy()),
                             Ok(()) => format!("── conversation cache off in {} ──", cfg.file_name().unwrap_or_default().to_string_lossy()),
                             Err(e) => format!("── the config could not be changed: {e} ──"),
                         };

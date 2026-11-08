@@ -212,8 +212,14 @@ else ifeq ($(APPLE_LINUX),1)
 	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
 	mkdir -p engine-metal && rm -f engine-metal/strata-metal engine-metal/strata-vision
 	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
+else ifeq ($(shell uname -s),Linux)
+	@# another Linux PC: the same engine on the CPU (llama.cpp's CPU backend, built for this CPU)
+	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON -DSTRATA_METAL_CPU=ON
+	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
+	mkdir -p engine-metal && rm -f engine-metal/strata-metal engine-metal/strata-vision
+	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
 else
-	@echo "on Linux / Windows setup builds or downloads the engine: make setup (or python3 bootstrap.py --setup --build)"
+	@echo "on Windows setup builds or downloads the engine: make setup (or python3 bootstrap.py --setup --build)"
 endif
 
 # the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
@@ -243,12 +249,21 @@ app: server
 	@# the app runs engine-metal/strata-metal, which only make build refreshes: say so when its source is newer
 	@[ ! -f engine-metal/strata-metal ] || [ engine-metal/strata-metal -nt metal/strata_metal.cpp ] || echo "warning: engine-metal/strata-metal is older than metal/strata_metal.cpp: run make build too (the app keeps using the old engine)"
 	$(CARGO) build --release --manifest-path app/Cargo.toml
+ifneq ($(shell uname -s),Darwin)
+	@# Linux: the app beside the engine, and in the desktop's applications (GTK, WebKitGTK and a tray icon:
+	@# libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev to build)
+	rm -f engine-metal/strata-app && cp app/target/release/strata-app engine-metal/strata-app
+	mkdir -p $(HOME)/.local/share/applications
+	printf '[Desktop Entry]\nType=Application\nName=Strata\nComment=Local AI models\nExec=$(CURDIR)/engine-metal/strata-app\nIcon=utilities-terminal\nTerminal=false\nCategories=Development;\n' > $(HOME)/.local/share/applications/strata.desktop
+	@echo "built engine-metal/strata-app: make app-run, or Strata in the desktop's applications"
+else
 	rm -rf Strata.app && mkdir -p Strata.app/Contents/MacOS
 	cp app/target/release/strata-app Strata.app/Contents/MacOS/Strata
 	cp app/Info.plist Strata.app/Contents/Info.plist
 	@# a locked keychain (an ssh session: errSecInternalComponent) signs ad-hoc instead, and says so
 	codesign --force --sign $(SIGN_ID) Strata.app || { echo "signed ad-hoc: unlock the keychain (security unlock-keychain) to sign as $(SIGN_ID); macOS will ask for its permissions again"; codesign --force --sign - Strata.app; }
 	@echo "built Strata.app: make app-run, or open Strata.app (or drag it to /Applications; it runs the server from $(CURDIR))"
+endif
 
 # strata-tui (tui/, Rust): Strata.app in a terminal, for Linux on an Apple Silicon Mac (and any terminal, SSH too)
 tui-build: server
@@ -267,7 +282,7 @@ app-stop:
 # blue-green while the model is busy (app/src/deploy.rs): the new app's server takes the port, the old one finishes its
 # requests; idle, the old app quits and the new one opens
 app-run: app
-	Strata.app/Contents/MacOS/Strata --deploy
+	$(if $(filter Darwin,$(shell uname -s)),Strata.app/Contents/MacOS/Strata,engine-metal/strata-app) --deploy
 
 # the server's tests: its unit and golden tests, then its answers against the Python server's recorded ones
 # (server/golden/e2e.py --replay; the packs it needs are the ones on this Mac, a missing one is skipped)

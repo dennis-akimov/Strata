@@ -3,7 +3,7 @@
 <style>
 :root{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mute:#6e6e73;--line:#d2d2d7;--acc:#0a84ff;--log:#1d1d1f;--logfg:#e5e5ea}
 @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--fg:#f5f5f7;--mute:#98989d;--line:#3a3a3c;--log:#000;--logfg:#d1d1d6}}
-*{box-sizing:border-box}[hidden]{display:none!important}html,body{height:100%}body{margin:0;font:12.5px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
+*{box-sizing:border-box}[hidden]{display:none!important}body:not([data-os=macos]) .mac-only{display:none!important}html,body{height:100%}body{margin:0;font:12.5px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
 #bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:nowrap;white-space:nowrap;height:44px;overflow:visible;width:100%}
 #bar>*{flex-shrink:0}
 /* the bar is one 44 px line (the page view sits under it): fit() moves the less used items into More until it fits */
@@ -68,11 +68,11 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   <span id="rate" class="mute"></span><span style="flex:1"></span>
   <span class="mute" id="url"></span>
   <button id="webbtn" title="a browser beside the chat (Send page to chat puts the page you read into the message box)">Web</button>
-  <button id="sysbtn" title="what macOS runs that the model would rather have the memory of">System</button>
+  <button id="sysbtn" class="mac-only" title="what macOS runs that the model would rather have the memory of">System</button>
   <button id="logbtn" title="the server's output">Log</button>
   <span id="more"><button id="morebtn">More ▾</button><div id="menu">
     <button class="narrow" id="m_load">Load model</button><button class="narrow" id="m_unload">Unload model</button>
-    <button class="narrow" id="m_web">Web</button><button class="narrow" id="m_sys">System</button><button class="narrow" id="m_log">Log</button>
+    <button class="narrow" id="m_web">Web</button><button class="narrow mac-only" id="m_sys">System</button><button class="narrow" id="m_log">Log</button>
     <button id="browser">Open in browser</button><button id="edit_config">Edit config</button>
     <button id="reveal">Show config in Finder</button><button id="engine_log">Engine log in Console</button>
     <button id="copy_key">Copy API key</button>
@@ -101,8 +101,11 @@ let base='',up=false;
 const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const gb=b=>b==null?'–':(b/1e9).toFixed(1)+' GB', k=c=>c>=1048576&&c%1048576===0?c/1048576+'M':c>=1024?Math.round(c/1024)+'K':c;
 let mem=null,running=false,snap=null;
+// macOS or not (Linux): the System card and the Mac's GPU, energy and memory words only on macOS
+const mac=()=>!snap||!snap.os||snap.os==='macos',here=()=>mac()?'this Mac':'this computer';
 function init(s){
   snap=s;
+  document.body.dataset.os=s.os||'macos';
   const name=c=>{const n=c.name.replace(/^strata-|\.json$/g,'');return n==='apple-afm'?"Apple's on-device model (apple-afm)":n+(c.model&&c.model!==n?' — '+c.model:'');};
   // the closed picker's name: the size dropped (qwen3.6-35b -> qwen3.6) when no other config would read the same
   const bare=c=>c.name.replace(/^strata-|\.json$/g,''),cut=c=>bare(c).replace(/-\d+(\.\d+)?b(?=-|$)/i,'');
@@ -166,7 +169,7 @@ function memory(m){
     $('memcard').innerHTML=`<h3>Memory</h3><div class="verdict red">${esc(m.error)}</div>`;return;}
   chip.className='chip '+m.state;   // what it needs next to what this Mac has: the GPU's share, and what is free right now
   chip.textContent=`${gb(m.need).replace(' GB','')} / ${gb(m.limit)}`+(m.state==='green'?'':' ⚠');   // needs / the GPU's share
-  chip.title=`needs ${gb(m.need)} · GPU has ${gb(m.limit)}`+(m.avail!=null?` · ${gb(m.avail)} free`:'')+` · ${m.advice} (click for this Mac's memory)`;
+  chip.title=`needs ${gb(m.need)} · ${mac()?'GPU has':'RAM for it'} ${gb(m.limit)}`+(m.avail!=null?` · ${gb(m.avail)} free`:'')+` · ${m.advice} (click for ${here()}'s memory)`;
   memsum();
   $('ctx').innerHTML=m.options.map(o=>`<option value="${o.ctx}" data-b="${o.batch512?1:0}"${o.ctx===m.context?' selected':''} data-s="${k(o.ctx)}" data-l="context ${k(o.ctx)} · ${gb(o.need)}${o.recommended?' · recommended':o.fits?'':' · too big'}${o.batch512?' (batch 512)':''}"></option>`).join('');shorten($('ctx'));
   const tot=Math.max(m.need,m.limit),pct=b=>(100*b/tot).toFixed(1)+'%';
@@ -202,14 +205,15 @@ document.addEventListener('click',e=>{const b=e.target.closest('.applist button'
 // the chip's popover: this model against the GPU, Strata's processes now, and the whole Mac as Activity Monitor shows it
 function memsum(){
   const m=mem||{},s=sysMem,row=(a,b)=>`<div class="row"><span>${a}</span><span>${b}</span></div>`;
-  let h=`<h3>Strata</h3>`+(m.need!=null?row(`this model at context ${k(m.context||0)}`,gb(m.need))+row('the GPU can use',gb(m.limit)):'')+
-    (strataMem!=null?row('Strata\'s processes (its GPU memory is in wired)',gb(strataMem)):'')+
+  let h=`<h3>Strata</h3>`+(m.need!=null?row(`this model at context ${k(m.context||0)}`,gb(m.need))+row(mac()?'the GPU can use':'RAM for the model (less the system\'s share)',gb(m.limit)):'')+
+    (strataMem!=null?row(mac()?'Strata\'s processes (its GPU memory is in wired)':'Strata\'s processes',gb(strataMem)):'')+
     (cacheStat&&cacheStat.enabled?row('conversation cache (RAM)',`${gb(cacheStat.bytes||0).replace(' GB','')} / ${Math.round(cacheStat.budget_mib/1024)} GB · ${cacheStat.parked||0} kept · ${cacheStat.restores||0} back`):'');
   // the whole Mac in binary GB, as Activity Monitor and macOS's "128 GB" count it
   const gib=b=>b==null?'–':(b/2**30).toFixed(1)+' GB';
   if(s){const p=s.pressure,c=p==null?'var(--line)':p<50?'#34c759':p<80?'#ff9f0a':'#ff453a';
-    h+=`<h3>This Mac · ${Math.round(s.total/2**30)} GB</h3>`+(p!=null?row('memory pressure',p+'%')+`<div class="meter"><span style="width:${p}%;background:${c}"></span></div>`:'')+
-      row('apps',gib(s.app))+row('wired (macOS, the GPU)',gib(s.wired))+row('compressed',gib(s.compressed))+row('free or file cache',gib(s.free))+
+    h+=`<h3>${mac()?'This Mac':'This computer'} · ${Math.round(s.total/2**30)} GB</h3>`+(p!=null?row('memory pressure',p+'%')+`<div class="meter"><span style="width:${p}%;background:${c}"></span></div>`:'')+
+      (mac()?row('apps',gib(s.app))+row('wired (macOS, the GPU)',gib(s.wired))+row('compressed',gib(s.compressed))+row('free or file cache',gib(s.free))
+        :row('in use',gib(s.app))+row('available (free or cache)',gib(s.free)))+
       (s.swap_total?row('swap',`${gib(s.swap_used)} of ${gib(s.swap_total)}`):'');}
   $('memsum').innerHTML=h;
 }

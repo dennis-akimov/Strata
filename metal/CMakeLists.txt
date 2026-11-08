@@ -9,9 +9,16 @@ if(APPLE)
   set(GGML_METAL ON CACHE BOOL "" FORCE)
   set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # the shaders inside the binary: no Xcode needed to run it
 else()
-  # Linux on Apple Silicon (Asahi): the GPU through Vulkan (Mesa's Honeykrisp; libvulkan-dev + glslc to build)
+  # Linux on Apple Silicon (Asahi): the GPU through Vulkan (Mesa's Honeykrisp; libvulkan-dev + glslc to build).
+  # STRATA_METAL_CPU: llama.cpp's CPU backend only, for a PC whose GPU no Vulkan driver serves well (an old laptop's
+  # Intel HD 4000 / Kepler: the model in RAM, decoded on the CPU, the same engine, server and app otherwise)
+  option(STRATA_METAL_CPU "Linux: the engine on the CPU only (no Vulkan)" OFF)
   set(GGML_METAL OFF CACHE BOOL "" FORCE)
-  set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+  if(STRATA_METAL_CPU)
+    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+  else()
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+  endif()
 endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
