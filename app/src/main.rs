@@ -163,6 +163,26 @@ fn signal_pipe(sigs: &[libc::c_int]) -> libc::c_int {
     fds[0]
 }
 
+/// A web view in the app's window: a GTK widget in its Fixed on Linux (keyboard focus and Wayland work there; an X11
+/// child window took no typing), a child view of the window elsewhere
+#[cfg(target_os = "linux")]
+fn attach(b: WebViewBuilder, _win: &tao::window::Window, fixed: &gtk::Fixed) -> WebView {
+    use wry::WebViewBuilderExtUnix;
+    b.build_gtk(fixed).expect("webview")
+}
+#[cfg(not(target_os = "linux"))]
+fn attach(b: WebViewBuilder, win: &tao::window::Window, _: &()) -> WebView {
+    b.build_as_child(win).expect("webview")
+}
+
+/// `x.pipe(f)` = `f(x)`: a builder chain ends in a function
+trait Pipe: Sized {
+    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
+        f(self)
+    }
+}
+impl<T> Pipe for T {}
+
 /// What the app calls the machine in what it says, and what the memory limit is on it
 const HERE: &str = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
 const LIMIT_WORD: &str = if cfg!(target_os = "macos") { "the GPU can use" } else { "RAM for the model" };
@@ -1552,13 +1572,6 @@ pub fn short(t: &str, n: usize) -> String {
 const ALLOW_WITHIN_S: u64 = 140;
 
 fn main() {
-    // Linux: the window through XWayland when there is one - wry puts its child web views (control bar, the server's
-    // page, the browser pane) in a window only on X11 ("webview: UnsupportedWindowHandle" on native Wayland); a
-    // GDK_BACKEND set by the user stands
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("GDK_BACKEND").is_none() && std::env::var_os("DISPLAY").is_some() {
-        unsafe { std::env::set_var("GDK_BACKEND", "x11") };   // before any thread or GTK starts
-    }
     let root = root();
     let settings = load_settings();
     let config = settings["config"].as_str().map(PathBuf::from).filter(|p| p.is_file()).or_else(|| configs(&root).into_iter().next());
@@ -1674,6 +1687,19 @@ fn main() {
     app_menu.init_for_nsapp();
 
     let control_win = WindowBuilder::new().with_title("Strata").with_inner_size(tao::dpi::LogicalSize::new(1280.0, 900.0)).build(&event_loop).expect("window");
+    // where the web views go: a gtk::Fixed in the window on Linux (each view a widget at its bounds), the window itself
+    // elsewhere
+    #[cfg(target_os = "linux")]
+    let host = {
+        use gtk::prelude::*;
+        use tao::platform::unix::WindowExtUnix;
+        let fixed = gtk::Fixed::new();
+        fixed.show_all();
+        control_win.default_vbox().expect("the window's gtk box").pack_start(&fixed, true, true, 0);
+        fixed
+    };
+    #[cfg(not(target_os = "linux"))]
+    let host = ();
     // two views in the window: the control bar, and the server's own page (Chat, Monitor, Firewall, About) under it.
     // The bar covers the whole window while the server is down, its log is open or there is a problem to show; the
     // page is hidden then.  The page is made last, so it is the top view whenever it shows: it never depends on the
@@ -1689,8 +1715,7 @@ fn main() {
                     let _ = p.send_event(Ev::Ipc(v));
                 }
             })
-            .build_as_child(&control_win)
-            .expect("webview")
+            .pipe(|b| attach(b, &control_win, &host))
     };
     let page = {
         let p = proxy.clone();
@@ -1722,8 +1747,7 @@ fn main() {
                 eprintln!("strata-app: page {event} {url}"); // a trace a run from Terminal shows (no window needed)
                 let _ = p.send_event(Ev::Page(json!({"event": event, "url": url})));
             })
-            .build_as_child(&control_win)
-            .expect("webview")
+            .pipe(|b| attach(b, &control_win, &host))
     };
     // the browser pane (the bar's Web button): a strip of controls, and a web view, right of the page; hidden until opened
     let web_open = std::cell::Cell::new(false);
@@ -1738,8 +1762,7 @@ fn main() {
                     let _ = p.send_event(Ev::Ipc(v));
                 }
             })
-            .build_as_child(&control_win)
-            .expect("webview")
+            .pipe(|b| attach(b, &control_win, &host))
     };
     // the picker bridge's token (browser_mcp::frame_bridge_js): made at each start, known to this app and the script
     let frame_token: String = {
@@ -1771,8 +1794,7 @@ fn main() {
                     let _ = p.send_event(Ev::Web(url));
                 }
             })
-            .build_as_child(&control_win)
-            .expect("webview")
+            .pipe(|b| attach(b, &control_win, &host))
     };
     // the page's loads: a load that never finishes (10 s) or finishes empty is said, with Open in browser and Retry
     let (navs, loaded) = (Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)));
@@ -2294,8 +2316,7 @@ fn main() {
                                 let _ = p.send_event(Ev::AgentWeb(i, url));
                             }
                         })
-                        .build_as_child(&control_win)
-                        .expect("webview");
+                        .pipe(|b| attach(b, &control_win, &host));
                     agents.borrow_mut()[i - 1] = Some(AgentPane { web: w, seen: Default::default(), last: Default::default(), searched: None, load_waiters: vec![], search_waiters: vec![] });
                 }
                 if !web_open.get() {

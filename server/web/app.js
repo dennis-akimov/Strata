@@ -541,6 +541,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, failu
             hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
             (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
+  // a CPU engine (a Linux PC whose GPU it does not use): the model is in RAM, and there is no GPU to show
+  const cpuOnly = eng.backend === "cpu";
+  for (const k of ["gpu", "temp", "power", "pcie", "clock"]) if (cpuOnly) $("mc-" + k).hidden = true;
+  $("mc-vram").querySelector(".st-metric__label").lastChild.textContent = cpuOnly ? "RAM" : "VRAM";
+  if (cpuOnly) {
+    setMetric("vram", hw.ram_used == null ? null : gb(hw.ram_used), hw.ram_total ? `/ ${gb(hw.ram_total, 0)} GB` : "GB", "the model and its context are here");
+    spark("sp-vram", h.ram_used, hw.ram_total);
+  }
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {

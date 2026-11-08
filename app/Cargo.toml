@@ -19,6 +19,11 @@ wry = "0.57.1"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSGeometry"] }
 
+# Linux: the web views go into a gtk::Fixed in the window (wry's build_gtk): X11 child windows (build_as_child) took
+# no keyboard input and do not exist on Wayland
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
 [dev-dependencies]
 # the page scripts' tests drive headless Chrome over the DevTools protocol (a websocket); skipped without Chrome
 tungstenite = "0.24"

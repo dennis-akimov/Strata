@@ -534,7 +534,12 @@ fn cpu_ticks() -> Option<(u64, u64)> {
     Some((info[2] as u64, total))
 }
 
+/// Bytes read and written since boot, all disks: IOBlockStorageDriver (macOS), /proc/diskstats (Linux)
 fn disk_bytes() -> Option<(u64, u64)> {
+    if !cfg!(target_os = "macos") {
+        let whole = |n: &str| std::path::Path::new("/sys/block").join(n).exists();
+        return diskstats_bytes(&std::fs::read_to_string("/proc/diskstats").ok()?, whole);
+    }
     let text = ioreg("IOBlockStorageDriver");
     let rd = regex::Regex::new(r#""Bytes \(Read\)"=(\d+)"#).unwrap();
     let wr = regex::Regex::new(r#""Bytes \(Write\)"=(\d+)"#).unwrap();
@@ -544,6 +549,22 @@ fn disk_bytes() -> Option<(u64, u64)> {
         return None;
     }
     Some((r, w))
+}
+
+/// /proc/diskstats summed over whole disks (`whole`: a name under /sys/block; partitions are not, so nothing counts
+/// twice) less loop, ram and zram devices; its sectors are 512 bytes whatever the disk's own size
+fn diskstats_bytes(text: &str, whole: impl Fn(&str) -> bool) -> Option<(u64, u64)> {
+    let (mut r, mut w, mut any) = (0u64, 0u64, false);
+    for l in text.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 10 || ["loop", "ram", "zram"].iter().any(|p| f[2].starts_with(p)) || !whole(f[2]) {
+            continue;
+        }
+        r += f[5].parse::<u64>().unwrap_or(0) * 512;
+        w += f[9].parse::<u64>().unwrap_or(0) * 512;
+        any = true;
+    }
+    any.then_some((r, w))
 }
 
 pub type Extra = Box<dyn Fn() -> Map<String, Value> + Send + Sync>;
@@ -769,5 +790,16 @@ mod linux_reader_tests {
         assert_eq!((mac["gpu_mem_used"].clone(), mac["gpu_mem_total"].clone()), (json!(5), json!(9))); // the OS's own win
         let none = gpu_memory_from_engine(json!({"gpu_mem_used": null}), &json!({}).as_object().unwrap().clone());
         assert!(none["gpu_mem_used"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod diskstats_tests {
+    #[test]
+    fn whole_disks_only_in_bytes() {
+        let t = "   7       0 loop0 10 0 800 0 0 0 0 0 0 0 0\n   8       0 sda 100 0 2000 0 50 0 4000 0 0 0 0\n   8       1 sda1 90 0 1900 0 40 0 3900 0 0 0 0\n   8      16 sdb 10 0 20 0 5 0 40 0 0 0 0\n";
+        let whole = |n: &str| n == "sda" || n == "sdb" || n == "loop0";
+        assert_eq!(super::diskstats_bytes(t, whole), Some((2020 * 512, 4040 * 512)));
+        assert_eq!(super::diskstats_bytes("", whole), None);
     }
 }
