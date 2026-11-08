@@ -257,7 +257,7 @@ linux-deliver:
 	@test -f $(LINUX_PKG) || { echo "no $(LINUX_PKG): make linux-package first"; exit 1; }
 	@ssh $(LINUX_HOST) "cd $(LINUX_DIR) && git rev-parse --short=8 HEAD" | grep -qx $(LINUX_SHA) || { echo "$(LINUX_HOST):$(LINUX_DIR) is not at $(LINUX_SHA): make linux pushes it"; exit 1; }
 	scp -q $(LINUX_PKG) $(LINUX_HOST):/tmp/strata-linux.tar.gz
-	ssh $(LINUX_HOST) "cd $(LINUX_DIR) && mkdir -p engine-metal && rm -f $(LINUX_BINS) && tar -xzf /tmp/strata-linux.tar.gz && rm -f /tmp/strata-linux.tar.gz && ls -l engine-metal"
+	ssh $(LINUX_HOST) "cd $(LINUX_DIR) && mkdir -p engine-metal && rm -f $(LINUX_BINS) && tar -xzf /tmp/strata-linux.tar.gz && rm -f /tmp/strata-linux.tar.gz && echo $(LINUX_SHA) > engine-metal/.build && ls -l engine-metal"
 	ssh $(LINUX_HOST) "mkdir -p ~/.local/share/applications && printf '[Desktop Entry]\nType=Application\nName=Strata\nComment=Local AI models\nExec=$(LINUX_DIR)/engine-metal/strata-app\nIcon=utilities-terminal\nTerminal=false\nCategories=Development;\n' > ~/.local/share/applications/strata.desktop"
 
 linux:
@@ -317,15 +317,25 @@ tui: tui-build
 	engine-metal/strata-tui
 
 # SIGTERM is the app's Quit: it stops its server the server's way (the engine frees its memory) and exits
-APP_PAT = Strata.app/Contents/MacOS/Strata$$
+APP_PAT = $(if $(filter Darwin,$(shell uname -s)),Strata.app/Contents/MacOS/Strata$$,engine-metal/strata-app$$)
 app-stop:
 	@if pkill -TERM -f '$(APP_PAT)'; then printf 'stopping Strata.app'; \
 	  while pgrep -f '$(APP_PAT)' >/dev/null; do printf .; sleep 1; done; echo ' stopped'; else echo 'Strata.app is not running'; fi
 
 # blue-green while the model is busy (app/src/deploy.rs): the new app's server takes the port, the old one finishes its
 # requests; idle, the old app quits and the new one opens
+# Linux: binaries already built for this checkout's commit (make linux-deliver writes it into engine-metal/.build) are
+# used as they are - a 2012 laptop needs no hour of compiling for what another machine built; else they are built here
+ifeq ($(shell uname -s),Darwin)
 app-run: app
-	$(if $(filter Darwin,$(shell uname -s)),Strata.app/Contents/MacOS/Strata,engine-metal/strata-app) --deploy
+	Strata.app/Contents/MacOS/Strata --deploy
+else
+app-run:
+	@if [ -x engine-metal/strata-app ] && [ -s engine-metal/.build ] && git diff --quiet "$$(cat engine-metal/.build)" HEAD -- app server metal CMakeLists.txt 2>/dev/null; then \
+	  echo "engine-metal has the build of $$(cat engine-metal/.build): no app, server or engine change since, nothing to compile"; \
+	else $(MAKE) build app && git rev-parse --short=8 HEAD > engine-metal/.build; fi
+	engine-metal/strata-app --deploy
+endif
 
 # the server's tests: its unit and golden tests, then its answers against the Python server's recorded ones
 # (server/golden/e2e.py --replay; the packs it needs are the ones on this Mac, a missing one is skipped)
