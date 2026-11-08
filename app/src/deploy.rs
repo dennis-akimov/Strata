@@ -159,6 +159,13 @@ fn clients_up(metrics: &dyn Fn() -> Option<Value>, limit: Duration, pause: Durat
     }
 }
 
+/// The signal a deploy sends the running app to switch its server: SIGUSR1 on macOS; SIGUSR2 elsewhere, where
+/// WebKitGTK's JavaScriptCore takes SIGUSR1 for its own threads
+#[cfg(target_os = "macos")]
+pub const SWITCH_SIGNAL: libc::c_int = libc::SIGUSR1;
+#[cfg(not(target_os = "macos"))]
+pub const SWITCH_SIGNAL: libc::c_int = libc::SIGUSR2;
+
 /// The running app's command line (an app a blue-green deploy started runs with --handoff)
 #[cfg(target_os = "macos")]
 const APP_PATTERN: &str = "Strata.app/Contents/MacOS/Strata($| --handoff)";
@@ -311,7 +318,7 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
         wait_idle(if share { "a second engine would not fit in memory" } else { "the running server cannot share its port: it predates blue-green" });
     }
     let _ = std::fs::remove_file(switch_done_path());
-    if std::fs::write(switch_path(), mode).is_err() || unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
+    if std::fs::write(switch_path(), mode).is_err() || unsafe { libc::kill(pid, SWITCH_SIGNAL) } != 0 {
         say("could not reach the running app; nothing was changed");
         return 1;
     }

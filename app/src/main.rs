@@ -135,6 +135,34 @@ fn root() -> PathBuf {
     }
 }
 
+/// The write end of the signal pipe (signal_pipe): what the handler, async-signal-safe, writes the signal's number to
+#[cfg(not(target_os = "macos"))]
+static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(not(target_os = "macos"))]
+extern "C" fn on_signal(sig: libc::c_int) {
+    let b = sig as u8;
+    unsafe { libc::write(SIGNAL_PIPE.load(std::sync::atomic::Ordering::Relaxed), &b as *const u8 as *const libc::c_void, 1) };
+}
+
+/// A handler for each of `sigs` that writes its number into a pipe; the read end, for one thread to read them from
+#[cfg(not(target_os = "macos"))]
+fn signal_pipe(sigs: &[libc::c_int]) -> libc::c_int {
+    let mut fds = [0 as libc::c_int; 2];
+    unsafe {
+        libc::pipe(fds.as_mut_ptr());
+        SIGNAL_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+        for &s in sigs {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(s, &sa, std::ptr::null_mut());
+        }
+    }
+    fds[0]
+}
+
 /// What the app calls the machine in what it says, and what the memory limit is on it
 const HERE: &str = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
 const LIMIT_WORD: &str = if cfg!(target_os = "macos") { "the GPU can use" } else { "RAM for the model" };
@@ -1552,6 +1580,7 @@ fn main() {
 
     // SIGTERM / Ctrl+C on the app = Quit (the server is stopped its own way, not orphaned); blocked before any thread
     // starts so only the waiter gets them (a spawned server starts with an empty mask)
+    #[cfg(target_os = "macos")]
     let sigs = unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
@@ -1561,15 +1590,33 @@ fn main() {
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         set
     };
+    // Linux: WebKitGTK's JavaScriptCore suspends its threads with SIGUSR1 and runs threads that block nothing, so a
+    // blocked set and sigwait missed the deploy's signal (it went to JavaScriptCore) and a SIGTERM there would end
+    // the app without stopping its server.  A handler is the process's wherever the signal lands: it writes the
+    // signal into a pipe this thread reads.  Nothing blocked; the deploy's signal is SIGUSR2 (deploy::SWITCH_SIGNAL).
+    #[cfg(not(target_os = "macos"))]
+    let sig_read = signal_pipe(&[libc::SIGTERM, libc::SIGINT, deploy::SWITCH_SIGNAL]);
     let event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     std::thread::spawn({
         let p = proxy.clone();
         move || {
             loop {
-                let mut sig = 0;
-                unsafe { libc::sigwait(&sigs, &mut sig) };
-                if sig == libc::SIGUSR1 {
+                #[cfg(target_os = "macos")]
+                let sig = {
+                    let mut sig = 0;
+                    unsafe { libc::sigwait(&sigs, &mut sig) };
+                    sig
+                };
+                #[cfg(not(target_os = "macos"))]
+                let sig = {
+                    let mut b = [0u8; 1];
+                    if unsafe { libc::read(sig_read, b.as_mut_ptr() as *mut libc::c_void, 1) } != 1 {
+                        continue;   // EINTR: a signal came during the read itself
+                    }
+                    b[0] as libc::c_int
+                };
+                if sig == deploy::SWITCH_SIGNAL {
                     let _ = p.send_event(Ev::Switch);
                     continue;
                 }
