@@ -98,8 +98,7 @@ fn fingerprint(p: &Path) -> Option<u64> {
 }
 
 fn running_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    Path::new(&home).join("Library/Application Support/Strata/running.json")
+    crate::app_dir().join("running.json")
 }
 
 /// The request file a deploy writes before SIGUSR1 ("handoff" or "restart"), and the app's answer
@@ -121,14 +120,14 @@ pub fn record_running() {
 }
 
 /// The running app that can switch its server, when its build is the one on disk: its pid
-fn switchable(old: &[i32], bundle: &Path) -> Option<i32> {
+fn switchable(old: &[i32], exe: &Path) -> Option<i32> {
     let r: Value = serde_json::from_str(&std::fs::read_to_string(running_path()).ok()?).ok()?;
-    switchable_from(&r, old, bundle)
+    switchable_from(&r, old, exe)
 }
 
-fn switchable_from(r: &Value, old: &[i32], bundle: &Path) -> Option<i32> {
+fn switchable_from(r: &Value, old: &[i32], exe: &Path) -> Option<i32> {
     let pid = r["pid"].as_i64()? as i32;
-    let same = r["fingerprint"].as_u64().is_some() && r["fingerprint"].as_u64() == fingerprint(&bundle.join("Contents/MacOS/Strata"));
+    let same = r["fingerprint"].as_u64().is_some() && r["fingerprint"].as_u64() == fingerprint(exe);
     (old.contains(&pid) && same).then_some(pid)
 }
 
@@ -160,6 +159,53 @@ fn clients_up(metrics: &dyn Fn() -> Option<Value>, limit: Duration, pause: Durat
     }
 }
 
+/// The running app's command line (an app a blue-green deploy started runs with --handoff)
+#[cfg(target_os = "macos")]
+const APP_PATTERN: &str = "Strata.app/Contents/MacOS/Strata($| --handoff)";
+#[cfg(not(target_os = "macos"))]
+const APP_PATTERN: &str = "engine-metal/strata-app($| --handoff)";
+
+/// The app's program: inside Strata.app on macOS, engine-metal/strata-app elsewhere (make app)
+pub fn app_exe(root: &Path) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") { root.join("Strata.app/Contents/MacOS/Strata") } else { root.join("engine-metal/strata-app") }
+}
+
+/// Open the app.  macOS: `open -n` (always new: right after the old app quits, LaunchServices may still count it and
+/// only "activate" it, 2026-11-03).  Elsewhere the program itself, in its own session, on the desktop the user is
+/// signed in to: a deploy runs over SSH, with no display of its own.
+fn launch(root: &Path) -> bool {
+    if cfg!(target_os = "macos") {
+        return Command::new("/usr/bin/open").arg("-n").arg(root.join("Strata.app")).status().map(|s| s.success()).unwrap_or(false);
+    }
+    let mut c = Command::new(app_exe(root));
+    c.current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
+    for (k, v) in desktop_env() {
+        c.env(k, v);
+    }
+    c.spawn().is_ok()
+}
+
+/// The desktop session's display and bus (Wayland or X11) from its shell's environment, where this process has none
+fn desktop_env() -> Vec<(String, String)> {
+    const KEYS: [&str; 6] = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY", "XDG_SESSION_TYPE"];
+    let uid = unsafe { libc::getuid() }.to_string();
+    let shell = ["gnome-shell", "plasmashell", "kwin_wayland", "xfce4-session", "cinnamon", "mate-session"].iter()
+        .find_map(|n| pids("/usr/bin/pgrep", &["-u", &uid, "-x", n]).first().copied());
+    let theirs = shell.and_then(|p| std::fs::read(format!("/proc/{p}/environ")).ok()).unwrap_or_default();
+    session_env(&theirs, &KEYS, |k| std::env::var(k).ok())
+}
+
+/// KEYS from a NUL-separated environment (/proc/PID/environ), each one this process already has winning
+fn session_env(environ: &[u8], keys: &[&str], own: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    keys.iter().filter_map(|k| {
+        own(k).filter(|v| !v.is_empty()).or_else(|| environ.split(|b| *b == 0).find_map(|e| {
+            let e = String::from_utf8_lossy(e);
+            e.strip_prefix(&format!("{k}=")).map(String::from)
+        })).map(|v| (k.to_string(), v))
+    }).collect()
+}
+
 /// make app-run: the decision, then its steps; the exit code says whether the new server runs.  One Strata.app at a
 /// time: the running app switches its server (SIGUSR1, main.rs switch_server); only when the app's own code changed
 /// does it restart, after the model is idle.
@@ -176,10 +222,9 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
     };
     let me = std::process::id() as i32;
     // an app a blue-green deploy started runs with --handoff: it is the old app the next deploy replaces too
-    let old: Vec<i32> = pids("/usr/bin/pgrep", &["-f", "Strata.app/Contents/MacOS/Strata($| --handoff)"]).into_iter().filter(|p| *p != me).collect();
-    let bundle = root.join("Strata.app");
-    // -n always: right after the old app quits, LaunchServices may still count it and only "activate" it (2026-11-03)
-    let open = || Command::new("/usr/bin/open").arg("-n").arg(&bundle).status().map(|s| s.success()).unwrap_or(false);
+    let old: Vec<i32> = pids("/usr/bin/pgrep", &["-f", APP_PATTERN]).into_iter().filter(|p| *p != me).collect();
+    let exe = app_exe(root);
+    let open = || launch(root);
     let quit_old = || {
         for p in &old {
             unsafe { libc::kill(*p, libc::SIGTERM) };
@@ -245,7 +290,7 @@ pub fn run(root: &Path, config: Option<&Path>) -> i32 {
     let m = metrics();
     let share = can_share(&host, port);
     let fit = m.as_ref().is_some_and(|m| fits(m, model_bytes(&cfg)));
-    let Some(pid) = switchable(&old, &bundle) else {
+    let Some(pid) = switchable(&old, &exe) else {
         // the app's own code changed (or it predates switching servers in it): a restart, one app at a time
         say(&format!("the app itself changed: it restarts (old app {old:?}, port {port}, {})", if m.as_ref().is_some_and(busy) { "busy" } else { "idle" }));
         wait_idle("the app restarts when no request runs");
@@ -304,10 +349,10 @@ mod tests {
         std::fs::write(d.join("Contents/MacOS/Strata"), b"build one").unwrap();
         let fp = fingerprint(&d.join("Contents/MacOS/Strata")).unwrap();
         let rec = |pid: i32, fp: Option<u64>| serde_json::json!({"pid": pid, "fingerprint": fp});
-        assert_eq!(switchable_from(&rec(42, Some(fp)), &[42], &d), Some(42));
-        assert_eq!(switchable_from(&rec(42, Some(fp)), &[7], &d), None);       // that app is gone
-        assert_eq!(switchable_from(&rec(42, Some(fp ^ 1)), &[42], &d), None);  // the app's code changed
-        assert_eq!(switchable_from(&rec(42, None), &[42], &d), None);
+        assert_eq!(switchable_from(&rec(42, Some(fp)), &[42], &d.join("Contents/MacOS/Strata")), Some(42));
+        assert_eq!(switchable_from(&rec(42, Some(fp)), &[7], &d.join("Contents/MacOS/Strata")), None);       // that app is gone
+        assert_eq!(switchable_from(&rec(42, Some(fp ^ 1)), &[42], &d.join("Contents/MacOS/Strata")), None);  // the app's code changed
+        assert_eq!(switchable_from(&rec(42, None), &[42], &d.join("Contents/MacOS/Strata")), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -327,6 +372,13 @@ mod tests {
         assert!(!can_share("127.0.0.1", l.local_addr().unwrap().port()));
         let free = { let t = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); t.local_addr().unwrap().port() };
         assert!(can_share("127.0.0.1", free));
+    }
+
+    #[test]
+    fn a_launch_over_ssh_takes_the_desktop_session_display() {
+        let theirs = b"HOME=/home/x\0WAYLAND_DISPLAY=wayland-0\0XDG_RUNTIME_DIR=/run/user/1000\0DISPLAY=:0\0";
+        let got = session_env(theirs, &["WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "XAUTHORITY"], |k| (k == "DISPLAY").then(|| ":1".to_string()));
+        assert_eq!(got, vec![("WAYLAND_DISPLAY".into(), "wayland-0".into()), ("DISPLAY".into(), ":1".into()), ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into())]);
     }
 
     #[test]

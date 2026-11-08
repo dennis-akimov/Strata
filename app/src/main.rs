@@ -135,9 +135,21 @@ fn root() -> PathBuf {
     }
 }
 
-fn settings_path() -> PathBuf {
+/// The app's own folder: ~/Library/Application Support/Strata (macOS), $XDG_CONFIG_HOME/strata or ~/.config/strata
+/// (Linux and the rest): its settings, the running app's record, the deploy and app locks
+pub fn app_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    Path::new(&home).join("Library/Application Support/Strata/app.json")
+    if cfg!(target_os = "macos") {
+        return Path::new(&home).join("Library/Application Support/Strata");
+    }
+    match std::env::var("XDG_CONFIG_HOME") {
+        Ok(x) if !x.is_empty() => Path::new(&x).join("strata"),
+        _ => Path::new(&home).join(".config/strata"),
+    }
+}
+
+fn settings_path() -> PathBuf {
+    app_dir().join("app.json")
 }
 
 fn load_settings() -> Value {
@@ -322,10 +334,39 @@ fn memory_apps() -> (Vec<Value>, u64) {
 /// The whole Mac's memory as Activity Monitor counts it: app (anonymous pages less purgeable), wired, compressed (the
 /// compressor's own pages), the rest free or file cache; pressure is 100 - kern.memorystatus_level; swap in use.
 fn sys_memory() -> Value {
+    if !cfg!(target_os = "macos") {
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        return sys_memory_linux(&read("/proc/meminfo"), &read("/proc/pressure/memory"));
+    }
     let vm = Command::new("/usr/bin/vm_stat").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let sc = Command::new("/usr/sbin/sysctl").args(["-n", "kern.memorystatus_level", "hw.memsize", "vm.swapusage"]).output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     sys_memory_of(&vm, &sc)
+}
+
+/// The machine's memory in bytes: hw.memsize (macOS), MemTotal of /proc/meminfo (Linux)
+fn ram_bytes() -> u64 {
+    if cfg!(target_os = "macos") {
+        return Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output().ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
+    }
+    meminfo_kib(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default(), "MemTotal") * 1024
+}
+
+/// A /proc/meminfo field in kB ("MemAvailable:   13631488 kB")
+fn meminfo_kib(text: &str, key: &str) -> u64 {
+    text.lines().find(|l| l.split(':').next() == Some(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+/// Linux's memory in the Mac's fields: in use = total less MemAvailable (what can be had without swapping); no wired or
+/// compressed pages to show; pressure = the share of the last 10 s some task waited for memory (PSI "some avg10")
+fn sys_memory_linux(meminfo: &str, psi: &str) -> Value {
+    let kib = |k: &str| meminfo_kib(meminfo, k) * 1024;
+    let (total, avail) = (kib("MemTotal"), kib("MemAvailable"));
+    let pressure = psi.lines().find(|l| l.starts_with("some")).and_then(|l| l.split_whitespace().find_map(|f| f.strip_prefix("avg10=")))
+        .and_then(|v| v.parse::<f64>().ok()).map(|v| v.round() as u64);
+    json!({"total": total, "app": total.saturating_sub(avail), "wired": 0, "compressed": 0, "free": avail, "pressure": pressure,
+        "swap_used": kib("SwapTotal").saturating_sub(kib("SwapFree")), "swap_total": kib("SwapTotal")})
 }
 
 fn sys_memory_of(vm: &str, sc: &str) -> Value {
@@ -470,8 +511,7 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
         "avail": if running { Value::Null } else { json!(avail) }, "running": running,
         "weights": n(&g["model"]) + n(&h["model"]), "cache": n(&g["context"]) + n(&h["context"]), "work": n(&g["compute"]) + n(&h["compute"]),
         "state": state, "advice": advice, "options": options, "recommended": best.map(|i| options[i].clone()),
-        "cache_max_mib": cache_max_mib(Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output().ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0), need),
+        "cache_max_mib": cache_max_mib(ram_bytes(), need),
         "wired_mb": wired_mb, "suggest_limit_mb": if suggest_mb > 0 && gpu_need > limit { json!(suggest_mb) } else { Value::Null },
         "power": power()})
 }
@@ -488,6 +528,12 @@ fn cache_max_mib(ram: u64, need: f64) -> u64 {
 /// is about two thirds of the memory, below Metal's recommendedMaxWorkingSetSize (a 16 GB M1: 12.4 GiB recommended,
 /// ran out at 11.7).  (limit bytes, the sysctl's MB, a value to suggest: the memory less 3 GB or 15% for macOS)
 fn gpu_limit(recommended: f64) -> (f64, u64, u64) {
+    // no unified GPU memory to limit (Linux, the CPU engine): the model and its contexts are in RAM, less the system's
+    // share (15%, 3 GB at least) - the same reserve the conversation cache keeps
+    if !cfg!(target_os = "macos") {
+        let ram_mb = ram_bytes() >> 20;
+        return (ram_mb.saturating_sub((ram_mb * 15 / 100).max(3072)) as f64 * 1048576.0, 0, 0);
+    }
     let sysctl = |k: &str| Command::new("/usr/sbin/sysctl").args(["-n", k]).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
     let (wired, ram) = (sysctl("iogpu.wired_limit_mb"), sysctl("hw.memsize"));
     let ram_mb = ram >> 20;
@@ -1389,7 +1435,7 @@ fn snapshot(st: &Shared) -> Value {
         })
         .collect();
     let settings = load_settings();
-    json!({"root": s.root, "configs": list, "config": s.config, "port": s.port, "phase": s.phase,
+    json!({"os": std::env::consts::OS, "root": s.root, "configs": list, "config": s.config, "port": s.port, "phase": s.phase,
         "running": s.child.is_some(), "log": s.log.iter().cloned().collect::<Vec<_>>(), "status": s.last,
         "key": s.api_key(), "autostart": settings["autostart"].as_bool().unwrap_or(false), "server": server_exe(&s.root).is_file()})
 }
@@ -1431,8 +1477,35 @@ fn query_escape(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
+/// macOS's `open` (a URL; -t a file in the text editor, -R shown in the Finder, -a APP); elsewhere xdg-open with what
+/// it can do: the file, or the folder it is in for -R
 fn open(args: &[&str]) {
-    let _ = Command::new("open").args(args).spawn();
+    if cfg!(target_os = "macos") {
+        let _ = Command::new("open").args(args).spawn();
+        return;
+    }
+    let _ = Command::new("xdg-open").arg(xdg_target(args)).spawn();
+}
+
+/// The command that takes text on stdin into the clipboard: pbcopy (macOS), wl-copy (Wayland), xclip (X11)
+fn clipboard() -> Command {
+    if cfg!(target_os = "macos") {
+        return Command::new("pbcopy");
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Command::new("wl-copy");
+    }
+    let mut c = Command::new("xclip");
+    c.args(["-selection", "clipboard"]);
+    c
+}
+
+fn xdg_target(args: &[&str]) -> String {
+    let last = args.last().copied().unwrap_or("");
+    if args.first() == Some(&"-R") {
+        return Path::new(last).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    }
+    last.to_string()
 }
 
 /// The first n characters of a text (for the log).
@@ -1860,7 +1933,8 @@ fn main() {
                             stop_and_wait(&st2);
                         }
                         let name = cfg.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                        let host = Command::new("/usr/sbin/scutil").args(["--get", "LocalHostName"]).output().ok()
+                        let host = Command::new(if cfg!(target_os = "macos") { "/usr/sbin/scutil" } else { "hostname" })
+                            .args(if cfg!(target_os = "macos") { &["--get", "LocalHostName"][..] } else { &[][..] }).output().ok()
                             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|h| !h.is_empty()).unwrap_or_else(|| "this-mac".into());
                         let port = read_config(&cfg)["port"].as_u64().unwrap_or(8090);
                         let msg = match set_shared(&cfg, on) {
@@ -2078,7 +2152,7 @@ fn main() {
                 }
                 "copy_key" => {
                     let key = st.lock().unwrap().api_key();
-                    if let Ok(mut c) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+                    if let Ok(mut c) = clipboard().stdin(Stdio::piped()).spawn() {
                         use std::io::Write;
                         let _ = c.stdin.take().map(|mut i| i.write_all(key.as_bytes()));
                         let _ = c.wait();
@@ -2807,6 +2881,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_memory_reads_proc() {
+        let mi = "MemTotal:       16000000 kB\nMemFree:          1000000 kB\nMemAvailable:   12000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n";
+        let psi = "some avg10=12.40 avg60=3.00 avg300=1.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        let m = sys_memory_linux(mi, psi);
+        assert_eq!((m["total"].as_u64(), m["free"].as_u64(), m["app"].as_u64()), (Some(16_384_000_000), Some(12_288_000_000), Some(4_096_000_000)));
+        assert_eq!((m["swap_used"].as_u64(), m["swap_total"].as_u64(), m["pressure"].as_u64()), (Some(512_000_000), Some(2_048_000_000), Some(12)));
+        assert_eq!(sys_memory_linux(mi, "")["pressure"], Value::Null);   // a kernel without PSI: no pressure, none made up
+    }
+
+    #[test]
+    fn xdg_open_gets_what_it_can_open() {
+        assert_eq!(xdg_target(&["http://127.0.0.1:8090/"]), "http://127.0.0.1:8090/");
+        assert_eq!(xdg_target(&["-t", "/a/b.json"]), "/a/b.json");
+        assert_eq!(xdg_target(&["-R", "/a/b.json"]), "/a");                // shown in its folder
+        assert_eq!(xdg_target(&["-a", "Console", "/a/x.log"]), "/a/x.log");
+    }
 
     #[test]
     fn rewrites_context_keeping_the_config() {
