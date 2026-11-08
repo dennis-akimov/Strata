@@ -23,7 +23,23 @@ mod browser_mcp;
 mod deploy;
 mod google;
 mod mapfile;
+#[cfg(target_os = "macos")]
 mod native_input;
+/// No AppKit off macOS: the browser pane clicks and types with the page's own scripts there (never reaches these)
+#[cfg(not(target_os = "macos"))]
+mod native_input {
+    use wry::WebView;
+    const NONE: &str = "no native mouse and keyboard events on this system";
+    pub fn click(_: &WebView, _: f64, _: f64) -> Result<(), String> {
+        Err(NONE.into())
+    }
+    pub fn type_text(_: &WebView, _: &str) -> Result<(), String> {
+        Err(NONE.into())
+    }
+    pub fn press(_: &WebView, _: &str, _: &[&str]) -> Result<(), String> {
+        Err(NONE.into())
+    }
+}
 mod table;
 
 const PANEL: &str = include_str!("panel.html");
@@ -2518,8 +2534,9 @@ fn main() {
                 let n = job.args["element"].as_i64().unwrap_or(0);
                 if let Some(e) = v["error"].as_str() {
                     let _ = job.reply.send(Err(e.to_string()));
-                } else if what == "click" && v["hidden"] == true {
-                    // nowhere a mouse can reach it (no size, off screen): clicked by the page's script instead
+                } else if what == "click" && (v["hidden"] == true || !cfg!(target_os = "macos")) {
+                    // nowhere a mouse can reach it (no size, off screen), or no AppKit to send a mouse's events with
+                    // (Linux): clicked by the page's script instead
                     load_waiters.borrow_mut().push(job.reply.clone());
                     act_then_read(&web, &browser_mcp::click_js(n), job.reply, &proxy, 2000);
                 } else if what == "click" {
@@ -2533,6 +2550,11 @@ fn main() {
                             read_later(job.reply, &proxy, 2000);
                         }
                     }
+                } else if !cfg!(target_os = "macos") {
+                    // no AppKit (Linux): the page's script types into the field, and submits it when asked
+                    let text = job.args["text"].as_str().unwrap_or("").to_string();
+                    load_waiters.borrow_mut().push(job.reply.clone());
+                    act_then_read(&web, &browser_mcp::type_js(n, &text, job.args["submit"] == true), job.reply, &proxy, 2500);
                 } else {
                     let text = job.args["text"].as_str().unwrap_or("").to_string();
                     let submit = job.args["submit"] == true;
