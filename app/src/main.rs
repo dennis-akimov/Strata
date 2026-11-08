@@ -1535,6 +1535,8 @@ fn main() {
     let edit = Submenu::with_items("Edit", true, &[&PredefinedMenuItem::undo(None), &PredefinedMenuItem::redo(None), &PredefinedMenuItem::separator(), &PredefinedMenuItem::cut(None), &PredefinedMenuItem::copy(None), &PredefinedMenuItem::paste(None), &PredefinedMenuItem::select_all(None)]).unwrap();
     let window_menu = Submenu::with_items("Window", true, &[&PredefinedMenuItem::minimize(None), &close_win]).unwrap();
     app_menu.append_items(&[&strata, &edit, &window_menu]).unwrap();
+    // the menu bar (and with it Cmd+C / Cmd+V in the web view); WebKitGTK has Ctrl+C / Ctrl+V itself, the tray its menu
+    #[cfg(target_os = "macos")]
     app_menu.init_for_nsapp();
 
     let control_win = WindowBuilder::new().with_title("Strata").with_inner_size(tao::dpi::LogicalSize::new(1280.0, 900.0)).build(&event_loop).expect("window");

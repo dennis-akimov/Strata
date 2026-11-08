@@ -43,6 +43,7 @@ fn can_share(host: &str, port: u16) -> bool {
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one as *const _ as *const libc::c_void, sz);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &one as *const _ as *const libc::c_void, sz);
         let mut a: libc::sockaddr_in = std::mem::zeroed();
+        #[cfg(target_os = "macos")]
         a.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
         a.sin_family = libc::AF_INET as libc::sa_family_t;
         a.sin_port = port.to_be();
