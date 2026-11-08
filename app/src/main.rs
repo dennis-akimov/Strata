@@ -1524,6 +1524,13 @@ pub fn short(t: &str, n: usize) -> String {
 const ALLOW_WITHIN_S: u64 = 140;
 
 fn main() {
+    // Linux: the window through XWayland when there is one - wry puts its child web views (control bar, the server's
+    // page, the browser pane) in a window only on X11 ("webview: UnsupportedWindowHandle" on native Wayland); a
+    // GDK_BACKEND set by the user stands
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GDK_BACKEND").is_none() && std::env::var_os("DISPLAY").is_some() {
+        unsafe { std::env::set_var("GDK_BACKEND", "x11") };   // before any thread or GTK starts
+    }
     let root = root();
     let settings = load_settings();
     let config = settings["config"].as_str().map(PathBuf::from).filter(|p| p.is_file()).or_else(|| configs(&root).into_iter().next());

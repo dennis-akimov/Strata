@@ -190,6 +190,13 @@ fn launch(root: &Path) -> bool {
 fn desktop_env() -> Vec<(String, String)> {
     const KEYS: [&str; 6] = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY", "XDG_SESSION_TYPE"];
     let uid = unsafe { libc::getuid() }.to_string();
+    // the systemd user session's environment first (GNOME puts DISPLAY and WAYLAND_DISPLAY there, not in its shell's)
+    let systemd = Command::new("systemctl").args(["--user", "show-environment"]).env("XDG_RUNTIME_DIR", format!("/run/user/{uid}")).output()
+        .map(|o| o.stdout.split(|b| *b == b'\n').collect::<Vec<_>>().join(&0u8)).unwrap_or_default();
+    let from_systemd = session_env(&systemd, &KEYS, |k| std::env::var(k).ok());
+    if from_systemd.iter().any(|(k, _)| k == "WAYLAND_DISPLAY" || k == "DISPLAY") {
+        return from_systemd;
+    }
     let shell = ["gnome-shell", "plasmashell", "kwin_wayland", "xfce4-session", "cinnamon", "mate-session"].iter()
         .find_map(|n| pids("/usr/bin/pgrep", &["-u", &uid, "-x", n]).first().copied());
     let theirs = shell.and_then(|p| std::fs::read(format!("/proc/{p}/environ")).ok()).unwrap_or_default();
