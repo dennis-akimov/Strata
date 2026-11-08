@@ -6,8 +6,11 @@ fn main() {
         std::process::Command::new("git").args(args).output().ok().filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
-    let sha = git(&["rev-parse", "--short=8", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    // a build from a git archive (make linux-package's Docker build) has no .git: the commit comes in STRATA_BUILD_SHA
+    println!("cargo:rerun-if-env-changed=STRATA_BUILD_SHA");
+    let given = std::env::var("STRATA_BUILD_SHA").ok().filter(|s| !s.is_empty());
+    let sha = given.clone().or_else(|| git(&["rev-parse", "--short=8", "HEAD"])).unwrap_or_else(|| "unknown".into());
+    let dirty = given.is_none() && git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
     println!("cargo:rustc-env=STRATA_BUILD={sha}{}", if dirty { "-dirty" } else { "" });
     for p in ["../.git/HEAD", "../.git/index", "src", "web", "build.rs"] {
         println!("cargo:rerun-if-changed={p}");

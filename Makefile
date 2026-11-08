@@ -245,7 +245,7 @@ linux-package:
 	docker build -q -t strata-linux-build linux
 	mkdir -p $(LINUX_WORK)/src $(LINUX_WORK)/cargo
 	git archive HEAD | tar -x -C $(LINUX_WORK)/src
-	docker run --rm --platform linux/amd64 -v $(LINUX_WORK)/src:$(LINUX_DIR) -v $(LINUX_WORK)/cargo:/opt/cargo/registry -w $(LINUX_DIR) \
+	docker run --rm --platform linux/amd64 -v $(LINUX_WORK)/src:$(LINUX_DIR) -v $(LINUX_WORK)/cargo:/opt/cargo/registry -w $(LINUX_DIR) -e STRATA_BUILD_SHA=$(LINUX_SHA) \
 	  strata-linux-build sh -c 'make build LINUX_CPU_ARGS="-DGGML_NATIVE=OFF $(LINUX_CPU_FLAGS)" && make app'
 	tar -C $(LINUX_WORK)/src -czf $(LINUX_PKG) $(LINUX_BINS)
 	@echo "package: $(LINUX_PKG); make linux-deliver puts it on $(LINUX_HOST)"

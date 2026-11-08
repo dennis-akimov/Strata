@@ -1414,6 +1414,8 @@ int main(int argc, char** argv) {
     }
 #ifdef __APPLE__
     const char* backend = "metal";
+#elif defined(STRATA_CPU_ONLY)
+    const char* backend = "cpu";
 #else
     const char* backend = "vulkan";
 #endif

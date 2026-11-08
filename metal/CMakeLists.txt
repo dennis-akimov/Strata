@@ -96,6 +96,9 @@ else()
 endif()
 target_compile_options(strata-metal PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero ${STRATA_CFI})
 target_compile_definitions(strata-metal PRIVATE _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST)
+if(STRATA_METAL_CPU)
+  target_compile_definitions(strata-metal PRIVATE STRATA_CPU_ONLY)   # INFO backend=cpu
+endif()
 
 # the residual stream and next-token log-probabilities for strata-ablate (docs/ABLATION.md)
 add_executable(strata-directions strata_directions.cpp)
