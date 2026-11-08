@@ -29,6 +29,14 @@ pub fn fits(m: &Value, model_bytes: u64) -> bool {
     need > 0.0 && need <= ram_free && need <= gpu_free
 }
 
+/// BSD's sockaddr length byte (macOS); Linux's sockaddr_in has none
+#[cfg(target_os = "macos")]
+fn set_len(a: &mut libc::sockaddr_in) {
+    a.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+}
+#[cfg(not(target_os = "macos"))]
+fn set_len(_: &mut libc::sockaddr_in) {}
+
 /// Can a socket bind beside the server's: only when that one set SO_REUSEPORT too.  Bound, never listening, closed:
 /// it takes no connection.
 fn can_share(host: &str, port: u16) -> bool {
@@ -43,8 +51,7 @@ fn can_share(host: &str, port: u16) -> bool {
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one as *const _ as *const libc::c_void, sz);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &one as *const _ as *const libc::c_void, sz);
         let mut a: libc::sockaddr_in = std::mem::zeroed();
-        #[cfg(target_os = "macos")]
-        a.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        set_len(&mut a);
         a.sin_family = libc::AF_INET as libc::sa_family_t;
         a.sin_port = port.to_be();
         a.sin_addr.s_addr = u32::from(ip).to_be();
