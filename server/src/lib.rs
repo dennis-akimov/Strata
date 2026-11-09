@@ -68,7 +68,8 @@ mod say_tests {
         super::log_to(p.to_str().unwrap());
         super::say("a request too big for its context goes to the main engine");
         let text = std::fs::read_to_string(&p).unwrap();
-        assert!(text.starts_with("[strata] 2") && text.trim_end().ends_with("goes to the main engine"), "{text}");
+        // other tests say() at the same time, into the same file: find this test's line
+        assert!(text.lines().any(|l| l.starts_with("[strata] 2") && l.ends_with("goes to the main engine")), "{text}");
         let _ = std::fs::remove_file(&p);
     }
 }
