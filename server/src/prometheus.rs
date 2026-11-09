@@ -147,6 +147,25 @@ fn strata(m: &Value, out: &mut Vec<String>, lab: &str) {
             metric(name, "gauge", help, &g[key], &format!(",gpu=\"{}\"", crate::py::py_str(&g["index"])));
         }
     }
+    for (name, key, help) in [("cpu_power_watts", "cpu_power", "CPU power draw (hardware.cpu_power)."), ("dram_power_watts", "dram_power", "DRAM power draw (hardware.dram_power)."),
+                              ("gpu_mhz", "gpu_mhz", "GPU clock, mean over its active states (hardware.gpu_mhz)."), ("swap_used_bytes", "swap_used", "Swap in use (hardware.swap_used)."),
+                              ("memory_pressure", "memory_pressure", "macOS memory pressure: 1 normal, 2 warning, 4 critical (hardware.memory_pressure)."),
+                              ("thermal_level", "thermal_level", "macOS thermal pressure: 0 nominal .. 4 sleeping (hardware.thermal_level).")] {
+        metric(name, "gauge", help, &hw[key], "");
+    }
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ");
+    for f in m["failures"]["by_status"].as_array().into_iter().flatten() {
+        metric("http_errors_total", "counter", "Answers with status >= 400, by status and error type (failures.by_status).", &f["count"],
+               &format!(",status=\"{}\",type=\"{}\"", crate::py::py_str(&f["status"]), esc(f["type"].as_str().unwrap_or(""))));
+    }
+    for (tool, t) in m["mcp_tools"].as_object().into_iter().flatten() {
+        let ok = serde_json::json!(t["calls"].as_u64().unwrap_or(0) - t["errors"].as_u64().unwrap_or(0));
+        metric("mcp_tool_calls_total", "counter", "MCP tool calls by outcome (mcp_tools).", &ok, &format!(",tool=\"{}\",ok=\"true\"", esc(tool)));
+        metric("mcp_tool_calls_total", "counter", "MCP tool calls by outcome (mcp_tools).", &t["errors"], &format!(",tool=\"{}\",ok=\"false\"", esc(tool)));
+    }
+    let cc = &m["conversation_cache"];
+    metric("conversation_cache_park_seconds_total", "counter", "Time copying conversations out to the RAM cache (conversation_cache.park_ms).", &secs(&cc["park_ms"]), "");
+    metric("conversation_cache_restore_seconds_total", "counter", "Time copying conversations back from it (conversation_cache.restore_ms).", &secs(&cc["restore_ms"]), "");
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", &hw["cpu"], "");
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", &hw["ram_used"], "");
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", &hw["ram_total"], "");

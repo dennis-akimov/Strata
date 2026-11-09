@@ -4,7 +4,7 @@
 //! here: `emit` hands each item out, and its Err(Closed) is the consumer leaving (GeneratorExit).
 
 use crate::errors::Fail;
-use crate::parser::{Event, GlmParser, HarmonyParser, Kind, OutputParser, Parse, THINK_END};
+use crate::parser::{Event, GlmParser, HarmonyParser, Kind, OutputParser, Parse, THINK_END, THINK_START};
 use crate::py::{self, truthy};
 use crate::say;
 use crate::service::*;
@@ -145,15 +145,49 @@ impl Service {
             sampling.insert("strata_tool_grammar".into(), json!(g));
             sampling.insert("strata_tool_grammar_from".into(), json!(from));
         }
+        // a response_format's JSON schema by grammar, on an engine that has it (INFO json_schema=1): the reply can only
+        // be JSON the schema accepts (still validated after); a thinking model thinks freely and is held to it from its
+        // thinking's end token on - when that is one token, else no grammar (validation alone, as before)
+        let schema = sampling.remove("strata_json_schema");
+        sampling.remove("strata_json_schema_hex");
+        sampling.remove("strata_json_schema_from");
+        if let (Some(Value::String(s)), Some(e)) = (schema, self.engine.strata()) {
+            if e.info.lock().unwrap().get("json_schema").and_then(Value::as_i64) == Some(1) {
+                let from = if thinking { match self.tok.encode(THINK_END, true)[..] { [t] => Some(Some(t)), _ => None } } else { Some(None) };
+                if let Some(from) = from {
+                    sampling.insert("strata_json_schema_hex".into(), json!(s.bytes().map(|b| format!("{b:02x}")).collect::<String>()));
+                    if let Some(t) = from {
+                        sampling.insert("strata_json_schema_from".into(), json!(t));
+                    }
+                }
+            }
+        }
+        // thinking off on a template that thinks: <think> and </think> are never sampled.  LFM2.5 has no switch for it
+        // (Liquid: it "opens the <think> channel for non-trivial problems"); asked not to think, it opened one anyway
+        // and wrote it into the answer, or closed the empty thought the template had put there with a stray </think>
+        // (2026-11-07, the M1: 6 of 12 short answers).  On an engine with token biases in its slots (INFO logit_bias=2;
+        // =1 without --batch); a client's own bias for those tokens stands.
+        if !thinking && self.template.caps.thinks {
+            let ok = self.engine.strata().map(|e| e.info.lock().unwrap().get("logit_bias").and_then(Value::as_i64)).flatten()
+                .is_some_and(|b| b == 2 || (b == 1 && self.engine.batch() == 0));
+            if ok {
+                let mut bias = crate::bias::normalize(sampling.get("logit_bias"), None).unwrap_or_default();
+                for tag in [THINK_START, THINK_END] {
+                    if let [t] = self.tok.encode(tag, true)[..] {
+                        bias.entry(t as u64).or_insert(-100.0);
+                    }
+                }
+                sampling.insert("logit_bias".into(), Value::Object(bias.iter().map(|(k, v)| (k.to_string(), json!(v))).collect()));
+            }
+        }
         let samp_v = Value::Object(sampling.clone());
         let mut budget = if thinking { self.reasoning_budget(&samp_v).map_err(Stop::Err)? } else { None };
-        if let Some(b) = budget {
-            if max_new > 0 {
-                let reserve = (ANSWER_RESERVE_MIN.max(max_new / 4)).min(max_new / 2);
-                if b > max_new - reserve {
-                    say(&format!("thinking capped at {} of max_tokens {max_new} to leave room for the answer (budget {b})", max_new - reserve));
-                    budget = Some((max_new - reserve).max(1));
-                }
+        if thinking {
+            let capped = thinking_cap(budget, self.budget_given(&samp_v), max_new);
+            if capped != budget {
+                say(&format!("thinking capped at {} of max_tokens {max_new} to leave room for the answer ({})", capped.unwrap_or(0),
+                             budget.map(|b| format!("budget {b}")).unwrap_or_else(|| "no budget given".into())));
+                budget = capped;
             }
         }
         let mut parser: Box<dyn Parse> = if self.harmony {
@@ -331,6 +365,12 @@ impl Service {
                 emit(Item::Event(ev))?;
             }
             loop {
+                // a segment after the thinking closed (the model's </think>, or this server's wrap-up written into the
+                // prompt): the schema's grammar from its first token - the trigger is in the prompt and never comes
+                // again, and the JSON ran on unchecked to max_tokens (2026-11-07: LFM2.5, budget 64, 1 email in 4)
+                if thinking && !matches!(parser.state(), "reasoning" | "rcall") {
+                    sampling.remove("strata_json_schema_from");
+                }
                 let mut g = self.engine.generate(prompt.clone(), max_new - n, sampling.clone(), cancel.clone(), emb.as_ref().map(|p| p.to_string_lossy().into_owned()));
                 let mut recover_prompt: Option<Vec<u32>> = None;
                 let mut seg: Vec<u32> = vec![];
@@ -630,7 +670,11 @@ impl Service {
                 (Some(g2), Some(d)) if n != 0 && g2 != 0 && d != 0.0 => json!(pyround(g2 as f64 / (d / 1000.0), 1)),
                 _ => Value::Null,
             };
+            // from arrival: the wait in the queue (and a model load), then to the first token (OpenTelemetry's TTFT)
+            let waited = crate::service::trace().map(|t| { let t = t.lock().unwrap(); ["queue_s", "load_s"].iter().filter_map(|k| t.get(*k).and_then(Value::as_f64)).sum::<f64>() }).unwrap_or(0.0);
+            let ttft = s.get("first_token").and_then(Value::as_f64).map(|f| pyround(waited + f - started, 3));
             let rec = json!({
+                "queue_s": pyround(waited, 3), "ttft_s": ttft,
                 "projection": if loaded { json!(sampling.get("experimental_speed_projection") != Some(&Value::Bool(false))) } else { Value::Null },
                 "time": started, "duration_s": pyround(t - started, 1), "finish": finish,
                 "prompt_tokens": seen, "reused": g("reused"), "output_tokens": n,
@@ -642,6 +686,7 @@ impl Service {
                 "drafts_offered": g("drafts_offered"), "drafts_accepted": g("drafts_accepted")});
             {
                 let mut stt = self.state.lock().unwrap();
+                crate::observe::client_request(&rec);
                 stt.history.push_back(rec);
                 while stt.history.len() > 500 {
                     stt.history.pop_front();

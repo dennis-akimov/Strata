@@ -40,6 +40,120 @@ Measured on one MacBook Pro with an M5 Max (40-core GPU, 128 GB), macOS 26.4, in
 
 ‡ Measured 2026-10-13 on 300-token answers, against 91-99 tokens/s without the draft in the same runs: the draft helps math, not chat.
 
+**Several agents at once.** One model can answer several requests at the same time: `"parallel": N` in the run config
+(2-8), or the *agents* menu in Strata.app. It is one engine on one port with one copy of the weights; each agent gets
+its own conversation cache, and the engine writes all of their answers in the same passes. Qwen3.6-35B-A3B (MXFP4_MOE)
+on the M5 Max, 2026-11-01, 256-token answers to four different 590-token chat prompts, thinking off, the engine driven
+directly:
+
+| Agents at once | Tokens/s together | Tokens/s each | Memory at a 128K context |
+| ---: | ---: | ---: | ---: |
+| 1 | 98.6 | 98.6 | 26.5 GB |
+| 2 | 148.7 | 74.4 | |
+| 3 | 171.6 | 57.2 | 34.8 GB |
+| 4 | 190.5 | 47.6 | 37.5 GB |
+
+- Four agents write 1.9x what one does, each at about half the speed. Three copies of the model instead would hold
+  the 22 GB of weights three times and share the same GPU.
+- An agent's new prompt is read before the others go on: an 18,605-token one took 11 s (about 1,700 tokens/s), and
+  the two agents already answering wrote 3 tokens meanwhile. A follow-up message reads only what is new, so these
+  pauses are usually short.
+- Each agent's context gets its own cache (here 128K each); the memory column is the engine's own measure (`--plan`).
+
+**Agents, context and the conversation cache.** `server/target/release/strata-bench CONFIG.json --agents 1,2,3,4`
+restarts the config's server for every mix of agents, context (16K-256K each) and `--conversation-cache-mib`
+(0-32 GB), and has each agent write three 128-token answers through the OpenAI API: one to a new 8K-token
+conversation, one to a second, short conversation (which pushes the first out of the GPU), and a follow-up in the first.
+It puts Strata's own config back with `--restore CONFIG.json`. M5 Max, 2026-11-02, Docker running (results in
+`bench/results/2026-11-02-agents-matrix*`, about 20% apart from run to run):
+
+| Model | Agents | Context each | Cache | Follow-up: first token | Tokens/s together | GPU memory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.6-35B-A3B (MXFP4_MOE) | 3 | 16K-256K | 0 | 6-8 s | 65-92 | 27-48 GB |
+| | 3 | 16K-256K | 8-32 GB | 0.33-0.5 s | 115-155 | 27-48 GB |
+| | 4 | 64K | 16 GB | 0.42 s | 165 | 33 GB |
+| | 4 | 256K | 8-32 GB | 0.5-0.6 s | 149-153 | 54 GB |
+| Qwen3-Coder-30B-A3B (Q8_0) | 1 | 128K-256K | 16 GB | 0.35-0.4 s | 80 | 49-62 GB |
+| | 2 | 64K | 16 GB | 0.7 s | 86 | 54 GB |
+| | 4 | 32K | 16 GB | 1.1 s | 89 | 52 GB |
+| | 4 | 32K | 8 GB | 9 s (25% kept) | 44 | 51 GB |
+| | 4 | 128K | 16 GB | 19 s | 33 | 100 GB |
+| Qwen3-Coder-30B-A3B (Q4_K_M) | 1 | 16K-256K | 8-32 GB | 0.3-0.45 s | 90-105 | 22-48 GB |
+| | 2 | 32K-128K | 16 GB | 0.55-0.75 s | 95-103 | 31-61 GB |
+| | 3 | 64K | 16 GB | 0.8 s | 110 | 48 GB |
+| | 4 | 16K | 16-32 GB | 1.1 s | 99-107 | 29 GB |
+| | 3 | 256K | any | no answer | - | 110 GB |
+
+- Without the cache every follow-up reads its whole conversation again (6-15 s). With it the follow-up reads only the
+  new message. 8 GB is enough for Qwen3.6 here, but Qwen3-Coder's larger cache per token needs 16 GB for 3-4 agents.
+- A longer context costs memory, not speed, until it no longer fits: Qwen3-Coder at 2 × 256K or 4 × 128K takes
+  100-113 GB and slows down, and 3-4 × 256K does not answer at all (Q4_K_M too: 3 × 256K needs 110 GB, over the
+  107.5 GB macOS gives the GPU).
+- Qwen3-Coder (Q8_0) writes about 85-90 tokens/s together however many agents run: its weights are twice as heavy to
+  read per token as Qwen3.6's MXFP4. For several agents at once, Qwen3.6 writes about twice as much.
+- Qwen3-Coder at Q4_K_M (measured on one requantized from the Q8_0 with `llama-quantize`, the same size and types as
+  Unsloth's that `make pull MODEL=QWEN3-CODER-30B-Q4` fetches) is about 40% faster than
+  Q8_0 for one agent and 20-30% for 3-4, and takes 14 GB less memory. Its conversation memory per token does not
+  shrink, so 3-4 agents still stop at about 110 tokens/s together.
+- Strata.app's default for Qwen3.6 is 4 agents, 64K each, 16 GB of cache.
+
+**How many agents, and how to set them up.** In the model's run config (`strata-<model>.json`), or the *agents* menu
+in Strata.app:
+
+```
+"parallel": 4,
+"args": [..., "--max-context", "65536", "--conversation-cache-mib", "16384"]
+```
+
+All agents use the same port, API key and model name; point each coding agent (or each subagent) at it as usual.
+A request beyond the N slots waits in the server's queue, it is not refused. `--max-context` is per agent and is held
+in memory from the start, so agents × context must fit in what macOS lets the GPU use (`make check`). The
+conversation cache is shared by all agents: it keeps the conversations they are not working on right now, so a
+subagent's side question does not cost the main conversation its place. More in [docs/BATCHING.md](docs/BATCHING.md)
+and [docs/DETAILS.md](docs/DETAILS.md).
+
+The same bench at a 64K context each and 16 GB of cache, follow-up answers (tokens/s together / each):
+
+| Model | 1 agent | 2 agents | 3 agents | 4 agents | Memory, 3 agents at 128K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.6-35B-A3B (MXFP4_MOE) | 99 (2026-11-01) | 149 / 74 (2026-11-01) | 135 / 45 | 165 / 41 | 37 GB |
+| Qwen3-Coder-30B-A3B (Q8_0) | 68 | 86 / 43 | 82 / 27 | 68 / 17 (89 / 22 at 32K) | 87 GB |
+| Qwen3-Coder-30B-A3B (Q4_K_M) | 87 | 95 / 48 | 110 / 37 | 85 / 21 (91 / 23 at 32K) | 74 GB |
+| GPT-OSS 120B (MXFP4) * | 53 | 81 / 40 | 89 / 30 | not run | 86 GB |
+
+\* While the Mac checked a large download and Docker ran, so a floor: one agent wrote 96-99 tokens/s at a 16K context
+in the same run.
+
+- For agents that mostly wait on tools (tests, builds, searches), 3-4 agents of Qwen3.6 keep the GPU busy; for one
+  agent that has to be fast, one slot is quickest.
+- Qwen3-Coder and GPT-OSS 120B gain little past 2-3 agents and need much more memory per agent: 2-3 agents at
+  64-128K is their sweet spot on a 128 GB Mac. For Qwen3-Coder take the Q4_K_M: 3 agents at 64K with 16 GB of cache
+  wrote the most (110 tokens/s together, first token in 0.8 s, 48 GB).
+- The follow-up's first token comes in 0.3-0.7 s with 1-2 agents and about 1 s with 3-4, while every agent's
+  conversation stays in the cache.
+
+**Agents of different sizes: own slots, one shared pool, or a router.** By default each agent holds its whole context
+from the start (4 agents at 128K = 4 x 128K of K/V). Two other ways, measured on the M5 Max, 2026-11-03, Qwen3.6-35B-A3B,
+four agents at once with ~20K / 40K / 50K / 100K-token conversations (docs/CONTEXT_POOL.md):
+
+| Layout | Memory | Reading the 4 prompts (~210K tokens) | First token, cold: 20K / 40K / 50K / 100K | Follow-up's first token | Decode, 4 at once | Decode, each |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| Own slots, 4 x 128K (the default) | 35.5 GB | 273 s | 14 / 107 / 68 / 258 s | 0.3-1.5 s | **58.1 tok/s** | 14.7-15.2 |
+| A shared pool of 288K, each agent up to 128K | **29.2 GB** | 255 s | 14 / 234 / 200 / 153 s | 0.6-2.4 s | 47.5 tok/s | 12.0-12.5 |
+| A router: servers of 32K, 2 x 64K and 128K | three engines | 259 s | 42 / 86 / 219 / 247 s | 0.4-4.0 s | 47.2 tok/s | 12.2-14.5 |
+
+- **Own slots decode fastest** (22% faster than a pool): each agent's attention reads only its own conversation. Take
+  them when the agents' contexts fit in memory (Qwen3.6 keeps K/V on 10 of its 40 layers, so they easily do).
+- **A pool holds the same agents in less memory** (6.3 GB less here) and lets any agent grow to the cap, but each
+  token's attention walks the whole pool. Take it when the contexts would not fit as own slots: a model with a big
+  K/V per token (GLM-5.3, GPT-OSS 120B) at long contexts. In Strata.app: the *pool* menu beside *agents* (off, or a
+  half / three quarters / all of context x agents, kept in proportion when you change either); in a run config:
+  `"args": [..., "--kv-unified", "--kv-pool", "294912"]`.
+- **A router** (`strata-router --backend URL=CONTEXT ...`) sends each request to the smallest server it fits; on one
+  Mac its engines compete for the GPU instead of sharing a batch, so it was slowest. It is for spreading agents over
+  several Macs.
+- Reading prompts dominates a first request in every layout (they are read one at a time); follow-ups reuse ~100%.
+
 On a 16 GB Mac: a 13-inch MacBook Pro with the M1 (2020), 2026-10-29/30, short answers, on macOS and on Linux on the
 same Mac:
 
@@ -61,6 +175,123 @@ LFM2.5-24B UD-Q3_K_XL (IQ3_XXS experts) answered at 1.3 tokens/s, 91% of each to
 Q3_K_M of the same model at 12.2 (Qwen3.6-35B's 2-bit UD-IQ2_M, since taken out of `make pull`, at 2.4). The LFM2.5 models (`make pull MODEL=LFM2.5-8B` / `LFM2.5-24B`, LiquidAI, both
 think before answering) passed the M1's checks (arithmetic, a fact, letter counting, Russian, code, a tool call): the
 server reads their `<|tool_call_start|>[f(a=1)]<|tool_call_end|>` calls and their template's `{% generation %}` tag.
+
+Several agents at once on the M1 (`"parallel": 3`, see [above](#how-fast-is-it)): LFM2.5-8B-A1B (Q8_0) on macOS, 2026-11-01,
+through the OpenAI API, three different chat prompts at a time, each answer its full 512 tokens (the model thinks first):
+
+| Agents at once | Tokens/s together | Tokens/s each | Memory at a 32K context each |
+| ---: | ---: | ---: | ---: |
+| 1 | 30.1 | 30.1 | 10.65 GB |
+| 2 | 34.4 | 17.2 | |
+| 3 | 36.8 | 12.3 | 11.86 GB |
+
+The M1 gains much less from writing several answers at once than the M5 Max (1.22x for three, against 1.74x for
+Qwen3.6-35B there): its 8-core GPU is already busy with one. Three agents fit easily (LFM2.5's hybrid layers keep
+small caches: 1.6 GB for three 32K contexts), so on the M1 they are for working at the same time, not for more output.
+
+The agents bench (`strata-bench`, as above: each agent's own ~3,000-token conversation, a short side question each, then
+the conversation again plus a turn) on the M1, 2026-11-03, Sheared-LLaMA-2.7B (Q5_K_M, 1.9 GB; a 2023 base model with
+SentencePiece's tokenizer, which Strata reads since that day; its 4K context, 128-token answers):
+
+| Agents | Answer, tokens/s each | Follow-up's first token, no cache | ... with a 4 GB conversation cache | Memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 19.6-20.5 | 9.8 s | 0.6 s (99% of it from the cache) | 3.9 GB |
+| 2 | 15.0-17.5 | 15.0 s | 26.5 s (50%) | 6.7 GB |
+| 3 | 14.7-18.9 | 22.5 s | 45.3 s (0%) | 8.1 GB |
+| 4 | 15.9-18.8 | 37.7 s | 46.5 s (25%) | 9.4 GB |
+
+Its prompts read at 210-268 tokens/s. One agent's conversation fits the cache and comes back in 0.6 s; with 2-4 the
+cache holds too few of them (this 2023 model keeps a big state per token: about 1 GB a conversation) and a follow-up
+waited longer than without one.
+
+**No tools: `supports_tools: false`.** Sheared-LLaMA is a base model: it continues text and was never trained to
+follow instructions or call tools, and its chat template (`User:` / `Assistant:`) has no place for tools (`/props`
+says `"chat_template_caps": {"supports_tools": false, ...}`).  Asked to "use the web to find today's news" it writes
+more made-up `User:` and `Assistant:` turns.  The web page's tools (MCP) are refused with an HTTP 400 that says so; a
+client's own tools are dropped, and the server log says so once.  For tools on a small Mac take LFM2.5-8B or
+Qwen3-4B.
+
+**Qwen3-4B-Instruct-2507 on the M1** (`make pull MODEL=QWEN3-4B`: Unsloth's Q8_0, 4.3 GB; a 32K context, about 11 GB
+in all), 2026-11-03, one agent:
+
+| Prompt | Read, tokens/s | Answer, tokens/s |
+| ---: | ---: | ---: |
+| 26 tokens | - | 12.6 |
+| 1.9K | 189 | 11.2 |
+| 4.5K | 112 | 8.5 |
+| 15K (12.7K of it reused) | 65 (the 2.2K new) | 8.7 |
+| 19K | 107 | - |
+
+It calls tools in Hermes' JSON form (`<tool_call>{"name": ..., "arguments": {...}}</tool_call>`), which the server
+reads.  Asked on Strata's page, with tools on, for today's top 3 technology headlines with sources, it searched
+(Strata.app's browser), opened Reuters pages in 8 rounds and answered with three dated headlines and their links in
+351 s; 120 s of that were two page clicks that timed out (60 s each).  It writes at about 40% of LFM2.5-8B's speed
+(30 tokens/s here: 1.5B parameters active a token against Qwen3-4B's 4B), and needs no thinking first.
+
+Several agents on the M1, `make pull MODEL=QWEN3-4B-Q4` (Q4_K_M, 2.5 GB; 1.6x the Q8_0's writing speed for one) against
+LFM2.5-8B (Q8_0): the agents bench (each agent's ~3,000-token conversation, a short side question, the conversation
+again plus a turn), 8K context each, no conversation cache, 2026-11-03:
+
+| Agents | Prompt read, tok/s: 4B Q4 / 8B | Follow-up's first token | Follow-up written together, tok/s | GPU memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 187 / 321 | 11.4 / 4.3 s | 20.3 / 19.7 | 5.3 / 10.5 GB |
+| 2 | 179 / 374 | 20.8 / 9.3 s | 18.7 / 19.9 | 7.7 / 10.7 GB |
+| 3 | 121 / 366 | 35.0 / 14.1 s | 17.3 / 25.1 | 8.9 / 10.8 GB |
+| 4 | 126 / 315 | 42.5 / 17.1 s | 22.4 / 23.5 | 10.1 / 10.9 GB |
+
+- LFM2.5-8B reads prompts 2-3x faster (a mixture of experts, 1.5B active) and so answers a follow-up 2.5x sooner;
+  both write about 20 tokens/s together. LFM2.5-8B thinks before it answers, Qwen3-4B does not.
+- Qwen3-4B keeps a large state per token (147 KB at f16), so its memory grows with the agents: 4 x 8K is about what
+  fits a 16 GB M1 (10.1 GB). LFM2.5-8B's hybrid layers keep its memory flat at about 10.5-11 GB for 1-4 agents.
+- With the cache on, a follow-up reuses its conversation instead of reading it again (see above).
+
+**LFM2.5-8B in Q4_K_M** (`make pull MODEL=LFM2.5-8B-Q4`, LiquidAI's own, 5.2 GB against the Q8_0's 9.0) on the M1,
+2026-11-03: six checks (17 x 23, a capital, the r's in strawberry, Russian, a Python function that is run, a tool
+call) all pass at Q8_0, Q4_K_M and Q4_0 alike, writing 32.9 / 50.5 / 52.6 tokens/s on them.  The same agents bench
+(8K each, no cache), Q4_K_M against Q8_0:
+
+| Agents | Prompt read, tok/s | Follow-up's first token | Follow-up written together, tok/s | GPU memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 510 / 321 | 4.5 / 4.3 s | 52.7 / 19.7 | 6.6 / 10.5 GB |
+| 2 | 440 / 374 | 7.5 / 9.3 s | 32.0 / 19.9 | 7.1 / 10.7 GB |
+| 3 | 420 / 366 | 10.5 / 14.1 s | 37.5 / 25.1 | 6.9 / 10.8 GB |
+| 4 | 412 / 315 | 13.6 / 17.1 s | 33.2 / 23.5 | 7.2 / 10.9 GB |
+
+On the M1 the Q4_K_M is the one to take: 1.3-2.7x the writing speed, a faster read, 4 GB less memory, the same
+answers on these checks.
+
+**LFM2.5-24B in i1-IQ3_XXS** (`make pull MODEL=LFM2.5-24B-IQ3`, mradermacher's, 9.3 GB against the Q3_K_M's 11.5;
+macOS only, see ‖) on the M1, 2026-11-03, the same six checks, one run each:
+
+| Quant | Size | Checks | Writing, tok/s |
+| --- | ---: | ---: | ---: |
+| Q3_K_M | 11.5 GB | 6/6 | 30.1 |
+| **i1-IQ3_XXS** | 9.3 GB | 6/6 | **36.2** |
+| UD-Q2_K_XL (Unsloth) | 8.0 GB | 6/6 | 35.6 |
+| i1-Q2_K | 8.8 GB | 6/6 | 29.5 (rambles: 2.6x the tokens) |
+
+The model is bound more by its compute than by reading its weights, so the smaller files gain little; i1-IQ3_XXS is
+the M1's 24B.
+
+Apple's on-device model (`make afm`, `"engine": "afm"`) took about 1.5 GB loaded and 3.2 GB while answering on the
+M1, estimated from the Mac's wired memory (its system service's own memory is readable by root only); the Monitor
+shows the same estimate.
+
+The newer models keep far smaller states, and there 2 GB of conversation cache holds every agent's conversation. The
+same bench, 8K context each, the follow-up's first token without the cache / with the automatic one (2 GB here; 99% of
+the prompt from the cache), 2026-11-03:
+
+| Model (M1, 16 GB) | 1 agent | 2 agents | 3 agents | 4 agents | Answer, tokens/s each |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| LFM2.5-8B-A1B (Q8_0) | 4.3 s / 0.43 s | 6.5 s / 0.70 s | 8.8 s / 1.1 s | 10.9 s / 1.2 s | 34 (one), 29-31 (several) |
+| LFM2.5-24B-A2B (Q3_K_M) | 10.1 s / 0.50 s | 15.1 s / 0.78 s | 20.3 s / 1.1 s | 25.3 s / 1.4 s | 31 (one), 22-25 (several) |
+| GPT-OSS 20B (MXFP4) | 12.5 s / 0.83 s | 25.0 s / 1.4 s | does not fit | does not fit | 22 (one), 20-27 (two) |
+
+The server sizes that cache itself when the config sets none, by the RAM beside the model: 2 GB on a 16 GB Mac for
+these, 4 GB for Sheared-LLaMA (one agent's follow-up 9.8 -> 3.7 s; with 2-4 its conversations do not fit and it is
+slower either way), 16 GB on a 128 GB Mac with Qwen3.6 (`"--conversation-cache-mib"` in the args sets it, `0` turns
+it off; Strata.app's menu has 0.2-32 GB and auto). GPT-OSS 20B with 3-4 agents at 8K is past the M1's GPU memory
+(13 GB) with or without the cache.
 
 On Linux the GPU sets the pace (the engine uses under 10% of the CPU; the GPU's clock is its firmware's, the same top
 1278 MHz as under macOS, with no Linux setting). What was measured on the M1, 2026-10-29:
@@ -105,6 +336,27 @@ The Qwen numbers use its MTP draft layer, which is opt-in (`python3 bootstrap.py
 The context's cache comes on top of the model file (a few GB; more for long contexts). In the *Automatic* energy mode
 the same Mac wrote long answers 2-3x slower. Other Macs were not measured. Every number and how it was measured:
 [docs/MACOS.md](docs/MACOS.md#measured).
+
+## How good is it?
+
+`server/target/release/strata-eval CONFIG.json [CONFIG2.json ...] [--n 15] [--effort none]` scores models on the same
+fixed tasks of public benchmarks, graded by code: HumanEval+ in Python, MultiPL-E's HumanEval in Rust and C++ (compiled
+and run against their tests), BFCL v3 tool calls (simple, choose one of several, parallel) and IFEval instructions.
+Overall = mean of code (Python, Rust, C++), tools and instructions. `strata-eval --selftest` checks the graders
+against the benchmarks' own answers. M5 Max, 2026-11-02, 15 tasks per area, thinking off, greedy (results in
+`bench/results/2026-11-02-eval`; with 15 tasks a score moves about ±10 between close models, `--n 40` separates them):
+
+| Model | Overall | Code (Python / Rust / C++) | Tool calls | Instructions | Time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GLM-5.3-Flash (Maya-S24), 2 slots | 93 | 93 (93 / 93 / 93) | 100 | 87 | 576 s |
+| Qwen3.6-35B-A3B (MXFP4_MOE) | 91 | 93 (93 / 87 / 100) | 80 | 100 | 193 s |
+| Qwen3-Coder-30B-A3B (Q4_K_M) | 90 | 91 (87 / 93 / 93) | 93 | 87 | 163 s |
+| Qwen3.8-Flash-Next (Q2_0) | 88 | 84 (73 / 80 / 100) | 80 | 100 | 245 s |
+| GPT-OSS 120B heretic (MXFP4) | 74 | 96 (87 / 100 / 100) | 53 | 73 | 301 s |
+
+- GPT-OSS writes the best code here but makes one tool call where a task needs two or three at once, and breaks
+  rules like "no commas"; Qwen3.6 sometimes answers from memory instead of calling the tool; Qwen3-Coder calls tools
+  best.
 
 ## What you need
 
@@ -166,6 +418,8 @@ in your browser.
 | GPT-OSS 120B + DFlash draft | 1.6 GB more | about 72 GB (estimate) | Faster on math and step-by-step answers (about +35%), slower on chat (about -20%). `make pull MODEL=GPT-OSS-120B-DFLASH`, then [steps](docs/MACOS.md#gpt-oss-120b-with-a-dflash-draft) |
 | GPT-OSS 20B | 12 GB | 19 GB (measured) | The fastest here (about 3.6B parameters active per token), less capable than the 120B. `make pull MODEL=GPT-OSS-20B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
 | Qwen3.6-35B-A3B | 22 GB | 29 GB (measured) | About 3B parameters active per token, but no faster than GPT-OSS 120B here. `make pull MODEL=QWEN3.6-35B`, then [steps](docs/MACOS.md#gpt-oss-20b-and-qwen36-35b-a3b) |
+| Qwen3-Coder-30B-A3B (Q8_0) | 32.5 GB | 49 GB at 128K, 1 agent (measured) | Unsloth's, made for code, no thinking; about 80 tokens/s for one agent and no more for several ([above](#how-fast-is-it)). `make pull MODEL=QWEN3-CODER-30B` (it writes its run config) |
+| Qwen3-Coder-30B-A3B (Q4_K_M) | 18.6 GB | 35 GB at 128K, 1 agent (measured) | About 90-105 tokens/s for one agent, 110 together for three; the better pick of the two. `make pull MODEL=QWEN3-CODER-30B-Q4` (it writes its run config) |
 | Apple's on-device model (AFM 3 Core on macOS 27) | none (part of macOS) | macOS's own | 3B dense, 4,096-token context on M1/M2 (8,192 on M3 and later); about 30 tokens/s on the 16 GB M1. Small: on the M1's checks it got arithmetic, Russian and code right, Australia's capital and the r's in "strawberry" wrong, and it does not call tools through Strata yet. Needs macOS 26 or later and Apple Intelligence on. `make afm` (it writes `strata-apple-afm.json`), then pick it in Strata.app |
 | LFM2.5-8B-A1B | 9.0 GB | about 13 GB at 128K (measured) | LiquidAI's, 1.5B parameters active per token, thinks before answering; 22.9 tokens/s on the 16 GB M1 under Linux. `make pull MODEL=LFM2.5-8B` (it writes its run config) |
 | LFM2.5-24B-A2B | 11.5 GB | about 13 GB at 32K (measured) | LiquidAI's, 2.45B active, thinks before answering; 12.2 tokens/s on the M1 under Linux. `make pull MODEL=LFM2.5-24B` |

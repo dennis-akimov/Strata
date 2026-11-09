@@ -3,7 +3,7 @@
 //! request monitor.  Each request runs on its own thread (as the Python server's), writing to the connection through
 //! a channel; a client that hangs up sets `gone`, which the request's watcher turns into its cancel.
 
-use crate::api::{self, anthropic_collect, anthropic_events, openai_chunks, openai_collect, structured_chunks, McpRun, Run};
+use crate::api::{self, anthropic_collect, anthropic_events, completion_body, completion_chunk, openai_chunks, openai_collect, structured_chunks, McpRun, Run};
 use crate::errors::Fail;
 use crate::frontend::{anthropic_to_messages, images_of, openai_to_messages};
 use crate::parser::{forced_call, tool_choice_of, CALL_START};
@@ -231,6 +231,11 @@ impl Ctx {
     }
 
     fn json_h(&mut self, code: u16, obj: &Value, extra: Vec<(String, String)>) {
+        if code >= 400 {
+            let e = obj.get("error");
+            let msg = e.and_then(|e| e.get("message").or(Some(e))).map(|m| m.as_str().map(String::from).unwrap_or_else(|| m.to_string())).unwrap_or_default();
+            crate::observe::failed(self.raw_path.split('?').next().unwrap_or(""), code, e.and_then(|e| e.get("type")).and_then(Value::as_str).unwrap_or(""), &msg);
+        }
         if let Some(r) = &self.record {
             let mut r = r.lock().unwrap();
             r.insert("http_status".into(), json!(code));
@@ -429,6 +434,7 @@ impl Ctx {
 }
 
 fn dispatch(mut c: Ctx) {
+    crate::observe::set_client(&c.peer, c.header("user-agent").as_deref(), &c.path());
     // the Host check (DNS rebinding) before anything, unless there is an API key
     let host = c.header("host");
     let any = c.svc().set.allowed_hosts.iter().any(|h| h == "*");
@@ -440,7 +446,14 @@ fn dispatch(mut c: Ctx) {
     }
     match c.method.as_str() {
         "GET" => get_(&mut c),
-        "POST" => post(&mut c),
+        "POST" => {
+            crate::observe::client_begin();
+            match crate::clients::pick(crate::clients::routes(), &c.path(), c.header("user-agent").as_deref()) {
+                Some(r) if c.body.as_ref().is_ok_and(|b| client_fits(&c, r, b)) => route_to(&mut c, r),
+                _ => post(&mut c),
+            }
+            crate::observe::client_end();
+        }
         "DELETE" => delete(&mut c),
         "OPTIONS" => {
             let mut h = c.cors();
@@ -453,6 +466,105 @@ fn dispatch(mut c: Ctx) {
             let _ = c.send_head(501, vec![("Content-Type".into(), "text/html;charset=utf-8".into()), ("Content-Length".into(), body.len().to_string())]);
             let _ = c.write(body);
         }
+    }
+}
+
+/// The request fits the client's engine (Route::fits): its body counted with the model's tokenizer.
+fn client_fits(c: &Ctx, r: &crate::clients::Route, body: &[u8]) -> bool {
+    if r.max_context.is_none() {
+        return true;
+    }
+    let text = String::from_utf8_lossy(body);
+    let max = serde_json::from_slice::<Value>(body).ok()
+        .and_then(|v| ["max_tokens", "max_completion_tokens", "max_output_tokens", "n_predict"].iter().find_map(|k| v[k].as_i64()));
+    let ok = r.fits(c.svc().tok.encode(&text, false).len(), max);
+    if !ok {
+        crate::say(&format!("client engine {}: a request too big for its context goes to the main engine", r.name));
+    }
+    ok
+}
+
+/// A client with an engine of its own (docs/CLIENT_ENGINES.md): the request as sent to that engine, its answer
+/// streamed back and counted for the client
+fn route_to(c: &mut Ctx, r: &crate::clients::Route) {
+    use std::io::Read;
+    if !c.authorized() {
+        return;
+    }
+    crate::observe::client_routed(&r.name);
+    // a VIP client: the main engine yields the GPU while any such request runs (counted: several at once)
+    struct Vip(Option<Arc<crate::engine::StrataEngine>>);
+    static VIPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    impl Drop for Vip {
+        fn drop(&mut self) {
+            if let Some(e) = &self.0 {
+                if VIPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    e.vip(false);
+                }
+            }
+        }
+    }
+    let _vip = Vip(c.svc().engine.strata().filter(|_| r.vip).cloned().inspect(|e| {
+        if VIPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            e.vip(true);
+        }
+    }));
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = AGENT.get_or_init(|| ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(3))).http_status_as_error(false).build().into());
+    let body = c.body.as_ref().map(|b| b.to_vec()).unwrap_or_default();
+    let mut b = ureq::http::Request::builder().method("POST").uri(format!("{}{}", r.url, c.raw_path));
+    for (k, v) in c.headers.iter().filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length" | "connection" | "transfer-encoding")) {
+        b = b.header(k.as_str(), v.as_bytes());
+    }
+    let t0 = Instant::now();
+    let resp = match b.body(body).map_err(|e| e.to_string()).and_then(|q| agent.run(q).map_err(|e| e.to_string())) {
+        Ok(resp) => resp,
+        Err(e) => {
+            let msg = format!("this client's engine ({}, {}) is not answering: {e} (still loading? retry shortly)", r.name, r.url);
+            return c.json_h(503, &json!({"error": {"type": "overloaded_error", "message": msg}}), vec![("Retry-After".into(), "10".into())]);
+        }
+    };
+    let status = resp.status().as_u16();
+    let sse = resp.headers().get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+    let mut h: Vec<(String, String)> = resp.headers().iter().filter(|(k, _)| !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection"))
+        .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect();
+    h.push(("X-Strata-Engine".into(), r.name.clone()));
+    if c.send_head(status, h).is_err() {
+        return;
+    }
+    let (mut ttft, mut acc, mut whole, mut line) = (None, Map::new(), vec![], vec![]);
+    let mut rd = resp.into_body().into_reader();
+    let mut buf = vec![0u8; 16384];
+    loop {
+        let n = match rd.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        ttft.get_or_insert(t0.elapsed().as_secs_f64());
+        if sse {
+            for &ch in &buf[..n] {
+                if ch == b'\n' {
+                    crate::clients::merge_event(&mut acc, &String::from_utf8_lossy(&line));
+                    line.clear();
+                } else {
+                    line.push(ch);
+                }
+            }
+        } else if whole.len() < 64 << 20 {
+            whole.extend_from_slice(&buf[..n]);
+        }
+        if c.write(&buf[..n]).is_err() {
+            return; // the client went away; dropping the reader closes the engine's connection
+        }
+    }
+    let answer = if sse { Value::Object(acc) } else { serde_json::from_slice(&whole).unwrap_or(Value::Null) };
+    if status >= 400 {
+        let msg = answer.pointer("/error/message").and_then(Value::as_str).unwrap_or("");
+        crate::observe::failed(&c.path(), status, answer.pointer("/error/type").and_then(Value::as_str).unwrap_or(""), &format!("{} engine: {msg}", r.name));
+    } else {
+        let mut rec = crate::clients::record_from(&answer, ttft);
+        rec["engine"] = json!(r.name);
+        crate::observe::client_request(&rec);
     }
 }
 
@@ -513,7 +625,10 @@ fn get_(c: &mut Ctx) {
             return;
         }
         if c.authorized() {
-            let m = svc.metrics(c.raw_path.contains("requests=all"));
+            let mut m = svc.metrics(c.raw_path.contains("requests=all"));
+            if !crate::clients::routes().is_empty() {
+                m["client_engines"] = crate::clients::status(svc.set.api_key.first().map(String::as_str));
+            }
             c.json(200, m);
         }
         return;
@@ -522,6 +637,18 @@ fn get_(c: &mut Ctx) {
         if c.authorized() {
             let limit = c.query_param("limit").and_then(|v| v.parse().ok()).unwrap_or(500);
             c.json(200, crate::firewall::history(limit));
+        }
+        return;
+    }
+    if path == "/clients" {
+        if c.authorized() {
+            c.json(200, json!({"clients": crate::observe::clients_view(), "time": crate::sync::now()}));
+        }
+        return;
+    }
+    if path == "/hub" {
+        if c.authorized() {
+            c.json(200, crate::hub::status());
         }
         return;
     }
@@ -583,7 +710,7 @@ fn get_(c: &mut Ctx) {
         return c.static_(&body, "text/html; charset=utf-8", "no-cache");
     }
     match path.as_str() {
-        "/health" | "/api/health" => c.json(200, json!({"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model, "images": svc.vision.is_some(), "api_key": !svc.set.api_key.is_empty(), "image_generation": svc.image.is_some(), "video_generation": svc.video.is_some(), "web": web_version(), "loaded": svc.loaded(), "service": "strata"})),
+        "/health" | "/api/health" => c.json(200, json!({"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model, "images": svc.vision.is_some(), "api_key": !svc.set.api_key.is_empty(), "image_generation": svc.image.is_some(), "video_generation": svc.video.is_some(), "web": web_version(), "loaded": svc.loaded(), "service": "strata", "build": env!("STRATA_BUILD")})),
         "/status" => {
             if !c.authorized() {
                 return;
@@ -771,6 +898,7 @@ fn post(c: &mut Ctx) {
         "/mcp/servers" => return mcp_put(c),
         "/mcp/reminders" => return reminders_post(c),
         "/schedules" => return schedules_post(c),
+        "/hub" => return hub_post(c),
         "/voice" => return voice_post(c),
         _ => {}
     }
@@ -849,7 +977,6 @@ fn error_answer(c: &mut Ctx, path: &str, e: Fail) {
     let responses = path == "/v1/responses";
     match e {
         Fail::Value(m) | Fail::Session { message: m, .. } => {
-            say(&format!("400 invalid request: {m}"));
             if responses {
                 c.json(400, rs::error_body(&m, "invalid_request_error", None, None));
             } else {
@@ -934,7 +1061,7 @@ fn post_api(c: &mut Ctx, path: &str) -> Result<(), Fail> {
         }
         return Ok(());
     }
-    if ["/v1/chat/completions", "/v1/messages", "/v1/responses"].contains(&path) {
+    if ["/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"].contains(&path) {
         c.record = svc.begin_request(path, &rv);
     }
     match path {
@@ -945,6 +1072,7 @@ fn post_api(c: &mut Ctx, path: &str) -> Result<(), Fail> {
             Ok(())
         }
         "/v1/chat/completions" => openai(c, req),
+        "/v1/completions" => completions(c, req),
         "/v1/messages" => anthropic(c, req),
         "/v1/messages/count_tokens" => {
             let req = svc.with_shared(&req, "anthropic");
@@ -1024,8 +1152,10 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     let vocab = Some(svc.tok.vocab_size());
     crate::bias::normalize(req.get("logit_bias"), vocab)?;
     let rv = Value::Object(req.clone());
-    let (messages, tools, kw) = openai_to_messages(&rv)?;
+    let (mut messages, tools, kw) = openai_to_messages(&rv)?;
     no_local_images(c, &messages)?;
+    // "/team TASK" from the page: agents on the task at once (team.rs)
+    let team = if get(&rv, "strata_mcp") == &json!(true) { crate::team::command(&mut messages).map(|t| t.0).unwrap_or(0) } else { 0 };
     let prompt_tools = tools.clone();
     let mut tools = tools;
     if tool_choice_of(get(&rv, "tool_choice")).0 == "none" {
@@ -1043,11 +1173,35 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     if validator.is_some() && (tools.is_some() || truthy(get(&rv, "strata_mcp"))) {
         return Err(Fail::Value("structured response_format with tools/MCP is not supported".into()));
     }
+    // the schema for the engine's grammar (run.rs sends it when the engine has one); never a client's own key
+    req.remove("strata_json_schema");
+    if let Some(s) = crate::structured::grammar_schema(get(&rv, "response_format")) {
+        req.insert("strata_json_schema".into(), json!(s.to_string()));
+    }
     svc.load()?;
     let mt = if truthy(get(&rv, "max_completion_tokens")) { get(&rv, "max_completion_tokens") } else { get(&rv, "max_tokens") };
     let max_req = int_of(if truthy(mt) { mt } else { &Value::Null })?;
     let info_bias = svc.engine.info().get("logit_bias").and_then(Value::as_i64);
     crate::bias::validate_request(&req, info_bias, svc.engine.batch(), vocab)?;
+    // a chat template with no tool format (a base model: Sheared-LLaMA) drops the tools unseen; the model then answers
+    // from memory as if it had none.  The page's own tools: say so; a client's: once in the log
+    // Apple's on-device model (strata-afm) gets the conversation as text: no tools reach it yet, and its chat goes on
+    // without them (the page has them on by default; refusing here broke its chat)
+    // ponytail: FoundationModels has its own Tool protocol; strata-afm could take MCP tools through it
+    let afm = matches!(svc.engine, crate::engine::Engine::Afm(_));
+    if afm && tools.is_some() {
+        static AFM_SAID: std::sync::Once = std::sync::Once::new();
+        AFM_SAID.call_once(|| say("Apple's on-device model answers without tools: strata-afm does not pass them on yet"));
+    }
+    if !svc.template.caps.supports_tools && !afm {
+        if get(&rv, "strata_mcp") == &json!(true) && svc.mcp.is_some() {
+            return Err(Fail::Value(format!("{} cannot use tools: its chat template has no tool format (a base model, not trained to follow instructions or call tools). Switch tools off in Sampling, or pick a model that calls tools (LFM2.5, GPT-OSS, Qwen3.6)", svc.model)));
+        }
+        static SAID: std::sync::Once = std::sync::Once::new();
+        if tools.is_some() {
+            SAID.call_once(|| say(&format!("a request sent tools, but {}'s chat template has no tool format: the model does not see them", svc.model)));
+        }
+    }
     let mut use_mcp = get(&rv, "strata_mcp") == &json!(true) && svc.mcp.is_some();
     let own: Vec<String> = tools.iter().flatten().filter_map(|t| get(t, "name").as_str().map(String::from)).collect();
     let mut extra = vec![];
@@ -1056,8 +1210,12 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
             return Ok(());
         }
         let hub = svc.mcp.clone().unwrap();
+        hub.retry_failed();
         hub.wait(Some(10.0));
         extra = hub.template_tools(&own);
+        // the team agents' own browsers (agent1-agent4, Strata.app): a team's only, the usual chat never sees them
+        let agent_tool = |t: &Value| { let n = get(t, "name").as_str().unwrap_or(""); n.starts_with("agent") && n[5..].split_once("__").is_some_and(|(k, _)| k.parse::<u8>().is_ok()) };
+        if team > 0 { extra.retain(agent_tool) } else { extra.retain(|t| !agent_tool(t)) }
         use_mcp = !extra.is_empty();
         let mut all = tools.clone().unwrap_or_default();
         all.extend(extra.iter().cloned());
@@ -1074,7 +1232,7 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
     debug_req("openai", &Value::Object(req.clone()), &messages, tools.as_deref(), max_new, thinking, ids.len());
     let cancel = Arc::new(Flag::new());
     c.watch_client(&cancel);
-    let mcp = if use_mcp { Some(McpRun { messages: messages.clone(), kw: kw.clone(), max_req, names: extra.iter().filter_map(|t| get(t, "name").as_str().map(String::from)).collect() }) } else { None };
+    let mcp = if use_mcp { Some(McpRun { messages: messages.clone(), kw: kw.clone(), max_req, names: extra.iter().filter_map(|t| get(t, "name").as_str().map(String::from)).collect(), team, rounds: None }) } else { None };
     let rv = Value::Object(req.clone());
     let mut run = Run { svc: &svc, ids, thinking, tools, max_new, sampling: req, cancel: cancel.clone(), force, mcp };
     let stream = truthy(get(&rv, "stream"));
@@ -1140,6 +1298,71 @@ fn openai(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
         }
         Ok(())
     }
+}
+
+/// OpenAI's legacy /v1/completions: the prompt as it is (no chat template; special tokens in it are tokens, as in
+/// llama-server), its continuation as `text`.  One prompt a request; max_tokens 16 when unset (OpenAI's default).
+fn completions(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
+    let svc = c.svc().clone();
+    let mut req = svc.with_shared(&req, "openai");
+    let rv = Value::Object(req.clone());
+    let prompt = match get(&rv, "prompt") {
+        Value::String(s) => s.clone(),
+        Value::Array(a) if a.len() == 1 && a[0].is_string() => a[0].as_str().unwrap_or("").to_string(),
+        _ => return Err(Fail::Value("prompt: one string (or a list of one string) per request".into())),
+    };
+    stop_strings(&rv)?;
+    check_request_sampling(&mut req)?;
+    svc.load()?;
+    let ids = svc.tok.encode(&prompt, true);
+    if ids.is_empty() {
+        return Err(Fail::Value("prompt is empty".into()));
+    }
+    let mt = get(&rv, "max_tokens");
+    let max_req = if mt.is_null() { 16 } else { int_of(mt)? };
+    let max_new = svc.room_for(ids.len() as i64, Some(max_req))?;
+    let cancel = Arc::new(Flag::new());
+    c.watch_client(&cancel);
+    let mut run = Run { svc: &svc, ids, thinking: false, tools: None, max_new, sampling: req, cancel: cancel.clone(), force: None, mcp: None };
+    if !truthy(get(&rv, "stream")) {
+        let mut chunks = vec![];
+        let mut keep = |ch: Option<Value>| -> Result<(), Closed> {
+            chunks.extend(ch);
+            Ok(())
+        };
+        return match openai_chunks(&rv, &mut run, &mut keep) {
+            Ok(()) => {
+                c.json(200, completion_body(&openai_collect(&chunks)));
+                Ok(())
+            }
+            Err(Stop::Closed) => Ok(()),
+            Err(Stop::Err(e)) => Err(e),
+        };
+    }
+    if c.sse().is_err() {
+        cancel.set();
+        return Ok(());
+    }
+    let mut send = |ch: Option<Value>| -> Result<(), Closed> {
+        let r = match &ch {
+            None => c.write(b": keep-alive\n\n"),
+            Some(v) => c.write(format!("data: {}\n\n", pyjson::dumps_u(&completion_chunk(v))).as_bytes()),
+        };
+        if r.is_err() {
+            cancel.set();
+        }
+        r
+    };
+    match openai_chunks(&rv, &mut run, &mut send) {
+        Ok(()) => {
+            let _ = c.write(b"data: [DONE]\n\n");
+        }
+        Err(Stop::Closed) => {}
+        Err(Stop::Err(e)) => {
+            let _ = c.write(format!("data: {}\n\ndata: [DONE]\n\n", pyjson::dumps(&json!({"error": {"type": "server_error", "message": e.to_string()}}))).as_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn anthropic(c: &mut Ctx, req: Map<String, Value>) -> Result<(), Fail> {
@@ -1643,6 +1866,18 @@ fn schedules_post(c: &mut Ctx) {
     }
     match crate::schedules::put(&req) {
         Ok(_) => c.json(200, crate::schedules::list()),
+        Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
+    }
+}
+
+/// POST /hub {url, key, name, enabled}: the AI-cluster connection's settings (the Hub tab).
+fn hub_post(c: &mut Ctx) {
+    if !c.own_page("the AI-cluster connection can be changed") {
+        return;
+    }
+    let req: Value = c.body().ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    match crate::hub::put(&req) {
+        Ok(s) => c.json(200, s),
         Err(e) => c.json(400, json!({"error": {"type": "invalid_request_error", "message": e}})),
     }
 }

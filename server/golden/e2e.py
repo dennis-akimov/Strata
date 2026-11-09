@@ -59,10 +59,14 @@ def call(port, method, path, body=None, headers=None):
 IDS = re.compile(r'^(chatcmpl-|msg_|resp_|rs_|fc_|ctc_|call_|video_)[0-9a-f]{6,}$')
 CLOCKS = {"ms", "duration_s", "load_s", "queue_s", "wallclock_s", "first_token_s", "path", "file", "log", "chat_template", "model_path", "created", "created_at", "completed_at", "time", "since", "started", "uptime_s", "at", "started_at", "finished_at", "last_request_at", "elapsed_s", "web", "encrypted_content", "machine"}  # machine: live hardware readings
 
+# what the Rust server says and the recorded Python server never did: /health "build" (the git commit it was built from)
+ONLY_RS = {"build"}
+
+
 def norm(v):
     """ids and clocks out of a parsed answer; the order of keys is kept (it is compared too)."""
     if isinstance(v, dict):
-        return [[k, "X" if k in CLOCKS else norm(x)] for k, x in v.items()]
+        return [[k, "X" if k in CLOCKS else norm(x)] for k, x in v.items() if k not in ONLY_RS]
     if isinstance(v, list):
         return [norm(x) for x in v]
     if isinstance(v, str) and IDS.match(v):

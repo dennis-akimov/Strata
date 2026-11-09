@@ -104,6 +104,11 @@ main { flex: 1; min-height: 0; display: flex; }
 .badges .st-badge.on { opacity: 1; }
 .state-card__row { display: flex; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
                    font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
+.state-slots { display: flex; flex-direction: column; gap: var(--st-s-2); border-top: 1px solid var(--st-line-soft); padding-top: var(--st-s-3); }
+.state-slot { display: grid; grid-template-columns: 6.5em minmax(0, 1fr) auto; align-items: center; gap: var(--st-s-3);
+              font-size: var(--st-fs-sm); font-variant-numeric: tabular-nums; }
+.state-slot .st-progress { height: 6px; }
+.state-slot--idle { color: var(--st-ink-muted); }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-4); }
 .metric-card { padding: var(--st-s-4) var(--st-s-5); }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
@@ -118,6 +123,11 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-metric__spark[data-tone="info"] { color: var(--st-info); }
 .monitor-row { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 2.4fr); gap: var(--st-s-4); }
 .ctx-card { display: flex; flex-direction: column; gap: var(--st-s-2); }
+.ctx-agents { display: flex; flex-direction: column; gap: 6px; margin-bottom: var(--st-s-2); }
+.ctx-agents .state-slot { grid-template-columns: 5.5em minmax(0, 1fr) auto; font-size: var(--st-fs-sm, 13px); }
+.no-hit .col-hit { display: none; }
+tr.failed td { color: var(--st-danger-text); }
+.chip--err { color: var(--st-danger-text); }
 .ctx-gauge { position: relative; width: 150px; height: 150px; margin: var(--st-s-2) auto var(--st-s-3); }
 .ctx-gauge .st-gauge { width: 150px; height: 150px; }
 .ctx-gauge .st-gauge__fill { transition: stroke-dasharray 400ms var(--st-ease); }

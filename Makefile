@@ -62,7 +62,7 @@ AB_GGUF     ?=
 AB_PROMPTS  ?=
 AB_ROUNDS   ?= 7
 
-.PHONY: help setup pull check update run start stop status wait chat models build build-ab server afm app app-run app-stop tui tui-build test test-server test-engine ab clean
+.PHONY: help setup pull check update run start stop status wait chat models build build-ab server afm app app-run app-stop tui tui-build test test-server test-engine ab clean linux-package linux-deliver linux
 
 help:
 	@echo "Strata - make targets (variables: PORT=$(PORT) HOST=$(HOST) API_KEY=... MODEL=... SETUP_ARGS=...;"
@@ -74,7 +74,7 @@ help:
 	@echo "  make pull          build the engine and download a model, without starting it: make pull MODEL=Q2_0"
 	@echo "                     (from Hugging Face into ../Strata-data, resumable: run it again if it stops)"
 	@echo "                     MODEL: Q2_0 IQ2_XS IQ3_XXS IQ3_S IQ1_M UD-Q4_K_XL UD-IQ4_XS (setup), or GLM-5.3"
-	@echo "                     GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B NUCLEUS"
+	@echo "                     GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B QWEN3-CODER-30B QWEN3-CODER-30B-Q4 NUCLEUS"
 	@echo "                     HUNYUAN WAN2.2"
 	@echo "                     (tools/pull_model.py; GPT-OSS-120B-DFLASH, NUCLEUS and HUNYUAN convert too; WAN2.2"
 	@echo "                     builds stable-diffusion.cpp's sd-cli for videos)"
@@ -92,6 +92,10 @@ help:
 	@echo "  make app-run       build it, stop a running Strata.app (and its server) and open the new one"
 	@echo "  make app-stop      quit Strata.app: its server sends QUIT to the engine and frees its memory first"
 	@echo "  make tui           Strata.app in a terminal (Linux on Apple Silicon, or over SSH): chat, monitor, memory, log"
+	@echo "  make linux-package the engine (CPU), server and app for an x86_64 Linux PC, built here in Docker for its CPU"
+	@echo "                     [LINUX_HOST=dadmin@vizio.local LINUX_DIR=/home/dadmin/Strata LINUX_CPU=ivybridge]"
+	@echo "  make linux-deliver that package into LINUX_DIR/engine-metal on LINUX_HOST, and Strata in its applications"
+	@echo "  make linux         push this commit there, package, deliver, and open (or switch) Strata on its desktop"
 	@echo "  make chat          one chat request: make chat PROMPT=\"Write a haiku\" [MAX_TOKENS=100 EFFORT=none|low|medium|high]"
 	@echo "                     REASONING_BUDGET=N: at most N tokens of thinking, then it answers (0: no cap; it counts"
 	@echo "                     toward MAX_TOKENS, so keep it 64+ below; EFFORT=none turns thinking off)"
@@ -113,8 +117,8 @@ else
 endif
 
 # setup's own download (Hugging Face, resumable; HF_ENDPOINT for a mirror, SETUP_ARGS="--data-dir DIR" for elsewhere);
-# the models setup does not install (GLM-5.3, GPT-OSS-120B, GPT-OSS-120B-HERETIC, GPT-OSS-120B-DFLASH, GPT-OSS-20B, QWEN3.6-35B, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.py
-PULL_EXTRA  := GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B LFM2.5-24B LFM2.5-8B NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b gpt-oss-120b-heretic gpt-oss-120b-dflash gpt-oss-20b qwen3.6-35b lfm2.5-24b lfm2.5-8b nucleus hunyuan wan2.2
+# the models setup does not install (GLM-5.3, GPT-OSS-120B, GPT-OSS-120B-HERETIC, GPT-OSS-120B-DFLASH, GPT-OSS-20B, QWEN3.6-35B, QWEN3-CODER-30B, QWEN3-CODER-30B-Q4, NUCLEUS, HUNYUAN, WAN2.2) through tools/pull_model.py
+PULL_EXTRA  := GLM-5.3 GPT-OSS-120B GPT-OSS-120B-HERETIC GPT-OSS-120B-DFLASH GPT-OSS-20B QWEN3.6-35B QWEN3-CODER-30B QWEN3-CODER-30B-Q4 LFM2.5-24B LFM2.5-24B-IQ3 LFM2.5-8B LFM2.5-8B-Q4 QWEN3-4B QWEN3-4B-Q4 NUCLEUS HUNYUAN WAN2.2 glm-5.3 gpt-oss-120b gpt-oss-120b-heretic gpt-oss-120b-dflash gpt-oss-20b qwen3.6-35b qwen3-coder-30b qwen3-coder-30b-q4 lfm2.5-24b lfm2.5-24b-iq3 lfm2.5-8b lfm2.5-8b-q4 qwen3-4b qwen3-4b-q4 nucleus hunyuan wan2.2
 DATA_DIR    ?= ../Strata-data
 pull:
 	$(if $(filter $(MODEL),$(PULL_EXTRA)),$(PY) tools/pull_model.py $(MODEL) $(DATA_DIR),python3 bootstrap.py --setup --no-start $(if $(MODEL),--model $(MODEL),) $(SETUP_ARGS))
@@ -193,10 +197,10 @@ models:
 build: server
 ifeq ($(shell uname -s),Darwin)
 	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON
-	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
+	$(CMAKE) --build build-metal --target strata-metal strata-vision strata-directions -j
 	@# installed where the run configs point; rm first: macOS kills a program whose binary was rewritten in place
-	rm -f engine-metal/strata-metal engine-metal/strata-vision engine-metal/strata-afm engine-metal/strata-voice
-	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
+	rm -f engine-metal/strata-metal engine-metal/strata-vision engine-metal/strata-directions engine-metal/strata-afm engine-metal/strata-voice
+	cp build-metal/metal/strata-metal build-metal/metal/strata-vision build-metal/metal/strata-directions engine-metal/
 	@# Apple's on-device model (macOS 26+): strata-afm for "engine": "afm" configs (make afm); skipped without FoundationModels
 	@swiftc -O -parse-as-library metal/afm/strata_afm.swift -o engine-metal/strata-afm 2>/dev/null || echo "strata-afm not built: Apple's on-device model needs macOS 26 or later"
 	@# "Hey Strata" (the chat's Voice button): Apple's on-device dictation; its Info.plist inside, for the microphone's prompt
@@ -212,9 +216,56 @@ else ifeq ($(APPLE_LINUX),1)
 	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
 	mkdir -p engine-metal && rm -f engine-metal/strata-metal engine-metal/strata-vision
 	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
+else ifeq ($(shell uname -s),Linux)
+	@# another Linux PC: the same engine on the CPU (llama.cpp's CPU backend, built for this CPU; LINUX_CPU_ARGS for
+	@# another one: make linux-package builds for the target PC's instruction set, not the build machine's)
+	$(CMAKE) -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON -DSTRATA_METAL_CPU=ON $(LINUX_CPU_ARGS)
+	$(CMAKE) --build build-metal --target strata-metal strata-vision -j
+	mkdir -p engine-metal && rm -f engine-metal/strata-metal engine-metal/strata-vision
+	cp build-metal/metal/strata-metal build-metal/metal/strata-vision engine-metal/
 else
-	@echo "on Linux / Windows setup builds or downloads the engine: make setup (or python3 bootstrap.py --setup --build)"
+	@echo "on Windows setup builds or downloads the engine: make setup (or python3 bootstrap.py --setup --build)"
 endif
+
+# Strata for an x86_64 Linux PC, built here in Docker (linux/Dockerfile; on a Mac under Rosetta) at the path it runs
+# from there (the app and the server keep their folder's path from the build), for that PC's CPU, not this one's.
+# LINUX_DIR there is a git checkout of the same commit (make linux pushes it): the package is the binaries.
+LINUX_HOST ?= dadmin@vizio.local
+LINUX_DIR  ?= /home/dadmin/Strata
+LINUX_CPU  ?= ivybridge
+LINUX_WORK ?= $(abspath ../Strata-linux-build)
+# ivybridge (a 2012 i7): AVX and F16C, no AVX2 / FMA; anything else: the x86-64-v3 set (AVX2, FMA)
+LINUX_CPU_FLAGS = $(if $(filter ivybridge,$(LINUX_CPU)),-DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=ON -DGGML_BMI2=OFF,-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON)
+LINUX_SHA  = $(shell git rev-parse --short=8 HEAD)
+LINUX_PKG  = $(LINUX_WORK)/strata-linux-x86_64-$(LINUX_SHA).tar.gz
+# LINUX_VULKAN=1: also strata-metal-vulkan, the same engine on the PC's GPUs through Vulkan (Mesa's NVK, ANV/hasvk; a
+# config's "exe" picks it); its shaders make the first build much longer
+LINUX_VULKAN ?= 0
+LINUX_BINS = engine-metal/strata-metal $(if $(filter 1,$(LINUX_VULKAN)),engine-metal/strata-metal-vulkan,) engine-metal/strata-vision engine-metal/strata-server engine-metal/strata-files engine-metal/strata-app
+LINUX_VK_BUILD = && cmake -S . -B build-metal-vk -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_METAL=ON -DGGML_NATIVE=OFF $(LINUX_CPU_FLAGS) \
+	  && cmake --build build-metal-vk --target strata-metal -j && cp build-metal-vk/metal/strata-metal engine-metal/strata-metal-vulkan
+
+linux-package:
+	@test -z "$$(git status --porcelain --untracked-files=no)" || { echo "commit first: the package is built from HEAD (git archive)"; exit 1; }
+	docker build -q -t strata-linux-build linux
+	mkdir -p $(LINUX_WORK)/src $(LINUX_WORK)/cargo
+	git archive HEAD | tar -x -C $(LINUX_WORK)/src
+	docker run --rm --platform linux/amd64 -v $(LINUX_WORK)/src:$(LINUX_DIR) -v $(LINUX_WORK)/cargo:/opt/cargo/registry -w $(LINUX_DIR) -e STRATA_BUILD_SHA=$(LINUX_SHA) \
+	  strata-linux-build sh -c 'make build LINUX_CPU_ARGS="-DGGML_NATIVE=OFF $(LINUX_CPU_FLAGS)" && make app $(if $(filter 1,$(LINUX_VULKAN)),$(LINUX_VK_BUILD),)'
+	tar -C $(LINUX_WORK)/src -czf $(LINUX_PKG) $(LINUX_BINS)
+	@echo "package: $(LINUX_PKG); make linux-deliver puts it on $(LINUX_HOST)"
+
+linux-deliver:
+	@test -f $(LINUX_PKG) || { echo "no $(LINUX_PKG): make linux-package first"; exit 1; }
+	@ssh $(LINUX_HOST) "cd $(LINUX_DIR) && git rev-parse --short=8 HEAD" | grep -qx $(LINUX_SHA) || { echo "$(LINUX_HOST):$(LINUX_DIR) is not at $(LINUX_SHA): make linux pushes it"; exit 1; }
+	scp -q $(LINUX_PKG) $(LINUX_HOST):/tmp/strata-linux.tar.gz
+	ssh $(LINUX_HOST) "cd $(LINUX_DIR) && mkdir -p engine-metal && rm -f $(LINUX_BINS) && tar -xzf /tmp/strata-linux.tar.gz && rm -f /tmp/strata-linux.tar.gz && echo $(LINUX_SHA) > engine-metal/.build && ls -l engine-metal"
+	ssh $(LINUX_HOST) "mkdir -p ~/.local/share/applications && printf '[Desktop Entry]\nType=Application\nName=Strata\nComment=Local AI models\nExec=$(LINUX_DIR)/engine-metal/strata-app\nIcon=utilities-terminal\nTerminal=false\nCategories=Development;\n' > ~/.local/share/applications/strata.desktop"
+
+linux:
+	git push -q $(LINUX_HOST):$(notdir $(LINUX_DIR)) HEAD:mac3
+	$(MAKE) linux-package linux-deliver
+	ssh $(LINUX_HOST) "cd $(LINUX_DIR) && engine-metal/strata-app --deploy"
 
 # the server (server/, Rust): built and put beside the engine, where setup and the run scripts start it
 # the tool-call grammar against llama.cpp's own GBNF validator (the engine's llama.cpp, after make metal)
@@ -240,13 +291,24 @@ afm:
 	.venv/bin/python metal/onboard_mac.py --config-only AFM
 
 app: server
+	@# the app runs engine-metal/strata-metal, which only make build refreshes: say so when its source is newer
+	@[ ! -f engine-metal/strata-metal ] || [ engine-metal/strata-metal -nt metal/strata_metal.cpp ] || echo "warning: engine-metal/strata-metal is older than metal/strata_metal.cpp: run make build too (the app keeps using the old engine)"
 	$(CARGO) build --release --manifest-path app/Cargo.toml
+ifneq ($(shell uname -s),Darwin)
+	@# Linux: the app beside the engine, and in the desktop's applications (GTK, WebKitGTK and a tray icon:
+	@# libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev to build)
+	rm -f engine-metal/strata-app && cp app/target/release/strata-app engine-metal/strata-app
+	mkdir -p $(HOME)/.local/share/applications
+	printf '[Desktop Entry]\nType=Application\nName=Strata\nComment=Local AI models\nExec=$(CURDIR)/engine-metal/strata-app\nIcon=utilities-terminal\nTerminal=false\nCategories=Development;\n' > $(HOME)/.local/share/applications/strata.desktop
+	@echo "built engine-metal/strata-app: make app-run, or Strata in the desktop's applications"
+else
 	rm -rf Strata.app && mkdir -p Strata.app/Contents/MacOS
 	cp app/target/release/strata-app Strata.app/Contents/MacOS/Strata
 	cp app/Info.plist Strata.app/Contents/Info.plist
 	@# a locked keychain (an ssh session: errSecInternalComponent) signs ad-hoc instead, and says so
 	codesign --force --sign $(SIGN_ID) Strata.app || { echo "signed ad-hoc: unlock the keychain (security unlock-keychain) to sign as $(SIGN_ID); macOS will ask for its permissions again"; codesign --force --sign - Strata.app; }
 	@echo "built Strata.app: make app-run, or open Strata.app (or drag it to /Applications; it runs the server from $(CURDIR))"
+endif
 
 # strata-tui (tui/, Rust): Strata.app in a terminal, for Linux on an Apple Silicon Mac (and any terminal, SSH too)
 tui-build: server
@@ -257,13 +319,25 @@ tui: tui-build
 	engine-metal/strata-tui
 
 # SIGTERM is the app's Quit: it stops its server the server's way (the engine frees its memory) and exits
-APP_PAT = Strata.app/Contents/MacOS/Strata$$
+APP_PAT = $(if $(filter Darwin,$(shell uname -s)),Strata.app/Contents/MacOS/Strata$$,engine-metal/strata-app$$)
 app-stop:
 	@if pkill -TERM -f '$(APP_PAT)'; then printf 'stopping Strata.app'; \
 	  while pgrep -f '$(APP_PAT)' >/dev/null; do printf .; sleep 1; done; echo ' stopped'; else echo 'Strata.app is not running'; fi
 
-app-run: app app-stop
-	open Strata.app
+# blue-green while the model is busy (app/src/deploy.rs): the new app's server takes the port, the old one finishes its
+# requests; idle, the old app quits and the new one opens
+# Linux: binaries already built for this checkout's commit (make linux-deliver writes it into engine-metal/.build) are
+# used as they are - a 2012 laptop needs no hour of compiling for what another machine built; else they are built here
+ifeq ($(shell uname -s),Darwin)
+app-run: app
+	Strata.app/Contents/MacOS/Strata --deploy
+else
+app-run:
+	@if [ -x engine-metal/strata-app ] && [ -s engine-metal/.build ] && git diff --quiet "$$(cat engine-metal/.build)" HEAD -- app server metal CMakeLists.txt 2>/dev/null; then \
+	  echo "engine-metal has the build of $$(cat engine-metal/.build): no app, server or engine change since, nothing to compile"; \
+	else $(MAKE) build app && git rev-parse --short=8 HEAD > engine-metal/.build; fi
+	engine-metal/strata-app --deploy
+endif
 
 # the server's tests: its unit and golden tests, then its answers against the Python server's recorded ones
 # (server/golden/e2e.py --replay; the packs it needs are the ones on this Mac, a missing one is skipped)

@@ -3,10 +3,11 @@
 <style>
 :root{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mute:#6e6e73;--line:#d2d2d7;--acc:#0a84ff;--log:#1d1d1f;--logfg:#e5e5ea}
 @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--fg:#f5f5f7;--mute:#98989d;--line:#3a3a3c;--log:#000;--logfg:#d1d1d6}}
-*{box-sizing:border-box}[hidden]{display:none!important}html,body{height:100%}body{margin:0;font:12.5px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
-#bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:nowrap;white-space:nowrap;height:44px;overflow:visible}
-#bar>*{flex-shrink:0}#bar>#cfg,#bar>#ctx{flex-shrink:1;min-width:90px}
-@media (max-width:1400px){#url{display:none}}@media (max-width:1150px){#rate,.sep{display:none}#mem{max-width:110px;overflow:hidden;text-overflow:ellipsis}}
+*{box-sizing:border-box}[hidden]{display:none!important}body:not([data-os=macos]) .mac-only{display:none!important}html,body{height:100%}body{margin:0;font:12.5px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
+#bar{display:flex;gap:6px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:nowrap;white-space:nowrap;height:44px;overflow:visible;width:100%}
+#bar>*{flex-shrink:0}
+/* the bar is one 44 px line (the page view sits under it): fit() moves the less used items into More until it fits */
+#menu .narrow{display:none}#menu .narrow.shown{display:block}.folded{display:none!important}
 select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
 button{cursor:pointer}button:hover:not(:disabled){border-color:var(--acc)}button:disabled{opacity:.4;cursor:default}
 button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{border-color:var(--acc);color:var(--acc)}
@@ -15,6 +16,14 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
 #more{position:relative}#menu{display:none;position:absolute;right:0;top:28px;z-index:9;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px;min-width:220px;box-shadow:0 6px 24px #0003}
 #menu.open{display:block}#menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:6px 8px}#menu button:hover{background:var(--bg)}
 #menu label{display:block;padding:6px 8px}
+#memwrap{position:relative}#mem{cursor:pointer}#refresh{padding:2px 7px}
+#mempop{display:none;position:absolute;left:0;top:28px;z-index:9;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;width:380px;max-width:90vw;box-shadow:0 6px 24px #0003}
+#mempop.open{display:block}
+#mempop{white-space:normal}   /* the bar's nowrap would stretch the table and the note past the popover */
+#popapps{padding-top:8px}#mempop .applist table{table-layout:fixed}#mempop .applist td:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#mempop .applist td.n{width:5.5em}#mempop .applist td.b{width:7em}#mempop h3{margin:8px 0 4px;font-size:13px}#mempop h3:first-child{margin-top:0}
+#mempop .row{display:flex;justify-content:space-between;font-variant-numeric:tabular-nums;padding:1px 0}
+#mempop .meter{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin:4px 0}#mempop .meter span{display:block;height:100%}
 #main{flex:1;display:flex;flex-direction:column;min-height:0}
 #idle{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:16px;text-align:center}
 #idle h2{margin:0;font-size:20px}#note{color:#ff453a;min-height:1em}
@@ -47,19 +56,28 @@ button.main{background:var(--acc);border-color:var(--acc);color:#fff}button.on{b
   <span class="dot" id="dot"></span><span id="phase">stopped</span>
   <select id="cfg" title="run config (strata-*.json in the Strata folder; port from the config)"></select>
   <select id="ctx" title="the context window: the longest conversation the model keeps (more needs more memory)"></select>
-  <span id="mem" class="chip" title="what this model needs at this context, against what this Mac has">memory …</span>
+  <select id="cache" title="conversation cache: RAM that keeps conversations another one displaced, so they come back without being read again (RAM, not the GPU's share; a running server restarts)"></select>
+  <select id="par" title="agents: requests answered at once by one engine and one copy of the weights, each with its own context (more needs more memory; a running server restarts)"></select>
+  <select id="pool" title="K/V pool: off = each agent holds its own context from the start; a pool = one pool all agents draw from, each up to the context (less memory for agents of different sizes; a running server restarts)"></select>
+  <select id="share" title="prompt sharing: while one agent's new prompt is read, the agents already writing get this share of the time (off: they wait until it is read; a running server restarts)"></select>
+  <button id="refresh" title="look for models again (a new run config, a download that finished)">↻</button>
+  <span id="memwrap"><span id="mem" class="chip" title="what this model needs at this context, against what this Mac has">memory …</span>
+    <div id="mempop"><div id="memsum"></div><div class="applist" id="popapps"></div></div></span>
   <button class="main" id="start">Start</button><button id="stop">Stop</button><button id="restart">Restart</button>
-  <span class="mute sep">|</span><button id="load">Load model</button><button id="unload">Unload</button>
+  <span class="mute sep" id="sep1">|</span><button id="load">Load model</button><button id="unload">Unload</button>
   <span id="rate" class="mute"></span><span style="flex:1"></span>
   <span class="mute" id="url"></span>
   <button id="webbtn" title="a browser beside the chat (Send page to chat puts the page you read into the message box)">Web</button>
-  <button id="sysbtn" title="what macOS runs that the model would rather have the memory of">System</button>
+  <button id="sysbtn" class="mac-only" title="what macOS runs that the model would rather have the memory of">System</button>
   <button id="logbtn" title="the server's output">Log</button>
   <span id="more"><button id="morebtn">More ▾</button><div id="menu">
+    <button class="narrow" id="m_load">Load model</button><button class="narrow" id="m_unload">Unload model</button>
+    <button class="narrow" id="m_web">Web</button><button class="narrow mac-only" id="m_sys">System</button><button class="narrow" id="m_log">Log</button>
     <button id="browser">Open in browser</button><button id="edit_config">Edit config</button>
     <button id="reveal">Show config in Finder</button><button id="engine_log">Engine log in Console</button>
     <button id="copy_key">Copy API key</button>
     <label><input type="checkbox" id="autostart"> Start the server when the app opens</label>
+    <label title="other devices on your network use the model at http://THIS-MAC.local:PORT/v1 with the API key (one is made when there is none); the server restarts"><input type="checkbox" id="shared"> Share on the network</label>
   </div></span>
 </div>
 <div id="main">
@@ -82,19 +100,41 @@ const COLORS={ready:'#34c759',busy:'#0a84ff',starting:'#ff9f0a',stopping:'#ff9f0
 let base='',up=false;
 const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const gb=b=>b==null?'–':(b/1e9).toFixed(1)+' GB', k=c=>c>=1048576&&c%1048576===0?c/1048576+'M':c>=1024?Math.round(c/1024)+'K':c;
-let mem=null,running=false;
+let mem=null,running=false,snap=null;
+// macOS or not (Linux): the System card and the Mac's GPU, energy and memory words only on macOS
+const mac=()=>!snap||!snap.os||snap.os==='macos',here=()=>mac()?'this Mac':'this computer';
 function init(s){
+  snap=s;
+  document.body.dataset.os=s.os||'macos';
   const name=c=>{const n=c.name.replace(/^strata-|\.json$/g,'');return n==='apple-afm'?"Apple's on-device model (apple-afm)":n+(c.model&&c.model!==n?' — '+c.model:'');};
-  $('cfg').innerHTML=s.configs.map(c=>`<option value="${esc(c.path)}"${c.problem?' disabled':''}>${esc(name(c))}${c.problem?' (not ready)':''}</option>`).join('')||'<option>no run config yet: make setup</option>';
+  // the closed picker's name: the size dropped (qwen3.6-35b -> qwen3.6) when no other config would read the same
+  const bare=c=>c.name.replace(/^strata-|\.json$/g,''),cut=c=>bare(c).replace(/-\d+(\.\d+)?b(?=-|$)/i,'');
+  const short=c=>s.configs.filter(o=>cut(o)===cut(c)).length===1?cut(c):bare(c);
+  $('cfg').innerHTML=s.configs.map(c=>{const l=name(c)+(c.problem?' (not ready)':''),sh=short(c);
+    return `<option value="${esc(c.path)}"${c.problem?' disabled':''} data-s="${esc(sh)}" data-l="${esc(l)}">${esc(l)}</option>`;}).join('')||'<option>no run config yet: make setup</option>';
+  const cur=s.configs.find(c=>c.path===s.config),pn=cur?cur.parallel||1:1;
+  cacheMenu(cur);
+  // the pool: off, or half / three quarters / all of context x agents (the A/B: docs/CONTEXT_POOL.md)
+  const cx=cur?cur.ctx||0:0,full=cx*pn,pv=cur?cur.pool||0:0,poolv=[0,...(pn>1&&cx?[full/2,full*3/4,full]:[])].concat(pv&&![0,full/2,full*3/4,full].includes(pv)?[pv]:[]);
+  $('pool').hidden=pn<2&&!pv;
+  $('pool').innerHTML=poolv.map(v=>`<option value="${v}"${v===pv?' selected':''} data-s="${v?'pool '+k(v):'pool off'}" data-l="${v?`one pool of ${k(v)} tokens for the ${pn} agents, each up to ${k(cx)}`:`each agent its own ${k(cx)} context, held from the start`}"></option>`).join('');
+  // prompt sharing: the writing agents' share of the time while a new prompt is read (docs/CONTEXT_POOL.md)
+  const sv=cur&&cur.share!=null?cur.share:0.25,sharev=[0,0.1,0.25,0.5].concat([0,0.1,0.25,0.5].includes(sv)?[]:[sv]).sort((a,b)=>a-b);
+  $('share').hidden=pn<2&&sv===0.25;
+  $('share').innerHTML=sharev.map(v=>`<option value="${v}"${v===sv?' selected':''} data-s="${v?'sharing '+Math.round(v*100)+'%':'sharing off'}" data-l="${v?`while a new prompt is read, the agents already writing get ${Math.round(v*100)}% of the time${v===0.25?' (default)':''}`:'sharing off: a new prompt is read whole while the other agents wait'}"></option>`).join('');
+  $('par').innerHTML=[1,2,3,4,5,6,7,8].map(n=>`<option value="${n}"${n===pn?' selected':''} data-s="${n===1?'1 agent':n+' agents'}" data-l="${n===1?'1 agent: one request at a time':n+' agents at once, each with its own context'}"></option>`).join('');
   const bad=s.configs.filter(c=>c.problem);
   $('notready').innerHTML=bad.length?'<b>Not ready yet:</b>'+bad.map(c=>`<div>${esc(name(c))}: ${esc(c.problem)}</div>`).join(''):'';
-  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;
+  if(s.config)$('cfg').value=s.config;$('autostart').checked=s.autostart;$('shared').checked=!!(cur&&cur.shared);shorten($('cfg'));shorten($('par'));shorten($('cache'));shorten($('pool'));shorten($('share'));
   base=`http://127.0.0.1:${s.port}`;$('url').textContent=`127.0.0.1:${s.port}`;
   $('log').textContent='';(s.log||[]).forEach(log);
   $('where').textContent=s.server?`${s.root}`:'engine-metal/strata-server is missing: run `make server` in '+s.root;
   status({...s.status,phase:s.phase,running:s.running});
+  fit();
 }
+let cacheStat=null;
 function status(s){
+  if(s.conversation_cache!==undefined){cacheStat=s.conversation_cache;if($('mempop').classList.contains('open'))memsum();}
   const ph=s.phase||'stopped';const was=running;running=!!s.running;if(was!==running)send('memory');
   $('phase').textContent=ph;$('dot').style.background=COLORS[ph]||COLORS.stopped;
   $('start').disabled=running;$('start2').hidden=running;$('stop').disabled=!running||ph==='stopping';$('restart').disabled=!running;
@@ -108,19 +148,30 @@ function status(s){
   $('idle').hidden=up||!$('alert').hidden||!$('sys').hidden;document.body.classList.toggle('down',!up);layout();
   $('idletitle').textContent={starting:'Starting… loading the model',stopping:'Stopping… the engine frees its memory'}[ph]||'The server is stopped';
   if(ph!=='stopped')$('note').textContent='';
+  fit();
 }
-let full=null;function layout(){const f=!up||$('log').classList.contains('open')||!$('alert').hidden||!$('sys').hidden;if(f!==full){full=f;send('layout',{full:f});}}
+let full=null;function layout(){const f=!up||$('log').classList.contains('open')||!$('alert').hidden||!$('sys').hidden||$('mempop').classList.contains('open');if(f!==full){full=f;send('layout',{full:f});}}
+// the conversation cache's sizes: up to what this Mac holds beside the model (mem.cache_max_mib, the memory check's;
+// the engine caps a larger one to it), that largest one offered as "max"
+function cacheMenu(cur){
+  const cm=cur&&cur.cache_mib!=null?cur.cache_mib:-1,max=mem&&cur&&mem.config===cur.path&&mem.cache_max_mib!=null?mem.cache_max_mib:null,std=[-1,0,205,512,1024,2048,4096,8192,16384,32768];
+  const cachev=[...new Set(std.concat([cm],max>0?[max]:[]))].sort((a,b)=>a-b);
+  $('cache').innerHTML=cachev.map(v=>{const g=Math.round(v/1024*10)/10,over=max!=null&&v>max,top=v>0&&v===max;
+    return `<option value="${v}"${v===cm?' selected':''}${over&&v!==cm?' disabled':''} data-s="${v<0?'cache auto':v?'cache '+g+' GB'+(over?' ⚠':''):'no cache'}" data-l="${v<0?'conversation cache sized for this Mac (its RAM beside the model; the server log says how much)':!v?'no conversation cache: a displaced conversation is read again':over?`conversation cache ${g} GB: more than this Mac holds beside the model (the engine uses ${Math.round(max/1024*10)/10} GB)`:`conversation cache ${g} GB of RAM${top?' · max for this Mac':''}: displaced conversations come back without reading them again`}"></option>`;}).join('');
+  shorten($('cache'));
+}
 // the memory check of the selected config (the engine's --plan, and the memory free now)
 function memory(m){
-  mem=m;const chip=$('mem');
+  mem=m;const chip=$('mem');if(snap)cacheMenu(snap.configs.find(c=>c.path===snap.config));
   if(m.afm){chip.className='chip green';chip.textContent="Apple's on-device model";chip.title=m.advice;$('ctx').innerHTML='';
     $('memcard').hidden=false;$('memcard').innerHTML=`<h3>Memory</h3><div class="verdict green">✓ ${esc(m.advice)}</div>`;return;}
   if(m.error){chip.className='chip red';chip.textContent='memory ?';chip.title=m.error;$('ctx').innerHTML='';$('memcard').hidden=false;
     $('memcard').innerHTML=`<h3>Memory</h3><div class="verdict red">${esc(m.error)}</div>`;return;}
   chip.className='chip '+m.state;   // what it needs next to what this Mac has: the GPU's share, and what is free right now
-  chip.textContent=`needs ${gb(m.need)} · GPU has ${gb(m.limit)}`+(m.avail!=null?` · ${gb(m.avail)} free`:'')+(m.state==='green'?'':m.state==='amber'?' · tight':' · too big');
-  chip.title=m.advice;
-  $('ctx').innerHTML=m.options.map(o=>`<option value="${o.ctx}" data-b="${o.batch512?1:0}"${o.ctx===m.context?' selected':''}>context ${k(o.ctx)} · ${gb(o.need)}${o.recommended?' · recommended':o.fits?'':' · too big'}${o.batch512?' (batch 512)':''}</option>`).join('');
+  chip.textContent=`${gb(m.need).replace(' GB','')} / ${gb(m.limit)}`+(m.state==='green'?'':' ⚠');   // needs / the GPU's share
+  chip.title=`needs ${gb(m.need)} · ${mac()?'GPU has':'RAM for it'} ${gb(m.limit)}`+(m.avail!=null?` · ${gb(m.avail)} free`:'')+` · ${m.advice} (click for ${here()}'s memory)`;
+  memsum();
+  $('ctx').innerHTML=m.options.map(o=>`<option value="${o.ctx}" data-b="${o.batch512?1:0}"${o.ctx===m.context?' selected':''} data-s="${k(o.ctx)}" data-l="context ${k(o.ctx)} · ${gb(o.need)}${o.recommended?' · recommended':o.fits?'':' · too big'}${o.batch512?' (batch 512)':''}"></option>`).join('');shorten($('ctx'));
   const tot=Math.max(m.need,m.limit),pct=b=>(100*b/tot).toFixed(1)+'%';
   $('memcard').hidden=false;
   $('memcard').innerHTML=`<h3>Memory for this model at a context of ${m.context.toLocaleString()} tokens</h3>
@@ -131,16 +182,16 @@ function memory(m){
     ${m.recommended&&m.recommended.ctx!==m.context?`<div class="acts" style="margin-top:8px"><button id="userec">Use context ${k(m.recommended.ctx)}${m.recommended.batch512?' with batch 512':''} (${gb(m.recommended.need)})</button></div>`:''}`;
   $('memcard').insertAdjacentHTML('beforeend',tips(m));
   if($('userec'))$('userec').onclick=()=>setCtx(m.recommended);
-  if(m.state!=='green'||m.avail!=null&&m.need>m.avail*0.9)send('apps');else for(const el of document.querySelectorAll('.applist'))el.hidden=true;
+  if(m.state!=='green'||m.avail!=null&&m.need>m.avail*0.9)send('apps');else for(const el of document.querySelectorAll('.applist:not(#popapps)'))el.hidden=true;
 }
 // the apps using the most memory: Quit asks the app (it may ask to save), Force quit ends it (unsaved work is lost)
-let appsList=[],stillRunning=null;
+let appsList=[],stillRunning=null,sysMem=null,strataMem=null;
 function apps(a){
-  appsList=a.apps||[];if(a.still)stillRunning=a.still;
+  appsList=a.apps||[];if(a.still)stillRunning=a.still;if(a.sys){sysMem=a.sys;strataMem=a.strata;memsum();}
   const need=mem&&mem.avail!=null&&mem.need>mem.avail?mem.need-mem.avail:0;
   const html=!appsList.length?'':`<h3>${need?`Free ${gb(need)}: quit apps you do not need`:'Apps using the most memory'}</h3>
-    <table>${appsList.map((x,i)=>`<tr><td>${esc(x.name)}</td><td class="n">${gb(x.bytes)}</td><td class="b">`+
-      (!x.app?`<span class="mute" title="${esc(x.bundle)}">background · not quit from here</span>`
+    <table>${appsList.map((x,i)=>`<tr><td title="${esc(x.name)}">${esc(x.name)}</td><td class="n">${gb(x.bytes)}</td><td class="b">`+
+      (!x.app?`<span class="mute" title="${esc(x.bundle)}: a background process, not quit from here">background</span>`
       :x.bundle===stillRunning?`<span class="mute">still open · </span><button class="force" data-i="${i}" data-f="1">Force quit</button>`
                               :`<button data-i="${i}">Quit</button>`)+`</td></tr>`).join('')}</table>
     <div class="mute" style="margin-top:6px">Quit asks the app to close (it may ask to save your work); background services
@@ -151,6 +202,21 @@ document.addEventListener('click',e=>{const b=e.target.closest('.applist button'
   if(b.dataset.f&&!confirm(`Force quit ${x.name}? Unsaved work in it is lost.`))return;
   b.disabled=true;b.textContent=b.dataset.f?'Ending…':'Quitting…';if(b.dataset.f)stillRunning=null;
   send('quit_app',{bundle:x.bundle,pid:x.pid,force:!!b.dataset.f});});
+// the chip's popover: this model against the GPU, Strata's processes now, and the whole Mac as Activity Monitor shows it
+function memsum(){
+  const m=mem||{},s=sysMem,row=(a,b)=>`<div class="row"><span>${a}</span><span>${b}</span></div>`;
+  let h=`<h3>Strata</h3>`+(m.need!=null?row(`this model at context ${k(m.context||0)}`,gb(m.need))+row(mac()?'the GPU can use':'RAM for the model (less the system\'s share)',gb(m.limit)):'')+
+    (strataMem!=null?row(mac()?'Strata\'s processes (its GPU memory is in wired)':'Strata\'s processes',gb(strataMem)):'')+
+    (cacheStat&&cacheStat.enabled?row('conversation cache (RAM)',`${gb(cacheStat.bytes||0).replace(' GB','')} / ${Math.round(cacheStat.budget_mib/1024)} GB · ${cacheStat.parked||0} kept · ${cacheStat.restores||0} back`):'');
+  // the whole Mac in binary GB, as Activity Monitor and macOS's "128 GB" count it
+  const gib=b=>b==null?'–':(b/2**30).toFixed(1)+' GB';
+  if(s){const p=s.pressure,c=p==null?'var(--line)':p<50?'#34c759':p<80?'#ff9f0a':'#ff453a';
+    h+=`<h3>${mac()?'This Mac':'This computer'} · ${Math.round(s.total/2**30)} GB</h3>`+(p!=null?row('memory pressure',p+'%')+`<div class="meter"><span style="width:${p}%;background:${c}"></span></div>`:'')+
+      (mac()?row('apps',gib(s.app))+row('wired (macOS, the GPU)',gib(s.wired))+row('compressed',gib(s.compressed))+row('free or file cache',gib(s.free))
+        :row('in use',gib(s.app))+row('available (free or cache)',gib(s.free)))+
+      (s.swap_total?row('swap',`${gib(s.swap_used)} of ${gib(s.swap_total)}`):'');}
+  $('memsum').innerHTML=h;
+}
 // what else would let it fit or run faster: macOS's GPU memory limit, the energy mode (one click each: macOS asks
 // for an administrator's password; the Terminal command beside it for those who prefer it)
 function tips(m){
@@ -238,12 +304,37 @@ function log(line){const l=$('log'),end=l.scrollTop+l.clientHeight>=l.scrollHeig
   while(l.childNodes.length>2000)l.firstChild.remove();if(end)l.scrollTop=l.scrollHeight;}
 function note(m){$('note').textContent=m;if(up&&!$('log').classList.contains('open'))$('logbtn').click();log('── '+m+' ──');}
 $('cfg').onchange=()=>send('select',{config:$('cfg').value});
+$('refresh').onclick=()=>send('init');
+// the popover needs the whole window: the bar's own view is only the bar's height while the chat shows below it
+$('mem').onclick=()=>{const p=$('mempop');if(p.classList.toggle('open')){memsum();send('apps');
+  p.style.left='0px';const r=p.getBoundingClientRect();if(r.right>innerWidth-8)p.style.left=Math.min(0,innerWidth-8-r.right)+'px';}layout();};   // kept inside the window
+$('par').onchange=()=>{send('set_parallel',{n:+$('par').value});$('mem').textContent='memory …';};
+// the pick kept in the panel's copy of the configs: the memory check that follows redraws the menu from it
+$('cache').onchange=()=>{const c=snap&&snap.configs.find(c=>c.path===snap.config);if(c)c.cache_mib=+$('cache').value;send('set_cache',{mib:+$('cache').value});};
+$('pool').onchange=()=>{send('set_pool',{tokens:+$('pool').value});$('mem').textContent='memory …';};
+$('share').onchange=()=>send('set_share',{share:+$('share').value});
+// the bar fits its window: the least used items fold into More, one at a time, until nothing is cut off (and come back
+// when there is room); measured, not by width breakpoints, since what the bar holds (names, the memory chip) varies
+const FOLD=[['url'],['rate'],['sep1'],['load','m_load'],['unload','m_unload'],['webbtn','m_web'],['sysbtn','m_sys'],['logbtn','m_log']];
+function fit(){const bar=$('bar');for(const [b,m] of FOLD){$(b).classList.remove('folded');if(m)$(m).classList.remove('shown');}
+  for(const [b,m] of FOLD){if(bar.scrollWidth<=bar.clientWidth)break;$(b).classList.add('folded');if(m)$(m).classList.add('shown');}}
+addEventListener('resize',fit);
+new MutationObserver(()=>requestAnimationFrame(fit)).observe($('bar'),{subtree:true,childList:true,characterData:true});   // a name or the memory chip changed
+// the buttons a narrow window keeps in More
+for(const [m,b] of [['m_load','load'],['m_unload','unload'],['m_web','webbtn'],['m_sys','sysbtn'],['m_log','logbtn']])
+  $(m).onclick=()=>{$('menu').classList.remove('open');$(b).click();};
+// a picker shows the short name when closed and the whole line in its list (its width held while the list is open)
+function shorten(sel){sel.style.width='';for(const o of sel.options)if(o.dataset.s!=null)o.textContent=o.dataset.s;}
+function lengthen(sel){if(sel.style.width)return;sel.style.width=sel.offsetWidth+'px';for(const o of sel.options)if(o.dataset.l!=null)o.textContent=o.dataset.l;}
+for(const id of ['cfg','ctx','par','cache','pool','share']){const sel=$(id);sel.addEventListener('mousedown',()=>lengthen(sel));sel.addEventListener('keydown',()=>lengthen(sel));
+  sel.addEventListener('change',()=>shorten(sel));sel.addEventListener('blur',()=>shorten(sel));}
 $('ctx').onchange=()=>{const o=mem&&mem.options.find(o=>o.ctx===+$('ctx').value);if(o)setCtx(o);};
 $('autostart').onchange=e=>send('autostart',{on:e.target.checked});
+$('shared').onchange=e=>send('set_shared',{on:e.target.checked});
 $('start2').onclick=()=>send('start');$('showlog').onclick=e=>{e.preventDefault();$('logbtn').click();};
 $('logbtn').onclick=()=>{$('log').classList.toggle('open');$('logbtn').classList.toggle('on');$('log').scrollTop=1e9;layout();};
 $('morebtn').onclick=e=>{e.stopPropagation();$('menu').classList.toggle('open');};
-document.onclick=()=>$('menu').classList.remove('open');$('menu').onclick=e=>e.stopPropagation();
+document.onclick=e=>{$('menu').classList.remove('open');if(!e.target.closest('#memwrap')&&$('mempop').classList.contains('open')){$('mempop').classList.remove('open');layout();}};$('menu').onclick=e=>e.stopPropagation();
 for(const id of ['start','stop','restart','load','unload','browser','edit_config','reveal','engine_log','copy_key'])
   $(id).onclick=()=>{$('menu').classList.remove('open');send(id);};
 send('init');send('system');

@@ -1,0 +1,134 @@
+Strata: llama_set_adapter_ablation_mid - the directions of llama_set_adapter_ablation also removed right after each
+layer's attention (qwen35moe), before the feed-forward / experts read the stream, as orthogonalizing the attention's
+output weights would.  strata-metal --ablate-mid turns it on.
+
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -756,6 +756,10 @@
+                          int32_t   n_embd,
+                          int32_t   k,
+                            float   scale);
++
++    // Strata: also remove them right after each layer's attention, before its feed-forward reads the stream (where a
++    // model calls build_cvec_mid: qwen35moe), as orthogonalizing the attention's output weights would.  Off by default.
++    LLAMA_API void llama_set_adapter_ablation_mid(struct llama_context * ctx, bool on);
+ 
+     //
+     // Memory
+--- a/src/llama-adapter.h
++++ b/src/llama-adapter.h
+@@ -19,6 +19,10 @@
+ 
+     ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;
+ 
++    // Strata: the layer's ablation alone, after its attention (llama_set_adapter_ablation_mid)
++    ggml_tensor * ablate_mid(ggml_context * ctx, ggml_tensor * cur, int  il) const;
++    bool abl_mid = false;
++
+     bool apply(
+             const llama_model & model,
+             const float * data,
+@@ -39,6 +43,8 @@
+ private:
+     bool init(const llama_model & model);
+ 
++    ggml_tensor * ablate(ggml_context * ctx, ggml_tensor * cur, int  il) const;
++
+     std::vector<ggml_tensor *> abl;    // per layer: [n_embd, k], or nullptr
+     std::vector<ggml_tensor *> abl_t;  // per layer: [k, n_embd], the same rows transposed
+     float abl_scale = 1.0f;
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -26,7 +26,15 @@
+     if (layer_dir != nullptr) {
+         cur = ggml_add(ctx, cur, layer_dir);
+     }
++
++    return ablate(ctx, cur, il);
++}
++
++ggml_tensor * llama_adapter_cvec::ablate_mid(ggml_context * ctx, ggml_tensor * cur, int  il) const {
++    return abl_mid ? ablate(ctx, cur, il) : cur;
++}
+ 
++ggml_tensor * llama_adapter_cvec::ablate(ggml_context * ctx, ggml_tensor * cur, int  il) const {
+     // Strata: remove the layer's directions from every row (every hyper-connection stream of every token)
+     if (il >= 0 && (size_t) il < abl.size() && abl[il] != nullptr) {
+         ggml_tensor * x = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx, cur);
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1075,6 +1075,11 @@
+              ggml_tensor * cur,
+                      int   il) const;
+ 
++    // Strata: the ablation after a layer's attention (llama_set_adapter_ablation_mid)
++    ggml_tensor * build_cvec_mid(
++             ggml_tensor * cur,
++                     int   il) const;
++
+     // do mat_mul, while optionally apply lora and per-tensor scale
+     ggml_tensor * build_lora_mm(
+               ggml_tensor * w,
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1546,6 +1546,12 @@
+          ggml_tensor * cur,
+                  int   il) const {
+     return cvec->apply_to(ctx0, cur, il);
++}
++
++ggml_tensor * llm_graph_context::build_cvec_mid(
++         ggml_tensor * cur,
++                 int   il) const {
++    return cvec->ablate_mid(ctx0, cur, il);
+ }
+ 
+ ggml_tensor * llm_graph_context::build_lora_mm(
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -136,6 +136,7 @@
+                 int32_t   il_end);
+ 
+     bool set_adapter_ablation(const float * data, size_t len, int32_t n_embd, int32_t k, float scale);
++    void set_adapter_ablation_mid(bool on);
+ 
+     // process a single ubatch with a specific graph type
+     // if memory_context is provided, it will be applied first to the context's memory
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1409,6 +1409,12 @@
+     sched_need_reserve = true;
+ 
+     return res;
++}
++
++void llama_context::set_adapter_ablation_mid(bool on) {
++    cvec->abl_mid = on;
++
++    sched_need_reserve = true;
+ }
+ 
+ bool llama_context::set_adapter_ablation(const float * data, size_t len, int32_t n_embd, int32_t k, float scale) {
+@@ -4282,6 +4288,10 @@
+               int32_t   k,
+                 float   scale) {
+     return ctx->set_adapter_ablation(data, len, n_embd, k, scale) ? 0 : -1;
++}
++
++void llama_set_adapter_ablation_mid(llama_context * ctx, bool on) {
++    ctx->set_adapter_ablation_mid(on);
+ }
+ 
+ //
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -203,6 +203,9 @@
+         cur = ggml_add(ctx0, cur, inpSA);
+         cb(cur, "attn_residual", il);
+ 
++        // Strata: the ablation also before the experts read the stream (llama_set_adapter_ablation_mid)
++        cur = build_cvec_mid(cur, il);
++
+         // Save the tensor before post-attention norm for residual connection
+         ggml_tensor * ffn_residual = cur;
+ 

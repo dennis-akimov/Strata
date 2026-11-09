@@ -6,6 +6,7 @@ use crate::py::{self, find, find0, lstrip, strip};
 use crate::pyjson;
 use serde_json::{Map, Value};
 
+pub const THINK_START: &str = "<think>";
 pub const THINK_END: &str = "</think>";
 pub const CALL_START: &str = "<tool_call>";
 pub const CALL_END: &str = "</tool_call>";
@@ -273,15 +274,20 @@ pub fn parse_tool_call(body: &str, schema: Option<&Value>) -> Result<ToolCall, S
         rest = if end >= 0 { &rest[end as usize + PARAM_END.len()..] } else { "" };
         value = value.strip_prefix('\n').unwrap_or(value);
         value = value.strip_suffix('\n').unwrap_or(value);
-        let declared = py::get(py::get(props, &pname), "type");
-        let v = if declared.as_str() == Some("string") {
-            Value::String(value.to_string())
-        } else {
-            json_loads(value).unwrap_or_else(|| Value::String(value.to_string()))
-        };
+        let v = param_value(value, py::get(py::get(props, &pname), "type"));
         args.insert(pname, v);
     }
     Ok(ToolCall::new(name, args))
+}
+
+/// One `<parameter=P>` value by its declared type: a string as written, Python-style True/False for a boolean (as vLLM's
+/// qwen3_coder parser reads them), anything else JSON-decoded when it parses.
+fn param_value(value: &str, declared: &Value) -> Value {
+    match declared.as_str() {
+        Some("string") => Value::String(value.to_string()),
+        Some("boolean") if ["true", "false"].contains(&value.trim().to_lowercase().as_str()) => Value::Bool(value.trim().eq_ignore_ascii_case("true")),
+        _ => json_loads(value).unwrap_or_else(|| Value::String(value.to_string())),
+    }
 }
 
 /// The arguments a client's history (or a harmony call) carries -> the mapping the template renders.
@@ -379,6 +385,7 @@ pub struct OutputParser {
     sfirst: bool,
     sval_started: bool,
     sdeclared: Map<String, Value>,
+    sraw_type: Value,
 }
 
 impl OutputParser {
@@ -414,6 +421,7 @@ impl OutputParser {
             sfirst: true,
             sval_started: false,
             sdeclared: Map::new(),
+            sraw_type: Value::Null,
         }
     }
 
@@ -607,6 +615,7 @@ impl OutputParser {
                             self.ss = Scan::Str;
                             self.sval_started = false;
                         } else {
+                            self.sraw_type = self.sdeclared.get(&pname).cloned().unwrap_or(Value::Null);
                             self.ss = Scan::Raw;
                         }
                     } else if stripped.starts_with(FUNC_END) {
@@ -658,8 +667,7 @@ impl OutputParser {
                     let mut value = &rest[..end as usize];
                     value = value.strip_prefix('\n').unwrap_or(value);
                     value = value.strip_suffix('\n').unwrap_or(value);
-                    let v = json_loads(value).unwrap_or_else(|| Value::String(value.to_string()));
-                    args!(pyjson::dumps_u(&v));
+                    args!(pyjson::dumps_u(&param_value(value, &self.sraw_type)));
                     self.sp += end as usize + PARAM_END.len();
                     self.ss = Scan::Between;
                 }
@@ -1559,6 +1567,30 @@ impl Parse for GlmParser {
 #[cfg(test)]
 mod lfm_tests {
     use super::*;
+
+    #[test]
+    fn a_python_style_boolean_follows_the_schema() {
+        use serde_json::json;
+        let schema = json!({"parameters": {"properties": {"detailed": {"type": "boolean"}, "team": {"type": "string"}, "n": {"type": "integer"}}}});
+        let c = parse_tool_call("<function=f>\n<parameter=detailed>\nTrue\n</parameter>\n<parameter=team>\nTrue\n</parameter>\n<parameter=n>\nTrue\n</parameter>\n</function>", Some(&schema)).unwrap();
+        assert_eq!(c.arguments["detailed"], json!(true));
+        assert_eq!(c.arguments["team"], json!("True"), "a string stays as written");
+        assert_eq!(c.arguments["n"], json!("True"), "only a boolean parameter is read as one");
+        let c = parse_tool_call("<function=f>\n<parameter=detailed>\nFALSE\n</parameter>\n</function>", Some(&schema)).unwrap();
+        assert_eq!(c.arguments["detailed"], json!(false));
+    }
+
+    #[test]
+    fn a_streamed_python_style_boolean_follows_the_schema() {
+        // the API streams a call's arguments through the scanner, not through parse_tool_call
+        use serde_json::json;
+        let tools = [json!({"name": "f", "parameters": {"properties": {"detailed": {"type": "boolean"}, "team": {"type": "string"}}}})];
+        let mut p = OutputParser::new(false, Some(&tools), true, false);
+        let mut ev = p.feed_inner("<tool_call>\n<function=f>\n<parameter=team>\nTrue\n</parameter>\n<parameter=detailed>\nTrue\n</parameter>\n</function>\n</tool_call>").unwrap();
+        ev.extend(p.finish_inner(Some("stop")).unwrap());
+        let args: String = ev.iter().filter(|e| e.kind == Kind::ToolArgs).map(|e| e.text.as_str()).collect();
+        assert_eq!(serde_json::from_str::<Value>(&args).unwrap(), json!({"team": "True", "detailed": true}), "{args}");
+    }
 
     #[test]
     fn lfm_calls_become_outputparser_calls() {

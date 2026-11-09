@@ -9,9 +9,16 @@ if(APPLE)
   set(GGML_METAL ON CACHE BOOL "" FORCE)
   set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # the shaders inside the binary: no Xcode needed to run it
 else()
-  # Linux on Apple Silicon (Asahi): the GPU through Vulkan (Mesa's Honeykrisp; libvulkan-dev + glslc to build)
+  # Linux on Apple Silicon (Asahi): the GPU through Vulkan (Mesa's Honeykrisp; libvulkan-dev + glslc to build).
+  # STRATA_METAL_CPU: llama.cpp's CPU backend only, for a PC whose GPU no Vulkan driver serves well (an old laptop's
+  # Intel HD 4000 / Kepler: the model in RAM, decoded on the CPU, the same engine, server and app otherwise)
+  option(STRATA_METAL_CPU "Linux: the engine on the CPU only (no Vulkan)" OFF)
   set(GGML_METAL OFF CACHE BOOL "" FORCE)
-  set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+  if(STRATA_METAL_CPU)
+    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+  else()
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+  endif()
 endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
@@ -79,6 +86,24 @@ target_compile_features(strata-metal PRIVATE cxx_std_17)
 target_compile_definitions(strata-metal PRIVATE STRATA_VERSION="${PROJECT_VERSION}"
                            STRATA_LLAMA_COMMIT="${STRATA_LLAMA_COMMIT}")
 target_link_libraries(strata-metal PRIVATE llama llama-common)
+# hardened as strata-image (bible's C++ skill, Apple clang on arm64), and libc++'s fast hardening: slot and sequence
+# numbers come over the protocol, and an index past a vector's end traps (SIGTRAP) instead of writing past it
+# control-flow protection for this CPU: pointer auth + BTI on arm64, CET on x86_64 (a Linux PC's build)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+  set(STRATA_CFI -mbranch-protection=standard)
+else()
+  set(STRATA_CFI -fcf-protection=full)
+endif()
+target_compile_options(strata-metal PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero ${STRATA_CFI})
+target_compile_definitions(strata-metal PRIVATE _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST)
+if(STRATA_METAL_CPU)
+  target_compile_definitions(strata-metal PRIVATE STRATA_CPU_ONLY)   # INFO backend=cpu
+endif()
+
+# the residual stream and next-token log-probabilities for strata-ablate (docs/ABLATION.md)
+add_executable(strata-directions strata_directions.cpp)
+target_compile_features(strata-directions PRIVATE cxx_std_17)
+target_link_libraries(strata-directions PRIVATE llama)
 
 # the image engine (Nucleus-Image on ggml/Metal, docs/MACOS.md): its own executable, as strata-vision is.  Hardened as
 # bible's C++ skill lists for Apple clang 17 on arm64 (flags the compiler and linker accept there)
@@ -86,8 +111,7 @@ add_executable(strata-image ${CMAKE_CURRENT_SOURCE_DIR}/image/strata_image.cpp $
                ${CMAKE_CURRENT_SOURCE_DIR}/image/text_encoder.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/hunyuan_image.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/image/gguf_weights.cpp ${CMAKE_CURRENT_SOURCE_DIR}/image/nucleus_vae.cpp)
 target_compile_features(strata-image PRIVATE cxx_std_17)
-target_compile_options(strata-image PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero
-                       -mbranch-protection=standard)
+target_compile_options(strata-image PRIVATE -Wall -Wextra -fstack-protector-strong -ftrivial-auto-var-init=zero ${STRATA_CFI})
 target_link_libraries(strata-image PRIVATE llama ggml z)
 # ggml-backend-impl.h (gguf_weights.cpp: a Metal mapping that failed is a buffer with no context, not a null buffer)
 get_target_property(STRATA_GGML_SRC ggml SOURCE_DIR)

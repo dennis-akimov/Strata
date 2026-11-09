@@ -261,9 +261,16 @@ impl Http {
         h
     }
 
+    /// IPv4 for a Bonjour name (moneymaker.local): it resolves to an IPv6 link-local address first, which needs its
+    /// interface (fe80::...%en0) that ureq does not add: "No route to host" on the M1 while curl got through.
+    fn family(&self) -> ureq::config::IpFamily {
+        let host = self.url.split("://").nth(1).unwrap_or("").split(['/', ':', '?']).next().unwrap_or("");
+        if host.ends_with(".local") { ureq::config::IpFamily::Ipv4Only } else { ureq::config::IpFamily::Any }
+    }
+
     /// One POST; for a request (rid Some) the message that answers it.
     fn post(&self, msg: &Value, rid: Option<i64>, timeout: f64) -> Result<Option<Value>, McpErr> {
-        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs_f64(timeout))).http_status_as_error(false).build().into();
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs_f64(timeout))).http_status_as_error(false).ip_family(self.family()).build().into();
         let mut req = agent.post(&self.url);
         for (k, v) in self.headers() {
             req = req.header(&k, &v);
@@ -353,7 +360,7 @@ impl Http {
         if self.session.lock().unwrap().is_none() {
             return;
         }
-        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(3))).build().into();
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(3))).ip_family(self.family()).build().into();
         let mut req = agent.delete(&self.url);
         for (k, v) in self.headers() {
             req = req.header(&k, &v);
@@ -737,6 +744,19 @@ impl McpHub {
         }
     }
 
+    /// Servers that failed to start over 30 s ago: started again (a chat's tools then come back on their own; the M1
+    /// once failed bible's at start, its .local name resolving to an IPv6 address not reachable yet, and kept it off).
+    pub fn retry_failed(&self) {
+        let all: Vec<_> = self.servers.lock().unwrap().values().cloned().collect();
+        for s in all {
+            let again = { let st = s.st.lock().unwrap(); st.status == "failed" && st.last_start.elapsed() > Duration::from_secs(30) };
+            if again {
+                say(&format!("MCP server {} failed to start before: trying again", py::py_repr(&json!(s.name))));
+                self.spawn_start(s);
+            }
+        }
+    }
+
     /// Wait (up to `timeout` s in all) for servers that are still starting.
     pub fn wait(&self, timeout: Option<f64>) {
         let end = timeout.map(|t| Instant::now() + Duration::from_secs_f64(t));
@@ -841,6 +861,7 @@ impl McpHub {
         out.insert("chars".into(), json!(full));
         out.insert("truncated".into(), json!(truncated));
         out.insert("ms".into(), json!(t0.elapsed().as_millis() as i64));
+        crate::observe::tool_call(name, ok, t0.elapsed().as_millis() as u64, if ok { None } else { out.get("text").and_then(Value::as_str) });
         Ok(out)
     }
 

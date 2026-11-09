@@ -9,12 +9,21 @@ Hugging Face revision; a stopped download continues when you run the same line a
   GPT-OSS-120B-DFLASH  z-lab's DFlash draft for gpt-oss-120b (1.6 GB, sha-256 checked), converted to one GGUF
                  (strata-metal --dflash; it needs metal/patches/core/0002)
   GPT-OSS-20B    gpt-oss-20b MXFP4 (12.1 GB, sha-256 checked) and its tokenizer pack
-  QWEN3.6-35B    Qwen3.6-35B-A3B MXFP4_MOE (21.7 GB, sha-256 checked) and its tokenizer pack
+  QWEN3.6-35B    Qwen3.6-35B-A3B MXFP4_MOE (21.7 GB, sha-256 checked), its vision encoder (0.9 GB) and tokenizer pack
+  QWEN3-CODER-30B  Qwen3-Coder-30B-A3B-Instruct Q8_0 (32.5 GB, sha-256 checked) and its tokenizer pack
+  QWEN3-CODER-30B-Q4  the same in Unsloth's Q4_K_M (18.6 GB, sha-256 checked): ~40% faster for one agent, 14 GB less
   LFM2.5-24B     LiquidAI's LFM2.5-24B-A2B (2.45B active, always thinks) in mradermacher's Q3_K_M (11.5 GB, sha-256
                  checked): fits a 16 GB Mac; and its tokenizer pack.  Not Unsloth's UD-Q3_K_XL: its IQ3_XXS experts
                  decode at 1.3 tok/s on Linux's Apple GPU driver (that mat-vec runs 15-30x slower there)
+  LFM2.5-24B-IQ3  the same in mradermacher's i1-IQ3_XXS (9.3 GB, sha-256 checked), macOS only: on the M1 1.2x the
+                 Q3_K_M's writing speed, 2.2 GB less, the same answers on the setup checks
   LFM2.5-8B      LiquidAI's LFM2.5-8B-A1B (1.5B active, thinks) in their Q8_0 (9.0 GB, sha-256 checked) and its
                  tokenizer pack
+  LFM2.5-8B-Q4   the same in their Q4_K_M (5.2 GB, sha-256 checked): on the M1 1.5-2.7x the Q8_0's writing speed, 4 GB
+                 less memory, the same answers on the setup checks
+  QWEN3-4B       Qwen3-4B-Instruct-2507 in Unsloth's Q8_0 (4.3 GB, sha-256 checked): small, calls tools (web search on
+                 an 8-16 GB Mac); and its tokenizer pack
+  QWEN3-4B-Q4    the same in Unsloth's Q4_K_M (2.5 GB, sha-256 checked): faster, room for 3-4 agents on a 16 GB Mac
   NUCLEUS        Nucleus-Image: ~50 GB downloaded, converted to 3 GGUFs (~21 GB), the downloads deleted
   HUNYUAN        HunyuanImage-3.0-Instruct-Distil: 169 GB streamed shard by shard into one 54 GB GGUF
   WAN2.2         Wan 2.2 T2V A14B for videos: both experts (Q4_K_M), UMT5 (Q8_0), the VAE, the Lightning LoRAs (29 GB),
@@ -42,8 +51,8 @@ ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 PY = ROOT / ".venv" / "bin" / "python"
 MTP_PY = ROOT / ".venv-mtp" / "bin" / "python"
-NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "LFM2.5-24B", "LFM2.5-8B",
-         "NUCLEUS", "HUNYUAN", "WAN2.2")
+NAMES = ("GLM-5.3", "GPT-OSS-120B", "GPT-OSS-120B-HERETIC", "GPT-OSS-120B-DFLASH", "GPT-OSS-20B", "QWEN3.6-35B", "QWEN3-CODER-30B", "QWEN3-CODER-30B-Q4", "LFM2.5-24B", "LFM2.5-24B-IQ3",
+         "LFM2.5-8B",          "LFM2.5-8B-Q4", "QWEN3-4B", "QWEN3-4B-Q4", "NUCLEUS", "HUNYUAN", "WAN2.2")
 
 
 def die(msg: str) -> None:
@@ -53,7 +62,7 @@ def die(msg: str) -> None:
 
 def sh(*cmd, quiet: bool = False, cwd=None) -> None:
     out = subprocess.DEVNULL if quiet else None
-    if subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=out).returncode != 0:
+    if subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=out, check=False).returncode != 0:
         die(f"failed: {' '.join(map(str, cmd))}")
 
 
@@ -149,7 +158,7 @@ def ensure_venv() -> None:
     if not PY.exists():
         print("making .venv (Python packages for the tokenizer pack) ...", flush=True)
         sh(sys.executable, "-m", "venv", ".venv")
-    if subprocess.run([str(PY), "-c", "import regex, numpy, jinja2"], stderr=subprocess.DEVNULL).returncode != 0:
+    if subprocess.run([str(PY), "-c", "import regex, numpy, jinja2"], stderr=subprocess.DEVNULL, check=False).returncode != 0:
         print("installing the Python packages into .venv (requirements.txt) ...", flush=True)
         sh(PY, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", "requirements.txt")
 
@@ -216,14 +225,41 @@ def pull(name: str, data: Path) -> None:
         g = get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
                 "2fdd20997c4d88ee25f70f500c61f8b999378d92ab055f9d450fc70d617158d3")
         tokenizer(g, data / "packs" / "qwen3.6-35b-a3b")
+        # its vision encoder (0.9 GB): pictures in the chat, with "vision" in the run config
+        get(m / "Qwen3.6-35B-A3B", "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/mmproj-F16.gguf",
+            "8971ee4f331ff0a4c609374f32984b3d4e6dc086c0aa35f1d637fad1829e887f")
+    elif name == "QWEN3-CODER-30B":
+        g = get(m / "Qwen3-Coder-30B-A3B-Instruct", "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/b17cb02dd882d5b6ab62fc777ad2995f19668350/Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf",
+                "4ff1cff607804037bf6d2168249c570baa4e1621292b159c0e06591e0d7c3066")
+        tokenizer(g, data / "packs" / "qwen3-coder-30b-a3b")
+    elif name == "QWEN3-CODER-30B-Q4":
+        g = get(m / "Qwen3-Coder-30B-A3B-Instruct", "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/b17cb02dd882d5b6ab62fc777ad2995f19668350/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+                "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad")
+        tokenizer(g, data / "packs" / "qwen3-coder-30b-a3b")
     elif name == "LFM2.5-24B":
         g = get(m / "LFM2.5-24B-A2B", "https://huggingface.co/mradermacher/LFM2.5-24B-A2B-GGUF/resolve/38c24e5c182245615c52f66a4d6e58ea430ba7c5/LFM2.5-24B-A2B.Q3_K_M.gguf",
                 "5d91897ff9357e9ecb2a1be7134be78eb1d9fb3c07909427605f0aada665069b")
+        tokenizer(g, data / "packs" / "lfm2.5-24b-a2b")
+    elif name == "LFM2.5-24B-IQ3":
+        g = get(m / "LFM2.5-24B-A2B", "https://huggingface.co/mradermacher/LFM2.5-24B-A2B-i1-GGUF/resolve/b558210203487f7b6768c5cf879cc7f4928830b9/LFM2.5-24B-A2B.i1-IQ3_XXS.gguf",
+                "cb78a1116f2330dd06b9c5b3050212f1045db64e8af12ba1dd82eac811906352")
         tokenizer(g, data / "packs" / "lfm2.5-24b-a2b")
     elif name == "LFM2.5-8B":
         g = get(m / "LFM2.5-8B-A1B", "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q8_0.gguf",
                 "33ab3b8ce6a964fb8ebac89360c9b3cf72c4fa418d5e4c0a94d46883124d5c02")
         tokenizer(g, data / "packs" / "lfm2.5-8b-a1b")
+    elif name == "LFM2.5-8B-Q4":
+        g = get(m / "LFM2.5-8B-A1B", "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q4_K_M.gguf",
+                "4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0")
+        tokenizer(g, data / "packs" / "lfm2.5-8b-a1b")
+    elif name == "QWEN3-4B":
+        g = get(m / "Qwen3-4B-Instruct-2507", "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q8_0.gguf",
+                "391c1e410fd9f4cf2de2b510273b56a84c19ce18f4fa3bfb3774031dac4ef068")
+        tokenizer(g, data / "packs" / "qwen3-4b-instruct-2507")
+    elif name == "QWEN3-4B-Q4":
+        g = get(m / "Qwen3-4B-Instruct-2507", "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597")
+        tokenizer(g, data / "packs" / "qwen3-4b-instruct-2507")
     elif name == "NUCLEUS":
         d = m / "Nucleus-Image"
         outs = [d / "nucleus-dit-q4_0.gguf", d / "nucleus-vae.gguf", d / "qwen3vl-8b-text-q8_0.gguf"]
@@ -268,9 +304,9 @@ def pull(name: str, data: Path) -> None:
         patch = "../../metal/video/sdcpp-metal-conv3d.patch"
         if not (b / "src" / ".git").exists():
             sh("git", "clone", "-q", "https://github.com/leejet/stable-diffusion.cpp", b / "src")
-        head = subprocess.run(["git", "-C", str(b / "src"), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        head = subprocess.run(["git", "-C", str(b / "src"), "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
         patched = subprocess.run(["git", "-C", str(b / "src"), "apply", "--reverse", "--check", patch],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
         if head != sdc or not patched:
             sh("git", "-C", b / "src", "fetch", "-q", "origin")
             sh("git", "-C", b / "src", "checkout", "-q", "-f", sdc)

@@ -28,7 +28,9 @@ def embeddings(path, images, n_embd):
 
 class Engine:
     def __init__(self, *extra):
-        self.p = subprocess.Popen([EXE, "--serve", "--gguf", GGUF, "--max-context", "4096", "--image-pad-id", str(PAD), *extra],
+        # STRATA_METAL_EXTRA: more engine options for the whole suite (--kv-unified: docs/CONTEXT_POOL.md)
+        self.p = subprocess.Popen([EXE, "--serve", "--gguf", GGUF, "--max-context", "4096", "--image-pad-id", str(PAD), *extra,
+                                   *os.environ.get("STRATA_METAL_EXTRA", "").split()],
                                   stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.info = {}
@@ -169,6 +171,150 @@ class TestStrataMetal(unittest.TestCase):
         finally:
             e.close()
         self.assertEqual(resume, len(head))
+
+    def test_a_json_schema_holds_the_reply_to_it(self):
+        # response_format by grammar: json_schema=<hex> on the GEN line, converted by llama.cpp; the reply can only be
+        # JSON the schema accepts, and a schema that does not parse is refused with the engine still in step
+        import json
+        from tools.strata_tokenizer import Tokenizer
+        self.assertEqual(self.e.info.get("json_schema"), "1")
+        schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"],
+                  "additionalProperties": False}
+        hexs = json.dumps(schema).encode().hex()
+        self.e.send(f"GEN 40 json_schema={hexs} " + ",".join(map(str, self.m1)))
+        toks = []
+        while True:
+            line = self.e.line()
+            if line.startswith("T "):
+                toks.append(int(line[2:]))
+            elif line.startswith(("DONE", "ERR")):
+                self.assertTrue(line.startswith("DONE"), line)
+                break
+        text = Tokenizer.from_gguf(GGUF).decode([t for t in toks if t != self.e.im_start]).strip()
+        self.assertIn(json.loads(text.split("<|im_end|>")[0].strip())["answer"], ("yes", "no"), text)
+        self.e.send(f"GEN 8 json_schema={b'{not json'.hex()} " + ",".join(map(str, self.m1)))
+        while not (line := self.e.line()).startswith(("ERR", "DONE")):
+            pass
+        self.assertTrue(line.startswith("ERR") and "json_schema" in line, line)
+        self.assertEqual(len(self.e.gen(self.m1, max_new=3)[0]), 3)
+
+    def test_a_lazy_json_schema_starts_after_its_trigger_token(self):
+        # the server's thinking models: the schema holds from the thinking's end token on (grammar_trigger).  llama.cpp
+        # feeds a lazy grammar its trigger token too: a schema grammar that did not begin with it ended the engine
+        # ("empty grammar stack after accepting </think>").  The first token this model writes stands in for </think>.
+        import json
+        from tools.strata_tokenizer import Tokenizer
+        tok = Tokenizer.from_gguf(GGUF)
+        first = self.e.gen(self.m1, max_new=1)[0][0]
+        schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"],
+                  "additionalProperties": False}
+        keys = f"json_schema={json.dumps(schema).encode().hex()} grammar_trigger={first}"
+        for slot in (None, 0):
+            e = Engine("--batch", "1")
+            try:
+                if slot is None:
+                    e.send(f"GEN 40 {keys} " + ",".join(map(str, self.m1)))
+                else:
+                    e.send(f"BGEN 0 40 {keys} " + ",".join(map(str, self.m1)))
+                toks, done = [], False
+                while not done:
+                    line = e.line()
+                    self.assertFalse(line.startswith("ERR") or line == "", f"slot {slot}: {line or 'the engine ended'}")
+                    f = line.split()
+                    if f[0] == "T" or (f[0] == "BT" and f[1] == "0"):
+                        toks.append(int(f[-1]))
+                    # a slot's admission ends with its own DONE (the first token); the slot goes on until BDONE
+                    done = (slot is None and f[0] == "DONE") or (f[0] == "BDONE" and f[1] == "0")
+                self.assertEqual(toks[0], first)                       # the trigger, freely
+                text = tok.decode(toks[1:]).split("<|im_end|>")[0].strip()
+                try:
+                    answer = json.loads(text)["answer"]
+                except ValueError:
+                    self.fail(f"slot {slot}: not JSON: {text!r} from {toks[:12]}")
+                self.assertIn(answer, ("yes", "no"), f"slot {slot}: {text!r}")
+                self.assertEqual(len(e.gen(self.m1, max_new=2)[0]), 2)  # still in step
+            finally:
+                e.close()
+
+    def test_a_grammar_error_ends_the_request_not_the_engine(self):
+        # a lazy grammar that does not begin with its trigger token makes llama.cpp throw when the trigger comes ("empty
+        # grammar stack after accepting ..."): the request (or the slot) ends, the engine goes on for everyone else
+        first = self.e.gen(self.m1, max_new=1)[0][0]
+        keys = f"grammar={b'root ::= [a-z]+'.hex()} grammar_trigger={first}"
+        e = Engine("--batch", "1")
+        try:
+            e.send(f"GEN 8 {keys} " + ",".join(map(str, self.m1)))
+            while not (line := e.line()).startswith(("ERR", "DONE")):
+                self.assertNotEqual(line, "", "the engine ended")
+            self.assertTrue(line.startswith("ERR") and "sampling" in line, line)
+            self.assertEqual(len(e.gen(self.m1, max_new=2)[0]), 2)
+            e.send(f"BGEN 0 8 {keys} " + ",".join(map(str, self.m1)))
+            while not (line := e.line()).startswith(("BDONE", "ERR")):
+                self.assertNotEqual(line, "", "the engine ended")
+            self.assertTrue(line.startswith(("BDONE 0", "ERR")), line)
+            self.assertEqual(len(e.gen(self.m1, max_new=2)[0]), 2)
+        finally:
+            e.close()
+
+    def test_a_displaced_conversation_comes_back_from_the_ram_cache(self):
+        # document A, then document B in the same sequence (A's cells are gone), then a new question on A: the RAM
+        # cache gives A back instead of reading it again, and the answer is the one a fresh engine gives
+        s = self.e.im_start
+        doc_a = self.m1 + message(s, list(range(1000, 1300)))
+        doc_b = self.m1 + message(s, list(range(2000, 2300)))
+        resumes = {}
+        for extra in ((), ("--conversation-cache-mib", "512")):
+            e = Engine("--prefill-batch", "64", *extra)
+            try:
+                if extra:
+                    self.assertEqual(e.info.get("conversation_cache_mib"), "512")
+                e.gen(doc_a + list(range(700, 720)))
+                e.gen(doc_b + list(range(700, 720)))
+                out, resumes[extra], _ = e.gen(doc_a + list(range(900, 930)))
+            finally:
+                e.close()
+        self.assertEqual(resumes[()], len(self.m1))                       # without it: back to the shared start
+        self.assertGreater(resumes[("--conversation-cache-mib", "512")], len(doc_a) - 64)
+        fresh = Engine()
+        try:
+            self.assertEqual(out, fresh.gen(doc_a + list(range(900, 930)))[0])
+        finally:
+            fresh.close()
+
+    def test_the_ram_cache_evicts_the_oldest_conversation(self):
+        # two cache slots, four documents: A and B are parked, then C evicts A (the oldest); B comes back, A does not
+        s = self.e.im_start
+        docs = [self.m1 + message(s, list(range(b, b + 300))) for b in (1000, 2000, 3000, 4000)]
+        e = Engine("--prefill-batch", "64", "--conversation-cache-mib", "512", "--conversation-cache-slots", "2")
+        try:
+            for d in docs:
+                e.gen(d + list(range(700, 720)))
+            _, back_b, _ = e.gen(docs[1] + list(range(900, 930)))
+            _, back_a, _ = e.gen(docs[0] + list(range(900, 930)))
+        finally:
+            e.close()
+        self.assertGreater(back_b, len(docs[1]) - 64)
+        self.assertEqual(back_a, len(self.m1))
+
+    def test_checkpoint_tail_reads_the_end_in_small_chunks(self):
+        # the default batch (2048) reads this whole prompt in one chunk: no checkpoint inside the long message, unless
+        # --checkpoint-tail cuts its last tokens into chunks of 256
+        doc = self.m1 + message(self.e.im_start, list(range(1000, 1700)))
+        resumes = {}
+        for extra in ((), ("--checkpoint-tail", "512")):
+            e = Engine(*extra)
+            try:
+                e.gen(doc + list(range(700, 720)))
+                out, resumes[extra], _ = e.gen(doc + list(range(900, 930)))
+            finally:
+                e.close()
+        self.assertEqual(resumes[()], len(self.m1))                              # back to the message's start
+        self.assertGreater(resumes[("--checkpoint-tail", "512")], len(doc) - 256)  # within one small chunk
+        fresh = Engine()
+        try:
+            self.assertEqual(out, fresh.gen(doc + list(range(900, 930)))[0])
+        finally:
+            fresh.close()
 
     def test_the_latest_inside_checkpoints_are_kept(self):
         # --checkpoints 2: the long message's last two chunk ends; one early in it went, so the message's start serves
@@ -352,8 +498,12 @@ class TestStrataMetal(unittest.TestCase):
             fy, _, _ = b.admit(1, y, 10)
             b.admitted = 2
             got = b.slots()
-            self.assertEqual(fx + got[0][0], alone_x)
-            self.assertEqual(fy + got[1][0], alone_y)
+            # one K/V pool (--kv-unified): attention over the shared pool sums in another order, and on these made-up
+            # prompts (near-tied top tokens) that alone changes a greedy answer after a few tokens; a slot reading
+            # another's row shows from the first token, which is what this guards
+            n = 4 if "--kv-unified" in os.environ.get("STRATA_METAL_EXTRA", "") else 10
+            self.assertEqual((fx + got[0][0])[:n], alone_x[:n])
+            self.assertEqual((fy + got[1][0])[:n], alone_y[:n])
             b.admit(0, self.m1 + self.m2 + self.m3, 400)                   # two slots at once, one stopped
             b.admit(1, self.m3 + self.m1, 400)
             b.admitted = 2
@@ -364,6 +514,108 @@ class TestStrataMetal(unittest.TestCase):
             self.assertEqual(len(b.gen(self.m1, max_new=2)[0]), 2)         # the solo path still in step
         finally:
             b.close()
+
+    def test_a_banned_token_is_never_sampled(self):
+        # logit_bias=<id>:-100 (how the server keeps a model whose template has no thinking switch out of <think> when
+        # thinking is off): the token the prompt would start with is never the answer's, solo and in a batch slot
+        p = self.m1 + self.m3
+        first = self.e.gen(p, max_new=1)[0][0]
+        self.e.send(f"GEN 4 logit_bias={first}:-100 " + ",".join(map(str, p)))
+        toks = []
+        while True:
+            line = self.e.line()
+            if line.startswith("T "):
+                toks.append(int(line[2:]))
+            elif line.startswith("DONE ") or line.startswith("ERR"):
+                break
+        self.assertTrue(toks and first not in toks, (first, toks))
+        b = Engine("--batch", "2")
+        try:
+            self.assertEqual(b.info["logit_bias"], "2")
+            b.send(f"BGEN 0 4 logit_bias={first}:-100 " + ",".join(map(str, p)))
+            tok = None
+            while True:
+                line = b.line()
+                if line.startswith("T "):
+                    tok = int(line[2:])
+                elif line.startswith("BADM") or line.startswith("ERR"):
+                    break
+            self.assertIsNotNone(tok)
+            self.assertNotEqual(tok, first)
+        finally:
+            b.close()
+
+    def test_four_slots_with_the_cache_each_say_what_they_say_alone(self):
+        # the M1 (LFM2.5, --batch 4, a conversation cache, 2026-11-07): four requests at once came back mixed - "VC VOLANOC",
+        # another request's words, JSON a grammar could not have allowed - while two at once and the M5 were right.  Four
+        # prompts with one shared start (an app's system prompt: the cache's parked start is restored into each slot),
+        # each admitted while the others decode, twice (the second time from the cache), each answer as it is alone.
+        s = self.e.im_start
+        shared = self.m1
+        prompts = [shared + message(s, list(range(1000 + 50 * i, 1030 + 50 * i))) for i in range(4)]
+        solo = Engine()
+        try:
+            alone = [solo.gen(p, max_new=16)[0] for p in prompts]
+        finally:
+            solo.close()
+        b = Engine("--batch", "4", "--conversation-cache-mib", "256")
+        try:
+            for order in ([0, 1, 2, 3], [3, 1, 0, 2]):
+                first = {}
+                for slot, i in enumerate(order):
+                    tok, _, cont = b.admit(slot, prompts[i], 16)
+                    self.assertTrue(cont)
+                    first[slot] = tok
+                b.admitted = 4
+                got = b.slots()
+                for slot, i in enumerate(order):
+                    self.assertEqual(first[slot] + got[slot][0], alone[i], f"slot {slot}, prompt {i}, order {order}")
+        finally:
+            b.close()
+
+    def test_a_prompt_read_lets_decoding_slots_go_on(self):
+        # a slot decoding while another slot's long prompt is read gets tokens during the read (a window between
+        # --prefill-share pieces), not only after it
+        b = Engine("--batch", "2", "--prefill-share", "64")
+        try:
+            b.admit(0, self.m1 + self.m2, 400)
+            b.send("BGEN 1 4 " + ",".join(str(300 + i % 40) for i in range(1500)))
+            during, reading = 0, False
+            while True:
+                line = b.line()
+                if line.startswith("RESUME "):
+                    reading = True
+                elif line.startswith("BT 0 ") and reading:
+                    during += 1
+                elif line.startswith("BADM ") or line.startswith("ERR"):
+                    break
+            self.assertTrue(line.startswith("BADM 1 1"), line)
+            self.assertGreaterEqual(during, 1500 // 64 - 1)              # a token a piece
+            b.send("BSTOP 0")
+            b.send("BSTOP 1")
+            b.admitted = 2
+            b.slots()
+        finally:
+            b.close()
+
+    def test_vip_holds_the_engine_until_released(self):
+        # VIP 1 (a client engine's request runs): this engine gives way between passes until VIP 0
+        import select
+        self.e.send("VIP 1")
+        self.e.send("GEN 8 " + ",".join(map(str, self.m1)))
+        ready, _, _ = select.select([self.e.p.stdout], [], [], 1.0)
+        held = []
+        while ready:                                  # RESUME may come; no token while held
+            line = self.e.line()
+            held.append(line)
+            self.assertFalse(line.startswith(("T ", "DONE")), held)
+            ready, _, _ = select.select([self.e.p.stdout], [], [], 0.5)
+        self.e.send("VIP 0")
+        while True:
+            line = self.e.line()
+            if line.startswith("DONE"):
+                break
+        self.assertEqual(len(self.e.gen(self.m1, max_new=2)[0]), 2)   # still in step
 
     def test_refusals_stay_in_step(self):
         for cmd in ("GEN x", "GENI 4 1,2", "VRAM 100", "HELLO"):

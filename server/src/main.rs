@@ -12,7 +12,7 @@ use std::sync::Arc;
 use strata_server::engine::{py_g, AfmEngine, Engine, MockEngine, Spawn, StrataEngine, ENGINE_SILENCE_S};
 use strata_server::py::{self, get, truthy};
 use strata_server::service::{clean_shared_defaults, sampling_defaults_from_config, Service, Settings, REPEAT_STOP_TOKENS};
-use strata_server::tokenizer::{ByteTokenizer, Tokenize, Tokenizer};
+use strata_server::tokenizer::{ByteTokenizer, Tokenize};
 use strata_server::{http, mcp, net, root, say};
 
 #[derive(Parser)]
@@ -34,6 +34,10 @@ struct Args {
     /// if another Strata server holds the port, stop it and start this one
     #[arg(long)]
     replace: bool,
+    /// blue-green (make app-run while the model is busy): share the port with the Strata server that holds it, load the
+    /// model first, then take every new connection and have that one finish its requests and stop (SIGUSR2)
+    #[arg(long, conflicts_with = "replace")]
+    handoff: bool,
     #[arg(long)]
     gpu: Option<String>,
     /// pack tokenizer directory (falls back to a byte tokenizer if absent)
@@ -82,6 +86,36 @@ fn die(msg: &str) -> ! {
 fn exit_msg(msg: &str) -> ! {
     eprintln!("{}", strata_server::engine::stamp(msg));
     std::process::exit(1)
+}
+
+/// The model's own rules: the config's "system_prompt" (a text file; a relative path: from the config's folder), else the
+/// profile for the model's name in prompts/ (the longest file name it starts with: "lfm2.5-8b-a1b-q4" ->
+/// prompts/lfm2.5-8b.md); `false`: none (a client engine: its app sends its own)
+fn system_prompt(cfg: &Value, config: Option<&str>) -> Result<Option<String>, String> {
+    let path = match get(cfg, "system_prompt") {
+        Value::Bool(false) => return Ok(None),
+        Value::Null => match profile_for(&get(cfg, "model_name").as_str().map(String::from).unwrap_or_else(|| model_name_from_args(&str_args(cfg))), &root().join("prompts")) {
+            Some(p) => p,
+            None => return Ok(None),
+        },
+        Value::String(p) if !p.trim().is_empty() => config.and_then(|c| Path::new(c).parent()).unwrap_or(Path::new(".")).join(p),
+        v => return Err(format!("[strata] config \"system_prompt\" must be a file's path or false, not {}", py::py_repr(v))),
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("[strata] config \"system_prompt\" {}: {e}", path.display()))?;
+    let text = text.trim();
+    say(&format!("system prompt: {} ({} characters) ahead of each request's system text", path.display(), text.len()));
+    Ok((!text.is_empty()).then(|| text.to_string()))
+}
+
+/// The .md in `dir` whose name the model's name starts with, the longest such name
+fn profile_for(model: &str, dir: &Path) -> Option<PathBuf> {
+    let model = model.to_lowercase();
+    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .filter_map(|p| Some((p.file_stem()?.to_str()?.to_lowercase(), p.clone())))
+        .filter(|(stem, _)| !stem.is_empty() && model.starts_with(stem.as_str()))
+        .max_by_key(|(stem, _)| stem.len())
+        .map(|(_, p)| p)
 }
 
 /// #1641: "--reasoning-effort high" in a config's args is the config's "reasoning_effort".
@@ -223,6 +257,66 @@ fn model_name_from_args(args: &[String]) -> String {
     "qwen3.8-flash-next".into()
 }
 
+/// The conversation cache when the config sets no --conversation-cache-mib: by the RAM left beside the model's file.
+/// Measured (strata-bench, 2026-11-03): 16 GB kept 4 Qwen3.6 agents' conversations on the 128 GB M5 Max; on the 16 GB
+/// M1, 2 GB brought 1-4 agents' 3,000-token conversations back (99%) for LFM2.5-8B / -24B and GPT-OSS-20B, follow-ups
+/// in 0.4-2 s instead of 4-32 s.  A model with a big state per token (Sheared-LLaMA: 1 GB a conversation) needs 4 GB
+/// for one agent's and is slower with 2-4 agents either way.
+// ponytail: by RAM only; sizing by the model's state per token (the engine knows it) when a model needs it
+fn auto_cache_mib(ram_gib: f64, model_gib: f64) -> u64 {
+    match ram_gib - model_gib {
+        f if f >= 64.0 => 16384,
+        f if f >= 24.0 => 8192,
+        f if f >= 8.0 => 4096,
+        f if f >= 4.0 => 2048,
+        _ => 0,
+    }
+}
+
+/// The model's size on disk: its --gguf, with the other shards of a split file (NAME-00001-of-00003.gguf)
+fn model_gib(args: &[String]) -> Option<f64> {
+    let g = Path::new(args.get(args.iter().position(|a| a == "--gguf")? + 1)?);
+    let name = g.file_name()?.to_str()?;
+    let prefix = name.split_once("-00001-of-").map(|(p, _)| format!("{p}-0")).unwrap_or_else(|| name.to_string());
+    let bytes: u64 = std::fs::read_dir(g.parent()?).ok()?.flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n == name || (n.starts_with(&prefix) && n.ends_with(".gguf"))))
+        .filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+    Some(bytes as f64 / 1073741824.0)
+}
+
+/// --conversation-cache-mib added by auto_cache_mib when the args have none ("0" in the config: off)
+fn add_auto_cache(args: &mut Vec<String>) {
+    if args.iter().any(|a| a == "--conversation-cache-mib") {
+        return;
+    }
+    let (_, total) = strata_server::telemetry::ram();
+    let (Some(total), Some(model)) = (total, model_gib(args)) else { return };
+    let ram = total as f64 / 1073741824.0;
+    let mib = auto_cache_mib(ram, model);
+    say(&format!("conversation cache: {} (automatic: {ram:.0} GB of RAM, the model {model:.1} GB; \"--conversation-cache-mib\" in the config's args sets it, 0 = off)",
+                 if mib > 0 { format!("{} GB", mib / 1024) } else { "off".into() }));
+    if mib > 0 {
+        args.extend(["--conversation-cache-mib".into(), mib.to_string()]);
+    }
+}
+
+/// Where a draining server leaves its agents' conversations for the one that took its port (docs/BLUE_GREEN.md)
+fn handoff_dir(port: u16) -> PathBuf {
+    std::env::temp_dir().join(format!("strata-handoff-{port}"))
+}
+
+/// The server's listener, SO_REUSEPORT on: a newer server (--handoff) can bind beside it, and macOS gives the newest
+/// listener the new connections (measured).  Two servers on one port by mistake stay impossible: port_free's plain
+/// bind, before this, fails while one listens.
+async fn listen(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    let sa = tokio::net::lookup_host(addr).await?.next().ok_or_else(|| std::io::Error::other(format!("{addr}: no address")))?;
+    let s = if sa.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    s.set_reuseaddr(true)?;
+    s.set_reuseport(true)?;
+    s.bind(sa)?;
+    s.listen(1024)
+}
+
 fn warn_budget_over_ram(args: &[String]) {
     let Some(i) = args.iter().position(|a| a == "--resident-budget-gib") else { return };
     let Some(budget) = args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) else { return };
@@ -250,12 +344,39 @@ fn port_holders(port: u16) -> Vec<(i32, String)> {
     let Ok(o) = std::process::Command::new("lsof").args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"]).output() else { return vec![] };
     let mut pids: Vec<i32> = String::from_utf8_lossy(&o.stdout).split_whitespace().filter_map(|p| p.parse().ok()).collect();
     pids.dedup();
-    pids.into_iter()
-        .map(|p| {
-            let cmd = std::process::Command::new("ps").args(["-o", "command=", "-p", &p.to_string()]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-            (p, cmd)
+    let found = pids.into_iter()
+        .filter_map(|p| {
+            let o = std::process::Command::new("ps").args(["-o", "ppid=,command=", "-p", &p.to_string()]).output().ok()?;
+            let line = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let (ppid, cmd) = line.split_once(char::is_whitespace)?;   // gone since lsof: not a holder
+            Some((p, ppid.parse().unwrap_or(0), cmd.trim().to_string()))
         })
-        .collect()
+        .collect();
+    servers_holding(found)
+}
+
+/// The holders that are not a Strata server's own child: a child between fork and exec holds a copy of its server's
+/// socket ("(lsof)", "(ioreg)"), for milliseconds, and for seconds once `make build` replaced the binary under the
+/// running server (macOS checks the new file at every spawn).  Counted as another program, it stopped the Zed engine
+/// in a deploy (2026-11-05: "port 8190 is already in use ... (held by pid 59122: )") and Zed's requests were refused.
+fn servers_holding(found: Vec<(i32, i32, String)>) -> Vec<(i32, String)> {
+    let servers: Vec<i32> = found.iter().filter(|(_, _, c)| is_strata_server(c)).map(|(p, _, _)| *p).collect();
+    found.into_iter().filter(|(_, ppid, c)| is_strata_server(c) || !servers.contains(ppid)).map(|(p, _, c)| (p, c)).collect()
+}
+
+/// The port check again while the port is in use and no process listens on it (a server stopping), up to `tries` times
+fn port_settled(mut check: impl FnMut() -> std::io::Result<()>, mut nobody: impl FnMut() -> bool, tries: usize, pause: std::time::Duration) -> std::io::Result<()> {
+    let mut r = check();
+    for _ in 0..tries {
+        match &r {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && nobody() => {
+                std::thread::sleep(pause);
+                r = check();
+            }
+            _ => break,
+        }
+    }
+    r
 }
 
 fn is_strata_server(cmd: &str) -> bool {
@@ -306,6 +427,26 @@ fn engines_in(ps: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether this server can listen on host:port.  On a wildcard host the loopback address is tried too: the socket's
+/// SO_REUSEADDR lets 0.0.0.0:8080 bind beside another program's 127.0.0.1:8080 (a Docker port), and then the app and
+/// every local client reach that program instead of this server.
+fn port_free(host: &str, port: u16) -> std::io::Result<()> {
+    let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.to_string() }, port);
+    std::net::TcpListener::bind(&addr)?;
+    // and the other way round: macOS lets 127.0.0.1:port bind while another server holds 0.0.0.0:port (a server
+    // on "host": "0.0.0.0" then hid from --replace, and its engine made this one refuse to start)
+    let other = match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        h if h.contains(':') => "::",
+        _ => "0.0.0.0",
+    };
+    match std::net::TcpListener::bind((other, port)) {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(e),
+        _ => Ok(()), // no address of that family here: nothing to shadow
+    }
+}
+
 fn listen_problem(host: &str, port: u16, e: &std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::AddrInUse => format!("port {port} is already in use - is Strata (or another server) already running? Close it, or start this one with a different --port"),
@@ -333,11 +474,31 @@ fn main() {
         cfg.insert("gpu".into(), g.trim().parse::<i64>().map(Value::from).unwrap_or(json!(g)));
     }
     let cfgv = Value::Object(cfg.clone());
-    strata_server::firewall::start(get(&cfgv, "firewall"), a.engine == "strata"); // history, connection sampler, the kernel's sandbox log
+    // "trace": true - STRATA_TRACE=1 for this server and its engine (Strata.app starts the server, so no shell sets it):
+    // which slot each request gets and why, and why the engine reads a prompt again or not
+    if get(&cfgv, "trace") == &json!(true) && std::env::var_os("STRATA_TRACE").is_none() {
+        // SAFETY: still one thread here - the runtime, the engine and the firewall sampler start below
+        unsafe { std::env::set_var("STRATA_TRACE", "1") };
+        say("trace on (\"trace\": true): slot choices here, the engine's reuse in this config's log");
+    }
+    // a client's own engine (docs/CLIENT_ENGINES.md): this server routes by User-Agent ("clients"), or it is one
+    // (STRATA_PARENT_PID: the main server runs the firewall history, voice, schedules and MCP servers)
+    strata_server::clients::set(strata_server::clients::parse(&cfgv, a.port).unwrap_or_else(|e| exit_msg(&format!("[strata] {e}"))));
+    let client_engine = strata_server::clients::watch_parent();
+    say(&format!("server build {} (git commit; -dirty: built with uncommitted changes)", env!("STRATA_BUILD")));
+    // a client engine's stdout is its log already (clients::start)
+    if let (false, Some(l)) = (client_engine, get(&cfgv, "log").as_str()) {
+        strata_server::log_to(l);
+    }
+    strata_server::firewall::start(get(&cfgv, "firewall"), a.engine == "strata" && !client_engine); // history, connection sampler, the kernel's sandbox log
     let host = a.host.clone().or_else(|| get(&cfgv, "host").as_str().filter(|h| !h.is_empty()).map(String::from)).unwrap_or_else(|| "127.0.0.1".into());
     // before the minutes of loading: is the port free?
     let addr = format!("{}:{}", if host.contains(':') { format!("[{host}]") } else { host.clone() }, a.port);
-    if let Err(e) = std::net::TcpListener::bind(&addr) {
+    let mut handoff_from: Vec<i32> = vec![];
+    // a server that is stopping holds its port a moment after its listener is gone: in use, held by no one (a client
+    // engine started while the previous run's one stopped quit "port 8190 is already in use", 2026-11-05)
+    let busy = port_settled(|| port_free(&host, a.port), || port_holders(a.port).is_empty(), 10, std::time::Duration::from_millis(500));
+    if let Err(e) = busy {
         let holders = if e.kind() == std::io::ErrorKind::AddrInUse { port_holders(a.port) } else { vec![] };
         let ours: Vec<&(i32, String)> = holders.iter().filter(|(_, c)| is_strata_server(c)).collect();
         if ours.is_empty() || ours.len() != holders.len() {
@@ -347,6 +508,10 @@ fn main() {
         let (pid, cmd) = ours[0];
         let config = cmd.split_once("--config").map(|(_, r)| r.split_whitespace().next().unwrap_or("?").trim_matches('"').to_string()).unwrap_or_else(|| "?".into());
         say(&format!("port {} is held by another Strata server: pid {pid}, {}", a.port, Path::new(&config).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or(config)));
+        if a.handoff {
+            handoff_from = ours.iter().map(|(p, _)| *p).collect();
+            say(&format!("handoff: this server takes port {} over from pid {pid} once its model is loaded", a.port));
+        } else {
         if !a.replace {
             use std::io::IsTerminal;
             if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
@@ -364,6 +529,7 @@ fn main() {
             die(&format!("strata-server: error: could not free port {} (pid {pid} did not stop)", a.port));
         }
         say(&format!("port {} is free", a.port));
+        }
     }
     // "engine": "afm": Apple's on-device model (metal/afm/strata-afm, FoundationModels): text in and out, so bytes for
     // tokens and the conversation as JSON for a prompt
@@ -373,8 +539,8 @@ fn main() {
         die(&format!("strata-server: error: the model's tokenizer is missing ({}); run setup again", tpath.join("vocab.json").display()));
     }
     let tok: Arc<dyn Tokenize> = if !afm && tpath.join("vocab.json").exists() {
-        match Tokenizer::from_dir(&tpath) {
-            Ok(t) => Arc::new(t),
+        match strata_server::tokenizer::from_pack_dir(&tpath) {
+            Ok(t) => Arc::from(t),
             Err(e) => die(&format!("strata-server: error: the tokenizer in {}: {e}", tpath.display())),
         }
     } else {
@@ -384,8 +550,15 @@ fn main() {
     let dotenv = strata_server::dotenv::load(&root());
     let mut env_mcp = strata_server::dotenv::mcp_servers(&dotenv);
     // Strata.app's browser for the model (app/src/browser_mcp.rs): its endpoint and key, made at each app start
-    if let (Ok(u), Ok(k)) = (std::env::var("STRATA_BROWSER_MCP_URL"), std::env::var("STRATA_BROWSER_MCP_KEY")) {
+    if client_engine {
+        env_mcp.clear();
+    }
+    if let (false, Ok(u), Ok(k)) = (client_engine, std::env::var("STRATA_BROWSER_MCP_URL"), std::env::var("STRATA_BROWSER_MCP_KEY")) {
         env_mcp.insert("browser".into(), json!({"url": u, "headers": {"Authorization": format!("Bearer {k}")}}));
+        // a "/team"'s agents: a browser each, beside the pane people see (team.rs)
+        for i in 1..=4 {
+            env_mcp.insert(format!("agent{i}"), json!({"url": format!("{u}/{i}"), "headers": {"Authorization": format!("Bearer {k}")}}));
+        }
     }
     if !env_mcp.is_empty() {
         say(&format!("MCP servers from .env or Strata.app (its browser): {}", env_mcp.keys().cloned().collect::<Vec<_>>().join(", ")));
@@ -408,6 +581,21 @@ fn main() {
     } else if a.engine == "strata" {
         if cfg.is_empty() {
             die("strata-server: error: --engine strata needs --config");
+        }
+        // on the network (0.0.0.0, a LAN address) only with a key - before the model loads: anyone who reaches it
+        // could use the model, read the request monitor and drive its MCP tools
+        let some_key = |v: &Value| match v {
+            Value::String(k) => !k.trim().is_empty(),
+            Value::Array(a) => !a.is_empty(),
+            _ => false,
+        };
+        let keyed = a.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+            || std::env::var("STRATA_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+            || some_key(get(&cfgv, "api_key"))
+            || strata_server::dotenv::get(&dotenv, "API_KEY").is_some_and(|k| !k.trim().is_empty());
+        if !keyed && !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
+            exit_msg(&format!("[strata] \"host\": \"{host}\" shares this server with other devices, so it needs an API key: \
+                Strata.app's More > Share on the network puts one in .env; or API_KEY in .env, \"api_key\" in the run config, or --api-key"));
         }
         let env = child_env(&cfgv);
         sampling_defaults = sampling_defaults_from_config(&cfgv).unwrap_or_else(|e| exit_msg(&e));
@@ -433,7 +621,8 @@ fn main() {
         // two engines need the memory for two models: on a 16 GB Mac the kernel's out-of-memory killer then ends one of
         // them (and systemd the session it ran in: a TUI was lost that way).  --replace has already stopped this port's.
         let others = other_engines();
-        if !others.is_empty() && std::env::var("STRATA_ALLOW_SECOND_ENGINE").map(|v| v != "1").unwrap_or(true) {
+        // a handoff runs two engines for a while: the weights are the same mapped file, only the contexts are twice
+        if !others.is_empty() && handoff_from.is_empty() && std::env::var("STRATA_ALLOW_SECOND_ENGINE").map(|v| v != "1").unwrap_or(true) {
             exit_msg(&format!(
                 "[strata] another Strata engine is running (pid {}): two models need the memory of both, and the system ends one when it runs out. \
                  Stop that one first (Ctrl+S in its make tui, Stop in Strata.app, or make stop), or start this one with --replace on its port. \
@@ -451,6 +640,7 @@ fn main() {
         };
         effort_end = effort_end_args(&cfgv, &exe, &*tok).unwrap_or_else(|e| exit_msg(&format!("[strata] config {e}")));
         let mut args = engine_args(&cfgv);
+        add_auto_cache(&mut args);
         args.extend(effort_end.clone().unwrap_or_default());
         let spawn = Spawn { exe, args, cwd: cwd.clone(), log: get(&cfgv, "log").as_str().map(String::from), env, jail: get(&cfgv, "sandbox") != &json!(false) };
         let e = match StrataEngine::new(spawn, lazy) {
@@ -472,6 +662,7 @@ fn main() {
     // ------------------------------------------------------------------ the settings
     let mut set = Settings { sampling_defaults, fit_max_tokens: a.fit_max_tokens || get(&cfgv, "fit_max_tokens") == &json!(true), ..Default::default() };
     set.reasoning_close_retry = get(&cfgv, "reasoning_close_retry") == &json!(true);
+    set.system_prompt = system_prompt(&cfgv, a.config.as_deref()).unwrap_or_else(|e| exit_msg(&e));
     if !get(&cfgv, "prevent_sleep").is_null() && !get(&cfgv, "prevent_sleep").is_boolean() {
         exit_msg(&format!("[strata] config \"prevent_sleep\" must be true or false, not {}", py::py_repr(get(&cfgv, "prevent_sleep"))));
     }
@@ -608,9 +799,8 @@ fn main() {
     let host_names = net::host_names_for(&host, &set.allowed_hosts, &set.trusted_origins);
     set.host_names = host_names;
     let mut svc = Service::new(engine.clone(), tok, template, model, vision.clone(), set);
-    if svc.set.reasoning_budget_tokens.is_null() {
-        svc.set.reasoning_budget_tokens = json!(0);
-    } else {
+    // left unset (null) when the config has none: a request without a budget then keeps room to answer (thinking_cap)
+    if !svc.set.reasoning_budget_tokens.is_null() {
         match svc.reasoning_budget(&json!({})) {
             Err(e) => exit_msg(&format!("[strata] config {e}")),
             Ok(Some(b)) => say(&format!("thinking budget: {b} tokens (reasoning_budget_tokens; a request can set its own)")),
@@ -639,16 +829,89 @@ fn main() {
     svc.start_telemetry();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().max_blocking_threads(1024).build().expect("runtime");
     let app = http::App::new(svc.clone());
-    let listener = rt.block_on(tokio::net::TcpListener::bind(&addr)).unwrap_or_else(|e| die(&format!("strata-server: error: {}", listen_problem(&host, a.port, &e))));
+    if !handoff_from.is_empty() {
+        // the old server keeps answering until this one can: the model is loaded before the port is taken
+        say("handoff: loading the model before taking the port ...");
+        if let Err(e) = svc.ensure_loaded() {
+            die(&format!("strata-server: error: handoff: the model did not load ({e}); the server on port {} keeps running", a.port));
+        }
+    }
+    let listener = rt.block_on(listen(&addr)).unwrap_or_else(|e| die(&format!("strata-server: error: {}", listen_problem(&host, a.port, &e))));
     let router = axum::Router::new().fallback(http::handle).with_state(app);
-    rt.spawn(async move {
-        let _ = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+    // SIGUSR2 (a newer server took the port over): stop accepting, finish every request in flight, then stop; the
+    // agents' conversations go to the new engine as they come free (docs/BLUE_GREEN.md)
+    let drained = Arc::new(tokio::sync::Notify::new());
+    let handing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hdir = handoff_dir(a.port);
+    let strata_engine = engine.strata().cloned();
+    let mut usr2 = rt.block_on(async { tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) }).expect("signal");
+    rt.spawn({
+        let (drained, handing, hdir) = (drained.clone(), handing.clone(), hdir.clone());
+        async move {
+            let (handing, hdir, eng) = (handing.clone(), hdir.clone(), strata_engine.clone());
+            let drain = async move {
+                usr2.recv().await;
+                say("handed over: no new requests here; finishing the ones in flight, then stopping");
+                strata_server::clients::stop_restarts();
+                handing.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(e) = eng {
+                    // now, and again each time a slot's request ends: those agents' state goes over one by one
+                    std::thread::spawn(move || {
+                        let mut busy_before = usize::MAX;
+                        while !e.ended.load(std::sync::atomic::Ordering::SeqCst) {
+                            let busy = e.slots_view().iter().filter(|s| s["state"] != "idle").count();
+                            if busy < busy_before && e.handoff("EXPORT", &hdir).is_err() {
+                                return;
+                            }
+                            busy_before = busy;
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                        }
+                    });
+                }
+            };
+            // TCP keepalive on every connection: a non-streaming answer is minutes of silence, and a client
+            // whose connection died on the way (2026-11-04: deep research in Docker to the M1's LAN address,
+            // "connection closed before message completed" 226 s in) left its generation running to the end
+            // while its retry ran beside it; the probes keep such paths open and find a dead peer, which
+            // ends the request as a hang-up does
+            let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+                let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(30)).with_interval(std::time::Duration::from_secs(10));
+                let _ = socket2::SockRef::from(&*tcp).set_tcp_keepalive(&ka);
+            });
+            let _ = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(drain).await;
+            drained.notify_one();
+        }
     });
+    for pid in &handoff_from {
+        say(&format!("handoff: port {} is this server's now; pid {pid} finishes its requests and stops", a.port));
+        unsafe { libc::kill(*pid, libc::SIGUSR2) };
+    }
+    if let (false, Some(e)) = (handoff_from.is_empty(), engine.strata().cloned()) {
+        // the old server's agents, as it writes them: into this engine's conversation cache
+        let (blue, dir) = (handoff_from.clone(), handoff_dir(a.port));
+        std::thread::spawn(move || {
+            let mut after = 0;
+            while after < 10 {
+                if !blue.iter().any(|p| unsafe { libc::kill(*p, 0) } == 0) {
+                    after += 1;
+                }
+                let waiting = std::fs::read_dir(&dir).map(|d| d.flatten().any(|f| f.path().extension().is_some_and(|x| x == "sseq"))).unwrap_or(false);
+                if waiting && e.handoff("IMPORT", &dir).is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
+    }
     svc.start_idle_unload();
     let here = if ["0.0.0.0", "", "::"].contains(&host.as_str()) { "127.0.0.1".to_string() } else { host.clone() };
     println!("ready: http://{here}:{}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context {} tokens{}{})", a.port, engine.max_context(), if vision.is_some() { ", images on" } else { "" }, if svc.set.api_key.is_empty() { "" } else { ", API key required" });
-    strata_server::voice::autostart(a.port, svc.set.api_key.first().map(String::as_str)); // "Hey ...": on again if it was on
-    strata_server::schedules::start(a.port, svc.set.api_key.first().cloned()); // scheduled prompts (missed ones run once)
+    if !client_engine {
+        strata_server::voice::autostart(a.port, svc.set.api_key.first().map(String::as_str)); // "Hey ...": on again if it was on
+        strata_server::schedules::start(a.port, svc.set.api_key.first().cloned()); // scheduled prompts (missed ones run once)
+        strata_server::hub::start(a.port, svc.set.api_key.first().cloned()); // the AI-cluster connection (Hub tab), when it is on
+    }
+    strata_server::clients::spawn_all(a.port, !handoff_from.is_empty());
     let args = str_args(&cfgv);
     let gguf = args[..args.len().saturating_sub(1)].iter().position(|x| x == "--gguf").map(|i| Path::new(&args[i + 1]).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
     println!("       model: {}{}", svc.model, if gguf.is_empty() { String::new() } else { format!("  ({gguf})") });
@@ -681,10 +944,19 @@ fn main() {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = term.recv() => {},
+            _ = drained.notified() => {},
         }
     });
     println!();
     say("stopping (Ctrl+C again to end the engine at once) ...");
+    // ponytail: after a handoff the old clients' engines stop here too, cutting what they still answer; their
+    // replacements took their ports already
+    strata_server::clients::stop_all();
+    if handing.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(e) = engine.strata() {
+            let _ = e.handoff("EXPORT", &handoff_dir(a.port)); // the last ones, before QUIT (the engine reads in order)
+        }
+    }
     std::thread::spawn(|| {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async { let _ = tokio::signal::ctrl_c().await; });
@@ -704,6 +976,55 @@ fn main() {
 }
 
 #[cfg(test)]
+mod profile_tests {
+    use super::profile_for;
+
+    #[test]
+    fn a_model_gets_the_profile_its_name_starts_with() {
+        let d = std::env::temp_dir().join(format!("strata-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for f in ["lfm2.5.md", "lfm2.5-8b.md", "qwen3.6.md", "notes.txt"] {
+            std::fs::write(d.join(f), "x").unwrap();
+        }
+        let name = |m: &str| profile_for(m, &d).map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+        assert_eq!(name("lfm2.5-8b-a1b-q4").as_deref(), Some("lfm2.5-8b.md"));   // the longest match
+        assert_eq!(name("LFM2.5-24B-A2B").as_deref(), Some("lfm2.5.md"));
+        assert_eq!(name("qwen3.6-35b-a3b").as_deref(), Some("qwen3.6.md"));
+        assert_eq!(name("gpt-oss-120b"), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod port_holder_tests {
+    use super::servers_holding;
+
+    #[test]
+    fn a_servers_half_started_child_is_not_another_program() {
+        let srv = "/x/engine-metal/strata-server --engine strata --port 8190";
+        let found = vec![(10, 1, srv.to_string()), (11, 10, "(lsof)".to_string()), (12, 99, "nginx: master".to_string())];
+        assert_eq!(servers_holding(found), vec![(10, srv.to_string()), (12, "nginx: master".to_string())]);
+    }
+
+    #[test]
+    fn a_port_held_by_no_one_is_checked_again_until_it_is_free() {
+        use std::io::{Error, ErrorKind};
+        let z = std::time::Duration::ZERO;
+        let mut n = 0;
+        let r = super::port_settled(|| { n += 1; if n < 3 { Err(Error::from(ErrorKind::AddrInUse)) } else { Ok(()) } }, || true, 10, z);
+        assert!(r.is_ok() && n == 3);
+        // held by a process: no retry, the caller looks at who holds it
+        let mut m = 0;
+        let r = super::port_settled(|| { m += 1; Err(Error::from(ErrorKind::AddrInUse)) }, || false, 10, z);
+        assert!(r.is_err() && m == 1);
+        // never free: gives up after the tries
+        let mut k = 0;
+        assert!(super::port_settled(|| { k += 1; Err(Error::from(ErrorKind::AddrInUse)) }, || true, 3, z).is_err());
+        assert_eq!(k, 4);
+    }
+}
+
+#[cfg(test)]
 mod engine_guard_tests {
     use super::engines_in;
 
@@ -712,5 +1033,60 @@ mod engine_guard_tests {
         let ps = "    1 /sbin/launchd\n 2148 /home/dadmin/Strata/engine-metal/strata-metal --serve --gguf m.gguf\n 2141 engine-metal/strata-server --engine strata\n  77 strata-metal\n 99 /usr/bin/strata-metal-helper\n 120 /Users/x/My Apps/Strata/engine-metal/strata-metal --serve\n 17790 /Users/x/Strata/engine-metal/strata-metal --plan --gguf m.gguf --max-context 8192\n 300 vim notes-about-strata-metal.txt\n";
         assert_eq!(engines_in(ps), ["2148", "77", "120"]);
         assert!(engines_in("  1 /sbin/init\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::{auto_cache_mib, model_gib};
+
+    #[test]
+    fn the_cache_follows_the_ram_beside_the_model() {
+        assert_eq!(auto_cache_mib(128.0, 22.0), 16384); // M5 Max, Qwen3.6
+        assert_eq!(auto_cache_mib(128.0, 86.0), 8192); // M5 Max, GLM-5.3
+        assert_eq!(auto_cache_mib(16.0, 1.8), 4096); // M1, Sheared-LLaMA
+        assert_eq!(auto_cache_mib(16.0, 8.4), 2048); // M1, LFM2.5-8B (measured: 99% reused with 2 GB)
+        assert_eq!(auto_cache_mib(16.0, 11.3), 2048); // M1, GPT-OSS-20B
+        assert_eq!(auto_cache_mib(16.0, 13.0), 0); // no room
+    }
+
+    #[test]
+    fn a_split_model_counts_all_its_shards() {
+        let d = std::env::temp_dir().join(format!("strata-shards-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for (n, len) in [("m-00001-of-00002.gguf", 3), ("m-00002-of-00002.gguf", 5), ("other.gguf", 7)] {
+            std::fs::write(d.join(n), vec![0u8; len]).unwrap();
+        }
+        let gib = |f: &str| model_gib(&["--gguf".into(), d.join(f).to_string_lossy().into_owned()]).unwrap() * 1073741824.0;
+        assert_eq!(gib("m-00001-of-00002.gguf").round(), 8.0);
+        assert_eq!(gib("other.gguf").round(), 7.0);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::port_free;
+
+    #[test]
+    fn a_wildcard_host_is_refused_when_another_program_has_the_loopback_port() {
+        // a Docker port: 127.0.0.1:P held by another program, this server asked for 0.0.0.0:P
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = other.local_addr().unwrap().port();
+        assert!(std::net::TcpListener::bind(("0.0.0.0", p)).is_ok(), "the wildcard alone binds beside it (SO_REUSEADDR)");
+        assert_eq!(port_free("0.0.0.0", p).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(port_free("127.0.0.1", p).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        drop(other);
+        assert!(port_free("0.0.0.0", p).is_ok());
+    }
+
+    #[test]
+    fn a_loopback_host_is_refused_when_another_server_has_the_wildcard_port() {
+        // a Strata server on "host": "0.0.0.0", this one asked for 127.0.0.1: --replace must see that one
+        let other = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let p = other.local_addr().unwrap().port();
+        assert_eq!(port_free("127.0.0.1", p).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        drop(other);
+        assert!(port_free("127.0.0.1", p).is_ok());
     }
 }

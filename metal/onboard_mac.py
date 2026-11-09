@@ -36,18 +36,21 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent.parent
 LINUX = platform.system() == "Linux"     # Linux on Apple Silicon (Asahi): the same engine on Vulkan, no Strata.app
 sys.path.insert(0, str(ROOT))
-from bootstrap import apple_silicon      # noqa: E402  (stdlib only: what this machine is, read on the fly)
+# stdlib only: what this machine is, read on the fly
+from bootstrap import apple_silicon
+
 # what onboarding installs on Linux (Debian / Ubuntu names): the compiler and make, cmake / ninja, llama.cpp's Vulkan
 # backend (headers, glslc, SPIR-V headers), Mesa's Apple GPU driver (Honeykrisp), downloads, the Firewall tab's lsof
 APT = ["build-essential", "make", "pkg-config", "cmake", "ninja-build", "git", "curl", "ca-certificates",
        "python3-venv", "python3-pip", "aria2", "lsof", "libvulkan-dev", "glslc", "spirv-headers", "glslang-tools",
        "mesa-vulkan-drivers", "vulkan-tools"]
 def meminfo(key: str) -> float:
-    m = re.search(rf"^{key}:\s+(\d+) kB", Path("/proc/meminfo").read_text(), re.M)
+    m = re.search(rf"^{key}:\s+(\d+) kB", Path("/proc/meminfo").read_text(), re.MULTILINE)
     return float(m.group(1)) * 1024 if m else 0.0
 ENGINE = ROOT / "engine-metal"
 GB = 1e9
@@ -57,35 +60,62 @@ GIB = 2**30
 # estimated); mem_min: at the smallest context (about the weights + 1 GB).  how: "pull" = tools/pull_model.py, then
 # the run config written here; "setup" = setup.py's own installer (it writes its run config).
 MODELS = {
-    "GPT-OSS-20B": dict(title="GPT-OSS 20B", about="the fastest; good for 16-24 GB Macs", download=12.1, mem_min=12.0,
-                        mem_full=19, how="pull", gguf="gpt-oss-20b/gpt-oss-20b-MXFP4.gguf", pack="gpt-oss-20b",
-                        name="gpt-oss-20b", context=131072, sampling={"temperature": 1.0, "top_p": 1.0}),
-    "QWEN3.6-35B": dict(title="Qwen3.6-35B-A3B", about="35B, about 3B active per token", download=21.7, mem_min=22.5,
-                        mem_full=29, how="pull", gguf="Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
-                        pack="qwen3.6-35b-a3b", name="qwen3.6-35b-a3b", context=131072,
-                        sampling={"temperature": 0.6, "top_p": 0.95, "top_k": 20}),
-    "LFM2.5-24B": dict(title="LFM2.5-24B-A2B", about="LiquidAI's, 2.45B active per token, always thinks; Q3_K_M fits a 16 GB Mac",
-                       download=11.5, mem_min=12.5, mem_full=14, how="pull",
-                       gguf="LFM2.5-24B-A2B/LFM2.5-24B-A2B.Q3_K_M.gguf", pack="lfm2.5-24b-a2b",
-                       name="lfm2.5-24b-a2b", context=131072,
-                       sampling={"temperature": 0.1, "top_k": 50, "repetition_penalty": 1.05}),
-    "LFM2.5-8B": dict(title="LFM2.5-8B-A1B", about="LiquidAI's, 1.5B active per token, thinks; Q8_0", download=9.0,
-                      mem_min=10.0, mem_full=12, how="pull", gguf="LFM2.5-8B-A1B/LFM2.5-8B-A1B-Q8_0.gguf",
-                      pack="lfm2.5-8b-a1b", name="lfm2.5-8b-a1b", context=131072,
-                      sampling={"temperature": 0.2, "top_k": 64, "repetition_penalty": 1.05}),  # LiquidAI: top_k 80; the engine's sampler takes up to 64
-    "Q2_0": dict(title="Qwen3.8-Flash-Next Q2_0", about="the default and the most tested on a Mac", download=66.4,
-                 mem_min=52, mem_full=60, how="setup"),
-    "GPT-OSS-120B": dict(title="GPT-OSS 120B", about="about 5B active per token", download=63.4, mem_min=62,
-                         mem_full=70, how="pull", gguf="gpt-oss-120b/gpt-oss-120b-MXFP4.gguf", pack="gpt-oss-120b",
-                         name="gpt-oss-120b", context=131072, sampling={"temperature": 1.0, "top_p": 1.0}),
-    "IQ3_XXS": dict(title="Qwen3.8-Flash-Next IQ3_XXS", about="less compressed than Q2_0", download=75.8, mem_min=60,
-                    mem_full=65, how="setup"),
-    "IQ3_S": dict(title="Qwen3.8-Flash-Next IQ3_S", about="less compressed again", download=83.6, mem_min=68,
-                  mem_full=74, how="setup"),
-    "GLM-5.3": dict(title="GLM-5.3-Flash (Maya-S24)", about="the largest (320B), the slowest", download=94.7,
-                    mem_min=88, mem_full=89, how="pull",
-                    gguf="GLM-5.3-Flash-Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00001-of-00003.gguf",
-                    pack="glm-5.3-flash-maya-s24", name="glm-5.3-flash-maya-s24", context=32768, sampling={}),
+    "GPT-OSS-20B": {"title": "GPT-OSS 20B", "about": "the fastest; good for 16-24 GB Macs", "download": 12.1, "mem_min": 12.0,
+                        "mem_full": 19, "how": "pull", "gguf": "gpt-oss-20b/gpt-oss-20b-MXFP4.gguf", "pack": "gpt-oss-20b",
+                        "name": "gpt-oss-20b", "context": 131072, "sampling": {"temperature": 1.0, "top_p": 1.0}},
+    "QWEN3.6-35B": {"title": "Qwen3.6-35B-A3B", "about": "35B, about 3B active per token", "download": 21.7, "mem_min": 22.5,
+                        "mem_full": 29, "how": "pull", "gguf": "Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
+                        "pack": "qwen3.6-35b-a3b", "name": "qwen3.6-35b-a3b", "context": 131072,
+                        "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
+    "QWEN3-CODER-30B": {"title": "Qwen3-Coder-30B-A3B", "about": "coding, about 3B active per token, no thinking; Q8_0",
+                            "download": 32.5, "mem_min": 33.5, "mem_full": 47, "how": "pull",
+                            "gguf": "Qwen3-Coder-30B-A3B-Instruct/Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf",
+                            "pack": "qwen3-coder-30b-a3b", "name": "qwen3-coder-30b-a3b", "context": 131072,
+                            "sampling": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "repetition_penalty": 1.05}},
+    "QWEN3-CODER-30B-Q4": {"title": "Qwen3-Coder-30B-A3B Q4", "about": "coding, about 3B active per token, no thinking; Q4_K_M",
+                               "download": 18.6, "mem_min": 19.5, "mem_full": 35, "how": "pull",
+                               "gguf": "Qwen3-Coder-30B-A3B-Instruct/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+                               "pack": "qwen3-coder-30b-a3b", "name": "qwen3-coder-30b-a3b-q4", "context": 131072,
+                               "sampling": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "repetition_penalty": 1.05}},
+    "LFM2.5-24B": {"title": "LFM2.5-24B-A2B", "about": "LiquidAI's, 2.45B active per token, always thinks; Q3_K_M fits a 16 GB Mac",
+                       "download": 11.5, "mem_min": 12.5, "mem_full": 14, "how": "pull",
+                       "gguf": "LFM2.5-24B-A2B/LFM2.5-24B-A2B.Q3_K_M.gguf", "pack": "lfm2.5-24b-a2b",
+                       "name": "lfm2.5-24b-a2b", "context": 131072,
+                       "sampling": {"temperature": 0.1, "top_k": 50, "repetition_penalty": 1.05}},
+    "LFM2.5-24B-IQ3": {"title": "LFM2.5-24B-A2B IQ3", "about": "LiquidAI's, 2.45B active per token, always thinks; i1-IQ3_XXS: faster, 2 GB less",
+                           "download": 9.3, "mem_min": 10.3, "mem_full": 12, "how": "pull",
+                           "gguf": "LFM2.5-24B-A2B/LFM2.5-24B-A2B.i1-IQ3_XXS.gguf", "pack": "lfm2.5-24b-a2b",
+                           "name": "lfm2.5-24b-a2b-iq3", "context": 131072,
+                           "sampling": {"temperature": 0.1, "top_k": 50, "repetition_penalty": 1.05}},
+    "LFM2.5-8B": {"title": "LFM2.5-8B-A1B", "about": "LiquidAI's, 1.5B active per token, thinks; Q8_0", "download": 9.0,
+                      "mem_min": 10.0, "mem_full": 12, "how": "pull", "gguf": "LFM2.5-8B-A1B/LFM2.5-8B-A1B-Q8_0.gguf",
+                      "pack": "lfm2.5-8b-a1b", "name": "lfm2.5-8b-a1b", "context": 131072,
+                      "sampling": {"temperature": 0.2, "top_k": 64, "repetition_penalty": 1.05}},  # LiquidAI: top_k 80; the engine's sampler takes up to 64
+    "LFM2.5-8B-Q4": {"title": "LFM2.5-8B-A1B Q4", "about": "LiquidAI's, 1.5B active per token, thinks; Q4_K_M: faster, 4 GB less",
+                         "download": 5.2, "mem_min": 6.0, "mem_full": 8, "how": "pull", "gguf": "LFM2.5-8B-A1B/LFM2.5-8B-A1B-Q4_K_M.gguf",
+                         "pack": "lfm2.5-8b-a1b", "name": "lfm2.5-8b-a1b-q4", "context": 131072,
+                         "sampling": {"temperature": 0.2, "top_k": 64, "repetition_penalty": 1.05}},
+    "QWEN3-4B": {"title": "Qwen3-4B-Instruct-2507", "about": "small and quick, calls tools (web search); Q8_0", "download": 4.3,
+                     "mem_min": 5.0, "mem_full": 8, "how": "pull", "gguf": "Qwen3-4B-Instruct-2507/Qwen3-4B-Instruct-2507-Q8_0.gguf",
+                     "pack": "qwen3-4b-instruct-2507", "name": "qwen3-4b-instruct-2507", "context": 32768,
+                     "sampling": {"temperature": 0.7, "top_p": 0.8, "top_k": 20}},  # Qwen's settings for the 2507 Instruct
+    "QWEN3-4B-Q4": {"title": "Qwen3-4B-Instruct-2507 Q4", "about": "small and quicker, calls tools; Q4_K_M, room for 3-4 agents",
+                        "download": 2.5, "mem_min": 3.5, "mem_full": 6, "how": "pull",
+                        "gguf": "Qwen3-4B-Instruct-2507/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "pack": "qwen3-4b-instruct-2507",
+                        "name": "qwen3-4b-instruct-2507-q4", "context": 32768, "sampling": {"temperature": 0.7, "top_p": 0.8, "top_k": 20}},
+    "Q2_0": {"title": "Qwen3.8-Flash-Next Q2_0", "about": "the default and the most tested on a Mac", "download": 66.4,
+                 "mem_min": 52, "mem_full": 60, "how": "setup"},
+    "GPT-OSS-120B": {"title": "GPT-OSS 120B", "about": "about 5B active per token", "download": 63.4, "mem_min": 62,
+                         "mem_full": 70, "how": "pull", "gguf": "gpt-oss-120b/gpt-oss-120b-MXFP4.gguf", "pack": "gpt-oss-120b",
+                         "name": "gpt-oss-120b", "context": 131072, "sampling": {"temperature": 1.0, "top_p": 1.0}},
+    "IQ3_XXS": {"title": "Qwen3.8-Flash-Next IQ3_XXS", "about": "less compressed than Q2_0", "download": 75.8, "mem_min": 60,
+                    "mem_full": 65, "how": "setup"},
+    "IQ3_S": {"title": "Qwen3.8-Flash-Next IQ3_S", "about": "less compressed again", "download": 83.6, "mem_min": 68,
+                  "mem_full": 74, "how": "setup"},
+    "GLM-5.3": {"title": "GLM-5.3-Flash (Maya-S24)", "about": "the largest (320B), the slowest", "download": 94.7,
+                    "mem_min": 88, "mem_full": 89, "how": "pull",
+                    "gguf": "GLM-5.3-Flash-Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00001-of-00003.gguf",
+                    "pack": "glm-5.3-flash-maya-s24", "name": "glm-5.3-flash-maya-s24", "context": 32768, "sampling": {}},
 }
 
 GREEN, AMBER, RED, BOLD, DIM, END = ("\033[32m", "\033[33m", "\033[31m", "\033[1m", "\033[2m", "\033[0m") \
@@ -108,7 +138,7 @@ def warn(msg: str) -> None:
     print(f"  {AMBER}!{END} {msg}", flush=True)
 
 
-def fail(msg: str, fix: str = "") -> None:
+def fail(msg: str, fix: str = "") -> NoReturn:
     print(f"\n{RED}✗ {msg}{END}" + (f"\n  {fix}" if fix else ""), flush=True)
     sys.exit(1)
 
@@ -118,7 +148,7 @@ def run(cmd, what: str = "", quiet: bool = False, **kw) -> None:
     if what:
         note(what)
     out = subprocess.DEVNULL if quiet else None
-    r = subprocess.run(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT if quiet else None, **kw)
+    r = subprocess.run(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT if quiet else None, **kw, check=False)
     if r.returncode != 0:
         fail(f"{' '.join(map(str, cmd))} failed (exit {r.returncode})", "Run `make setup` again after fixing it: finished steps are skipped.")
 
@@ -131,7 +161,7 @@ def ask(question: str, default: str, yes: bool) -> str:
 
 
 def sysctl(name: str) -> str:
-    return subprocess.run(["sysctl", "-n", name], capture_output=True, text=True).stdout.strip()
+    return subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, check=False).stdout.strip()
 
 
 def metal_limit() -> float:
@@ -154,8 +184,8 @@ def free_now() -> float:
     MemAvailable)."""
     if LINUX:
         return meminfo("MemAvailable")
-    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
-    page = int(re.search(r"page size of (\d+)", out).group(1)) if "page size" in out else 16384
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True, check=False).stdout
+    page = int(m.group(1)) if (m := re.search(r"page size of (\d+)", out)) else 16384
     pages = {m[0]: int(m[1]) for m in re.findall(r"Pages (free|inactive|speculative|purgeable):\s+(\d+)", out)}
     return float(sum(pages.values()) * page)
 
@@ -166,13 +196,13 @@ def memory_apps(n: int = 5) -> list[tuple[str, float]]:
     units = {"K": 2**10, "M": 2**20, "G": 2**30}
     if LINUX:                       # Linux: ps's resident memory, by program
         progs: dict[str, float] = {}
-        for line in subprocess.run(["ps", "-eo", "uid=,rss=,comm="], capture_output=True, text=True).stdout.splitlines():
+        for line in subprocess.run(["ps", "-eo", "uid=,rss=,comm="], capture_output=True, text=True, check=False).stdout.splitlines():
             f = line.split(None, 2)
             if len(f) == 3 and f[0] == str(os.getuid()) and not f[2].startswith("strata-"):
                 progs[f[2]] = progs.get(f[2], 0) + int(f[1]) * 1024
         big = sorted(((k, v) for k, v in progs.items() if v >= 300 * 2**20), key=lambda kv: -kv[1])[:n]
         return [(k + " (background)", v) for k, v in big]
-    top = subprocess.run(["top", "-l", "1", "-stats", "pid,mem"], capture_output=True, text=True).stdout
+    top = subprocess.run(["top", "-l", "1", "-stats", "pid,mem"], capture_output=True, text=True, check=False).stdout
     mem = {}
     for line in top.splitlines():
         f = line.split()
@@ -181,7 +211,7 @@ def memory_apps(n: int = 5) -> list[tuple[str, float]]:
             mem[int(f[0])] = float(v[:-1] or 0) * units.get(v[-1:], 1) if v[-1:] in units else float(v or 0)
     apps: dict[str, float] = {}
     uid = str(os.getuid())
-    for line in subprocess.run(["ps", "-axo", "pid=,uid=,comm="], capture_output=True, text=True).stdout.splitlines():
+    for line in subprocess.run(["ps", "-axo", "pid=,uid=,comm="], capture_output=True, text=True, check=False).stdout.splitlines():
         f = line.split(None, 2)
         if len(f) < 3 or f[1] != uid or f[2].startswith(("/System/", "/usr/libexec/", "/usr/sbin/")):
             continue
@@ -222,8 +252,8 @@ def power() -> list[str]:
 def power_mac() -> list[str]:
     """Energy-mode advice (pmset): Low Power slows the GPU; High Power (MacBook Pro with Max, 2024+ Pro, Mac mini Pro,
     Mac Studio 2026: a `powermode` line in pmset) keeps its clock under long answers; a battery holds it back."""
-    g = subprocess.run(["pmset", "-g"], capture_output=True, text=True).stdout
-    batt = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
+    g = subprocess.run(["pmset", "-g"], capture_output=True, text=True, check=False).stdout
+    batt = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, check=False).stdout
     field = {l.split()[0]: l.split()[1] for l in g.splitlines() if len(l.split()) >= 2}
     tips = []
     if field.get("lowpowermode") == "1" or field.get("powermode") == "1":
@@ -273,22 +303,22 @@ def path_with_cargo() -> dict:
 
 def apt_tools() -> None:
     """Linux: the system packages (sudo), and the GPU's groups for this user (/dev/dri/renderD128 is group render)."""
-    missing = [p for p in APT if subprocess.run(["dpkg", "-s", p], capture_output=True).returncode != 0]
+    missing = [p for p in APT if subprocess.run(["dpkg", "-s", p], capture_output=True, check=False).returncode != 0]
     if missing:
         if not shutil.which("apt-get"):
             fail("this Linux has no apt-get", "Install these (or your distribution's names for them), then run it again: " + " ".join(APT))
         note(f"installing {len(missing)} system packages with apt (sudo may ask for your password): {' '.join(missing)}")
-        if subprocess.run(["sudo", "apt-get", "update", "-q"]).returncode != 0 or \
-                subprocess.run(["sudo", "apt-get", "install", "-y", "-q", *missing]).returncode != 0:
+        if subprocess.run(["sudo", "apt-get", "update", "-q"], check=False).returncode != 0 or \
+                subprocess.run(["sudo", "apt-get", "install", "-y", "-q", *missing], check=False).returncode != 0:
             fail("apt-get could not install them", "If sudo says you may not use it: as root, usermod -aG sudo " +
                  os.environ.get("USER", "you") + ", log in again, then run it again.")
     ok("system packages (compiler, cmake, Vulkan, Mesa's Apple GPU driver, aria2, lsof)")
     user = os.environ.get("USER") or os.getlogin()
-    groups = subprocess.run(["id", "-nG", user], capture_output=True, text=True).stdout.split()
+    groups = subprocess.run(["id", "-nG", user], capture_output=True, text=True, check=False).stdout.split()
     if not {"render", "video"} <= set(groups):
         run(["sudo", "usermod", "-aG", "render,video", user], "adding you to the GPU's groups (render, video) ...")
         warn("you are in the GPU's groups now; they apply from your next login (setup itself uses them already)")
-    vk = subprocess.run(["sg", "render", "-c", "vulkaninfo --summary"], capture_output=True, text=True).stdout
+    vk = subprocess.run(["sg", "render", "-c", "vulkaninfo --summary"], capture_output=True, text=True, check=False).stdout
     gpu = re.search(r"deviceName\s*=\s*(Apple[^\n]*)", vk)
     if gpu:
         ok(f"the GPU through Vulkan: {gpu.group(1).strip()} (Honeykrisp)")
@@ -303,30 +333,30 @@ def tools(yes: bool) -> dict:
         apt_tools()
     # Python packages (cmake and ninja for the engine, the tokenizer pack's needs)
     if subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r",
-                       str(ROOT / "requirements.txt")], cwd=ROOT).returncode != 0:
+                       str(ROOT / "requirements.txt")], cwd=ROOT, check=False).returncode != 0:
         fail("pip could not install requirements.txt", "Check the internet connection, then run `make setup` again.")
     ok("Python packages (cmake, ninja, ...) in .venv")
     # Rust: the server, its file tool and the app
     if not shutil.which("cargo", path=env["PATH"]):
         note("Rust is missing: installing it with rustup (https://rustup.rs; into ~/.cargo, no sudo) ...")
         r = subprocess.run("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal",
-                           shell=True)
+                           shell=True, check=False)
         if r.returncode != 0 or not shutil.which("cargo", path=env["PATH"]):
             fail("rustup could not install Rust", "Install it by hand: https://rustup.rs, then run `make setup` again.")
-    v = subprocess.run(["cargo", "--version"], capture_output=True, text=True, env=env).stdout.strip()
+    v = subprocess.run(["cargo", "--version"], capture_output=True, text=True, env=env, check=False).stdout.strip()
     ok(f"Rust ({v})")
     if LINUX:
         return env
     # aria2: 16 connections a file, from Homebrew (tools/pull_model.py downloads alone without it: one connection)
     brew = brew_path()
-    if not shutil.which("aria2c") and not brew:
-        if ask("Install Homebrew (https://brew.sh) for aria2, faster downloads? It asks for your password (y/n)",
-               "y" if sys.stdin.isatty() else "n", yes).lower() == "y":
-            note("Homebrew's installer says what it does, then asks for your password ...")
-            script = subprocess.run(["curl", "-fsSL", "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"],
-                                    capture_output=True, text=True).stdout
-            if script and subprocess.run(["/bin/bash", "-c", script]).returncode == 0:
-                brew = brew_path()
+    if not shutil.which("aria2c") and not brew and \
+            ask("Install Homebrew (https://brew.sh) for aria2, faster downloads? It asks for your password (y/n)",
+                "y" if sys.stdin.isatty() else "n", yes).lower() == "y":
+        note("Homebrew's installer says what it does, then asks for your password ...")
+        script = subprocess.run(["curl", "-fsSL", "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"],
+                                capture_output=True, text=True, check=False).stdout
+        if script and subprocess.run(["/bin/bash", "-c", script], check=False).returncode == 0:
+            brew = brew_path()
     if brew:
         ok("Homebrew")
         env["PATH"] = f"{Path(brew).parent}{os.pathsep}{env['PATH']}"
@@ -407,7 +437,7 @@ def plan(gguf: Path, ctx: int, pb: int) -> dict:
     env = dict(os.environ, HK_SYSMEM=str(int(mac()["limit"]))) if LINUX else None
     r = subprocess.run([str(ENGINE / "strata-metal"), "--plan", "--gguf", str(gguf), "--max-context", str(ctx),
                         "--kv", "f16", "--prefill-batch", str(pb)], capture_output=True, text=True, errors="replace",
-                       timeout=300, env=env)  # llama.cpp logs vocabulary pieces: bytes, not always whole UTF-8
+                       timeout=300, env=env, check=False)  # llama.cpp logs vocabulary pieces: bytes, not always whole UTF-8
     line = next((l for l in r.stdout.splitlines() if l.startswith("{")), "")
     if not line:
         fail("the engine could not measure the model", (r.stderr or r.stdout).strip()[-800:])
@@ -429,7 +459,7 @@ def size_context(gguf: Path, want: int, me: dict) -> tuple[int, int, float]:
     for pb in (2048, 512, 256):
         p = plan(gguf, want, pb)
         want = min(want, p["n_ctx_train"] or want)
-        lo, hi = 0, want
+        lo, _hi = 0, want
         for c in sorted({4096, 8192, 16384, 32768, 65536, 131072, 262144, want}):
             if c > want:
                 break
@@ -454,7 +484,7 @@ def write_afm_config() -> None:
     exe = ENGINE / "strata-afm"
     if not exe.exists():
         fail("engine-metal/strata-afm is missing", "make build compiles it (macOS 26 or later, with Xcode or the Command Line Tools)")
-    hello = subprocess.run([str(exe)], input="", capture_output=True, text=True, errors="replace", timeout=60).stdout
+    hello = subprocess.run([str(exe)], input="", capture_output=True, text=True, errors="replace", timeout=60, check=False).stdout
     v = json.loads(next((l for l in hello.splitlines() if l.startswith("{")), '{"error": "no answer"}'))
     if "error" in v:
         fail("Apple's on-device model is not available", v["error"])
@@ -591,9 +621,9 @@ def shrink(cfg_path: Path) -> bool:
 
 
 def test(cfg_path: Path, yes: bool) -> bool:
-    if not LINUX and subprocess.run(["pgrep", "-f", "Strata.app/Contents/MacOS/Strata$"], capture_output=True).returncode == 0:
-        if ask("Strata.app is running (its model uses memory). Quit it for the test? (y/n)", "y", yes).lower() == "y":
-            subprocess.run(["make", "--no-print-directory", "app-stop"], cwd=ROOT)
+    if not LINUX and subprocess.run(["pgrep", "-f", "Strata.app/Contents/MacOS/Strata$"], capture_output=True, check=False).returncode == 0 \
+            and ask("Strata.app is running (its model uses memory). Quit it for the test? (y/n)", "y", yes).lower() == "y":
+        subprocess.run(["make", "--no-print-directory", "app-stop"], cwd=ROOT, check=False)
     while True:
         note("a first answer (the model loads first: a few seconds to a minute or two) ...")
         good, said = first_answer(cfg_path)
@@ -607,10 +637,10 @@ def test(cfg_path: Path, yes: bool) -> bool:
             if me["suggest_mb"] and me["wired_mb"] < me["suggest_mb"] and sys.stdin.isatty() and ask(
                     f"macOS lets the GPU hold {me['limit'] / GIB:.1f} GB{'' if me['wired_mb'] else ' by default'}. Raise it to "
                     f"{me['suggest_mb'] / 1024:.1f} GB until the Mac restarts (sudo sysctl iogpu.wired_limit_mb="
-                    f"{me['suggest_mb']}; it asks for your password)? (y/n)", "y", yes).lower() == "y":
-                if subprocess.run(["sudo", "sysctl", f"iogpu.wired_limit_mb={me['suggest_mb']}"]).returncode == 0:
-                    ok(f"the GPU may hold {me['suggest_mb'] / 1024:.1f} GB now (until the Mac restarts)")
-                    continue
+                    f"{me['suggest_mb']}; it asks for your password)? (y/n)", "y", yes).lower() == "y" and \
+                    subprocess.run(["sudo", "sysctl", f"iogpu.wired_limit_mb={me['suggest_mb']}"], check=False).returncode == 0:
+                ok(f"the GPU may hold {me['suggest_mb'] / 1024:.1f} GB now (until the Mac restarts)")
+                continue
             if shrink(cfg_path):
                 continue
             if not yes and sys.stdin.isatty():
@@ -651,7 +681,7 @@ def open_app(cfg_path: Path) -> None:
     s = json.loads(settings.read_text()) if settings.exists() else {}
     s["config"] = str(cfg_path)
     settings.write_text(json.dumps(s, indent=2))
-    subprocess.run(["open", str(ROOT / "Strata.app")])
+    subprocess.run(["open", str(ROOT / "Strata.app")], check=False)
     ok("Strata.app is open on this model: press Start, then Chat")
 
 

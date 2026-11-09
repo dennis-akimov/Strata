@@ -172,6 +172,15 @@ pub fn sampling_keys(s: &Map<String, Value>) -> String {
             keys += &format!(" grammar={g} grammar_trigger={t}");
         }
     }
+    // a response_format's schema (run.rs sets it, as hex), from the thinking's end token when the model thinks
+    if let Some(Value::String(h)) = s.get("strata_json_schema_hex") {
+        if !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()) && !keys.contains(" grammar=") {
+            keys += &format!(" json_schema={h}");
+            if let Some(t) = int("strata_json_schema_from").filter(|t| *t >= 0) {
+                keys += &format!(" grammar_trigger={t}");
+            }
+        }
+    }
     if let Some(Value::Number(pn)) = s.get("strata_prefix").and_then(|p| p.get("tokens")) {
         if let Some(pn) = pn.as_i64().filter(|n| *n > 0) {
             keys += &format!(" pin={pn}");
@@ -371,7 +380,7 @@ impl Default for ConvCacheLog {
 
 impl ConvCacheLog {
     fn reset(&mut self) {
-        self.state = json!({"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": null, "last_tokens": null, "last_at": null})
+        self.state = json!({"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "park_ms": 0.0, "restore_ms": 0.0, "last_ms": null, "last_event": null, "last_tokens": null, "last_at": null})
             .as_object()
             .cloned()
             .unwrap();
@@ -398,7 +407,7 @@ impl ConvCacheLog {
         let now = crate::sync::now();
         static EVENT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         static DROPPED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let ev = EVENT.get_or_init(|| regex::Regex::new(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)(?: evictions=(\d+))?").unwrap());
+        let ev = EVENT.get_or_init(|| regex::Regex::new(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)(?: evictions=(\d+))?(?: ms=([\d.]+))?").unwrap());
         let dr = DROPPED.get_or_init(|| regex::Regex::new(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)").unwrap());
         for line in data[..end].lines() {
             if !line.contains("conversation cache:") {
@@ -418,6 +427,14 @@ impl ConvCacheLog {
                     st.insert("last_event".into(), json!(&m[1]));
                     st.insert("last_tokens".into(), json!(m[2].parse::<i64>().unwrap_or(0)));
                     st.insert("last_at".into(), json!(now));
+                    // the copy's time (engines from 2026-11-03 on), summed per kind
+                    let ms = m.get(6).and_then(|x| x.as_str().parse::<f64>().ok());
+                    if let Some(ms) = ms {
+                        let k = if &m[1] == "parked" { "park_ms" } else { "restore_ms" };
+                        let t = st.get(k).and_then(Value::as_f64).unwrap_or(0.0) + ms;
+                        st.insert(k.into(), json!((t * 10.0).round() / 10.0));
+                    }
+                    st.insert("last_ms".into(), json!(ms));
                 }
                 continue;
             }
@@ -433,6 +450,19 @@ impl ConvCacheLog {
 /// An engine ERR line as a failure.  llama_process failed (-3) is llama.cpp's GGML_STATUS_FAILED: on a Mac, Metal ran
 /// out of memory (the engine log says kIOGPUCommandBufferCallbackErrorOutOfMemory) - not the request's fault (503),
 /// said with what to change (Strata.app finds this line in the server's output and offers a context that fits).
+/// The engine's refusal of a BGEN into a slot it still runs (strata_metal.cpp, the CUDA and SYCL engines alike).
+/// A request under a grammar (a response_format's schema, LFM's tool calls) stays where it starts: a move between the
+/// solo path and a slot sends its prompt and its answer so far again, and the engine's new sampler starts the grammar
+/// over in the middle of the answer.  2026-11-07, the M1: JSON a schema could not allow ("expected `:` at line 1
+/// column 12" under an enum of one value), 502 structured_output_failed, whenever a request came or went beside it.
+fn stays_in_one_place(keys: &str) -> bool {
+    keys.contains(" grammar=") || keys.contains(" json_schema=")
+}
+
+fn slot_still_running(f: &Fail) -> bool {
+    matches!(f, Fail::Value(why) if why.starts_with("BGEN: no such free slot"))
+}
+
 pub fn engine_err(line: &str, context: i64) -> Fail {
     let why = py::strip(line.get(4..).unwrap_or("")).to_string();
     if why.contains("llama_process failed (-3)") {
@@ -898,6 +928,21 @@ impl StrataEngine {
         m
     }
 
+    /// Blue-green (docs/BLUE_GREEN.md): `EXPORT <dir>` / `IMPORT <dir>` of the conversations it holds.  The engine
+    /// answers nothing on stdout (they go beside requests in flight); its log says what it did.
+    pub fn handoff(&self, verb: &str, dir: &std::path::Path) -> Result<(), Fail> {
+        let d = dir.to_string_lossy();
+        if !matches!(verb, "EXPORT" | "IMPORT") || d.contains(['\r', '\n', '\0']) {
+            return Err(Fail::Value("invalid handoff command".into()));
+        }
+        self.send(&format!("{verb} {d}"))
+    }
+
+    /// `VIP 1` / `VIP 0`: give a client engine's request the GPU, or take it back (the engine reads it at once)
+    pub fn vip(&self, on: bool) {
+        let _ = self.send(if on { "VIP 1" } else { "VIP 0" });
+    }
+
     fn send(&self, text: &str) -> Result<(), Fail> {
         btrace(&format!("send> {}", py::chars_prefix(text, 60)));
         let ok = {
@@ -1322,6 +1367,20 @@ impl StrataEngine {
         self.slots.lock().unwrap().wait_lens.iter().any(|(_, n)| n * 2 <= plen)
     }
 
+    /// STRATA_TRACE=1: which slot a request got and why, in the server's log (the engine traces its own reuse).
+    fn trace_pick(s: &Slots, b: usize, prompt: &[u32]) {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("STRATA_TRACE").is_ok_and(|v| !v.is_empty() && v != "0"));
+        if !*ON {
+            return;
+        }
+        let h = &s.held[b];
+        let common = h.iter().zip(prompt).take_while(|(x, y)| x == y).count();
+        let why = if !h.is_empty() && h.len() < prompt.len() && common == h.len() { "its whole history goes on" }
+                  else if common * 2 >= prompt.len() { "the same start for half the prompt or more" }
+                  else { "least recently used (no slot holds half of this prompt)" };
+        crate::say(&format!("trace slot {b} for a {}-token prompt: it holds {} tokens, {common} of them the prompt's start: {why}", prompt.len(), h.len()));
+    }
+
     /// A free slot for `prompt` (the caller holds the slot lock), None when every slot is busy.
     fn pick_slot(s: &Slots, prompt: &[u32]) -> Option<usize> {
         let free: Vec<usize> = s.order.iter().copied().filter(|b| !s.busy[*b]).collect();
@@ -1336,9 +1395,17 @@ impl StrataEngine {
             };
             return free.iter().copied().min_by_key(|b| (!fills_hole(*b), s.order.iter().position(|x| x == b).unwrap_or(0)));
         }
+        // what the slot's cache gives this prompt: its whole history when the prompt goes on from it, or a common start
+        // of at least half the prompt (llama.cpp's slot similarity, -sps 0.5): a new question after the same document
+        // or tool result, which the engine reads from its nearest checkpoint.  Less (a shared system prompt) counts as
+        // nothing, so a turn does not take over a slot whose conversation may come back for a few tokens.
         let held_prefix = |b: usize| {
             let h = &s.held[b];
-            if !h.is_empty() && h.len() < prompt.len() && prompt[..h.len()] == h[..] { h.len() } else { 0 }
+            if !h.is_empty() && h.len() < prompt.len() && prompt[..h.len()] == h[..] {
+                return h.len();
+            }
+            let common = h.iter().zip(prompt).take_while(|(x, y)| x == y).count();
+            if common * 2 >= prompt.len() { common } else { 0 }
         };
         // max() keeps the last of equals in Rust, the first in Python: pick the first maximum by hand
         let mut best = free[0];
@@ -1379,7 +1446,7 @@ impl StrataEngine {
                     let generated = r.get("generated").and_then(Value::as_f64).unwrap_or(0.0);
                     let started = r.get("started").and_then(Value::as_f64).unwrap_or(now);
                     json!({"slot": b, "state": r.get("state").cloned().unwrap_or(Value::Null), "prompt_tokens": r.get("prompt_tokens").cloned().unwrap_or(Value::Null),
-                           "generated": r.get("generated").cloned().unwrap_or(Value::Null), "elapsed_s": round1(now - started),
+                           "generated": r.get("generated").cloned().unwrap_or(Value::Null), "max_tokens": r.get("max_tokens").cloned().unwrap_or(Value::Null), "elapsed_s": round1(now - started),
                            "tok_s": ft.map(|ft| round1(generated / (now - ft).max(1e-6)))})
                 }
             })
@@ -1415,6 +1482,7 @@ impl StrataEngine {
     fn generate_batched(self: &Arc<Self>, y: &Yielder<Option<u32>, Fail>, ids: Vec<u32>, max_new: i64, sampling: Map<String, Value>, cancel: Arc<Event>, embeddings: Option<String>, stats: Stats) -> Result<(), Stop<Fail>> {
         *self.live.lock().unwrap() = Live::default();
         let keys = sampling_keys(&sampling);
+        let fixed = stays_in_one_place(&keys);
         let mut out: Vec<u32> = vec![];
         let mut prompt: Vec<u32> = ids.clone();
         let mut left = max_new;
@@ -1430,7 +1498,7 @@ impl StrataEngine {
         let mut reserved: Option<usize> = None;
         let mut phase = "none";
         let mut stop_sent = false;
-        let (mut yields, mut solo_again) = (0usize, 0usize);
+        let (mut yields, mut solo_again, mut busy_retries) = (0usize, 0usize, 0usize);
         let (mut admit_wait, mut admit_since, mut admit_said) = (false, Instant::now(), false);
         let emb = embeddings.is_some();
         let ids_line = |p: &[u32]| p.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
@@ -1449,7 +1517,7 @@ impl StrataEngine {
                     !s.busy.iter().any(|b| *b) && s.waiting == 0
                 };
                 let mut cont;
-                if alone && left > 1 {
+                if alone && left > 1 && !fixed {
                     let head = match &embeddings {
                         Some(e) => format!("GENI {left}{keys} {e}"),
                         None => format!("GEN {left}{keys}"),
@@ -1471,6 +1539,7 @@ impl StrataEngine {
                         if reserved.is_none() && !emb && yields < YIELDS_MAX && me2.shorter_waiting(prompt.len()) {
                             let mut s = me2.slots.lock().unwrap();
                             if let Some(r) = Self::pick_slot(&s, &prompt) {
+                                Self::trace_pick(&s, r, &prompt);
                                 s.busy[r] = true;
                                 s.claims.insert(r);
                                 reserved = Some(r);
@@ -1511,6 +1580,7 @@ impl StrataEngine {
                             {
                                 let mut s = self.slots.lock().unwrap();
                                 if let Some(b) = Self::pick_slot(&s, &prompt) {
+                                    Self::trace_pick(&s, b, &prompt);
                                     s.busy[b] = true;
                                     s.claims.insert(b);
                                     if admit_wait {
@@ -1584,7 +1654,7 @@ impl StrataEngine {
                     };
                     {
                         let mut s = self.slots.lock().unwrap();
-                        s.live[b] = Some(json!({"slot": b, "state": "reading", "prompt_tokens": prompt.len(), "generated": 0, "started": crate::sync::now(), "first_token": null}).as_object().cloned().unwrap());
+                        s.live[b] = Some(json!({"slot": b, "state": "reading", "prompt_tokens": prompt.len(), "generated": 0, "max_tokens": left, "started": crate::sync::now(), "first_token": null}).as_object().cloned().unwrap());
                     }
                     self.send(&format!("{head} {}", ids_line(&prompt))).map_err(Stop::Err)?;
                     self.slots.lock().unwrap().held[b] = vec![];
@@ -1597,12 +1667,27 @@ impl StrataEngine {
                         c.erred = false;
                     }
                     let mut asked = false;
-                    self.control(y, &cancel, &mut out, None, &stats, &mut |me2: &Self| {
+                    let admitted = self.control(y, &cancel, &mut out, None, &stats, &mut |me2: &Self| {
                         if !asked && !emb && yields < YIELDS_MAX && me2.shorter_waiting(prompt.len()) {
                             let _ = me2.send(&format!("BYIELD {b}"));
                             asked = true;
                         }
-                    })?;
+                    });
+                    // the engine still runs this slot though this server had it free (a slot freed before its BDONE:
+                    // a release that gave up waiting): stop what it runs there, free it at its BDONE, take another
+                    // one - never a 400 to the client (it was one, "BGEN: no such free slot", 2026-11-04)
+                    if let Err(Stop::Err(f)) = &admitted && slot_still_running(f) && busy_retries < 3 {
+                        busy_retries += 1;
+                        say(&format!("parallel: the engine was still running slot {b}, which this server had free: stopped there, the request takes another slot"));
+                        self.ctl_state.lock().unwrap().erred = false;
+                        self.slots.lock().unwrap().live[b] = None;
+                        self.release_slot_when_done(b, None);
+                        self.slots.lock().unwrap().claims.remove(&b);
+                        slot = None;
+                        phase = "none";
+                        continue;
+                    }
+                    admitted?;
                     cont = self.ctl_state.lock().unwrap().result.as_ref().map(|r| r.1).unwrap_or(false);
                     phase = if cont { "slot" } else { "none" };
                     let yielded = self.ctl_state.lock().unwrap().yielded;
@@ -1658,7 +1743,7 @@ impl StrataEngine {
                             continue;
                         }
                         y.yield_(Some(t))?;
-                        if !going_solo && !stop_sent && self.may_go_solo(max_new - out.len() as i64, solo_again, emb) {
+                        if !fixed && !going_solo && !stop_sent && self.may_go_solo(max_new - out.len() as i64, solo_again, emb) {
                             self.send(&format!("BSTOP {b}")).map_err(Stop::Err)?;
                             going_solo = true;
                         }
@@ -2143,13 +2228,42 @@ pub struct AfmEngine {
     exe: String,
     proc: Mutex<Option<AfmProc>>,
     pub max_context: i64,
+    mem: Mutex<AfmMem>,
+}
+
+/// Apple's model's memory, estimated: it runs in a system service (user _modelmanagerd) whose memory macOS lets only
+/// root read, so this is the system's wired memory above what it was before the model loaded.  Anything else that
+/// wires memory meanwhile (another engine loading) counts too: an estimate, best on an otherwise quiet Mac.
+#[derive(Default, Debug)]
+pub struct AfmMem {
+    base: Option<u64>,
+    now: u64,
+    peak: u64,
+}
+
+impl AfmMem {
+    pub fn start(wired: Option<u64>) -> Self {
+        AfmMem { base: wired, ..Default::default() }
+    }
+    pub fn sample(&mut self, wired: Option<u64>) {
+        if let (Some(b), Some(w)) = (self.base, wired) {
+            self.now = w.saturating_sub(b);
+            self.peak = self.peak.max(self.now);
+        }
+    }
+    /// {"now_mb", "peak_mb"}: None before a reading
+    pub fn view(&self) -> Option<Value> {
+        self.base.map(|_| json!({"now_mb": self.now >> 20, "peak_mb": self.peak >> 20}))
+    }
 }
 
 impl AfmEngine {
     pub fn new(exe: &str) -> Result<Self, String> {
+        let mut mem = AfmMem::start(crate::telemetry::wired_bytes());
         let (p, ctx) = Self::spawn(exe)?;
+        mem.sample(crate::telemetry::wired_bytes());
         // the server counts the prompt in bytes: about 4 to Apple's token
-        Ok(AfmEngine { exe: exe.to_string(), proc: Mutex::new(Some(p)), max_context: ctx * 4 })
+        Ok(AfmEngine { exe: exe.to_string(), proc: Mutex::new(Some(p)), max_context: ctx * 4, mem: Mutex::new(mem) })
     }
 
     fn spawn(exe: &str) -> Result<(AfmProc, i64), String> {
@@ -2196,6 +2310,7 @@ impl AfmEngine {
                     return if died { Err(Stop::Err(Fail::Died("Apple's model helper (strata-afm) stopped".into()))) } else { Ok(()) };
                 }
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                me.mem.lock().unwrap().sample(crate::telemetry::wired_bytes());
                 if let Some(d) = v["delta"].as_str() {
                     y.yield_(Some(chunk_id(d.to_string())))?;
                     n += 1;
@@ -2259,6 +2374,11 @@ impl Engine {
         self.strata().map(|s| s.batch()).unwrap_or(0)
     }
     pub fn info(&self) -> Map<String, Value> {
+        if let Engine::Afm(a) = self {
+            let mut m = a.mem.lock().unwrap();
+            m.sample(crate::telemetry::wired_bytes());
+            return m.view().map(|v| Map::from_iter([("afm_memory".to_string(), v)])).unwrap_or_default();
+        }
         self.strata().map(|s| s.info.lock().unwrap().clone()).unwrap_or_default()
     }
     pub fn live(&self) -> Live {
@@ -2272,6 +2392,26 @@ impl Engine {
 #[cfg(test)]
 mod engine_err_tests {
     use super::*;
+
+    #[test]
+    fn afm_memory_is_wired_memory_above_its_start() {
+        let mut m = AfmMem::start(Some(10 << 30));
+        assert_eq!(m.view(), Some(json!({"now_mb": 0, "peak_mb": 0})));
+        m.sample(Some(12 << 30)); // answering: +2 GB
+        m.sample(Some(11 << 30)); // settled: +1 GB, the peak kept
+        assert_eq!(m.view(), Some(json!({"now_mb": 1024, "peak_mb": 2048})));
+        m.sample(Some(9 << 30)); // less than at the start (something else let go): 0, never negative
+        assert_eq!(m.view().unwrap()["now_mb"], 0);
+        m.sample(None);
+        assert_eq!(m.view().unwrap()["now_mb"], 0);
+        assert_eq!(AfmMem::start(None).view(), None); // no reading (not a Mac): nothing shown
+    }
+
+    #[test]
+    fn a_bgen_into_a_running_slot_is_known_by_its_error() {
+        assert!(slot_still_running(&engine_err("ERR BGEN: no such free slot (--batch 4) or a bad max_new", 65536)));
+        assert!(!slot_still_running(&engine_err("ERR unknown command: X", 65536)));
+    }
 
     #[test]
     fn oom_is_said_with_a_fix() {
@@ -2321,5 +2461,61 @@ mod grammar_key_tests {
         assert_eq!(keys(json!({"strata_tool_grammar": "root ::= x", "strata_tool_grammar_from": 7})), "");
         assert_eq!(keys(json!({"strata_tool_grammar": "726f6f74"})), "");
         assert_eq!(keys(json!({"grammar": "root ::= x"})), "", "a client's grammar field is not Strata's");
+        assert_eq!(keys(json!({"strata_json_schema_hex": "7b7d"})), " json_schema=7b7d");
+        assert_eq!(keys(json!({"strata_json_schema_hex": "7b7d", "strata_json_schema_from": 9})), " json_schema=7b7d grammar_trigger=9");
+        assert_eq!(keys(json!({"strata_json_schema_hex": "{}"})), "", "only hex goes on the line");
+        assert_eq!(keys(json!({"json_schema": "7b7d"})), "", "a client's json_schema field is not Strata's");
+    }
+    #[test]
+    fn a_request_under_a_grammar_is_never_moved() {
+        let keys = |v: Value| sampling_keys(v.as_object().unwrap());
+        assert!(stays_in_one_place(&keys(json!({"strata_json_schema_hex": "7b7d"}))));
+        assert!(stays_in_one_place(&keys(json!({"strata_tool_grammar": "726f6f74", "strata_tool_grammar_from": 7}))));
+        assert!(!stays_in_one_place(&keys(json!({"temperature": 0.2}))));
+    }
+
+}
+
+#[cfg(test)]
+mod slot_pick_tests {
+    use super::*;
+
+    fn slots(held: Vec<Vec<u32>>, used: Vec<f64>) -> Slots {
+        let n = held.len();
+        Slots { busy: vec![false; n], claims: HashSet::new(), releasing: HashSet::new(), orphan_seen: HashMap::new(), held, used,
+                live: vec![None; n], order: (0..n).collect(), group: vec![0; n], groups: 1, gs: 0, waiting: 0, admitting: 0,
+                wait_lens: vec![], next_wait_id: 0, ctl_epoch: 0 }
+    }
+
+    #[test]
+    fn a_new_question_on_the_same_document_goes_to_the_slot_that_read_it() {
+        let sys: Vec<u32> = (1..33).collect();
+        let doc = |d: u32| sys.iter().copied().chain((0..2000).map(|i| d * 10000 + i)).collect::<Vec<u32>>();
+        let with = |mut v: Vec<u32>, tail: std::ops::Range<u32>| { v.extend(tail); v };
+        // slot 0: document B; slot 1: document A, its question 1 and answer; slot 2: empty and the least recently used
+        let s = slots(vec![with(doc(2), 900..960), with(doc(1), 700..800), vec![]], vec![5.0, 6.0, 1.0]);
+        assert_eq!(StrataEngine::pick_slot(&s, &with(doc(1), 300..330)), Some(1));       // question 2 on document A
+        // a turn that only shares the system prompt keeps away from the slots that hold conversations
+        assert_eq!(StrataEngine::pick_slot(&s, &with(sys.clone(), 400..460)), Some(2));
+        // a conversation going on (the slot's whole history, then more) stays in its slot
+        assert_eq!(StrataEngine::pick_slot(&s, &with(with(doc(2), 900..960), 10..20)), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod conv_cache_log_tests {
+    use super::ConvCacheLog;
+    use serde_json::json;
+
+    #[test]
+    fn parks_and_restores_are_counted_and_timed() {
+        let p = std::env::temp_dir().join(format!("strata-cclog-{}.log", std::process::id()));
+        std::fs::write(&p, "strata-metal: conversation cache: parked 9000 tokens (seq 1) parked=1 bytes=100 evictions=0\n\
+            strata-metal: conversation cache: parked 8000 tokens (seq 2) parked=2 bytes=200 evictions=0 ms=12.5\n\
+            strata-metal: conversation cache: restored 9000 tokens (seq 1) parked=1 bytes=100 evictions=0 ms=40.0\n").unwrap();
+        let st = ConvCacheLog::default().poll(p.to_str(), Some(0));
+        assert_eq!((st["parks"].clone(), st["restores"].clone()), (json!(2), json!(1)));
+        assert_eq!((st["park_ms"].clone(), st["restore_ms"].clone(), st["last_ms"].clone()), (json!(12.5), json!(40.0), json!(40.0)));
+        std::fs::remove_file(&p).ok();
     }
 }

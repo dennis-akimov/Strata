@@ -48,11 +48,19 @@ pub struct McpRun {
     pub kw: Map<String, Value>,
     pub max_req: i64,
     pub names: HashSet<String>,
+    /// "/team": how many agents (0: none, the usual loop)
+    pub team: usize,
+    /// the tool rounds an answer may take (None: the MCP settings' max_rounds); a team's agents take fewer
+    pub rounds: Option<i64>,
 }
 
 impl Run<'_> {
     pub fn go(&mut self, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(), Stop<Fail>> {
         match self.mcp.take() {
+            Some(m) if m.team > 1 => {
+                let task = m.messages.iter().rev().find(|x| x["role"] == "user").map(|x| crate::py::py_str(&x["content"])).unwrap_or_default();
+                crate::team::run(self.svc, m.team, &task, m, self.tools.clone().unwrap_or_default(), &self.sampling, &self.cancel, emit)
+            }
             Some(m) => run_with_mcp(self.svc, m, self.ids.clone(), self.thinking, self.tools.clone(), self.max_new, &self.sampling, &self.cancel, emit),
             None => self.svc.run(&self.ids, self.thinking, self.tools.as_deref(), self.max_new, &self.sampling, &self.cancel, self.force.clone(), emit),
         }
@@ -209,7 +217,7 @@ pub fn announces(text: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_mcp(svc: &Service, m: McpRun, mut ids: Vec<u32>, mut thinking: bool, tools: Option<Vec<Value>>, mut max_new: i64, sampling: &Map<String, Value>, cancel: &Arc<Flag>, emit: &mut dyn FnMut(Item) -> Result<(), Closed>) -> Result<(), Stop<Fail>> {
     let hub = svc.mcp.clone().expect("hub");
-    let mut max_rounds = hub.settings["max_rounds"].as_i64().unwrap_or(8);
+    let mut max_rounds = m.rounds.unwrap_or_else(|| hub.settings["max_rounds"].as_i64().unwrap_or(8));
     // an answer that said what it would do and did nothing is told once to do it; one that changed something checks
     // its work (up to twice: a fix is checked too)
     let (mut nudged, mut checks, mut changed) = (false, 0, false);
@@ -503,6 +511,37 @@ pub fn openai_chunks(req: &Value, run: &mut Run, out: Out) -> Result<(), Stop<Fa
 }
 
 /// The whole answer from the chunks (non-streamed requests).
+/// "chatcmpl-x" -> "cmpl-x", OpenAI's completion ids
+fn cmpl_id(id: &Value) -> Value {
+    id.as_str().map(|s| json!(format!("cmpl-{}", s.trim_start_matches("chatcmpl-")))).unwrap_or(Value::Null)
+}
+
+/// OpenAI's legacy /v1/completions from a chat stream chunk: the delta's text as `text`, object "text_completion"
+pub fn completion_chunk(chat: &Value) -> Value {
+    let mut out = json!({"id": cmpl_id(&chat["id"]), "object": "text_completion", "created": chat["created"], "model": chat["model"],
+        "choices": chat["choices"].as_array().map(|cs| cs.iter().map(|c| json!({"index": c["index"], "logprobs": null,
+            "text": c["delta"]["content"].as_str().unwrap_or(""), "finish_reason": c["finish_reason"]})).collect::<Vec<_>>()).unwrap_or_default()});
+    for k in ["usage", "timings"] {
+        if let Some(v) = chat.get(k).filter(|v| !v.is_null()) {
+            out[k] = v.clone();
+        }
+    }
+    out
+}
+
+/// ... and from a whole chat body (openai_collect's): the message's text as `text`
+pub fn completion_body(chat: &Value) -> Value {
+    let mut out = json!({"id": cmpl_id(&chat["id"]), "object": "text_completion", "created": chat["created"], "model": chat["model"],
+        "choices": chat["choices"].as_array().map(|cs| cs.iter().map(|c| json!({"index": c["index"], "logprobs": null,
+            "text": c["message"]["content"].as_str().unwrap_or(""), "finish_reason": c["finish_reason"]})).collect::<Vec<_>>()).unwrap_or_default()});
+    for k in ["usage", "timings"] {
+        if let Some(v) = chat.get(k).filter(|v| !v.is_null()) {
+            out[k] = v.clone();
+        }
+    }
+    out
+}
+
 pub fn openai_collect(chunks: &[Value]) -> Value {
     let (mut content, mut reasoning) = (String::new(), String::new());
     let mut by_index: std::collections::BTreeMap<i64, Value> = Default::default();
@@ -888,7 +927,7 @@ mod loop_tests {
         let messages = vec![json!({"role": "user", "content": "find events"})];
         let kw = Map::new();
         let (ids, thinking, max_new) = svc.prepare(&messages, Some(&tools), &kw, Some(200), None, None).unwrap();
-        let m = McpRun { messages, kw, max_req: 200, names };
+        let m = McpRun { messages, kw, max_req: 200, names, team: 0, rounds: None };
         let (mut mcp, mut text) = (vec![], String::new());
         run_with_mcp(&svc, m, ids, thinking, Some(tools), max_new, &Map::new(), &Arc::new(Flag::new()), &mut |item| {
             match item {
@@ -1108,5 +1147,23 @@ mod loop_tests {
         assert_eq!(results[0]["text"], "error: there is no tool named 'web__raed'", "no near name for one shared word: {:?}", results[0]);
         assert_eq!(results.len(), 2, "{mcp:?}");
         assert!(text.contains("Read it."), "{text:?}");
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::{completion_body, completion_chunk};
+    use serde_json::json;
+
+    #[test]
+    fn chat_shapes_become_text_completions() {
+        let ch = json!({"id": "c1", "created": 1, "model": "m", "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": null}]});
+        assert_eq!(completion_chunk(&ch), json!({"id": "cmpl-c1", "object": "text_completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "logprobs": null, "text": "Hi", "finish_reason": null}]}));
+        let body = json!({"id": "c1", "created": 1, "model": "m", "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Paris"}, "finish_reason": "stop"}]});
+        let c = completion_body(&body);
+        assert_eq!((c["choices"][0]["text"].clone(), c["choices"][0]["finish_reason"].clone(), c["usage"]["prompt_tokens"].clone()), (json!("Paris"), json!("stop"), json!(3)));
+        assert_eq!(completion_chunk(&json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}))["choices"][0]["text"], "");
     }
 }

@@ -46,6 +46,21 @@ pub fn effort_text(level: &str) -> &'static str {
 }
 pub const REPEAT_STOP_TOKENS: i64 = 256;
 pub const ANSWER_RESERVE_MIN: i64 = 512;
+
+/// The thinking budget a reply runs with: a given one capped so a quarter of max_tokens (at least ANSWER_RESERVE_MIN,
+/// at most half) stays for the answer; with none given at all, that same cap - a reply that spends max_tokens thinking
+/// has no answer (a reasoning model such as LFM2.5 always thinks first).  An explicit 0 keeps no budget.
+pub fn thinking_cap(budget: Option<i64>, given: bool, max_new: i64) -> Option<i64> {
+    if max_new <= 0 {
+        return budget;
+    }
+    let room = (max_new - (ANSWER_RESERVE_MIN.max(max_new / 4)).min(max_new / 2)).max(1);
+    match budget {
+        Some(b) => Some(b.min(room)),
+        None if !given => Some(room),
+        None => None,
+    }
+}
 pub const REASONING_CLOSE: &str = "\n</think>\n\n";
 pub const REASONING_WRAP_UP: &str = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n";
 pub const HARMONY_CLOSE: &str = "<|end|><|start|>assistant<|channel|>final<|message|>";
@@ -424,6 +439,27 @@ pub fn sampling_defaults_from_config(cfg: &Value) -> Result<Map<String, Value>, 
     Ok(out)
 }
 
+/// The model's own rules (the config's "system_prompt") at the start of the first system message, or as one: the same
+/// start in every request, so the conversation cache keeps it.  A template without a system role gets none.
+pub fn with_system_prompt(messages: &mut Vec<Value>, prompt: &str, system_role: bool) {
+    if !system_role {
+        return;
+    }
+    match messages.first_mut() {
+        Some(m) if m["role"] == "system" => match &mut m["content"] {
+            Value::String(s) if s.trim().is_empty() => *s = prompt.to_string(),
+            Value::String(s) => *s = format!("{prompt}\n\n{s}"),
+            Value::Array(parts) => parts.insert(0, json!({"type": "text", "text": format!("{prompt}\n\n")})),
+            c => *c = json!(prompt),
+        },
+        _ => messages.insert(0, json!({"role": "system", "content": prompt})),
+    }
+}
+
+/// The thought a no-switch thinker (LFM2.5) gets when a request turns thinking off, in tokens (measured: 32 lost one
+/// of 10 answers, 64 none)
+pub const NO_SWITCH_THINK_BUDGET: i64 = 64;
+
 /// The settings the Service runs with (the run config's keys, set once at the start).
 #[derive(Default)]
 pub struct Settings {
@@ -433,6 +469,8 @@ pub struct Settings {
     pub codex_compaction_cache: bool,
     pub codex_thread_titles: bool,
     pub sampling_defaults: Map<String, Value>,
+    /// The config's "system_prompt" file's text: the model's own short rules, ahead of each request's system text
+    pub system_prompt: Option<String>,
     pub config_effort: Option<String>,
     pub slot_save_path: Option<String>,
     pub api_key: Vec<String>,
@@ -502,7 +540,7 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(engine: Engine, tok: Arc<dyn Tokenize>, template: ChatTemplate, model: String, vision: Option<Arc<Vision>>, set: Settings) -> Self {
+    pub fn new(engine: Engine, tok: Arc<dyn Tokenize>, template: ChatTemplate, model: String, vision: Option<Arc<Vision>>, mut set: Settings) -> Self {
         let controls = tok.control_tokens();
         let literals = literal_tags(&controls);
         let special = |s: &str| tok.encode(s, true).len() == 1;
@@ -510,6 +548,11 @@ impl Service {
         let harmony = special("<|channel|>") && is_special(&*tok, "<|channel|>");
         let glm = is_special(&*tok, "<|observation|>");
         let lfm = !glm && is_special(&*tok, crate::parser::LFM_CALL_START);
+        // Hermes' JSON calls (`<tool_call>{"name": ..., "arguments": ...}</tool_call>`: Qwen3-4B-Instruct-2507) are the
+        // parser's recovery path for Qwen-Coder's XML form; for these templates they are the format, so always on
+        if !harmony && !glm && !lfm && template.source.contains("<tool_call>") && !template.source.contains("<function=") {
+            set.tool_call_recovery = true;
+        }
         let ends: Vec<&str> = if harmony { vec!["<|return|>", "<|call|>", "<|endoftext|>"] } else if glm { vec!["<|endoftext|>", "<|user|>", "<|observation|>"] } else { vec![IM_END, "<|endoftext|>"] };
         let mut stop_ids = vec![];
         for s in ends {
@@ -582,6 +625,11 @@ impl Service {
     }
 
     /// #123: the most tokens this request may think, or None; ValueError for anything but a whole number.
+    /// Whether the request or the config names a thinking budget at all (0 included: "no budget" said on purpose).
+    pub fn budget_given(&self, req: &Value) -> bool {
+        !get(req, "reasoning_budget_tokens").is_null() || !self.set.reasoning_budget_tokens.is_null()
+    }
+
     pub fn reasoning_budget(&self, req: &Value) -> Result<Option<i64>, Fail> {
         let mut value = get(req, "reasoning_budget_tokens").clone();
         if value.is_null() {
@@ -1009,6 +1057,8 @@ impl Service {
         let requests: Vec<Value> = hist.iter().rev().take(n).cloned().collect();
         let hardware = gpu_memory_from_engine(tel["now"].clone(), &engine);
         json!({"engine": engine, "live": live, "requests": requests,
+            "failures": crate::observe::FAILURES.lock().unwrap().view(), "latency": crate::observe::latency_view(&hist),
+            "mcp_tools": crate::observe::tools_view(),
             "conversation_cache": conversation_cache_view(&engine, &hist, &totals, &parked),
             "requests_kept": hist.len(), "totals": totals, "hardware": hardware, "hardware_static": tel["static"],
             "history": tel["history"], "time": t})
@@ -1166,8 +1216,60 @@ impl Service {
     }
 
     /// -> (ids, thinking, max_new).  An unset or non-positive max_new means the rest of the context.
-    pub fn prepare(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &Map<String, Value>, max_new: Option<i64>, force: Option<&str>, req: Option<&mut Map<String, Value>>) -> Result<(Vec<u32>, bool, i64), Fail> {
+    /// The answer's room: max_new when prompt (n tokens) + it fit the context, shortened to the room left with
+    /// "fit_max_tokens", else refused (requests are never truncated); none asked: all the room left
+    pub fn room_for(&self, n: i64, max_new: Option<i64>) -> Result<i64, Fail> {
+        let mut ctx = self.engine.max_context();
+        if ctx <= 0 {
+            if self.engine.starting() {
+                return Err(Fail::Starting("the engine is starting (a minute or two); try again shortly".into()));
+            }
+            ctx = self.engine.known_ctx();
+            if ctx <= 0 {
+                return Err(Fail::Starting("the engine is starting (a minute or two); try again shortly".into()));
+            }
+        }
+        let room = ctx - CTX_SLACK - n;
+        Ok(match max_new {
+            Some(m) if m > 0 && !(self.set.fit_max_tokens && room < 1) => {
+                if m > room {
+                    if !self.set.fit_max_tokens {
+                        return Err(Fail::Value(format!("request exceeds the context window: prompt ({n} tokens) + max tokens ({m}) exceeds the context ({ctx}); requests are never truncated. Send a smaller max_tokens (at most {} here), or add \"fit_max_tokens\": true to the model's strata-<model>.json to shorten it to the room left (#545)", room.max(0))));
+                    }
+                    room.max(1)
+                } else {
+                    m
+                }
+            }
+            _ => {
+                if room < 1 {
+                    return Err(Fail::Value(format!("request exceeds the context window: prompt ({n} tokens) leaves no room to answer in the context ({ctx}); requests are never truncated")));
+                }
+                room
+            }
+        })
+    }
+
+    pub fn prepare(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &Map<String, Value>, max_new: Option<i64>, force: Option<&str>, mut req: Option<&mut Map<String, Value>>) -> Result<(Vec<u32>, bool, i64), Fail> {
         let mut messages = messages.to_vec();
+        // thinking off on a template that thinks with no switch for it (LFM2.5): a short thought instead.  Kept from
+        // thinking (an empty thought in the prompt, its tags banned) it scored 2 of 10 on short questions - the
+        // reasoning spilled into the answer, the question came back, a tool call with no tools - in 1,996 tokens;
+        // thinking within 64 tokens scored 10 of 10 in 864 (LFM2.5-8B-A1B, greedy, 2026-11-07).
+        let mut kwargs_own;
+        let kwargs = if kwargs.get("enable_thinking") == Some(&Value::Bool(false)) && self.template.thinks_without_switch() {
+            kwargs_own = kwargs.clone();
+            kwargs_own.remove("enable_thinking");
+            if let Some(r) = req.as_deref_mut() {
+                r.entry("reasoning_budget_tokens").or_insert(json!(NO_SWITCH_THINK_BUDGET));
+            }
+            &kwargs_own
+        } else {
+            kwargs
+        };
+        if let Some(p) = &self.set.system_prompt {
+            with_system_prompt(&mut messages, p, self.template.caps.supports_system_role);
+        }
         let fetched = self.note_unreadable_tool_images(&mut messages);
         let mut kwargs = kwargs.clone();
         let mut force = force.map(String::from);
@@ -1247,36 +1349,7 @@ impl Service {
             }
             ids = out;
         }
-        let mut ctx = self.engine.max_context();
-        if ctx <= 0 {
-            if self.engine.starting() {
-                return Err(Fail::Starting("the engine is starting (a minute or two); try again shortly".into()));
-            }
-            ctx = self.engine.known_ctx();
-            if ctx <= 0 {
-                return Err(Fail::Starting("the engine is starting (a minute or two); try again shortly".into()));
-            }
-        }
-        let n = ids.len() as i64;
-        let room = ctx - CTX_SLACK - n;
-        let max_new = match max_new {
-            Some(m) if m > 0 && !(self.set.fit_max_tokens && room < 1) => {
-                if m > room {
-                    if !self.set.fit_max_tokens {
-                        return Err(Fail::Value(format!("request exceeds the context window: prompt ({n} tokens) + max tokens ({m}) exceeds the context ({ctx}); requests are never truncated. Send a smaller max_tokens (at most {} here), or add \"fit_max_tokens\": true to the model's strata-<model>.json to shorten it to the room left (#545)", room.max(0))));
-                    }
-                    room.max(1)
-                } else {
-                    m
-                }
-            }
-            _ => {
-                if room < 1 {
-                    return Err(Fail::Value(format!("request exceeds the context window: prompt ({n} tokens) leaves no room to answer in the context ({ctx}); requests are never truncated")));
-                }
-                room
-            }
-        };
+        let max_new = self.room_for(ids.len() as i64, max_new)?;
         if !images.is_empty() {
             let vision = self.vision.as_ref().unwrap();
             let size: u64 = encoded.iter().map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
@@ -1295,8 +1368,8 @@ impl Service {
                 req.insert("strata_prefix".into(), r);
             }
         }
-        // Apple's on-device model does not think: its text is all answer
-        Ok((ids, !thinking_off && !matches!(self.engine, crate::engine::Engine::Afm(_)), max_new))
+        // Apple's on-device model and a template without thinking (a base model, Qwen3-Coder): the text is all answer
+        Ok((ids, !thinking_off && self.template.caps.thinks && !matches!(self.engine, crate::engine::Engine::Afm(_)), max_new))
     }
 
     /// R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix -> {"tokens": N} or {}.
@@ -1443,4 +1516,45 @@ pub fn gpu_memory_from_engine(mut hardware: Value, engine: &Map<String, Value>) 
         hardware["gpu_mem_total"] = engine["gpu_total"].clone();
     }
     hardware
+}
+
+#[cfg(test)]
+mod thinking_cap_tests {
+    use super::thinking_cap;
+
+    #[test]
+    fn a_reply_keeps_room_to_answer_unless_no_budget_was_asked_for() {
+        // a given budget: capped as before so a quarter of max_tokens (at least 512, at most half) stays for the answer
+        assert_eq!(thinking_cap(Some(300), true, 4096), Some(300));
+        assert_eq!(thinking_cap(Some(4000), true, 4096), Some(3072));
+        // no budget anywhere (the 8B quiz's cut-offs): the same room, instead of thinking until max_tokens
+        assert_eq!(thinking_cap(None, false, 1500), Some(988));
+        assert_eq!(thinking_cap(None, false, 32), Some(16));                 // a short final-line request: half each
+        // reasoning_budget_tokens: 0 said on purpose, or no max_tokens: no budget
+        assert_eq!(thinking_cap(None, true, 1500), None);
+        assert_eq!(thinking_cap(None, false, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::with_system_prompt;
+    use serde_json::{json, Value};
+
+    fn with(mut m: Vec<Value>, role: bool) -> Vec<Value> {
+        with_system_prompt(&mut m, "R", role);
+        m
+    }
+
+    #[test]
+    fn the_rules_go_first_in_one_system_message() {
+        let user = json!({"role": "user", "content": "hi"});
+        assert_eq!(with(vec![user.clone()], true), vec![json!({"role": "system", "content": "R"}), user.clone()]);
+        assert_eq!(with(vec![json!({"role": "system", "content": "S"}), user.clone()], true)[0]["content"], "R\n\nS");
+        assert_eq!(with(vec![json!({"role": "system", "content": " "})], true)[0]["content"], "R");
+        assert_eq!(with(vec![json!({"role": "system", "content": [{"type": "text", "text": "S"}]})], true)[0]["content"],
+                   json!([{"type": "text", "text": "R\n\n"}, {"type": "text", "text": "S"}]));
+        // a template without a system role: nothing added
+        assert_eq!(with(vec![user.clone()], false), vec![user]);
+    }
 }

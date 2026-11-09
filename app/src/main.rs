@@ -20,9 +20,26 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use wry::{WebView, WebViewBuilder};
 
 mod browser_mcp;
+mod deploy;
 mod google;
 mod mapfile;
+#[cfg(target_os = "macos")]
 mod native_input;
+/// No AppKit off macOS: the browser pane clicks and types with the page's own scripts there (never reaches these)
+#[cfg(not(target_os = "macos"))]
+mod native_input {
+    use wry::WebView;
+    const NONE: &str = "no native mouse and keyboard events on this system";
+    pub fn click(_: &WebView, _: f64, _: f64) -> Result<(), String> {
+        Err(NONE.into())
+    }
+    pub fn type_text(_: &WebView, _: &str) -> Result<(), String> {
+        Err(NONE.into())
+    }
+    pub fn press(_: &WebView, _: &str, _: &[&str]) -> Result<(), String> {
+        Err(NONE.into())
+    }
+}
 mod table;
 
 const PANEL: &str = include_str!("panel.html");
@@ -55,12 +72,17 @@ enum Ev {
     FrameSent(browser_mcp::Job, String, u64, String),
     /// its answer looked for again (the u32-th time)
     FrameCollect(browser_mcp::Job, String, u64, u32),
+    /// `Strata --deploy` asked this app to switch its server (SIGUSR1; deploy.rs): the new server beside the old one
+    Switch,
     /// a Google tool's script (google.rs) looked for its value (id, the u32-th time)
     AsyncCollect(browser_mcp::Job, u64, u32),
     /// a click or typing done with the mouse and keyboard (native_input): the element found by a script first
     Native(browser_mcp::Job, &'static str, String),
     /// a Google tool's script past its time: told to change nothing more
     StopScript(u64),
+    /// a team agent's browser (pane 1-4, AgentPane): a load finished there; its page read for a waiting call
+    AgentWeb(usize, String),
+    AgentRead(usize, std::sync::mpsc::Sender<Result<String, String>>, bool),
     Quit,
 }
 
@@ -113,9 +135,90 @@ fn root() -> PathBuf {
     }
 }
 
-fn settings_path() -> PathBuf {
+/// The write end of the signal pipe (signal_pipe): what the handler, async-signal-safe, writes the signal's number to
+#[cfg(not(target_os = "macos"))]
+static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(not(target_os = "macos"))]
+extern "C" fn on_signal(sig: libc::c_int) {
+    let b = sig as u8;
+    unsafe { libc::write(SIGNAL_PIPE.load(std::sync::atomic::Ordering::Relaxed), &b as *const u8 as *const libc::c_void, 1) };
+}
+
+/// A handler for each of `sigs` that writes its number into a pipe; the read end, for one thread to read them from
+#[cfg(not(target_os = "macos"))]
+fn signal_pipe(sigs: &[libc::c_int]) -> libc::c_int {
+    let mut fds = [0 as libc::c_int; 2];
+    unsafe {
+        libc::pipe(fds.as_mut_ptr());
+        SIGNAL_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+        for &s in sigs {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(s, &sa, std::ptr::null_mut());
+        }
+    }
+    fds[0]
+}
+
+/// A web view in the app's window: a GTK widget in its Layout on Linux (keyboard focus and Wayland work there; an X11
+/// child window took no typing), a child view of the window elsewhere
+#[cfg(target_os = "linux")]
+fn attach(b: WebViewBuilder, _win: &tao::window::Window, host: &gtk::Layout) -> WebView {
+    use wry::WebViewBuilderExtUnix;
+    b.build_gtk(host).expect("webview")
+}
+
+/// A web view's place in the window.  Linux: moved in the Layout and sized by its size request - wry's set_bounds in a
+/// GTK container only allocates once, and the next layout pass put every view back at its first place and size (the
+/// control bar gone under the page, the window held at the views' 1280 x 900)
+#[cfg(target_os = "linux")]
+fn place(view: &WebView, host: &gtk::Layout, r: wry::Rect) {
+    use gtk::prelude::*;
+    use wry::WebViewExtUnix;
+    let (p, s) = (r.position.to_logical::<f64>(1.0), r.size.to_logical::<f64>(1.0));
+    let w = view.webview();
+    host.move_(&w, p.x.round() as i32, p.y.round() as i32);
+    w.set_size_request(s.width.round().max(1.0) as i32, s.height.round().max(1.0) as i32);
+}
+#[cfg(not(target_os = "linux"))]
+fn place(view: &WebView, _: &(), r: wry::Rect) {
+    let _ = view.set_bounds(r);
+}
+#[cfg(not(target_os = "linux"))]
+fn attach(b: WebViewBuilder, win: &tao::window::Window, _: &()) -> WebView {
+    b.build_as_child(win).expect("webview")
+}
+
+/// `x.pipe(f)` = `f(x)`: a builder chain ends in a function
+trait Pipe: Sized {
+    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
+        f(self)
+    }
+}
+impl<T> Pipe for T {}
+
+/// What the app calls the machine in what it says, and what the memory limit is on it
+const HERE: &str = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
+const LIMIT_WORD: &str = if cfg!(target_os = "macos") { "the GPU can use" } else { "RAM for the model" };
+
+/// The app's own folder: ~/Library/Application Support/Strata (macOS), $XDG_CONFIG_HOME/strata or ~/.config/strata
+/// (Linux and the rest): its settings, the running app's record, the deploy and app locks
+pub fn app_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    Path::new(&home).join("Library/Application Support/Strata/app.json")
+    if cfg!(target_os = "macos") {
+        return Path::new(&home).join("Library/Application Support/Strata");
+    }
+    match std::env::var("XDG_CONFIG_HOME") {
+        Ok(x) if !x.is_empty() => Path::new(&x).join("strata"),
+        _ => Path::new(&home).join(".config/strata"),
+    }
+}
+
+fn settings_path() -> PathBuf {
+    app_dir().join("app.json")
 }
 
 fn load_settings() -> Value {
@@ -193,6 +296,18 @@ fn mtime(p: &Path) -> std::time::SystemTime {
     std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH)
 }
 
+/// The config's engine arguments for --plan, with "parallel": N as --batch N the way the server adds it (at most 8):
+/// each batch slot holds a whole context's cache, so three agents need three caches.
+fn plan_args(c: &Value) -> Vec<String> {
+    let mut args: Vec<String> = c["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).filter(|a| *a != "--serve").map(String::from).collect()).unwrap_or_default();
+    if let Some(n) = c["parallel"].as_i64().filter(|n| *n > 1) {
+        if !args.iter().any(|a| a == "--batch" || a == "--slots") {
+            args.extend(["--batch".into(), n.min(8).to_string()]);
+        }
+    }
+    args
+}
+
 /// The engine's own measure of what this config needs (`<exe> --plan <args>`: llama.cpp lays the model and its
 /// buffers out without reading the weights, < 1 s), cached per config and engine file.
 fn plan(cfg_path: &Path) -> Result<Value, String> {
@@ -210,9 +325,8 @@ fn plan(cfg_path: &Path) -> Result<Value, String> {
     if !plans(&exe) {
         return Err("this engine is older than its memory check (--plan): run make build".into());
     }
-    let args: Vec<String> = c["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).filter(|a| *a != "--serve").map(String::from).collect()).unwrap_or_default();
     let mut cmd = Command::new(&exe);
-    cmd.arg("--plan").args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.arg("--plan").args(plan_args(&c)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     if let Some(cwd) = c["cwd"].as_str().filter(|d| Path::new(d).is_dir()) {
         cmd.current_dir(cwd);
     }
@@ -228,8 +342,9 @@ fn plan(cfg_path: &Path) -> Result<Value, String> {
 
 /// The apps using the most memory now, the ones a person can quit to give the model room: each app's processes added
 /// up (Chrome's helpers count as Chrome), from top's MEM (it counts compressed memory, unlike ps's RSS) and ps's paths.
-/// macOS's own (/System) and Strata are left out.  [{name, bundle, pid, bytes}], largest first, 150 MB or more.
-fn memory_apps() -> Vec<Value> {
+/// macOS's own (/System) and Strata are left out.  ([{name, bundle, pid, bytes}], largest first, 150 MB or more;
+/// Strata's own processes added up: this app, its server and engine).
+fn memory_apps() -> (Vec<Value>, u64) {
     let me = unsafe { libc::getuid() }.to_string();
     let ps = Command::new("/bin/ps").args(["-axo", "pid=,uid=,comm="]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let top = Command::new("/usr/bin/top").args(["-l", "1", "-stats", "pid,mem"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
@@ -244,6 +359,7 @@ fn memory_apps() -> Vec<Value> {
         Some((f.next()?.parse().ok()?, unit(f.next()?)))
     }).collect();
     let mut apps: HashMap<String, (u64, u32)> = HashMap::new();
+    let mut strata = 0;
     for l in ps.lines() {
         // "  296   501 /Applications/X.app/Contents/MacOS/X": columns padded with spaces, the path may hold spaces too
         let Some((pid, rest)) = l.trim_start().split_once(' ') else { continue };
@@ -261,6 +377,7 @@ fn memory_apps() -> Vec<Value> {
         };
         let name = Path::new(bundle).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if bundle.ends_with("/Strata.app") || name.starts_with("strata-") || pid == std::process::id() {
+            strata += mem.get(&pid).copied().unwrap_or(0);
             continue;
         }
         let e = apps.entry(bundle.to_string()).or_insert((0, 0));
@@ -275,11 +392,67 @@ fn memory_apps() -> Vec<Value> {
         .map(|(k, (b, p))| (k, b, p))
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
-    v.into_iter().take(8).map(|(bundle, bytes, pid)| {
+    let list = v.into_iter().take(8).map(|(bundle, bytes, pid)| {
         let app = bundle.ends_with(".app");
         let name = Path::new(&bundle).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         json!({"name": name, "bundle": bundle, "pid": pid, "bytes": bytes, "app": app})
-    }).collect()
+    }).collect();
+    (list, strata)
+}
+
+/// The whole Mac's memory as Activity Monitor counts it: app (anonymous pages less purgeable), wired, compressed (the
+/// compressor's own pages), the rest free or file cache; pressure is 100 - kern.memorystatus_level; swap in use.
+fn sys_memory() -> Value {
+    if !cfg!(target_os = "macos") {
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        return sys_memory_linux(&read("/proc/meminfo"), &read("/proc/pressure/memory"));
+    }
+    let vm = Command::new("/usr/bin/vm_stat").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let sc = Command::new("/usr/sbin/sysctl").args(["-n", "kern.memorystatus_level", "hw.memsize", "vm.swapusage"]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    sys_memory_of(&vm, &sc)
+}
+
+/// The machine's memory in bytes: hw.memsize (macOS), MemTotal of /proc/meminfo (Linux)
+fn ram_bytes() -> u64 {
+    if cfg!(target_os = "macos") {
+        return Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output().ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
+    }
+    meminfo_kib(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default(), "MemTotal") * 1024
+}
+
+/// A /proc/meminfo field in kB ("MemAvailable:   13631488 kB")
+fn meminfo_kib(text: &str, key: &str) -> u64 {
+    text.lines().find(|l| l.split(':').next() == Some(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+/// Linux's memory in the Mac's fields: in use = total less MemAvailable (what can be had without swapping); no wired or
+/// compressed pages to show; pressure = the share of the last 10 s some task waited for memory (PSI "some avg10")
+fn sys_memory_linux(meminfo: &str, psi: &str) -> Value {
+    let kib = |k: &str| meminfo_kib(meminfo, k) * 1024;
+    let (total, avail) = (kib("MemTotal"), kib("MemAvailable"));
+    let pressure = psi.lines().find(|l| l.starts_with("some")).and_then(|l| l.split_whitespace().find_map(|f| f.strip_prefix("avg10=")))
+        .and_then(|v| v.parse::<f64>().ok()).map(|v| v.round() as u64);
+    json!({"total": total, "app": total.saturating_sub(avail), "wired": 0, "compressed": 0, "free": avail, "pressure": pressure,
+        "swap_used": kib("SwapTotal").saturating_sub(kib("SwapFree")), "swap_total": kib("SwapTotal")})
+}
+
+fn sys_memory_of(vm: &str, sc: &str) -> Value {
+    let page = vm.split("page size of ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(16384);
+    let pages = |name: &str| vm.lines().find(|l| l.starts_with(name)).and_then(|l| l.rsplit(':').next()).and_then(|n| n.trim().trim_end_matches('.').parse::<u64>().ok()).unwrap_or(0);
+    let mut l = sc.lines();
+    let level: Option<u64> = l.next().and_then(|x| x.trim().parse().ok());
+    let total: u64 = l.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+    // "total = 17408.00M  used = 15980.56M  free = 1427.44M  (encrypted)"
+    let swap = |k: &str| l.clone().next().and_then(|x| x.split(k).nth(1)).and_then(|r| r.trim_start().split('M').next())
+        .and_then(|n| n.trim().parse::<f64>().ok()).map(|m| (m * 1048576.0) as u64).unwrap_or(0);
+    let app = pages("Anonymous pages").saturating_sub(pages("Pages purgeable")) * page;
+    let wired = pages("Pages wired down") * page;
+    let compressed = pages("Pages occupied by compressor") * page;
+    json!({"total": total, "app": app, "wired": wired, "compressed": compressed,
+        "free": total.saturating_sub(app + wired + compressed), "pressure": level.map(|v| 100u64.saturating_sub(v)),
+        "swap_used": swap("used ="), "swap_total": swap("total =")})
 }
 
 /// Quit an app the way the Dock does (it may ask to save); `force`: SIGKILL its processes (unsaved work is lost).
@@ -398,8 +571,8 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
         "green" => "fits".to_string(),
         "amber" => format!("fits the GPU, but only {} is free now: close other apps to free {}", gb(avail), gb(need - avail)),
         _ => match best {
-            Some(i) => format!("too big for this Mac at this context (the GPU can use {}): use a context of {}{}", gb(limit), options[i]["ctx"], if options[i]["batch512"] == true { " with a prefill batch of 512" } else { "" }),
-            None if n(&g["model"]) > limit => format!("the model alone ({}) is more than this Mac's GPU can use ({}): pick a smaller model", gb(n(&g["model"])), gb(limit)),
+            Some(i) => format!("too big for {HERE} at this context ({LIMIT_WORD} {}): use a context of {}{}", gb(limit), options[i]["ctx"], if options[i]["batch512"] == true { " with a prefill batch of 512" } else { "" }),
+            None if n(&g["model"]) > limit => format!("the model alone ({}) is more than {HERE} can hold ({}): pick a smaller model", gb(n(&g["model"])), gb(limit)),
             None => "no context size fits: close other apps or pick a smaller model".into(),
         },
     };
@@ -407,14 +580,29 @@ fn memory(cfg_path: &Path, running: bool) -> Value {
         "avail": if running { Value::Null } else { json!(avail) }, "running": running,
         "weights": n(&g["model"]) + n(&h["model"]), "cache": n(&g["context"]) + n(&h["context"]), "work": n(&g["compute"]) + n(&h["compute"]),
         "state": state, "advice": advice, "options": options, "recommended": best.map(|i| options[i].clone()),
+        "cache_max_mib": cache_max_mib(ram_bytes(), need),
         "wired_mb": wired_mb, "suggest_limit_mb": if suggest_mb > 0 && gpu_need > limit { json!(suggest_mb) } else { Value::Null },
         "power": power()})
+}
+
+/// The largest conversation cache this Mac holds beside the model (`need`: weights, K/V, work buffers): the memory less
+/// that and macOS's share (15%, 3 GB at least), in 256 MiB steps.  The engine caps --conversation-cache-mib the same way
+/// (strata_metal.cpp, its measured GPU memory): a 16 GB M1 with LFM2.5-8B had 8 GB set and room for about 5.
+fn cache_max_mib(ram: u64, need: f64) -> u64 {
+    let ram_mib = ram >> 20;
+    ram_mib.saturating_sub((need / 1048576.0) as u64 + (ram_mib * 15 / 100).max(3072)) / 256 * 256
 }
 
 /// What the GPU may really hold: iogpu.wired_limit_mb when it is set; else macOS's default, which on Macs up to 36 GB
 /// is about two thirds of the memory, below Metal's recommendedMaxWorkingSetSize (a 16 GB M1: 12.4 GiB recommended,
 /// ran out at 11.7).  (limit bytes, the sysctl's MB, a value to suggest: the memory less 3 GB or 15% for macOS)
 fn gpu_limit(recommended: f64) -> (f64, u64, u64) {
+    // no unified GPU memory to limit (Linux, the CPU engine): the model and its contexts are in RAM, less the system's
+    // share (15%, 3 GB at least) - the same reserve the conversation cache keeps
+    if !cfg!(target_os = "macos") {
+        let ram_mb = ram_bytes() >> 20;
+        return (ram_mb.saturating_sub((ram_mb * 15 / 100).max(3072)) as f64 * 1048576.0, 0, 0);
+    }
     let sysctl = |k: &str| Command::new("/usr/sbin/sysctl").args(["-n", k]).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
     let (wired, ram) = (sysctl("iogpu.wired_limit_mb"), sysctl("hw.memsize"));
     let ram_mb = ram >> 20;
@@ -433,6 +621,9 @@ fn gpu_limit(recommended: f64) -> (f64, u64, u64) {
 /// The Mac's energy mode (pmset): Low Power slows the GPU; High Power (MacBook Pro with Max, 2024+ Pro, Mac mini Pro,
 /// Mac Studio 2026: their pmset has a `powermode` line, 0 automatic / 1 low / 2 high) lets its fans hold the clock.
 fn power() -> Value {
+    if !cfg!(target_os = "macos") {
+        return power_from("", "");   // no pmset: no energy modes to offer
+    }
     let g = Command::new("/usr/bin/pmset").arg("-g").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let batt = Command::new("/usr/bin/pmset").args(["-g", "batt"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     power_from(&g, &batt)
@@ -613,9 +804,35 @@ fn admin(shell: &str) -> bool {
 }
 
 /// Rewrite a config's --max-context (and --prefill-batch), keeping its key order and indentation.
+/// A shared pool keeps its share of context x agents when either changes (3/4 of 4 x 128K = 384K becomes 3/4 of
+/// 4 x 32K = 96K), whole K, at least one agent's context and at most all of them
+fn rescaled_pool(pool: u64, old: (u64, u64), new: (u64, u64)) -> u64 {
+    if pool == 0 || old.0 * old.1 == 0 {
+        return pool;
+    }
+    let share = pool as f64 / (old.0 * old.1) as f64;
+    let v = ((share * (new.0 * new.1) as f64 / 1024.0).round() as u64) * 1024;
+    v.clamp(new.0, new.0 * new.1.max(1))
+}
+
+/// The pool rescaled in `v` after its context or agents changed from `old`
+fn keep_pool_share(v: &mut Value, old: (u64, u64)) {
+    let (pool, ctx) = pool_of(v);
+    let n = v["parallel"].as_u64().unwrap_or(1).max(1);
+    let new = rescaled_pool(pool, old, (ctx, n));
+    if new != pool {
+        if let Some(args) = v["args"].as_array_mut() {
+            if let Some(i) = args.iter().position(|a| a == "--kv-pool") {
+                args[i + 1] = json!(new.to_string());
+            }
+        }
+    }
+}
+
 fn set_context(cfg_path: &Path, ctx: u64, batch: Option<u64>) -> Result<(), String> {
     let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
     let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let old = (pool_of(&v).1, v["parallel"].as_u64().unwrap_or(1).max(1));
     let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
     for (flag, val) in [("--max-context", Some(ctx)), ("--prefill-batch", batch)] {
         let Some(val) = val else { continue };
@@ -624,11 +841,142 @@ fn set_context(cfg_path: &Path, ctx: u64, batch: Option<u64>) -> Result<(), Stri
             _ => args.extend([json!(flag), json!(val.to_string())]),
         }
     }
+    keep_pool_share(&mut v, old);
+    write_config(cfg_path, &text, &v)
+}
+
+/// How many requests the server runs at once ("parallel": 2..8 batch slots, one engine and one copy of the weights);
+/// 1 takes the key out.  A running server restarts with it.
+fn set_parallel(cfg_path: &Path, n: u64) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let old = (pool_of(&v).1, v["parallel"].as_u64().unwrap_or(1).max(1));
+    let o = v.as_object_mut().ok_or("the config is not a JSON object")?;
+    if n > 1 {
+        o.insert("parallel".into(), json!(n.min(8)));
+    } else {
+        o.remove("parallel");
+    }
+    keep_pool_share(&mut v, old);
+    write_config(cfg_path, &text, &v)
+}
+
+/// The engine's conversation cache in RAM (`--conversation-cache-mib N` in "args"): conversations another one displaced
+/// come back without being read again; 0 writes "0" (off), -1 takes the flag out (the server sizes it for this Mac).
+/// A running server restarts with it.
+fn set_cache_mib(cfg_path: &Path, mib: i64) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
+    if let Some(i) = args.iter().position(|a| a == "--conversation-cache-mib") {
+        args.drain(i..(i + 2).min(args.len()));
+    }
+    if mib >= 0 {
+        args.extend([json!("--conversation-cache-mib"), json!(mib.to_string())]);
+    }
+    write_config(cfg_path, &text, &v)
+}
+
+/// Sharing on the network: "host" "0.0.0.0" (every device that reaches this Mac) or "127.0.0.1" (this Mac only).  On,
+/// with no key in the config or .env, a new random API_KEY in .env too: the server refuses the network without one.
+fn set_shared(cfg_path: &Path, on: bool) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    v["host"] = json!(if on { "0.0.0.0" } else { "127.0.0.1" });
+    let has_key = match &v["api_key"] {
+        Value::String(k) => !k.trim().is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        _ => false,
+    };
+    let env = cfg_path.parent().unwrap_or(Path::new(".")).join(".env");
+    let env_has = std::fs::read_to_string(&env).unwrap_or_default().lines().any(|l| l.trim().strip_prefix("export ").unwrap_or(l.trim()).starts_with("API_KEY="));
+    if on && !has_key && !env_has && env_api_key(&v).is_empty() {
+        new_env_key(&env)?;
+    }
+    write_config(cfg_path, &text, &v)
+}
+
+/// A new random API_KEY added to the Strata folder's .env (the server's root, where the run configs are; created
+/// with mode 600 when it is not there): the key stays out of the config the user edits and shares.
+fn new_env_key(env: &Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut b = [0u8; 24];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|e| e.to_string())?;
+    let old = std::fs::read_to_string(env).unwrap_or_default();
+    let sep = if old.is_empty() || old.ends_with('\n') { "" } else { "\n" };
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(env).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(env, std::os::unix::fs::PermissionsExt::from_mode(0o600)).map_err(|e| e.to_string())?;
+    write!(f, "{sep}# made by Strata.app for sharing on the network (More > Copy API key)\nAPI_KEY=sk-strata-{}\n",
+           b.iter().map(|x| format!("{x:02x}")).collect::<String>()).map_err(|e| e.to_string())
+}
+
+/// The config shares this server beyond this Mac ("host" other than the loopback; none set: 127.0.0.1).
+fn shared(c: &Value) -> bool {
+    c["host"].as_str().is_some_and(|h| !["", "127.0.0.1", "localhost", "::1"].contains(&h))
+}
+
+/// The shared K/V pool (docs/CONTEXT_POOL.md): `--kv-unified --kv-pool N` in "args" (N tokens all agents draw from,
+/// each up to its --max-context); 0 takes both out (each agent its own context).  A running server restarts with it.
+fn set_pool(cfg_path: &Path, tokens: u64) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
+    if let Some(i) = args.iter().position(|a| a == "--kv-pool") {
+        args.drain(i..(i + 2).min(args.len()));
+    }
+    args.retain(|a| a != "--kv-unified");
+    if tokens > 0 {
+        args.extend([json!("--kv-unified"), json!("--kv-pool"), json!(tokens.to_string())]);
+    }
+    write_config(cfg_path, &text, &v)
+}
+
+/// Prompt sharing (docs/CONTEXT_POOL.md): while a new prompt is read, the agents already writing get `share` of the
+/// time (`--decode-share`, the engine's default 0.25); 0 turns it off (`--prefill-share 0`: the prompt read whole)
+fn set_share(cfg_path: &Path, share: f64) -> Result<(), String> {
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let args = v["args"].as_array_mut().ok_or("the config has no \"args\"")?;
+    for k in ["--prefill-share", "--decode-share"] {
+        if let Some(i) = args.iter().position(|a| a == k) {
+            args.drain(i..(i + 2).min(args.len()));
+        }
+    }
+    if share <= 0.0 {
+        args.extend([json!("--prefill-share"), json!("0")]);
+    } else if (share - 0.25).abs() > 1e-9 {
+        args.extend([json!("--decode-share"), json!(share.to_string())]);
+    }
+    write_config(cfg_path, &text, &v)
+}
+
+/// The config's prompt sharing: the writing agents' share of the time while a prompt is read (0: off)
+fn share_of(c: &Value) -> f64 {
+    let a = c["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let val = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).and_then(Value::as_str).and_then(|n| n.parse::<f64>().ok());
+    if val("--prefill-share") == Some(0.0) { 0.0 } else { val("--decode-share").unwrap_or(0.25) }
+}
+
+/// The config's shared pool in tokens (0: none) and its per-agent context
+fn pool_of(c: &Value) -> (u64, u64) {
+    let a = c["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let val = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).and_then(Value::as_str).and_then(|n| n.parse().ok());
+    (if a.iter().any(|x| x == "--kv-unified") { val("--kv-pool").unwrap_or(0) } else { 0 }, val("--max-context").unwrap_or(0))
+}
+
+/// The config's conversation cache budget in MiB (0: off, -1: none set, the server's automatic size).
+fn cache_mib(c: &Value) -> i64 {
+    let a = c["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    a.iter().position(|x| x == "--conversation-cache-mib").and_then(|i| a.get(i + 1)).and_then(Value::as_str).and_then(|n| n.parse().ok()).unwrap_or(-1)
+}
+
+/// The config written back with the indent it had (its other keys as they were).
+fn write_config(cfg_path: &Path, text: &str, v: &Value) -> Result<(), String> {
     let indent = text.lines().nth(1).map(|l| l.len() - l.trim_start().len()).filter(|n| *n > 0).unwrap_or(1);
     let mut out = vec![];
     let fmt = serde_json::ser::PrettyFormatter::with_indent(&b"        "[..indent.min(8)]);
     let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
-    serde::Serialize::serialize(&v, &mut ser).map_err(|e| e.to_string())?;
+    serde::Serialize::serialize(v, &mut ser).map_err(|e| e.to_string())?;
     out.push(b'\n');
     std::fs::write(cfg_path, out).map_err(|e| e.to_string())
 }
@@ -652,6 +1000,9 @@ struct State {
     last: Value,
     /// the model's browser (browser_mcp): its endpoint's port and key, for the server this app starts
     browser: Option<(u16, String)>,
+    /// started by `--deploy` for blue-green (deploy.rs): the first server start takes the port over (--handoff) from
+    /// the old app's server instead of stopping it (--replace)
+    handoff: bool,
 }
 
 impl State {
@@ -715,7 +1066,7 @@ fn start(st: &Shared, proxy: &EventLoopProxy<Ev>) -> Result<(), String> {
     cmd
         .args(["--engine", "strata", "--config"])
         .arg(&cfg)
-        .args(["--port", &s.port.to_string(), "--replace"])
+        .args(["--port", &s.port.to_string(), if s.handoff { "--handoff" } else { "--replace" }])
         .current_dir(&s.root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -748,6 +1099,7 @@ fn start(st: &Shared, proxy: &EventLoopProxy<Ev>) -> Result<(), String> {
     let port = s.port;
     s.push_log(format!("── started {} on port {} ──", cfg.file_name().unwrap_or_default().to_string_lossy(), port));
     s.child = Some(child);
+    s.handoff = false;
     s.phase = "starting";
     s.stopping_since = None;
     Ok(())
@@ -761,6 +1113,64 @@ fn stop(st: &Shared) {
         s.phase = "stopping";
         s.stopping_since = Some(Instant::now());
         s.push_log("── stopping (the engine frees its memory first) ──".into());
+    }
+}
+
+/// `Strata --deploy` in the running app (deploy.rs): the new build's server takes over from the old one, nginx's way
+/// (HUP: new workers, the old ones drain): "handoff" starts it with --handoff beside the old one, which finishes its
+/// requests and quits once the new one has loaded and taken the port; a new server that dies first leaves the old one
+/// serving.  "restart" (a second engine does not fit; the deploy waited until idle): stop, then start.  The outcome
+/// goes to deploy::switch_done_path() for the deploy that asked.
+fn switch_server(st: &Shared, proxy: &EventLoopProxy<Ev>) {
+    let mode = std::fs::read_to_string(deploy::switch_path()).unwrap_or_default();
+    let _ = std::fs::remove_file(deploy::switch_path());
+    let done = |ok: bool, msg: String| {
+        let _ = proxy.send_event(Ev::Log(format!("── {msg} ──")));
+        let _ = std::fs::write(deploy::switch_done_path(), json!({"ok": ok, "message": msg}).to_string());
+    };
+    let old = st.lock().unwrap().child.take();
+    let Some(mut old) = old else {
+        // nothing ran: just start
+        return match start(st, proxy) {
+            Ok(()) => done(true, "the new server started".into()),
+            Err(e) => done(false, e),
+        };
+    };
+    if mode.trim() == "restart" {
+        st.lock().unwrap().child = Some(old);
+        stop_and_wait(st);
+        return match start(st, proxy) {
+            Ok(()) => done(true, "the server restarted with the new build".into()),
+            Err(e) => done(false, e),
+        };
+    }
+    st.lock().unwrap().handoff = true;
+    if let Err(e) = start(st, proxy) {
+        st.lock().unwrap().child = Some(old);
+        return done(false, format!("the new server could not start ({e}); the old one keeps serving"));
+    }
+    let _ = proxy.send_event(Ev::Log(format!("── handoff: the new server loads its model beside the old one (pid {}) ──", old.id())));
+    let t = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if matches!(old.try_wait(), Ok(Some(_)) | Err(_)) {
+            return done(true, format!("handed over in {:.0} s: the new server serves, the old one finished its requests", t.elapsed().as_secs_f64()));
+        }
+        let mut s = st.lock().unwrap();
+        let new_gone = match s.child.as_mut() {
+            None => true,
+            Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+        };
+        if new_gone {
+            s.child = Some(old); // its log readers never stopped: it goes on as the app's server
+            s.phase = "ready";
+            drop(s);
+            return done(false, "the new server stopped before it took over; the old one keeps serving (its log above says why)".into());
+        }
+        if t.elapsed() > Duration::from_secs(1800) {
+            drop(s);
+            return done(false, "the old server still runs after 30 min; both are left as they are".into());
+        }
     }
 }
 
@@ -863,6 +1273,7 @@ fn poll(st: Shared, proxy: EventLoopProxy<Ev>) {
                 }
                 status["requests"] = m["totals"]["requests"].clone();
                 status["last"] = m["requests"].get(0).cloned().unwrap_or(Value::Null);
+                status["conversation_cache"] = m["conversation_cache"].clone();
             }
             let phase = {
                 let mut s = st.lock().unwrap();
@@ -1046,6 +1457,27 @@ fn save_map_export(args: &Value, kml: &str, title: &str, page: &Value) -> Result
                places.len(), if without > 0 { format!(", {without} with none") } else { String::new() }, kml_path.display(), gj.display()))
 }
 
+/// A team agent's own browser (/mcp/N; the server's "/team"): a web view of its own, stacked with the others in the
+/// browser's half while they run, so the agents never click on each other's pages.  Browsing only.
+// ponytail: clicks by the page's script, not the mouse (the pane people see clicks natively); typing not offered
+struct AgentPane {
+    web: WebView,
+    seen: Arc<Mutex<std::collections::HashSet<String>>>,
+    last: Arc<Mutex<String>>,
+    searched: Option<Instant>,
+    load_waiters: Vec<std::sync::mpsc::Sender<Result<String, String>>>,
+    search_waiters: Vec<std::sync::mpsc::Sender<Result<String, String>>>,
+}
+
+/// An agent pane's page read `ms` from now as the call's answer.
+fn agent_read_later(i: usize, reply: std::sync::mpsc::Sender<Result<String, String>>, proxy: &EventLoopProxy<Ev>, ms: u64, search: bool) {
+    let p = Mutex::new(proxy.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(ms));
+        let _ = p.lock().unwrap().send_event(Ev::AgentRead(i, reply, search));
+    });
+}
+
 /// The page read `ms` from now as the call's answer (what a click or typing led to).
 fn read_later(reply: std::sync::mpsc::Sender<Result<String, String>>, proxy: &EventLoopProxy<Ev>, ms: u64) {
     let p = Mutex::new(proxy.clone());
@@ -1069,11 +1501,13 @@ fn snapshot(st: &Shared) -> Value {
         .iter()
         .map(|p| {
             let c = read_config(p);
-            json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"], "problem": problem(&c)})
+            json!({"path": p, "name": p.file_name().unwrap_or_default().to_string_lossy(), "model": c["model_name"], "port": c["port"], "problem": problem(&c),
+                "parallel": c["parallel"].as_u64().filter(|n| *n > 1).map(|n| n.min(8)).unwrap_or(1), "cache_mib": cache_mib(&c),
+                "pool": pool_of(&c).0, "ctx": pool_of(&c).1, "share": share_of(&c), "shared": shared(&c)})
         })
         .collect();
     let settings = load_settings();
-    json!({"root": s.root, "configs": list, "config": s.config, "port": s.port, "phase": s.phase,
+    json!({"os": std::env::consts::OS, "root": s.root, "configs": list, "config": s.config, "port": s.port, "phase": s.phase,
         "running": s.child.is_some(), "log": s.log.iter().cloned().collect::<Vec<_>>(), "status": s.last,
         "key": s.api_key(), "autostart": settings["autostart"].as_bool().unwrap_or(false), "server": server_exe(&s.root).is_file()})
 }
@@ -1115,8 +1549,35 @@ fn query_escape(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
+/// macOS's `open` (a URL; -t a file in the text editor, -R shown in the Finder, -a APP); elsewhere xdg-open with what
+/// it can do: the file, or the folder it is in for -R
 fn open(args: &[&str]) {
-    let _ = Command::new("open").args(args).spawn();
+    if cfg!(target_os = "macos") {
+        let _ = Command::new("open").args(args).spawn();
+        return;
+    }
+    let _ = Command::new("xdg-open").arg(xdg_target(args)).spawn();
+}
+
+/// The command that takes text on stdin into the clipboard: pbcopy (macOS), wl-copy (Wayland), xclip (X11)
+fn clipboard() -> Command {
+    if cfg!(target_os = "macos") {
+        return Command::new("pbcopy");
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Command::new("wl-copy");
+    }
+    let mut c = Command::new("xclip");
+    c.args(["-selection", "clipboard"]);
+    c
+}
+
+fn xdg_target(args: &[&str]) -> String {
+    let last = args.last().copied().unwrap_or("");
+    if args.first() == Some(&"-R") {
+        return Path::new(last).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    }
+    last.to_string()
 }
 
 /// The first n characters of a text (for the log).
@@ -1133,26 +1594,65 @@ fn main() {
     let config = settings["config"].as_str().map(PathBuf::from).filter(|p| p.is_file()).or_else(|| configs(&root).into_iter().next());
     let config = config.filter(|c| runnable(&read_config(c))).or_else(|| configs(&root).into_iter().next());
     let port = config.as_deref().map(config_port).unwrap_or(8090);
-    let st: Shared = Arc::new(Mutex::new(State { root, config, port, child: None, phase: "stopped", stopping_since: None, log: VecDeque::new(), last: json!({}), browser: None }));
+    // make app-run: `Strata --deploy` puts this build in place of the running app (deploy.rs), with no window
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--deploy") {
+        std::process::exit(deploy::run(&root, config.as_deref()));
+    }
+    // one Strata.app: a second one would start a second server on the same port and a second engine
+    let Some(_one_app) = deploy::lock("app.lock", false) else {
+        eprintln!("strata-app: Strata.app is already running: this one quits");
+        std::process::exit(0);
+    };
+    let handoff = argv.iter().any(|a| a == "--handoff");
+    let st: Shared = Arc::new(Mutex::new(State { root, config, port, child: None, phase: "stopped", stopping_since: None, log: VecDeque::new(), last: json!({}), browser: None, handoff }));
+    deploy::record_running();
 
     // SIGTERM / Ctrl+C on the app = Quit (the server is stopped its own way, not orphaned); blocked before any thread
     // starts so only the waiter gets them (a spawned server starts with an empty mask)
+    #[cfg(target_os = "macos")]
     let sigs = unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGUSR1); // `Strata --deploy`: switch the server (deploy.rs)
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         set
     };
+    // Linux: WebKitGTK's JavaScriptCore suspends its threads with SIGUSR1 and runs threads that block nothing, so a
+    // blocked set and sigwait missed the deploy's signal (it went to JavaScriptCore) and a SIGTERM there would end
+    // the app without stopping its server.  A handler is the process's wherever the signal lands: it writes the
+    // signal into a pipe this thread reads.  Nothing blocked; the deploy's signal is SIGUSR2 (deploy::SWITCH_SIGNAL).
+    #[cfg(not(target_os = "macos"))]
+    let sig_read = signal_pipe(&[libc::SIGTERM, libc::SIGINT, deploy::SWITCH_SIGNAL]);
     let event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     std::thread::spawn({
         let p = proxy.clone();
         move || {
-            let mut sig = 0;
-            unsafe { libc::sigwait(&sigs, &mut sig) };
-            let _ = p.send_event(Ev::Quit);
+            loop {
+                #[cfg(target_os = "macos")]
+                let sig = {
+                    let mut sig = 0;
+                    unsafe { libc::sigwait(&sigs, &mut sig) };
+                    sig
+                };
+                #[cfg(not(target_os = "macos"))]
+                let sig = {
+                    let mut b = [0u8; 1];
+                    if unsafe { libc::read(sig_read, b.as_mut_ptr() as *mut libc::c_void, 1) } != 1 {
+                        continue;   // EINTR: a signal came during the read itself
+                    }
+                    b[0] as libc::c_int
+                };
+                if sig == deploy::SWITCH_SIGNAL {
+                    let _ = p.send_event(Ev::Switch);
+                    continue;
+                }
+                let _ = p.send_event(Ev::Quit);
+                return;
+            }
         }
     });
     // the model's browser: its MCP endpoint (after the signals are blocked: its threads must not take them)
@@ -1181,6 +1681,9 @@ fn main() {
     let last_read: std::sync::Arc<Mutex<String>> = Default::default();
     let searched: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None); // the last search (the check holds 10 min)
     let next_ask = std::cell::Cell::new(0u64);
+    // the team agents' browsers (made at their first call) and whether they hold the browser's half
+    let agents: std::cell::RefCell<Vec<Option<AgentPane>>> = std::cell::RefCell::new((0..4).map(|_| None).collect());
+    let agents_shown = std::cell::Cell::new(false);
     {
         let p = proxy.clone();
         MenuEvent::set_event_handler(Some(move |e| {
@@ -1196,9 +1699,25 @@ fn main() {
     let edit = Submenu::with_items("Edit", true, &[&PredefinedMenuItem::undo(None), &PredefinedMenuItem::redo(None), &PredefinedMenuItem::separator(), &PredefinedMenuItem::cut(None), &PredefinedMenuItem::copy(None), &PredefinedMenuItem::paste(None), &PredefinedMenuItem::select_all(None)]).unwrap();
     let window_menu = Submenu::with_items("Window", true, &[&PredefinedMenuItem::minimize(None), &close_win]).unwrap();
     app_menu.append_items(&[&strata, &edit, &window_menu]).unwrap();
+    // the menu bar (and with it Cmd+C / Cmd+V in the web view); WebKitGTK has Ctrl+C / Ctrl+V itself, the tray its menu
+    #[cfg(target_os = "macos")]
     app_menu.init_for_nsapp();
 
     let control_win = WindowBuilder::new().with_title("Strata").with_inner_size(tao::dpi::LogicalSize::new(1280.0, 900.0)).build(&event_loop).expect("window");
+    // where the web views go: a gtk::Layout in the window on Linux (each view a widget this app moves and sizes; its
+    // own minimum size does not follow them, so the window can be made smaller than the views' first size), the
+    // window itself elsewhere
+    #[cfg(target_os = "linux")]
+    let host = {
+        use gtk::prelude::*;
+        use tao::platform::unix::WindowExtUnix;
+        let layout = gtk::Layout::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        layout.show_all();
+        control_win.default_vbox().expect("the window's gtk box").pack_start(&layout, true, true, 0);
+        layout
+    };
+    #[cfg(not(target_os = "linux"))]
+    let host = ();
     // two views in the window: the control bar, and the server's own page (Chat, Monitor, Firewall, About) under it.
     // The bar covers the whole window while the server is down, its log is open or there is a problem to show; the
     // page is hidden then.  The page is made last, so it is the top view whenever it shows: it never depends on the
@@ -1214,8 +1733,7 @@ fn main() {
                     let _ = p.send_event(Ev::Ipc(v));
                 }
             })
-            .build_as_child(&control_win)
-            .expect("webview")
+            .pipe(|b| attach(b, &control_win, &host))
     };
     let page = {
         let p = proxy.clone();
@@ -1247,8 +1765,7 @@ fn main() {
                 eprintln!("strata-app: page {event} {url}"); // a trace a run from Terminal shows (no window needed)
                 let _ = p.send_event(Ev::Page(json!({"event": event, "url": url})));
             })
-            .build_as_child(&control_win)
-            .expect("webview")
+            .pipe(|b| attach(b, &control_win, &host))
     };
     // the browser pane (the bar's Web button): a strip of controls, and a web view, right of the page; hidden until opened
     let web_open = std::cell::Cell::new(false);
@@ -1263,8 +1780,7 @@ fn main() {
                     let _ = p.send_event(Ev::Ipc(v));
                 }
             })
-            .build_as_child(&control_win)
-            .expect("webview")
+            .pipe(|b| attach(b, &control_win, &host))
     };
     // the picker bridge's token (browser_mcp::frame_bridge_js): made at each start, known to this app and the script
     let frame_token: String = {
@@ -1296,8 +1812,7 @@ fn main() {
                     let _ = p.send_event(Ev::Web(url));
                 }
             })
-            .build_as_child(&control_win)
-            .expect("webview")
+            .pipe(|b| attach(b, &control_win, &host))
     };
     // the page's loads: a load that never finishes (10 s) or finishes empty is said, with Open in browser and Retry
     let (navs, loaded) = (Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)));
@@ -1317,7 +1832,7 @@ fn main() {
         move || poll(st, p)
     });
     std::thread::spawn(keep_off); // what the System card's toggles keep off
-    if settings["autostart"].as_bool().unwrap_or(false) {
+    if handoff || settings["autostart"].as_bool().unwrap_or(false) {
         let _ = start(&st, &proxy);
     }
 
@@ -1325,16 +1840,31 @@ fn main() {
         *control_flow = ControlFlow::Wait;
         let layout = |full: bool| {
             let sz = control_win.inner_size().to_logical::<f64>(control_win.scale_factor());
-            let _ = control_view.set_bounds(rect(0.0, 0.0, sz.width, if full { sz.height } else { BAR }));
+            place(&control_view, &host, rect(0.0, 0.0, sz.width, if full { sz.height } else { BAR }));
             // the browser open: the page on the left half, the browser (its strip, then the web view) on the right
             let split = web_open.get() && !full;
             let left = if split { (sz.width / 2.0).round() } else { sz.width };
-            let _ = page.set_bounds(rect(0.0, BAR, left, (sz.height - BAR).max(0.0)));
+            place(&page, &host, rect(0.0, BAR, left, (sz.height - BAR).max(0.0)));
             let _ = page.set_visible(!full);
-            let _ = web_bar.set_bounds(rect(left, BAR, sz.width - left, WEB_BAR));
-            let _ = web.set_bounds(rect(left, BAR + WEB_BAR, sz.width - left, (sz.height - BAR - WEB_BAR).max(0.0)));
+            place(&web_bar, &host, rect(left, BAR, sz.width - left, WEB_BAR));
+            place(&web, &host, rect(left, BAR + WEB_BAR, sz.width - left, (sz.height - BAR - WEB_BAR).max(0.0)));
             let _ = web_bar.set_visible(split);
             let _ = web.set_visible(split);
+            // a team's agents: their browsers stacked in the browser's half, in the place of the pane people use
+            let ags = agents.borrow();
+            let live: Vec<&AgentPane> = ags.iter().flatten().collect();
+            let stacked = split && agents_shown.get() && !live.is_empty();
+            if stacked {
+                let _ = web_bar.set_visible(false);
+                let _ = web.set_visible(false);
+                let h = ((sz.height - BAR) / live.len() as f64).floor();
+                for (k, a) in live.iter().enumerate() {
+                    place(&a.web, &host, rect(left, BAR + h * k as f64, sz.width - left, (h - 2.0).max(0.0)));
+                }
+            }
+            for a in &live {
+                let _ = a.web.set_visible(stacked);
+            }
         };
         let act = |cmd: &str, v: &Value| {
             let note = |msg: &str| js_call(&control_view, "note", &json!(msg));
@@ -1383,7 +1913,8 @@ fn main() {
                 "apps" => {
                     let p = proxy.clone();
                     std::thread::spawn(move || {
-                        let _ = p.send_event(Ev::Apps(json!({"apps": memory_apps()})));
+                        let (apps, strata) = memory_apps();
+                        let _ = p.send_event(Ev::Apps(json!({"apps": apps, "strata": strata, "sys": sys_memory()})));
                     });
                 }
                 "quit_app" => {
@@ -1391,7 +1922,8 @@ fn main() {
                     let (bundle, pid, force) = (v["bundle"].as_str().unwrap_or("").to_string(), v["pid"].as_u64().unwrap_or(0) as u32, v["force"] == true);
                     std::thread::spawn(move || {
                         let still = !bundle.is_empty() && pid > 0 && quit_app(&bundle, pid, force);
-                        let _ = p.send_event(Ev::Apps(json!({"apps": memory_apps(), "still": if still { json!(bundle) } else { Value::Null }})));
+                        let (apps, strata) = memory_apps();
+                        let _ = p.send_event(Ev::Apps(json!({"apps": apps, "strata": strata, "sys": sys_memory(), "still": if still { json!(bundle) } else { Value::Null }})));
                         check_memory(&st2, &p, None);
                     });
                 }
@@ -1412,6 +1944,132 @@ fn main() {
                         };
                         let _ = p2.send_event(Ev::Log(msg));
                         if start_after {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                        check_memory(&st2, &p2, None);
+                    });
+                }
+                "set_parallel" => {
+                    // requests at once in the config; a running server restarts with it (as a new context does)
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let n = v["n"].as_u64().unwrap_or(1).clamp(1, 8);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let msg = match set_parallel(&cfg, n) {
+                            Ok(()) => format!("── {n} request{} at once in {} ──", if n == 1 { "" } else { "s" }, cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        if running {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                        check_memory(&st2, &p2, None);
+                    });
+                }
+                "set_pool" => {
+                    // the shared K/V pool in the config; a running server restarts with it
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let tokens = v["tokens"].as_u64().unwrap_or(0);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let name = cfg.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        let msg = match set_pool(&cfg, tokens) {
+                            Ok(()) if tokens > 0 => format!("── one K/V pool of {}K tokens for all agents in {name} ──", tokens / 1024),
+                            Ok(()) => format!("── each agent its own context in {name} ──"),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        if running {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                        check_memory(&st2, &p2, None);
+                    });
+                }
+                "set_share" => {
+                    // prompt sharing in the config; a running server restarts with it
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let share = v["share"].as_f64().unwrap_or(0.25);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let name = cfg.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        let msg = match set_share(&cfg, share) {
+                            Ok(()) if share > 0.0 => format!("── while a prompt is read, the writing agents get {}% of the time in {name} ──", (share * 100.0).round()),
+                            Ok(()) => format!("── prompt sharing off in {name}: a new prompt is read whole first ──"),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        if running {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                    });
+                }
+                "set_shared" => {
+                    // other devices may use the model (with the API key); a running server restarts with it
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let on = v["on"].as_bool().unwrap_or(false);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let name = cfg.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        let host = Command::new(if cfg!(target_os = "macos") { "/usr/sbin/scutil" } else { "hostname" })
+                            .args(if cfg!(target_os = "macos") { &["--get", "LocalHostName"][..] } else { &[][..] }).output().ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|h| !h.is_empty()).unwrap_or_else(|| "this-mac".into());
+                        let port = read_config(&cfg)["port"].as_u64().unwrap_or(8090);
+                        let msg = match set_shared(&cfg, on) {
+                            Ok(()) if on => format!("── shared on the network in {name}: other devices use http://{host}.local:{port}/v1 with the API key (More > Copy API key) ──"),
+                            Ok(()) => format!("── {HERE} only in {name} ──"),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        let _ = p2.send_event(Ev::Ipc(json!({"cmd": "init"})));   // the switch shows the new state
+                        if running {
+                            if let Err(e) = start(&st2, &p2) {
+                                let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
+                            }
+                        }
+                    });
+                }
+                "set_cache" => {
+                    // the conversation cache's RAM budget in the config; a running server restarts with it
+                    let Some(cfg) = st.lock().unwrap().config.clone() else { return };
+                    let mib = v["mib"].as_i64().unwrap_or(-1);
+                    let running = st.lock().unwrap().child.is_some();
+                    let (st2, p2) = (st.clone(), proxy.clone());
+                    std::thread::spawn(move || {
+                        if running {
+                            stop_and_wait(&st2);
+                        }
+                        let msg = match set_cache_mib(&cfg, mib) {
+                            Ok(()) if mib > 0 => format!("── conversation cache {} GB in RAM in {} ──", mib / 1024, cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Ok(()) if mib < 0 => format!("── conversation cache automatic (sized for {HERE}) in {} ──", cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Ok(()) => format!("── conversation cache off in {} ──", cfg.file_name().unwrap_or_default().to_string_lossy()),
+                            Err(e) => format!("── the config could not be changed: {e} ──"),
+                        };
+                        let _ = p2.send_event(Ev::Log(msg));
+                        if running {
                             if let Err(e) = start(&st2, &p2) {
                                 let _ = p2.send_event(Ev::Log(format!("── {e} ──")));
                             }
@@ -1501,6 +2159,7 @@ fn main() {
                 }
                 "browser" => open(&[&format!("{}/", st.lock().unwrap().base())]),
                 "web" => {
+                    agents_shown.set(false);
                     web_open.set(!web_open.get());
                     if web_open.get() && web.url().map(|u| u == "about:blank").unwrap_or(true) {
                         nav_epoch.set(nav_epoch.get() + 1);
@@ -1594,7 +2253,7 @@ fn main() {
                 }
                 "copy_key" => {
                     let key = st.lock().unwrap().api_key();
-                    if let Ok(mut c) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+                    if let Ok(mut c) = clipboard().stdin(Stdio::piped()).spawn() {
                         use std::io::Write;
                         let _ = c.stdin.take().map(|mut i| i.write_all(key.as_bytes()));
                         let _ = c.wait();
@@ -1606,6 +2265,7 @@ fn main() {
         };
         match event {
             Event::NewEvents(tao::event::StartCause::Init) => {
+                layout(full.get()); // the views where they belong from the start (Linux: no first Resized to do it)
                 // the menu-bar icon is made once the app has started (macOS wants the run loop first)
                 tray = TrayIconBuilder::new().with_menu(Box::new(tray_menu.take().unwrap())).with_icon(dot(phase_color("stopped"))).with_tooltip("Strata: stopped").build().ok();
                 control_win.set_focus();
@@ -1660,7 +2320,130 @@ fn main() {
                     Ok(browser_mcp::loaded_text(&v, search))
                 });
             }
+            Event::UserEvent(Ev::Tool(job)) if job.pane > 0 => {
+                let i = job.pane;
+                if agents.borrow()[i - 1].is_none() {
+                    let p = proxy.clone();
+                    let w = WebViewBuilder::new()
+                        .with_url("about:blank")
+                        .with_user_agent(safari_user_agent(&safari_version()))
+                        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+                        .with_bounds(rect(640.0, BAR, 640.0, 300.0))
+                        .with_visible(false)
+                        .with_on_page_load_handler(move |e, url| {
+                            if matches!(e, wry::PageLoadEvent::Finished) {
+                                let _ = p.send_event(Ev::AgentWeb(i, url));
+                            }
+                        })
+                        .pipe(|b| attach(b, &control_win, &host));
+                    agents.borrow_mut()[i - 1] = Some(AgentPane { web: w, seen: Default::default(), last: Default::default(), searched: None, load_waiters: vec![], search_waiters: vec![] });
+                }
+                if !web_open.get() {
+                    web_open.set(true);
+                    js_call(&control_view, "webOpen", &json!(true));
+                    js_call(&page, "strataWeb", &json!(true));
+                }
+                if !agents_shown.get() {
+                    agents_shown.set(true);
+                }
+                layout(full.get());
+                let mut ags = agents.borrow_mut();
+                let a = ags[i - 1].as_mut().unwrap();
+                let n = job.args["element"].as_i64().unwrap_or(0);
+                let wait_load = |a: &mut AgentPane, reply: std::sync::mpsc::Sender<Result<String, String>>, secs: u64| {
+                    let late = reply.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(secs));
+                        let _ = late.send(Ok(format!("still loading after {secs} s: browser_read it in a moment")));
+                    });
+                    a.load_waiters.push(reply);
+                };
+                match job.tool.as_str() {
+                    "browser_search" => {
+                        a.searched = Some(Instant::now());
+                        let _ = a.web.load_url(&web_url(&format!("{} ", job.args["query"].as_str().unwrap_or("")).replace('.', " ")));
+                        let late = job.reply.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(15));
+                            let _ = late.send(Ok("the results did not load in 15 s: browser_read the page".into()));
+                        });
+                        a.search_waiters.push(job.reply);
+                    }
+                    "browser_open" => {
+                        let url = web_url(job.args["url"].as_str().unwrap_or(""));
+                        if a.searched.is_some_and(|t| t.elapsed() < Duration::from_secs(600)) && !link_seen(&a.seen.lock().unwrap(), &url) {
+                            let _ = job.reply.send(Ok(format!("not opened: {} is a site none of the results or pages you read showed (guessed addresses are usually 404s). Use browser_click with a result's number, or browser_search again.", site_of(&url))));
+                        } else {
+                            let _ = a.web.load_url(&url);
+                            wait_load(a, job.reply, 20);
+                        }
+                    }
+                    "browser_back" => {
+                        let _ = a.web.evaluate_script("history.back()");
+                        wait_load(a, job.reply, 8);
+                    }
+                    "browser_read" => {
+                        let (seen, last) = (a.seen.clone(), a.last.clone());
+                        eval_reply(&a.web, &browser_mcp::read_js(job.args["part"].as_i64().unwrap_or(1)), job.reply, move |v| {
+                            remember_links(&seen, &v);
+                            Ok(browser_mcp::once(&mut last.lock().unwrap(), browser_mcp::page_text(&v)))
+                        });
+                    }
+                    "browser_click" | "browser_scroll" => {
+                        let (js, ms) = if job.tool == "browser_click" {
+                            (browser_mcp::click_js(n), 2000)
+                        } else {
+                            (format!("window.scrollBy(0, {}innerHeight * 0.8); JSON.stringify({{y: Math.round(scrollY)}})", if job.args["direction"] == "up" { "-" } else { "" }), 800)
+                        };
+                        if job.tool == "browser_click" {
+                            a.load_waiters.push(job.reply.clone());
+                        }
+                        let (reply, p) = (job.reply, proxy.clone());
+                        let _ = a.web.evaluate_script_with_callback(&js, move |r| {
+                            if let Some(e) = js_value(&r)["error"].as_str() {
+                                let _ = reply.send(Err(e.to_string()));
+                            } else {
+                                agent_read_later(i, reply.clone(), &p, ms, false);
+                            }
+                        });
+                    }
+                    other => {
+                        let _ = job.reply.send(Err(format!("{other}: an agent's browser only browses (browser_search, browser_open, browser_read, browser_click, browser_scroll, browser_back)")));
+                    }
+                }
+            }
+            Event::UserEvent(Ev::AgentWeb(i, url)) => {
+                let mut ags = agents.borrow_mut();
+                let Some(a) = ags[i - 1].as_mut() else { return };
+                if url.contains("google.") && (url.contains("/search") || url.contains("/sorry/")) {
+                    for w in a.search_waiters.drain(..) {
+                        if url.contains("/sorry/") {
+                            let _ = w.send(Err("Google asks to prove this is a person (the browser shows it): the user can do that, then search again".into()));
+                        } else {
+                            agent_read_later(i, w, &proxy, 800, true);
+                        }
+                    }
+                }
+                for w in a.load_waiters.drain(..) {
+                    agent_read_later(i, w, &proxy, 800, false);
+                }
+            }
+            Event::UserEvent(Ev::AgentRead(i, w, search)) => {
+                let ags = agents.borrow();
+                let Some(a) = ags[i - 1].as_ref() else { return };
+                let (seen, last) = (a.seen.clone(), a.last.clone());
+                eval_reply(&a.web, &browser_mcp::read_js(1), w, move |v| {
+                    remember_links(&seen, &v);
+                    *last.lock().unwrap() = browser_mcp::page_text(&v);
+                    Ok(browser_mcp::loaded_text(&v, search))
+                });
+            }
             Event::UserEvent(Ev::Tool(job)) => {
+                // the pane people see is theirs again (a team's browsers step back)
+                if agents_shown.get() {
+                    agents_shown.set(false);
+                    layout(full.get());
+                }
                 // the model's browser tools work in the pane people see: it opens for them
                 if !web_open.get() {
                     web_open.set(true);
@@ -1928,8 +2711,9 @@ fn main() {
                 let n = job.args["element"].as_i64().unwrap_or(0);
                 if let Some(e) = v["error"].as_str() {
                     let _ = job.reply.send(Err(e.to_string()));
-                } else if what == "click" && v["hidden"] == true {
-                    // nowhere a mouse can reach it (no size, off screen): clicked by the page's script instead
+                } else if what == "click" && (v["hidden"] == true || !cfg!(target_os = "macos")) {
+                    // nowhere a mouse can reach it (no size, off screen), or no AppKit to send a mouse's events with
+                    // (Linux): clicked by the page's script instead
                     load_waiters.borrow_mut().push(job.reply.clone());
                     act_then_read(&web, &browser_mcp::click_js(n), job.reply, &proxy, 2000);
                 } else if what == "click" {
@@ -1943,6 +2727,11 @@ fn main() {
                             read_later(job.reply, &proxy, 2000);
                         }
                     }
+                } else if !cfg!(target_os = "macos") {
+                    // no AppKit (Linux): the page's script types into the field, and submits it when asked
+                    let text = job.args["text"].as_str().unwrap_or("").to_string();
+                    load_waiters.borrow_mut().push(job.reply.clone());
+                    act_then_read(&web, &browser_mcp::type_js(n, &text, job.args["submit"] == true), job.reply, &proxy, 2500);
                 } else {
                     let text = job.args["text"].as_str().unwrap_or("").to_string();
                     let submit = job.args["submit"] == true;
@@ -2163,6 +2952,10 @@ fn main() {
                     control_win.set_visible(false);
                 }
             }
+            Event::UserEvent(Ev::Switch) => {
+                let (st2, p2) = (st.clone(), proxy.clone());
+                std::thread::spawn(move || switch_server(&st2, &p2));
+            }
             Event::UserEvent(Ev::Quit) => {
                 if let Some(t) = &tray {
                     t.set_title(Some("stopping…"));
@@ -2191,6 +2984,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linux_memory_reads_proc() {
+        let mi = "MemTotal:       16000000 kB\nMemFree:          1000000 kB\nMemAvailable:   12000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n";
+        let psi = "some avg10=12.40 avg60=3.00 avg300=1.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        let m = sys_memory_linux(mi, psi);
+        assert_eq!((m["total"].as_u64(), m["free"].as_u64(), m["app"].as_u64()), (Some(16_384_000_000), Some(12_288_000_000), Some(4_096_000_000)));
+        assert_eq!((m["swap_used"].as_u64(), m["swap_total"].as_u64(), m["pressure"].as_u64()), (Some(512_000_000), Some(2_048_000_000), Some(12)));
+        assert_eq!(sys_memory_linux(mi, "")["pressure"], Value::Null);   // a kernel without PSI: no pressure, none made up
+    }
+
+    #[test]
+    fn xdg_open_gets_what_it_can_open() {
+        assert_eq!(xdg_target(&["http://127.0.0.1:8090/"]), "http://127.0.0.1:8090/");
+        assert_eq!(xdg_target(&["-t", "/a/b.json"]), "/a/b.json");
+        assert_eq!(xdg_target(&["-R", "/a/b.json"]), "/a");                // shown in its folder
+        assert_eq!(xdg_target(&["-a", "Console", "/a/x.log"]), "/a/x.log");
+    }
+
+    #[test]
     fn rewrites_context_keeping_the_config() {
         let p = std::env::temp_dir().join(format!("strata-app-test-{}.json", std::process::id()));
         std::fs::write(&p, "{\n \"exe\": \"x\",\n \"args\": [\"--gguf\", \"m.gguf\", \"--max-context\", \"131072\", \"--kv\", \"f16\"],\n \"port\": 8090\n}\n").unwrap();
@@ -2217,12 +3028,110 @@ mod tests {
 
     #[test]
     fn lists_the_apps_using_memory() {
-        let apps = memory_apps();
+        let (apps, _) = memory_apps();
         for w in apps.windows(2) {
             assert!(w[0]["bytes"].as_u64() >= w[1]["bytes"].as_u64());
         }
         assert!(apps.iter().all(|a| !a["bundle"].as_str().unwrap().starts_with("/System/") && a["name"] != "Strata"));
         eprintln!("{}", apps.iter().map(|a| format!("{} {:.1} GB", a["name"].as_str().unwrap(), a["bytes"].as_f64().unwrap() / 1e9)).collect::<Vec<_>>().join(", "));
+    }
+
+    #[test]
+    fn parallel_is_written_into_the_config_and_taken_out_at_one() {
+        let d = std::env::temp_dir().join(format!("strata-par-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("strata-x.json");
+        std::fs::write(&p, "{\n \"args\": [\"--gguf\", \"m\"],\n \"api_key\": \"k\"\n}\n").unwrap();
+        set_parallel(&p, 3).unwrap();
+        assert_eq!(read_config(&p)["parallel"], 3);
+        assert!(std::fs::read_to_string(&p).unwrap().contains("\n \"api_key\": \"k\""));   // the rest and its indent kept
+        set_parallel(&p, 12).unwrap();
+        assert_eq!(read_config(&p)["parallel"], 8);                                  // the engine's most
+        set_parallel(&p, 1).unwrap();
+        assert!(read_config(&p).get("parallel").is_none());                          // one at a time: no key at all
+        assert_eq!(plan_args(&read_config(&p)), ["--gguf", "m"]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn the_conversation_cache_is_set_in_args_zero_is_off_and_none_is_automatic() {
+        let d = std::env::temp_dir().join(format!("strata-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("strata-x.json");
+        std::fs::write(&p, "{\n \"args\": [\"--gguf\", \"m\", \"--conversation-cache-mib\", \"4096\", \"--kv\", \"f16\"]\n}\n").unwrap();
+        assert_eq!(cache_mib(&read_config(&p)), 4096);
+        assert_eq!(cache_max_mib(16 << 30, 9.1e9), 4608);                   // the M1, LFM2.5-8B at 64K: not 8 GB
+        assert_eq!(cache_max_mib(16 << 30, 15e9), 0);
+        let env = p.with_file_name(".env");
+        let _ = std::fs::remove_file(&env);
+        assert!(!shared(&read_config(&p)));
+        set_shared(&p, true).unwrap();                                       // on: 0.0.0.0, and a key in .env
+        assert!(shared(&read_config(&p)) && read_config(&p).get("api_key").is_none());
+        let text = std::fs::read_to_string(&env).unwrap();
+        assert!(text.contains("API_KEY=sk-strata-") && text.lines().filter(|l| l.starts_with("API_KEY=")).count() == 1);
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&env).unwrap().permissions()) & 0o777, 0o600);
+        set_shared(&p, false).unwrap();
+        set_shared(&p, true).unwrap();                                       // the key kept, never a second one
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), text);
+        set_cache_mib(&p, 16384).unwrap();                                   // replaced, never added twice
+        assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "16384"]));
+        assert_eq!(cache_mib(&read_config(&p)), 16384);
+        set_pool(&p, 294912).unwrap();                                       // a pool: both flags, once
+        set_pool(&p, 393216).unwrap();
+        assert_eq!(pool_of(&read_config(&p)).0, 393216);
+        assert_eq!(read_config(&p)["args"].as_array().unwrap().iter().filter(|a| *a == "--kv-unified").count(), 1);
+        set_pool(&p, 0).unwrap();
+        assert_eq!(pool_of(&read_config(&p)).0, 0);
+        assert_eq!(rescaled_pool(393216, (131072, 4), (32768, 4)), 98304); // 3/4 of 4 x 128K -> 3/4 of 4 x 32K
+        assert_eq!(rescaled_pool(393216, (131072, 4), (131072, 2)), 196608); // fewer agents: the same share
+        assert_eq!(rescaled_pool(131072, (131072, 4), (131072, 1)), 131072); // never below one agent's context
+        assert_eq!(rescaled_pool(0, (131072, 4), (32768, 4)), 0); // no pool stays none
+        assert!(!read_config(&p)["args"].as_array().unwrap().iter().any(|a| a == "--kv-unified" || a == "--kv-pool"));
+        assert_eq!(share_of(&read_config(&p)), 0.25);                        // the engine's default: nothing in args
+        set_share(&p, 0.0).unwrap();
+        assert_eq!(share_of(&read_config(&p)), 0.0);
+        set_share(&p, 0.5).unwrap();                                          // off -> 50%: the 0 is gone, once
+        assert_eq!(share_of(&read_config(&p)), 0.5);
+        set_share(&p, 0.25).unwrap();
+        assert!(!read_config(&p)["args"].as_array().unwrap().iter().any(|a| a == "--prefill-share" || a == "--decode-share"));
+        set_cache_mib(&p, 0).unwrap();                                       // off: "0", or the server would size one
+        assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16", "--conversation-cache-mib", "0"]));
+        assert_eq!(cache_mib(&read_config(&p)), 0);
+        set_cache_mib(&p, -1).unwrap();                                      // automatic: no flag at all
+        assert_eq!(read_config(&p)["args"], json!(["--gguf", "m", "--kv", "f16"]));
+        assert_eq!(cache_mib(&read_config(&p)), -1);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn the_memory_check_counts_parallel_slots() {
+        let c = |v: Value| plan_args(&v);
+        assert_eq!(c(json!({"args": ["--serve", "--gguf", "m"], "parallel": 3})), ["--gguf", "m", "--batch", "3"]);
+        assert_eq!(c(json!({"args": ["--gguf", "m"], "parallel": 20}))[3], "8");                 // the engine's most
+        assert_eq!(c(json!({"args": ["--gguf", "m", "--batch", "2"], "parallel": 3})), ["--gguf", "m", "--batch", "2"]);
+        for p in [json!(1), json!(false), Value::Null, json!("3")] {                                // one request at a time
+            assert_eq!(c(json!({"args": ["--gguf", "m"], "parallel": p})), ["--gguf", "m"]);
+        }
+    }
+
+    #[test]
+    fn reads_the_mac_memory_like_activity_monitor() {
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:     1460547.\nPages wired down:   534861.\n\
+                  Pages purgeable:   17820.\nFile-backed pages:  2135266.\nAnonymous pages:  2898072.\n\
+                  Pages stored in compressor:  4012441.\nPages occupied by compressor:  1274808.\n";
+        let m = sys_memory_of(vm, "77\n137438953472\ntotal = 17408.00M  used = 15980.56M  free = 1427.44M  (encrypted)\n");
+        assert_eq!(m["app"], (2898072u64 - 17820) * 16384);              // anonymous less purgeable, not "stored in"
+        assert_eq!(m["wired"], 534861u64 * 16384);
+        assert_eq!(m["compressed"], 1274808u64 * 16384);                // the compressor's own pages
+        assert_eq!(m["pressure"], 23);
+        assert_eq!(m["free"], 137438953472u64 - (2898072 - 17820 + 534861 + 1274808) * 16384);
+        assert_eq!(m["swap_used"], (15980.56f64 * 1048576.0) as u64);
+        assert_eq!(m["swap_total"], 17408u64 * 1048576);
+        let none = sys_memory_of("", "");                               // sysctl or vm_stat missing: nothing made up
+        assert_eq!(none["pressure"], Value::Null);
+        assert_eq!(none["free"], 0);
+        let live = sys_memory();
+        assert!(live["total"].as_u64().unwrap() > 0 && live["pressure"].as_u64().unwrap() <= 100, "{live}");
     }
 
     #[test]

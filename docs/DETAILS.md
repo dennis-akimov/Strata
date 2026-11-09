@@ -842,6 +842,24 @@ print(r.choices[0].message.content)
 - **Model aliases** (0.1.32). `"aliases": ["qwen", "local-model"]` in `strata-<model>.json` lists the model under
   those names too in `/v1/models` (each with its own `id`, and in the model's `aliases`), like llama-server's
   `--alias`; a request naming one is answered under that name. Any other name is still served, as before.
+- **Thinking off.** On a template with a switch for it (Qwen3) the template turns thinking off.  On one that thinks
+  with no switch (LFM2.5) it becomes a short thought: 64 tokens (`reasoning_budget_tokens`; a request's own stands),
+  parsed out as reasoning.  Kept from thinking, LFM2.5-8B-A1B answered 2 of 10 short questions right (the reasoning
+  spilled into the answer, the question came back, a tool call with no tools); with a 64-token thought 10 of 10, in
+  fewer tokens.  When thinking is off on any thinking template, `<think>` and `</think>` are banned while it samples
+  (a token bias; the Metal engine takes `logit_bias` in its batch slots too, INFO `logit_bias=2`).  A JSON answer's
+  grammar starts at the first token after the thought, also when this server closed the thought at its budget.  A
+  JSON object that names a key twice keeps the last value and goes out with each name once (RFC 8259 §4: SHOULD be
+  unique).
+- **Which build runs.** `/health` has `"build"`: the git commit the server was built from, `-dirty` when tracked
+  files differed from it; the server's first log line says it too.
+- **The model's own rules.** Each model gets the profile for its name in `prompts/`: the `.md` whose name the
+  config's `model_name` starts with, the longest one (`lfm2.5-8b-a1b-q4` -> `prompts/lfm2.5-8b.md`, `qwen3.6-35b-a3b`
+  -> `prompts/qwen3.6.md`).  `"system_prompt": "path.md"` in `strata-<model>.json` names another file (from the
+  config's folder), `"system_prompt": false` turns it off.  Its text goes at the start of every request's first system
+  message, or as one: the same start in every request, so the cache keeps it.  Keep it to a few rules about the
+  model's habits, with no tool names, dates or app-specific steps: every app on the server gets it.  Client engines
+  (`"clients"`) get none (their apps send their own), nor does a template without a system role.
 - **Model settings in the web page (0.1.39, #564).** The About tab's Model settings card shows and changes a few of
   the keys above in `strata-<model>.json`: the `sampling` defaults (temperature, top_p, top_k, min_p),
   `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`,
@@ -852,7 +870,10 @@ print(r.choices[0].message.content)
   editable there.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run setup with `START-HERE.bat --setup --host 0.0.0.0 --api-key some-long-secret` (or add `"host": "0.0.0.0"` and
-  `"api_key": "..."` to `strata-<model>.json`). The server window then prints this PC's addresses
+  `"api_key": "..."` to `strata-<model>.json`). On a Mac, Strata.app's **More > Share on the network** sets
+  `"host": "0.0.0.0"` in the run config and, when there is no key in it or in `.env`, adds a random `API_KEY` to the
+  Strata folder's `.env` (mode 600; **More > Copy API key** copies it). The server refuses to start on any address
+  but `127.0.0.1` without a key. The server window then prints this PC's addresses
   (`from other devices: http://192.168.x.x:8080/`); open that on the other device, or use `.../v1` as an API base URL.
   On Windows the firewall blocks it until you allow it: accept its prompt for Python (private networks), or run
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
