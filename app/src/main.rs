@@ -163,12 +163,29 @@ fn signal_pipe(sigs: &[libc::c_int]) -> libc::c_int {
     fds[0]
 }
 
-/// A web view in the app's window: a GTK widget in its Fixed on Linux (keyboard focus and Wayland work there; an X11
+/// A web view in the app's window: a GTK widget in its Layout on Linux (keyboard focus and Wayland work there; an X11
 /// child window took no typing), a child view of the window elsewhere
 #[cfg(target_os = "linux")]
-fn attach(b: WebViewBuilder, _win: &tao::window::Window, fixed: &gtk::Fixed) -> WebView {
+fn attach(b: WebViewBuilder, _win: &tao::window::Window, host: &gtk::Layout) -> WebView {
     use wry::WebViewBuilderExtUnix;
-    b.build_gtk(fixed).expect("webview")
+    b.build_gtk(host).expect("webview")
+}
+
+/// A web view's place in the window.  Linux: moved in the Layout and sized by its size request - wry's set_bounds in a
+/// GTK container only allocates once, and the next layout pass put every view back at its first place and size (the
+/// control bar gone under the page, the window held at the views' 1280 x 900)
+#[cfg(target_os = "linux")]
+fn place(view: &WebView, host: &gtk::Layout, r: wry::Rect) {
+    use gtk::prelude::*;
+    use wry::WebViewExtUnix;
+    let (p, s) = (r.position.to_logical::<f64>(1.0), r.size.to_logical::<f64>(1.0));
+    let w = view.webview();
+    host.move_(&w, p.x.round() as i32, p.y.round() as i32);
+    w.set_size_request(s.width.round().max(1.0) as i32, s.height.round().max(1.0) as i32);
+}
+#[cfg(not(target_os = "linux"))]
+fn place(view: &WebView, _: &(), r: wry::Rect) {
+    let _ = view.set_bounds(r);
 }
 #[cfg(not(target_os = "linux"))]
 fn attach(b: WebViewBuilder, win: &tao::window::Window, _: &()) -> WebView {
@@ -1687,16 +1704,17 @@ fn main() {
     app_menu.init_for_nsapp();
 
     let control_win = WindowBuilder::new().with_title("Strata").with_inner_size(tao::dpi::LogicalSize::new(1280.0, 900.0)).build(&event_loop).expect("window");
-    // where the web views go: a gtk::Fixed in the window on Linux (each view a widget at its bounds), the window itself
-    // elsewhere
+    // where the web views go: a gtk::Layout in the window on Linux (each view a widget this app moves and sizes; its
+    // own minimum size does not follow them, so the window can be made smaller than the views' first size), the
+    // window itself elsewhere
     #[cfg(target_os = "linux")]
     let host = {
         use gtk::prelude::*;
         use tao::platform::unix::WindowExtUnix;
-        let fixed = gtk::Fixed::new();
-        fixed.show_all();
-        control_win.default_vbox().expect("the window's gtk box").pack_start(&fixed, true, true, 0);
-        fixed
+        let layout = gtk::Layout::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        layout.show_all();
+        control_win.default_vbox().expect("the window's gtk box").pack_start(&layout, true, true, 0);
+        layout
     };
     #[cfg(not(target_os = "linux"))]
     let host = ();
@@ -1822,14 +1840,14 @@ fn main() {
         *control_flow = ControlFlow::Wait;
         let layout = |full: bool| {
             let sz = control_win.inner_size().to_logical::<f64>(control_win.scale_factor());
-            let _ = control_view.set_bounds(rect(0.0, 0.0, sz.width, if full { sz.height } else { BAR }));
+            place(&control_view, &host, rect(0.0, 0.0, sz.width, if full { sz.height } else { BAR }));
             // the browser open: the page on the left half, the browser (its strip, then the web view) on the right
             let split = web_open.get() && !full;
             let left = if split { (sz.width / 2.0).round() } else { sz.width };
-            let _ = page.set_bounds(rect(0.0, BAR, left, (sz.height - BAR).max(0.0)));
+            place(&page, &host, rect(0.0, BAR, left, (sz.height - BAR).max(0.0)));
             let _ = page.set_visible(!full);
-            let _ = web_bar.set_bounds(rect(left, BAR, sz.width - left, WEB_BAR));
-            let _ = web.set_bounds(rect(left, BAR + WEB_BAR, sz.width - left, (sz.height - BAR - WEB_BAR).max(0.0)));
+            place(&web_bar, &host, rect(left, BAR, sz.width - left, WEB_BAR));
+            place(&web, &host, rect(left, BAR + WEB_BAR, sz.width - left, (sz.height - BAR - WEB_BAR).max(0.0)));
             let _ = web_bar.set_visible(split);
             let _ = web.set_visible(split);
             // a team's agents: their browsers stacked in the browser's half, in the place of the pane people use
@@ -1841,7 +1859,7 @@ fn main() {
                 let _ = web.set_visible(false);
                 let h = ((sz.height - BAR) / live.len() as f64).floor();
                 for (k, a) in live.iter().enumerate() {
-                    let _ = a.web.set_bounds(rect(left, BAR + h * k as f64, sz.width - left, (h - 2.0).max(0.0)));
+                    place(&a.web, &host, rect(left, BAR + h * k as f64, sz.width - left, (h - 2.0).max(0.0)));
                 }
             }
             for a in &live {
@@ -2247,6 +2265,7 @@ fn main() {
         };
         match event {
             Event::NewEvents(tao::event::StartCause::Init) => {
+                layout(full.get()); // the views where they belong from the start (Linux: no first Resized to do it)
                 // the menu-bar icon is made once the app has started (macOS wants the run loop first)
                 tray = TrayIconBuilder::new().with_menu(Box::new(tray_menu.take().unwrap())).with_icon(dot(phase_color("stopped"))).with_tooltip("Strata: stopped").build().ok();
                 control_win.set_focus();
